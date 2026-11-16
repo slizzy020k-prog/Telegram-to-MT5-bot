@@ -138,6 +138,21 @@ def setup_logger():
     file_handler.setLevel(logging.INFO)
     logger.addHandler(file_handler)
 
+    # Route Telethon's internal logger through our handlers so Python's raw lastResort
+    # stderr handler never prints unformatted text onto the [MT5] bottom status bar
+    telethon_logger = logging.getLogger("telethon")
+    telethon_logger.setLevel(logging.WARNING)
+    telethon_logger.propagate = False
+    if not telethon_logger.handlers:
+        tg_console_handler = LiveHUDStreamHandler(sys.stdout)
+        tg_console_handler.setFormatter(ColoredConsoleFormatter(
+            "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        tg_console_handler.setLevel(logging.ERROR)
+        telethon_logger.addHandler(tg_console_handler)
+        telethon_logger.addHandler(file_handler)
+
     return logger
 
 
@@ -423,12 +438,28 @@ async def tp1_proximity_watcher_task() -> None:
     """
     logger.info("TP1 20-Pip Proximity Watcher & MT5 State Reconciler started (1.0s loop).")
     last_algo_check = 0.0
+    last_tg_keepalive = time.time()
 
     while True:
         try:
             now = time.time()
             update_live_terminal_status()
             await check_and_enforce_daily_drawdown()
+
+            # ---------------------------------------------------------------
+            # 0. 45-Second Telegram TCP Keepalive Ping (Prevents WinError 64 NAT Drops)
+            # ---------------------------------------------------------------
+            if now - last_tg_keepalive >= 45.0:
+                last_tg_keepalive = now
+                if telethon_client:
+                    try:
+                        if not telethon_client.is_connected():
+                            await telethon_client.connect()
+                        else:
+                            from telethon.tl.functions import PingRequest
+                            await telethon_client(PingRequest(ping_id=int(now * 1000) & 0x7FFFFFFF))
+                    except Exception as tg_err:
+                        logger.debug(f"Telegram keepalive ping reconnect check: {tg_err}")
 
             # ---------------------------------------------------------------
             # 1. 30-Second Algo Trading Button Monitor
