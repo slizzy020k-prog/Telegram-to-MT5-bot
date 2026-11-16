@@ -42,12 +42,16 @@ telegram-mt5-copier/
 ├── signals_state.json      # Auto-generated state file (tracks which ticket belongs to Layer 1, 2, or 3)
 ├── copier.log              # Rotating log file (capped at 5 MB x 5 backups)
 ├── requirements.txt        # Python dependencies
-├── .env                    # Active credentials and configuration settings
+├── .env                    # Active credentials and configuration settings (gitignored)
 ├── .env.example            # Template configuration with placeholder values
-└── tests/                  # Pytest verification suite (22 unit & integration tests)
+├── AI_HANDOVER.md          # Complete technical handover & architecture guide for AI agents/devs
+└── tests/                  # Pytest verification suite (57 unit & integration tests)
     ├── test_parser.py
     ├── test_state_manager.py
-    └── test_copier_scenarios.py
+    ├── test_copier_scenarios.py
+    ├── test_tp1_runner_and_phone_controls.py
+    ├── test_profit_notifications.py
+    └── test_production_edge_cases.py
 ```
 
 ---
@@ -78,6 +82,13 @@ telegram-mt5-copier/
 | `MAX_SL_PIPS` | `250` | Safety cap: rejects any parsed SL > 250 pips away (blocks typos like `Sl 387`) |
 | `NOTIFY_SAVED_MESSAGES` | `True` | Sends instant trade, edit, BE, proximity-close, and warning alerts to Saved Messages (`"me"`) |
 | `DEDUPLICATION_WINDOW_SECONDS` | `5` | Suppresses duplicate events received within N seconds |
+| `SELL_NOW_DELAY_SECONDS` | `20` | Seconds to hold an unpriced `"Sell now"` waiting for a limit/zone edit before market entry |
+| `MAX_NEW_EDIT_AGE_SECONDS` | `180` | Max age (seconds) for an untracked message edit to be treated as a new signal (blocks old emoji reactions) |
+| `FALLBACK_TP1_PIPS` | `50` | Fallback TP1 distance (`$5.00` on Gold) attached if an unpriced market trade gets no TP edit |
+| `UNPRICED_TP_GRACE_SECONDS` | `45` | Seconds to wait before attaching `FALLBACK_TP1_PIPS` to an unpriced market order |
+| `ENFORCE_HIGH_RISK_LOT_CAP` | `true` | Enforces the Professional Risk Guide High-Risk total lot cap (`floor(Balance/10)*0.01`) |
+| `DAILY_LOSS_PAUSE_PCT` | `50.0` | At 50% daily/floating loss, pauses **new** signals while holding open trades naturally to SL/TP |
+| `EMERGENCY_CUTOFF_LOSS_PCT` | `90.0` | At 90% loss of account balance, immediately cuts losing positions and cancels pending limits |
 | `DRY_RUN` | `false` | When `true`, simulates MT5 execution without live broker orders |
 
 ---
