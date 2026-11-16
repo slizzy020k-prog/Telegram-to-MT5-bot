@@ -234,32 +234,45 @@ async def check_and_enforce_daily_drawdown() -> str:
     return "OK"
 
 
+# Last rendered HUD state (bal, cred, eq, pnl, tot_lots, high_l) so we only redraw when values change
+_last_hud_state: Optional[Tuple[float, float, float, float, float, float]] = None
+
+
 def update_live_terminal_status(force_print: bool = False) -> None:
     """
-    Renders a live, dynamically updating in-place MetaTrader 5 Trade Bar at the bottom
-    of the terminal (updating Bid/Ask, Balance, Credit, Equity, Floating P&L, Free Margin,
-    and Active Lots every second without scrolling), plus updates the console window title.
+    Renders a compact (<79 chars, never line-wraps) in-place MetaTrader 5 balance bar at the
+    bottom of the terminal. Only redraws when Balance, Credit, Equity, P&L, or Lots change
+    so the console never floods when idle.
     """
-    global _last_terminal_snapshot, _current_hud_line
+    global _last_terminal_snapshot, _current_hud_line, _last_hud_state
     if executor.dry_run:
         return
     try:
         st = executor.get_risk_exposure_status()
-        bal = st.get("balance", 0.0)
-        cred = st.get("credit", 0.0)
-        eq = st.get("equity", 0.0)
-        pnl = st.get("profit", 0.0)
-        free_mgn = st.get("margin_free", eq)
+        bal = round(st.get("balance", 0.0), 2)
+        cred = round(st.get("credit", 0.0), 2)
+        eq = round(st.get("equity", 0.0), 2)
+        pnl = round(st.get("profit", 0.0), 2)
         curr = st.get("currency", "GBP")
         sym_char = "£" if curr == "GBP" else "$" if curr == "USD" else ""
-        tot_lots = st.get("total_lots", 0.0)
+        tot_lots = round(st.get("total_lots", 0.0), 2)
         low_l = st.get("low_risk_lots", 0.01)
         mid_l = st.get("mid_risk_lots", 0.01)
-        high_l = st.get("high_risk_lots", 0.01)
+        high_l = round(st.get("high_risk_lots", 0.01), 2)
 
-        tick = executor.get_tick(DEFAULT_SYMBOL)
-        bid_str = f"{tick.bid:.2f}" if tick and hasattr(tick, "bid") else "---"
-        ask_str = f"{tick.ask:.2f}" if tick and hasattr(tick, "ask") else "---"
+        snap = (bal, cred, tot_lots)
+        if force_print or snap != _last_terminal_snapshot:
+            _last_terminal_snapshot = snap
+            logger.info(
+                f"💳 [LIVE ACCOUNT & RISK GUIDE] Balance: {bal:.2f} {curr} | Credit: {cred:.2f} {curr} | "
+                f"Equity: {eq:.2f} {curr} | Active Lots: {tot_lots:.2f}/{high_l:.2f} Max "
+                f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
+            )
+
+        hud_state = (bal, cred, eq, pnl, tot_lots, high_l)
+        if not force_print and hud_state == _last_hud_state:
+            return
+        _last_hud_state = hud_state
 
         title_str = (
             f"[XAUUSD COPIER] Bal: {sym_char}{bal:.2f} | Cred: {sym_char}{cred:.2f} | "
@@ -275,27 +288,17 @@ def update_live_terminal_status(force_print: bool = False) -> None:
 
         pnl_color = "\033[92m" if pnl >= 0 else "\033[91m"
         pnl_sign = "+" if pnl >= 0 else "-"
+        # Compact (<79 visible chars) so it NEVER wraps in an 80- or 120-column cmd.exe window
         _current_hud_line = (
-            f"\033[93m\033[1m[MT5 LIVE]\033[0m "
-            f"\033[96m{DEFAULT_SYMBOL}:\033[97m {bid_str}/{ask_str} \033[90m|\033[0m "
-            f"\033[97mBal:\033[93m {sym_char}{bal:.2f} \033[90m|\033[0m "
-            f"\033[97mCred:\033[96m {sym_char}{cred:.2f} \033[90m|\033[0m "
-            f"\033[97mEq:\033[1m{pnl_color} {sym_char}{eq:.2f}\033[0m \033[90m|\033[0m "
-            f"\033[97mP&L:\033[1m{pnl_color} {pnl_sign}{sym_char}{abs(pnl):.2f}\033[0m \033[90m|\033[0m "
-            f"\033[97mFreeMgn:\033[92m {sym_char}{free_mgn:.2f} \033[90m|\033[0m "
-            f"\033[97mLots:\033[93m {tot_lots:.2f}/{high_l:.2f}\033[0m"
+            f"\033[93m[MT5]\033[0m "
+            f"Bal: \033[93m{sym_char}{bal:.2f}\033[0m | "
+            f"Cred: \033[96m{sym_char}{cred:.2f}\033[0m | "
+            f"Eq: {pnl_color}{sym_char}{eq:.2f}\033[0m | "
+            f"P&L: {pnl_color}{pnl_sign}{sym_char}{abs(pnl):.2f}\033[0m | "
+            f"Lots: \033[93m{tot_lots:.2f}/{high_l:.2f}\033[0m"
         )
         sys.stdout.write(f"\r\033[2K{_current_hud_line}")
         sys.stdout.flush()
-
-        snap = (round(bal, 2), round(cred, 2), round(tot_lots, 2))
-        if force_print or snap != _last_terminal_snapshot:
-            _last_terminal_snapshot = snap
-            logger.info(
-                f"💳 [LIVE ACCOUNT & RISK GUIDE] Balance: {bal:.2f} {curr} | Credit: {cred:.2f} {curr} | "
-                f"Equity: {eq:.2f} {curr} | Active Lots: {tot_lots:.2f}/{high_l:.2f} Max "
-                f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
-            )
     except Exception as e:
         logger.debug(f"Could not update live terminal status: {e}")
 
