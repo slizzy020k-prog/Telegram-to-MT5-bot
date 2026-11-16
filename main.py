@@ -35,6 +35,8 @@ from config import (
     MAX_NEW_EDIT_AGE_SECONDS,
     FALLBACK_TP1_PIPS,
     UNPRICED_TP_GRACE_SECONDS,
+    DAILY_LOSS_PAUSE_PCT,
+    EMERGENCY_CUTOFF_LOSS_PCT,
     TP1_LOCK_BUFFER,
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
@@ -135,6 +137,81 @@ _pending_sell_now_tasks: Dict[int, asyncio.Task] = {}
 
 # Last printed terminal financial/risk snapshot to avoid spamming identical lines
 _last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
+
+# Tracks date string (YYYY-MM-DD) when 50% daily loss pause alert was last sent
+_daily_50pct_alert_date: Optional[str] = None
+
+
+async def check_and_enforce_daily_drawdown() -> str:
+    """
+    Two-Stage Daily Loss & Account Drawdown Protection:
+    - Stage 2 (90% of balance): Urgency cut-off immediately closes all losing open positions & cancels limits.
+    - Stage 1 (50% of balance): Pauses NEW signals, while holding existing open trades naturally to SL/TP.
+    Returns "EMERGENCY_CUTOFF", "PAUSED_50PCT", or "OK".
+    """
+    global _daily_50pct_alert_date
+    dd = executor.get_daily_drawdown_status()
+    curr = dd.get("currency", "GBP")
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if dd.get("emergency_cutoff_triggered"):
+        active_sigs = state_mgr.get_active_signals()
+        all_mk: List[int] = []
+        all_pd: List[int] = []
+        for _, s in active_sigs:
+            all_mk.extend(s.get("market_tickets", []))
+            all_pd.extend(s.get("pending_tickets", []))
+
+        res = executor.emergency_cutoff_losing_trades(all_mk, all_pd)
+        closed_tkts = res.get("closed_tickets", [])
+        cancelled_ords = res.get("cancelled_orders", [])
+
+        for mid, s in active_sigs:
+            layers = s.get("layers", {})
+            for lk in layers:
+                layers[lk]["status"] = "CLOSED"
+            state_mgr.update_signal(
+                mid,
+                {
+                    "status": "CLOSED",
+                    "market_tickets": [],
+                    "pending_tickets": [],
+                    "layers": layers,
+                },
+            )
+
+        if closed_tkts or cancelled_ords or active_sigs:
+            fin = executor.get_account_financials()
+            logger.error(
+                f"🚨 90% EMERGENCY CUT-OFF TRIGGERED! Drawdown=-{dd['total_daily_loss']:.2f} {curr} "
+                f"({dd['loss_pct']:.1f}%). Closed={closed_tkts}, Cancelled={cancelled_ords}"
+            )
+            await notify_saved_messages(
+                f"🚨 **{int(EMERGENCY_CUTOFF_LOSS_PCT)}% EMERGENCY DRAWDOWN CUT-OFF TRIGGERED!**\n"
+                f"• Loss Risked: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
+                f"• Closed Losing Positions: `{closed_tkts}`\n"
+                f"• Cancelled Pending Limits: `{cancelled_ords}`\n"
+                f"• 🛡️ All losing positions cut immediately to protect your remaining account balance!\n\n"
+                f"{fin['formatted']}"
+            )
+        return "EMERGENCY_CUTOFF"
+
+    if dd.get("pause_new_signals"):
+        if _daily_50pct_alert_date != today_str:
+            _daily_50pct_alert_date = today_str
+            logger.warning(
+                f"🛑 50% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
+                f"Holding existing open trades to SL/TP; new signals paused."
+            )
+            await notify_saved_messages(
+                f"🛑 **{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Threshold Reached — New Signals Paused**\n"
+                f"• Current Daily/Floating Loss: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
+                f"• 🛡️ **Existing Trades Held:** Currently open positions are **NOT** closed — waiting naturally for their SL or TP.\n"
+                f"• 🚨 **90% Urgency Cut-Off:** Open losing trades will only be force-closed if drawdown reaches `{int(EMERGENCY_CUTOFF_LOSS_PCT)}%` (`-{dd['emergency_cutoff_amount']:.2f} {curr}`)."
+            )
+        return "PAUSED_50PCT"
+
+    return "OK"
 
 
 def update_live_terminal_status(force_print: bool = False) -> None:
@@ -306,6 +383,7 @@ async def tp1_proximity_watcher_task() -> None:
         try:
             now = time.time()
             update_live_terminal_status()
+            await check_and_enforce_daily_drawdown()
 
             # ---------------------------------------------------------------
             # 1. 30-Second Algo Trading Button Monitor
@@ -1934,10 +2012,19 @@ async def handle_saved_messages_command(event):
                     )
 
         risk_st = executor.get_risk_exposure_status()
+        dd_st = executor.get_daily_drawdown_status()
+        dd_state_str = (
+            "🚨 90% CUT-OFF" if dd_st["emergency_cutoff_triggered"]
+            else "🛑 50% PAUSED (Holding Open Trades)" if dd_st["pause_new_signals"]
+            else "🟢 OK"
+        )
         risk_str = (
             f"\n• Active Lots: `{risk_st['total_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` "
             f"(Low: `{risk_st['low_risk_lots']:.2f}` | Mid: `{risk_st['mid_risk_lots']:.2f}` | "
             f"High Cap: `{risk_st['high_risk_lots']:.2f}`)"
+            f"\n• Daily Drawdown Guard: `{dd_state_str}` "
+            f"(Loss: `-{dd_st['total_daily_loss']:.2f} {dd_st['currency']}` / `{dd_st['loss_pct']:.1f}%` | "
+            f"50% Pause: `-{dd_st['pause_limit_amount']:.2f}` | 90% Cut-Off: `-{dd_st['emergency_cutoff_amount']:.2f}`)"
         )
 
         reply_text = (

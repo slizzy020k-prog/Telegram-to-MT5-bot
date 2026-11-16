@@ -136,6 +136,12 @@ UNPRICED_TP_GRACE_SECONDS = float(os.getenv("UNPRICED_TP_GRACE_SECONDS", "45"))
 # Dynamic Risk Guide Cap: blocks opening new lots beyond the High-Risk threshold for current account capital
 ENFORCE_HIGH_RISK_LOT_CAP = os.getenv("ENFORCE_HIGH_RISK_LOT_CAP", "true").lower() in ("true", "1", "yes")
 
+# Two-Stage Daily Loss & Account Drawdown Protection:
+# - At 50% daily/floating loss: pause NEW signals, but keep existing trades running naturally to SL/TP.
+# - At 90% daily/floating loss: urgency cut-off immediately closes losing trades to protect remaining capital.
+DAILY_LOSS_PAUSE_PCT = float(os.getenv("DAILY_LOSS_PAUSE_PCT", "50.0"))
+EMERGENCY_CUTOFF_LOSS_PCT = float(os.getenv("EMERGENCY_CUTOFF_LOSS_PCT", "90.0"))
+
 # MT5 Optional Direct Login Settings
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0")) if os.getenv("MT5_LOGIN") else None
 MT5_PASSWORD = os.getenv("MT5_PASSWORD") or None

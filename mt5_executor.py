@@ -27,9 +27,12 @@ from config import (
     MT5_SERVER,
     MT5_PATH,
     ENFORCE_HIGH_RISK_LOT_CAP,
+    DAILY_LOSS_PAUSE_PCT,
+    EMERGENCY_CUTOFF_LOSS_PCT,
 )
 from parser import ZoneInfo
 import math
+from datetime import datetime, timezone
 
 logger = logging.getLogger("copier.mt5")
 
@@ -68,6 +71,8 @@ class MT5Executor:
         self.last_error: Optional[str] = None
         self._dry_run_capital: Optional[float] = None
         self._dry_run_ticket_lots: Dict[int, float] = {}
+        self._dry_run_daily_realized_pnl: float = 0.0
+        self._dry_run_floating_pnl: float = 0.0
 
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal."""
@@ -262,6 +267,16 @@ class MT5Executor:
         """
         if not self.is_trade_allowed():
             return False, "Algo Trading is OFF in MT5 (trade_allowed=False)"
+
+        dd = self.get_daily_drawdown_status()
+        if dd["pause_new_signals"]:
+            return (
+                False,
+                f"{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Limit Reached "
+                f"(-{dd['total_daily_loss']:.2f} {dd['currency']} / {dd['loss_pct']:.1f}% of "
+                f"{dd['reference_balance']:.2f} {dd['currency']} balance) — "
+                f"Holding existing open trades to natural SL/TP; new signals paused.",
+            )
 
         if self.dry_run:
             return True, "DRY_RUN: Pre-flight OK"
@@ -1160,6 +1175,115 @@ class MT5Executor:
                 f"will open until existing trades bank or close!"
             )
         return alerts
+
+    def get_daily_drawdown_status(self) -> Dict[str, Any]:
+        """
+        Two-Stage Daily Loss & Account Drawdown Monitor:
+        - Stage 1 (DAILY_LOSS_PAUSE_PCT = 50%): Pause NEW signals, keep existing trades running naturally to SL/TP.
+        - Stage 2 (EMERGENCY_CUTOFF_LOSS_PCT = 90%): Urgency cut-off immediately closes losing trades.
+        """
+        fin = self.get_account_financials()
+        curr = fin.get("currency", "GBP")
+
+        if self.dry_run or not self._connected:
+            curr_bal = self._dry_run_capital if self._dry_run_capital is not None else 200.0
+            realized_today = self._dry_run_daily_realized_pnl
+            floating_pnl = self._dry_run_floating_pnl
+        else:
+            curr_bal = fin.get("balance", 0.0)
+            realized_today = 0.0
+            floating_pnl = 0.0
+            try:
+                now_dt = datetime.now()
+                day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                deals = mt5.history_deals_get(day_start, now_dt) or []
+                out_entries = {
+                    getattr(mt5, "DEAL_ENTRY_OUT", 1),
+                    getattr(mt5, "DEAL_ENTRY_INOUT", 2),
+                    getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+                }
+                for d in deals:
+                    if getattr(d, "entry", 0) in out_entries:
+                        realized_today += (
+                            getattr(d, "profit", 0.0)
+                            + getattr(d, "commission", 0.0)
+                            + getattr(d, "swap", 0.0)
+                        )
+                positions = mt5.positions_get() or []
+                for p in positions:
+                    floating_pnl += getattr(p, "profit", 0.0) + getattr(p, "swap", 0.0)
+            except Exception as e:
+                logger.debug(f"Could not compute daily drawdown deals: {e}")
+
+        realized_today = round(realized_today, 2)
+        floating_pnl = round(floating_pnl, 2)
+        ref_bal = max(curr_bal, round(curr_bal - min(0.0, realized_today), 2))
+        floating_loss = max(0.0, round(-floating_pnl, 2))
+        realized_loss = max(0.0, round(-realized_today, 2))
+        total_daily_loss = round(realized_loss + floating_loss, 2)
+
+        pause_limit = round(ref_bal * (DAILY_LOSS_PAUSE_PCT / 100.0), 2)
+        cutoff_limit_ref = round(ref_bal * (EMERGENCY_CUTOFF_LOSS_PCT / 100.0), 2)
+        cutoff_limit_curr = round(curr_bal * (EMERGENCY_CUTOFF_LOSS_PCT / 100.0), 2)
+
+        loss_pct = round((total_daily_loss / ref_bal) * 100.0, 1) if ref_bal > 0 else 0.0
+        floating_loss_pct = round((floating_loss / curr_bal) * 100.0, 1) if curr_bal > 0 else 0.0
+
+        pause_new = bool(ref_bal > 0 and total_daily_loss >= pause_limit - 1e-9)
+        emergency_cutoff = bool(
+            (ref_bal > 0 and total_daily_loss >= cutoff_limit_ref - 1e-9)
+            or (curr_bal > 0 and floating_loss >= cutoff_limit_curr - 1e-9)
+        )
+
+        return {
+            "currency": curr,
+            "current_balance": round(curr_bal, 2),
+            "reference_balance": round(ref_bal, 2),
+            "realized_today_pnl": realized_today,
+            "floating_pnl": floating_pnl,
+            "floating_loss": floating_loss,
+            "total_daily_loss": total_daily_loss,
+            "loss_pct": max(loss_pct, floating_loss_pct),
+            "pause_limit_amount": pause_limit,
+            "emergency_cutoff_amount": min(cutoff_limit_ref, cutoff_limit_curr) if cutoff_limit_curr > 0 else cutoff_limit_ref,
+            "pause_new_signals": pause_new,
+            "emergency_cutoff_triggered": emergency_cutoff,
+        }
+
+    def emergency_cutoff_losing_trades(self, tracked_market_tickets: Optional[List[int]] = None, tracked_pending_tickets: Optional[List[int]] = None) -> Dict[str, List[int]]:
+        """
+        90% Emergency Drawdown Cut-Off:
+        Immediately closes all losing open positions at market and cancels all pending limit orders.
+        """
+        closed_tickets: List[int] = []
+        cancelled_orders: List[int] = []
+
+        if self.dry_run or not self._connected:
+            for t in list(tracked_market_tickets or list(self._dry_run_ticket_lots.keys())):
+                if self.close_market_position(t):
+                    closed_tickets.append(t)
+            for pt in list(tracked_pending_tickets or []):
+                if self.cancel_pending_order(pt):
+                    cancelled_orders.append(pt)
+            return {"closed_tickets": closed_tickets, "cancelled_orders": cancelled_orders}
+
+        try:
+            positions = mt5.positions_get() or []
+            for p in positions:
+                if getattr(p, "magic", 0) == MAGIC_NUMBER or (tracked_market_tickets and p.ticket in tracked_market_tickets):
+                    if getattr(p, "profit", 0.0) < 0.0 or tracked_market_tickets:
+                        if self.close_market_position(p.ticket):
+                            closed_tickets.append(p.ticket)
+
+            orders = mt5.orders_get() or []
+            for o in orders:
+                if getattr(o, "magic", 0) == MAGIC_NUMBER or (tracked_pending_tickets and o.ticket in tracked_pending_tickets):
+                    if self.cancel_pending_order(o.ticket):
+                        cancelled_orders.append(o.ticket)
+        except Exception as e:
+            logger.error(f"Error during 90% emergency cut-off: {e}")
+
+        return {"closed_tickets": closed_tickets, "cancelled_orders": cancelled_orders}
 
     def apply_selective_breakeven(
         self,

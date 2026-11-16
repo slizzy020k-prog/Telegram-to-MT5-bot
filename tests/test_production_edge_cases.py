@@ -584,3 +584,66 @@ async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path):
     assert sig_after["tp1_reached"] is True
     assert sig_after["status"] == "RUNNER_ACTIVE"
     assert sig_after["runner_layer"] == "BOTTOM"
+
+
+@pytest.mark.asyncio
+async def test_two_stage_daily_loss_50pct_hold_and_90pct_emergency_cutoff(tmp_path):
+    """
+    Verify two-stage daily loss guard:
+    - At 50% loss (£60 on £120): holds existing open trades to natural SL/TP, blocks new signals.
+    - At 90% loss (£108 on £120): urgency cut-off immediately closes losing positions & cancels limits.
+    """
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "drawdown_state.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 120.0
+    main._daily_50pct_alert_date = None
+
+    # Open an initial signal (3 layers) while loss is 0%
+    evt1 = MockTelethonEvent(msg_id=9981, text="Buy 3895-3887\nTP 3905\nSL 3875")
+    await main.handle_new_message(evt1)
+    sig1 = main.state_mgr.get_signal(9981)
+    assert sig1["status"] == "ACTIVE"
+    open_mk = list(sig1["market_tickets"])
+    open_pd = list(sig1["pending_tickets"])
+    assert len(open_mk) + len(open_pd) == 3
+
+    alerts = []
+    orig_notify = main.notify_saved_messages
+
+    async def cap_notify(txt):
+        alerts.append(txt)
+
+    main.notify_saved_messages = cap_notify
+    try:
+        # Stage 1: Floating loss hits 50% (-£62.00 on £120.00 balance)
+        main.executor._dry_run_floating_pnl = -62.0
+        state_50 = await main.check_and_enforce_daily_drawdown()
+        assert state_50 == "PAUSED_50PCT"
+
+        # Existing trade MUST still be ACTIVE (held naturally for SL/TP)
+        sig1_still = main.state_mgr.get_signal(9981)
+        assert sig1_still["status"] == "ACTIVE"
+        assert sig1_still["market_tickets"] == open_mk
+        assert any("50% Daily Loss Threshold Reached" in a and "NOT** closed" in a for a in alerts)
+
+        # New incoming signal MUST be blocked while at 50% loss
+        evt2 = MockTelethonEvent(msg_id=9982, text="Buy 3895-3887\nTP 3905\nSL 3875")
+        await main.handle_new_message(evt2)
+        assert main.state_mgr.get_signal(9982) is None
+        assert any("50% Daily Loss Limit Reached" in a for a in alerts)
+
+        # Stage 2: Floating loss reaches 90% (-£109.00 on £120.00 balance) -> Urgency Cut-Off!
+        main.executor._dry_run_floating_pnl = -109.0
+        state_90 = await main.check_and_enforce_daily_drawdown()
+        assert state_90 == "EMERGENCY_CUTOFF"
+
+        sig1_cut = main.state_mgr.get_signal(9981)
+        assert sig1_cut["status"] == "CLOSED"
+        assert sig1_cut["market_tickets"] == []
+        assert sig1_cut["pending_tickets"] == []
+        assert any("90% EMERGENCY DRAWDOWN CUT-OFF TRIGGERED" in a for a in alerts)
+    finally:
+        main.notify_saved_messages = orig_notify

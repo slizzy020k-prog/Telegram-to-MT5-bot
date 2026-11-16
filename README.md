@@ -372,10 +372,13 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
     - `Mid Risk` = `max(0.01, floor(Balance / 20) * 0.01)` (`£50`→`0.02`, `£100`→`0.05`, `£200`→`0.10`, `£500`→`0.25`, `£1000`→`0.50`)
     - `High Risk Cap` = `max(0.01, floor(Balance / 10) * 0.01)` (`£50`→`0.05`, `£100`→`0.10`, `£120`→`0.12`, `£200`→`0.20`, `£500`→`0.50`, `£1000`→`1.00`)
   - Sends alerts when total active lots cross **Low Risk** or **Mid Risk**, and **hard-caps** total active + pending lots at **High Risk** (`ENFORCE_HIGH_RISK_LOT_CAP=true`).
+- **Two-Stage Daily Loss & Account Drawdown Protection (`DAILY_LOSS_PAUSE_PCT=50.0`, `EMERGENCY_CUTOFF_LOSS_PCT=90.0`):**
+  - **At 50% loss of account balance:** Pauses **new** signals for the day while **holding existing open trades naturally** to their SL or TP.
+  - **At 90% loss of account balance:** Urgency cut-off immediately closes all losing open positions at market and cancels all pending limit orders to save remaining capital.
 - **Unfilled Zone Expiry at TP1:** If price hits `TP1` before any pending limit order fills, all pending limits for that zone are automatically cancelled so old limits cannot fill hours later on a reversal.
 - **Old Message Reaction / Edit Filter:** Untracked messages older than `MAX_NEW_EDIT_AGE_SECONDS` (`180s`) are ignored if edited or reacted to later.
 - **Fallback TP1 on Unpriced Market Entries:** If a `"Buy now"` / `"Sell now"` trade still has no `TP` after `UNPRICED_TP_GRACE_SECONDS` (`45s`), a fallback `TP1` (`FALLBACK_TP1_PIPS = 50` pips / `$5.00`) is attached automatically.
 - **Provider Reply `"TP1 hit"` Scaling:** If the provider replies `"TP1 hit"` / `"Tp1 was hit on this"` to an active signal, TP1 scaling & runner lock trigger immediately.
 
 ### Tests
-`python -m pytest tests -o pythonpath=. -q` -> 56 tests.
+`python -m pytest tests -o pythonpath=. -q` -> 57 tests.
