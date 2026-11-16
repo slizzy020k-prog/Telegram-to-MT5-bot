@@ -27,6 +27,16 @@ echo.
 echo  Starting copier engine in LIVE mode...
 echo.
 python main.py
+if %ERRORLEVEL% EQU 88 (
+    echo.
+    echo  ==============================================================================
+    echo    DAILY WIN TARGET REACHED - SESSION TERMINATED FOR TODAY!
+    echo    All trades have been banked and a summary was sent to Saved Messages.
+    echo    No further trades will be placed until you relaunch the copier.
+    echo  ==============================================================================
+    pause
+    exit /b 0
+)
 
 echo.
 echo  ==============================================================================

@@ -343,7 +343,8 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 
 | Command | Category | Description |
 | :--- | :--- | :--- |
-| `/status` | Diagnostics | Returns real-time health check: MT5 connection, Algo Trading button, floating bot P&L, layer states (`OPEN`/`PENDING`/`CLOSED`), shortfall guard arming, and active runner details. |
+| `dailywin` / `/dailywin` | Profit Target | Interactive toggle to set a Daily Win Limit (e.g. reply `£20` or type `dailywin 20`, or `dailywin off`). Once the bot makes that profit from trading today, it closes all open trades, cancels pending limits, sends a Saved Messages notification, and terminates the session for no more trading. |
+| `/status` | Diagnostics | Returns real-time health check: MT5 connection, Algo Trading button, floating bot P&L, Daily Win Limit status, layer states (`OPEN`/`PENDING`/`CLOSED`), shortfall guard arming, and active runner details. |
 | `/bank` | Live Control | Manually triggers the TP1 profit banking and runner scaling rule on the latest active trade. |
 | `/closeall` / `/panic` | Emergency | Emergency panic button: instantly closes all open bot positions (`MAGIC_NUMBER = 777001`) at market and deletes all pending limit orders. |
 | `/sim_tp1 1` | Simulation | Simulates TP1 hit for **Shallow Pullback** (only Layer 1 active) -> banks Layer 1 and cancels Layers 2 & 3 limits. |
@@ -390,6 +391,7 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 - **Old Message Reaction / Edit Filter:** Untracked messages older than `MAX_NEW_EDIT_AGE_SECONDS` (`180s`) are ignored if edited or reacted to later.
 - **Fallback TP1 on Unpriced Market Entries:** If a `"Buy now"` / `"Sell now"` trade still has no `TP` after `UNPRICED_TP_GRACE_SECONDS` (`45s`), a fallback `TP1` (`FALLBACK_TP1_PIPS = 50` pips / `$5.00`) is attached automatically.
 - **Provider Reply `"TP1 hit"` Scaling:** If the provider replies `"TP1 hit"` / `"Tp1 was hit on this"` to an active signal, TP1 scaling & runner lock trigger immediately.
+- **Daily Win Limit Toggle (`dailywin` in Saved Messages):** Type `dailywin` in Saved Messages and reply with your daily profit target (e.g. `20` or `£20`, or one-step `dailywin 20` / `dailywin off`). Once today's net trading profit (`realized + floating`) reaches the target, the copier automatically banks all open positions, cancels pending limit orders, posts a completion summary to Saved Messages, and terminates the session (exit code `88`, stopping the `.bat` supervisor loop so no more trades are taken).
 
 ### Tests
-`python -m pytest tests -o pythonpath=. -q` -> 57 tests.
+`python -m pytest tests -o pythonpath=. -q` -> 58 tests.

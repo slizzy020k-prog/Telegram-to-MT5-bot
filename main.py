@@ -176,6 +176,159 @@ _last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
 # Tracks date string (YYYY-MM-DD) when 50% daily loss pause alert was last sent
 _daily_50pct_alert_date: Optional[str] = None
 
+# Exit code signaling the launcher .bat that Daily Win Target was reached (do not auto-restart)
+DAILY_WIN_EXIT_CODE = 88
+
+# Tracks whether Saved Messages is waiting for the user's daily win target input after typing "dailywin"
+_awaiting_dailywin_input: bool = False
+
+# Flag set when Daily Win Target is reached so main() exits with DAILY_WIN_EXIT_CODE (88)
+_daily_win_terminate_requested: bool = False
+
+
+def get_daily_win_progress() -> Dict[str, Any]:
+    """
+    Calculate today's net trading profit relative to the Daily Win Target configuration.
+    Net Profit Today = (realized_today_pnl - baseline_pnl) + floating_pnl
+    """
+    cfg = state_mgr.get_daily_win_config()
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    enabled = bool(cfg.get("enabled", False))
+    target_amount = round(float(cfg.get("target_amount", 0.0)), 2)
+    baseline_pnl = round(float(cfg.get("baseline_pnl", 0.0)), 2)
+
+    if enabled and cfg.get("date") != today_str:
+        baseline_pnl = 0.0
+        cfg = state_mgr.set_daily_win_config(
+            enabled=True,
+            target_amount=target_amount,
+            baseline_pnl=0.0,
+            date_str=today_str,
+        )
+
+    dd = executor.get_daily_drawdown_status()
+    realized_today = round(float(dd.get("realized_today_pnl", 0.0)), 2)
+    floating_pnl = round(float(dd.get("floating_pnl", 0.0)), 2)
+    curr = dd.get("currency", "GBP")
+    net_profit = round((realized_today - baseline_pnl) + floating_pnl, 2)
+    target_reached = bool(enabled and target_amount > 0 and net_profit >= round(target_amount - 1e-9, 2))
+
+    return {
+        "enabled": enabled,
+        "target_amount": target_amount,
+        "baseline_pnl": baseline_pnl,
+        "realized_today_pnl": realized_today,
+        "floating_pnl": floating_pnl,
+        "net_profit_today": net_profit,
+        "currency": curr,
+        "target_reached": target_reached,
+        "date": cfg.get("date", today_str),
+    }
+
+
+async def check_and_enforce_daily_win_target() -> str:
+    """
+    Monitor today's net trading profit against the user's `dailywin` target.
+    Once net profit >= target_amount:
+    1. Banks (closes at market) all open bot positions and cancels all pending limit orders.
+    2. Marks all active signals CLOSED and resets the `dailywin` flag.
+    3. Sends a congratulatory summary + final account financials to Saved Messages.
+    4. Requests session termination (exit code 88) so no further trading occurs.
+    Returns "DAILY_WIN_REACHED" or "OK".
+    """
+    global _daily_win_terminate_requested
+    if _daily_win_terminate_requested:
+        return "DAILY_WIN_REACHED"
+
+    prog = get_daily_win_progress()
+    if not prog["target_reached"]:
+        return "OK"
+
+    _daily_win_terminate_requested = True
+    target_amount = prog["target_amount"]
+    baseline_pnl = prog["baseline_pnl"]
+    curr = prog["currency"]
+    closed_positions = 0
+    cancelled_orders = 0
+    closed_tickets_list: List[int] = []
+
+    # 1. Close live MT5 positions & pending orders belonging to the bot
+    if not executor.dry_run and executor.is_connected():
+        import MetaTrader5 as mt5
+        resolved_sym = executor.resolve_symbol(DEFAULT_SYMBOL)
+        positions = mt5.positions_get(symbol=resolved_sym) or []
+        for p in positions:
+            if p.magic == MAGIC_NUMBER:
+                closed_tickets_list.append(p.ticket)
+                if executor.close_market_position(p.ticket):
+                    closed_positions += 1
+        orders = mt5.orders_get(symbol=resolved_sym) or []
+        for o in orders:
+            if o.magic == MAGIC_NUMBER:
+                if executor.cancel_pending_order(o.ticket):
+                    cancelled_orders += 1
+
+    # 2. Close tracked tickets in state & cancel any delayed Sell Now timers
+    for pending_mid in list(_pending_sell_now_tasks.keys()):
+        _cancel_delayed_sell_now(pending_mid)
+
+    active_signals = state_mgr.get_active_signals()
+    for mid, s in active_signals:
+        for t in s.get("market_tickets", []):
+            if t not in closed_tickets_list:
+                closed_tickets_list.append(t)
+                if executor.close_market_position(t):
+                    closed_positions += 1
+        for pt in s.get("pending_tickets", []):
+            if executor.cancel_pending_order(pt):
+                cancelled_orders += 1
+
+        layers = s.get("layers", {})
+        for lk in layers:
+            layers[lk]["status"] = "CLOSED"
+
+        s["status"] = "CLOSED"
+        s["market_tickets"] = []
+        s["pending_tickets"] = []
+        s["layers"] = layers
+        state_mgr.update_signal(mid, s)
+
+    # 3. Disable dailywin so future sessions start clean unless toggled again
+    state_mgr.set_daily_win_config(
+        enabled=False,
+        target_amount=target_amount,
+        baseline_pnl=0.0,
+        date_str=prog["date"],
+    )
+
+    dd_after = executor.get_daily_drawdown_status()
+    realized_after = round(float(dd_after.get("realized_today_pnl", 0.0)) - baseline_pnl, 2)
+    final_profit = max(prog["net_profit_today"], realized_after)
+    fin = executor.get_account_financials()
+
+    logger.info(
+        f"🏆 DAILY WIN TARGET REACHED! Profit Made={format_profit(final_profit, curr)} "
+        f"(Target={format_profit(target_amount, curr)}). Closed={closed_positions} pos, "
+        f"Cancelled={cancelled_orders} limits. Terminating session!"
+    )
+
+    await notify_saved_messages(
+        f"🏆 **DAILY WIN TARGET REACHED ({format_profit(target_amount, curr)}) — SESSION TERMINATED!**\n"
+        f"• 💰 **Profit Made Today:** `{format_profit(final_profit, curr)}` (Target: `{format_profit(target_amount, curr)}`)\n"
+        f"• 🔒 **Positions Banked:** `{closed_positions}` | **Pending Limits Cancelled:** `{cancelled_orders}`\n"
+        f"• 🛑 **Session Terminated:** The copier has automatically shut down for the day so you keep your gains with no more trading!\n"
+        f"• 💡 _Relaunch the copier when you are ready for your next session._\n\n"
+        f"{fin['formatted']}"
+    )
+
+    if telethon_client:
+        try:
+            await telethon_client.disconnect()
+        except Exception as e:
+            logger.debug(f"Telethon disconnect on daily win exit: {e}")
+
+    return "DAILY_WIN_REACHED"
+
 
 async def check_and_enforce_daily_drawdown() -> str:
     """
@@ -445,6 +598,8 @@ async def tp1_proximity_watcher_task() -> None:
             now = time.time()
             update_live_terminal_status()
             await check_and_enforce_daily_drawdown()
+            if await check_and_enforce_daily_win_target() == "DAILY_WIN_REACHED":
+                break
 
             # ---------------------------------------------------------------
             # 0. 45-Second Telegram TCP Keepalive Ping (Prevents WinError 64 NAT Drops)
@@ -823,7 +978,6 @@ async def tp1_proximity_watcher_task() -> None:
                         f"{fin['formatted']}"
                     )
                     await notify_saved_messages(alert)
-                    await notify_saved_messages(alert)
 
         except asyncio.CancelledError:
             break
@@ -839,6 +993,8 @@ async def tp1_proximity_watcher_task() -> None:
 
 async def handle_new_message(event):
     """Handler for new messages in monitored Telegram channels."""
+    if _daily_win_terminate_requested:
+        return
     msg = event.message
     if not msg:
         return
@@ -1597,13 +1753,134 @@ async def handle_message_edited(event):
     await notify_saved_messages(alert)
 
 
+async def _apply_daily_win_input(event, raw_arg: str) -> None:
+    """Parse and apply a Daily Win Target input (e.g. '20', '£20', or 'off') from Saved Messages."""
+    global _awaiting_dailywin_input
+    import re
+
+    clean = raw_arg.strip().lower()
+    if clean in ("off", "disable", "disabled", "stop", "none", "cancel", "no", "false", "0"):
+        _awaiting_dailywin_input = False
+        state_mgr.set_daily_win_config(enabled=False, target_amount=0.0, baseline_pnl=0.0)
+        await event.reply(
+            "⚪ **Daily Win Limit Disabled**\n"
+            "• The copier will continue trading without a daily profit cap.\n"
+            "• Type `dailywin` anytime to set a new daily profit target."
+        )
+        return
+
+    m = re.search(r"(\d+(?:\.\d+)?)", clean)
+    if not m:
+        await event.reply(
+            "⚠️ **Invalid Daily Win Amount**\n"
+            "• Please reply with a positive profit target (for example `20` or `£20`), or type `off` to disable."
+        )
+        return
+
+    target_val = round(float(m.group(1)), 2)
+    if target_val <= 0:
+        _awaiting_dailywin_input = False
+        state_mgr.set_daily_win_config(enabled=False, target_amount=0.0, baseline_pnl=0.0)
+        await event.reply("⚪ **Daily Win Limit Disabled.**")
+        return
+
+    _awaiting_dailywin_input = False
+    dd = executor.get_daily_drawdown_status()
+    curr = dd.get("currency", "GBP")
+    realized_today = round(float(dd.get("realized_today_pnl", 0.0)), 2)
+    floating_pnl = round(float(dd.get("floating_pnl", 0.0)), 2)
+
+    # If today's prior realized profit already exceeds the target, set baseline to current realized
+    # so the bot aims to make +target_val from this point forward; otherwise count from 0.0 today.
+    baseline_pnl = realized_today if realized_today >= target_val else 0.0
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    state_mgr.set_daily_win_config(
+        enabled=True,
+        target_amount=target_val,
+        baseline_pnl=baseline_pnl,
+        date_str=today_str,
+    )
+
+    net_now = round((realized_today - baseline_pnl) + floating_pnl, 2)
+    remaining = max(0.0, round(target_val - net_now, 2))
+    await event.reply(
+        f"🏆 **Daily Win Limit Activated: `{format_profit(target_val, curr)}`**\n"
+        f"• 💰 **Current Session Profit:** `{format_profit(net_now, curr)}`\n"
+        f"• 🎯 **Remaining to Target:** `{format_profit(remaining, curr)}`\n"
+        f"• 🛑 **Auto-Termination:** Once the bot reaches `{format_profit(target_val, curr)}` in profit, "
+        f"it will automatically close all open trades, cancel pending orders, notify you here in Saved Messages, "
+        f"and terminate the session for no more trading!\n"
+        f"• 💡 _Type `dailywin off` anytime to disable._"
+    )
+    await check_and_enforce_daily_win_target()
+
+
 async def handle_saved_messages_command(event):
     """Remote monitoring commands sent to Saved Messages ('me')."""
+    global _awaiting_dailywin_input
     msg = event.message
     if not msg or not msg.message:
         return
 
-    text = msg.message.strip().lower()
+    raw_msg = msg.message.strip()
+    text = raw_msg.lower()
+
+    # Ignore bot-generated notifications sent to Saved Messages ("me") so they don't trigger prompts
+    if getattr(msg, "out", False) and any(
+        raw_msg.startswith(prefix)
+        for prefix in (
+            "🏆", "🚀", "🛡️", "💰", "🚪", "🎯", "⚠️", "❌", "⏳", "✏️", "🏦", "🚨",
+            "🧪", "🏃", "✅", "📋", "🤖", "⚪", "🚫", "🔄", "ℹ️", "💳", "🛑",
+        )
+    ):
+        return
+
+    # -----------------------------------------------------------------------
+    # LIVE CONTROL: dailywin / /dailywin (Toggle & Set Daily Win Target)
+    # -----------------------------------------------------------------------
+    if text in ("/dailywin", "dailywin", "/daily_win", "daily_win"):
+        _awaiting_dailywin_input = True
+        prog = get_daily_win_progress()
+        curr = prog.get("currency", "GBP")
+        if prog["enabled"] and prog["target_amount"] > 0:
+            curr_status = f"🟢 ACTIVE (Target: {format_profit(prog['target_amount'], curr)})"
+        else:
+            curr_status = "⚪ OFF"
+
+        await event.reply(
+            f"🎯 **Daily Win Limit Toggle (`dailywin`)**\n"
+            f"• Current Setting: `{curr_status}`\n"
+            f"• Today's Net Profit: `{format_profit(prog['net_profit_today'], curr)}`\n\n"
+            f"👉 **Reply with your Daily Win Target amount** (for example `20` or `£20`), "
+            f"or reply `off` to disable it.\n"
+            f"_(Once the bot makes that amount from trading, it will close all trades, leave a notification here, and terminate the session.)_"
+        )
+        return
+
+    if text.startswith("/dailywin ") or text.startswith("dailywin ") or text.startswith("/daily_win ") or text.startswith("daily_win "):
+        arg_part = raw_msg.split(None, 1)[1] if " " in raw_msg else ""
+        await _apply_daily_win_input(event, arg_part)
+        return
+
+    # If the user previously typed `dailywin` and is now replying with the target (e.g. "20", "£20", "off")
+    if _awaiting_dailywin_input:
+        known_cmds = {
+            "/bank", "bank", "/closeall", "closeall", "/panic", "panic",
+            "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
+            "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
+            "/status", "status", "/ping", "ping", "/trades", "trades",
+            "/algo", "algo", "/check", "check", "/help", "help",
+        }
+        if (
+            text in known_cmds
+            or text.startswith("/sim")
+            or text.startswith("sim ")
+            or text.startswith("sim_")
+        ):
+            _awaiting_dailywin_input = False
+        else:
+            await _apply_daily_win_input(event, raw_msg)
+            return
     # -----------------------------------------------------------------------
     # LIVE CONTROL: /bank (Manual TP1 Scaling & Runner Trigger)
     # -----------------------------------------------------------------------
@@ -2089,6 +2366,16 @@ async def handle_saved_messages_command(event):
 
         risk_st = executor.get_risk_exposure_status()
         dd_st = executor.get_daily_drawdown_status()
+        dw_prog = get_daily_win_progress()
+        dw_curr = dw_prog.get("currency", "GBP")
+        if dw_prog["enabled"] and dw_prog["target_amount"] > 0:
+            dw_state_str = (
+                f"🟢 ACTIVE — Target: `{format_profit(dw_prog['target_amount'], dw_curr)}` "
+                f"(Made: `{format_profit(dw_prog['net_profit_today'], dw_curr)}`)"
+            )
+        else:
+            dw_state_str = f"⚪ OFF (Today's Net: `{format_profit(dw_prog['net_profit_today'], dw_curr)}`)"
+
         dd_state_str = (
             "🚨 90% CUT-OFF" if dd_st["emergency_cutoff_triggered"]
             else "🛑 50% PAUSED (Holding Open Trades)" if dd_st["pause_new_signals"]
@@ -2098,6 +2385,7 @@ async def handle_saved_messages_command(event):
             f"\n• Active Lots: `{risk_st['total_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` "
             f"(Low: `{risk_st['low_risk_lots']:.2f}` | Mid: `{risk_st['mid_risk_lots']:.2f}` | "
             f"High Cap: `{risk_st['high_risk_lots']:.2f}`)"
+            f"\n• Daily Win Limit (`dailywin`): {dw_state_str}"
             f"\n• Daily Drawdown Guard: `{dd_state_str}` "
             f"(Loss: `-{dd_st['total_daily_loss']:.2f} {dd_st['currency']}` / `{dd_st['loss_pct']:.1f}%` | "
             f"50% Pause: `-{dd_st['pause_limit_amount']:.2f}` | 90% Cut-Off: `-{dd_st['emergency_cutoff_amount']:.2f}`)"
@@ -2115,7 +2403,7 @@ async def handle_saved_messages_command(event):
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}`"
             f"\n• Magic Number: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/status`, `/bank`, `/closeall`, `/sim_tp1 1|2|3`, `/sim_shortfall`, `/sim_trail 2|3`, `/testorder`"
+            f"📱 **Commands:** `dailywin`, `/status`, `/bank`, `/closeall`, `/sim_tp1 1|2|3`, `/sim_shortfall`, `/sim_trail 2|3`, `/testorder`"
         )
         await event.reply(reply_text)
 
@@ -2206,10 +2494,15 @@ async def main():
             pass
         executor.shutdown()
         logger.info("Copier terminated.")
+        if _daily_win_terminate_requested:
+            sys.exit(DAILY_WIN_EXIT_CODE)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except SystemExit as e:
+        print("\nShutdown complete.")
+        sys.exit(e.code)
+    except KeyboardInterrupt:
         print("\nShutdown complete.")

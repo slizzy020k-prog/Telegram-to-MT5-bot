@@ -239,6 +239,8 @@ class StateManager:
         with self._lock:
             active = []
             for msg_id, data in self._state.items():
+                if str(msg_id).startswith("_") or not isinstance(data, dict):
+                    continue
                 if data.get("status") in ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE"):
                     active.append((msg_id, dict(data)))
             return active
@@ -247,14 +249,16 @@ class StateManager:
         """Count active open signals."""
         with self._lock:
             return sum(
-                1 for data in self._state.values()
-                if data.get("status") in ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE")
+                1 for k, data in self._state.items()
+                if not str(k).startswith("_")
+                and isinstance(data, dict)
+                and data.get("status") in ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE")
             )
 
     def _sort_key(self, item: Tuple[str, Dict[str, Any]]):
         """Sort helper: parse ISO timestamp robustly with numeric msg_id tie-breaker."""
         msg_id_str, val = item
-        ts_str = val.get("timestamp", "")
+        ts_str = val.get("timestamp", "") if isinstance(val, dict) else ""
         try:
             ts = datetime.fromisoformat(ts_str)
         except (ValueError, TypeError):
@@ -265,8 +269,12 @@ class StateManager:
     def get_latest_signal(self, symbol: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
         """Get the most recent active signal."""
         with self._lock:
+            signal_items = [
+                (k, v) for k, v in self._state.items()
+                if not str(k).startswith("_") and isinstance(v, dict)
+            ]
             sorted_items = sorted(
-                self._state.items(),
+                signal_items,
                 key=self._sort_key,
                 reverse=True,
             )
@@ -290,6 +298,8 @@ class StateManager:
 
         with self._lock:
             for key, val in self._state.items():
+                if str(key).startswith("_") or not isinstance(val, dict):
+                    continue
                 if val.get("status") not in terminal_statuses:
                     continue
                 ts_str = val.get("timestamp", "")
@@ -312,6 +322,41 @@ class StateManager:
         return len(to_remove)
 
     def get_all_signals(self) -> Dict[str, Dict[str, Any]]:
-        """Return a copy of the full state."""
+        """Return a copy of the full state (excluding internal _ metadata keys)."""
         with self._lock:
-            return {k: dict(v) for k, v in self._state.items()}
+            return {
+                k: dict(v) for k, v in self._state.items()
+                if not str(k).startswith("_") and isinstance(v, dict)
+            }
+
+    def get_daily_win_config(self) -> Dict[str, Any]:
+        """Return the persistent Daily Win Target configuration."""
+        with self._lock:
+            cfg = self._state.get("_daily_win")
+            if not isinstance(cfg, dict):
+                return {
+                    "enabled": False,
+                    "target_amount": 0.0,
+                    "baseline_pnl": 0.0,
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                }
+            return dict(cfg)
+
+    def set_daily_win_config(
+        self,
+        enabled: bool,
+        target_amount: float = 0.0,
+        baseline_pnl: float = 0.0,
+        date_str: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist the Daily Win Target configuration in state file."""
+        with self._lock:
+            cfg = {
+                "enabled": bool(enabled),
+                "target_amount": round(float(target_amount), 2),
+                "baseline_pnl": round(float(baseline_pnl), 2),
+                "date": date_str or datetime.now().strftime("%Y-%m-%d"),
+            }
+            self._state["_daily_win"] = cfg
+            self._save_state_locked()
+            return dict(cfg)

@@ -139,11 +139,20 @@ Reproduces the benchmark table (`£50`→`0.01/0.02/0.05`, `£100`→`0.01/0.05/
   - Checked every 1 second in `check_and_enforce_daily_drawdown()`.
   - Immediately closes all losing open positions at market and cancels all pending limit orders via `executor.emergency_cutoff_losing_trades()`.
 
+### C. Daily Win Target & Auto-Session Termination (`dailywin` in Saved Messages)
+- Persisted under `_daily_win` in `StateManager` (`get_daily_win_config()` / `set_daily_win_config()`; keys prefixed with `_` are excluded from signal iterators).
+- **Saved Messages Toggle (`handle_saved_messages_command`):**
+  - Typing `dailywin` (or `/dailywin`) sets `_awaiting_dailywin_input = True` and prompts the user to reply with an amount (e.g. `20` or `£20`) or `off`. Also supports one-step `dailywin 20`, `dailywin £20`, `dailywin off`.
+- **1-Second Enforcement (`check_and_enforce_daily_win_target`):**
+  - Monitors `net_profit_today = (realized_today_pnl - baseline_pnl) + floating_pnl`.
+  - When `net_profit_today >= target_amount`: closes all open bot positions at market, cancels all pending limit orders, marks active signals `CLOSED`, resets `_daily_win["enabled"] = False`, sends a Saved Messages summary with updated `Balance`/`Credit`/`Equity`, disconnects Telethon, and exits `main.py` with `DAILY_WIN_EXIT_CODE = 88`.
+  - Both `start_copier.bat` and `Launch_XAUUSD_Copier.bat` check `if %ERRORLEVEL% EQU 88` and stop the auto-restart loop so no further trading occurs.
+
 ---
 
 ## 5. Development, Testing & Git Rules
 
-1. **Run Test Suite (57 Tests):**
+1. **Run Test Suite (58 Tests):**
    ```powershell
    python -m pytest tests -o pythonpath=. -v
    ```

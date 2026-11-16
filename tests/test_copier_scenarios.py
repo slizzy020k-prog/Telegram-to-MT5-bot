@@ -11,11 +11,16 @@ class MockTelethonEvent:
     """Mock for Telethon Message and MessageEdited events."""
     def __init__(self, msg_id: int, text: str, reply_to_msg_id: int = None, chat_id: int = -1001234567890, forward=None):
         self.chat_id = chat_id
+        self.replies = []
         self.message = MagicMock()
         self.message.id = msg_id
         self.message.message = text
         self.message.reply_to_msg_id = reply_to_msg_id
         self.message.forward = forward
+        self.message.out = False
+
+    async def reply(self, text: str):
+        self.replies.append(text)
 
 
 def test_scenario_a_asymmetric_zone_execution():

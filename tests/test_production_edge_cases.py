@@ -647,3 +647,90 @@ async def test_two_stage_daily_loss_50pct_hold_and_90pct_emergency_cutoff(tmp_pa
         assert any("90% EMERGENCY DRAWDOWN CUT-OFF TRIGGERED" in a for a in alerts)
     finally:
         main.notify_saved_messages = orig_notify
+
+
+@pytest.mark.asyncio
+async def test_daily_win_command_and_auto_session_termination(tmp_path):
+    """
+    Typing `dailywin` in Saved Messages prompts for a target (e.g. `£20`), and once the bot makes
+    +£20.00 from trading, it banks all open trades, cancels pending limits, sends a Saved Messages
+    notification, and terminates the session for no more trading.
+    """
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_dailywin.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 120.0
+    main._awaiting_dailywin_input = False
+    main._daily_win_terminate_requested = False
+
+    # Open an active trade (3 layers)
+    sig_evt = MockTelethonEvent(msg_id=9991, text="Buy 3895-3887\nTP 3905\nSL 3875")
+    await main.handle_new_message(sig_evt)
+    sig = main.state_mgr.get_signal(9991)
+    assert sig["status"] == "ACTIVE"
+    assert len(sig["market_tickets"]) + len(sig["pending_tickets"]) == 3
+
+    alerts = []
+    orig_notify = main.notify_saved_messages
+
+    async def cap_notify(txt):
+        alerts.append(txt)
+
+    main.notify_saved_messages = cap_notify
+    try:
+        # Step 1: User types `dailywin` in Saved Messages -> bot prompts for amount
+        cmd1 = MockTelethonEvent(msg_id=9992, text="dailywin", chat_id="me")
+        await main.handle_saved_messages_command(cmd1)
+        assert main._awaiting_dailywin_input is True
+        assert any("Daily Win Limit Toggle" in r for r in cmd1.replies)
+
+        # Step 2: User replies `£20` -> bot activates £20 daily win limit
+        cmd2 = MockTelethonEvent(msg_id=9993, text="£20", chat_id="me")
+        await main.handle_saved_messages_command(cmd2)
+        assert main._awaiting_dailywin_input is False
+        cfg = main.state_mgr.get_daily_win_config()
+        assert cfg["enabled"] is True
+        assert cfg["target_amount"] == 20.0
+        assert any("Daily Win Limit Activated: `+£20.00 GBP`" in r for r in cmd2.replies)
+
+        # Step 3: Profit is +£12.50 (below £20 target) -> session stays active
+        main.executor._dry_run_daily_realized_pnl = 10.0
+        main.executor._dry_run_floating_pnl = 2.50
+        res_mid = await main.check_and_enforce_daily_win_target()
+        assert res_mid == "OK"
+        assert main._daily_win_terminate_requested is False
+        assert main.state_mgr.get_signal(9991)["status"] == "ACTIVE"
+
+        # Step 4: Profit reaches +£20.50 (realized £15.00 + floating £5.50) -> triggers termination!
+        main.executor._dry_run_daily_realized_pnl = 15.0
+        main.executor._dry_run_floating_pnl = 5.50
+        res_hit = await main.check_and_enforce_daily_win_target()
+        assert res_hit == "DAILY_WIN_REACHED"
+        assert main._daily_win_terminate_requested is True
+
+        # Active trade must be banked/closed and pending limits cancelled
+        sig_after = main.state_mgr.get_signal(9991)
+        assert sig_after["status"] == "CLOSED"
+        assert sig_after["market_tickets"] == []
+        assert sig_after["pending_tickets"] == []
+
+        # Saved Messages notification must confirm target hit & session terminated
+        assert any(
+            "DAILY WIN TARGET REACHED (+£20.00 GBP) — SESSION TERMINATED!" in a
+            and "+£20.50 GBP" in a
+            for a in alerts
+        )
+
+        # Daily win config resets to disabled for next session
+        assert main.state_mgr.get_daily_win_config()["enabled"] is False
+
+        # Subsequent signals are ignored once session termination is flagged
+        late_sig = MockTelethonEvent(msg_id=9994, text="Buy 3895-3887\nTP 3905\nSL 3875")
+        await main.handle_new_message(late_sig)
+        assert main.state_mgr.get_signal(9994) is None
+    finally:
+        main._daily_win_terminate_requested = False
+        main.notify_saved_messages = orig_notify
+
