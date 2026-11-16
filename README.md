@@ -246,26 +246,58 @@ tests/test_state_manager.py::test_state_manager_cleanup_old_signals PASSED
 
 ---
 
-## 8. Deployment & Running
+## 8. Setup & Deployment Guide
 
-### Step 1: Ensure Prerequisites
-- Windows 10/11 with MetaTrader 5 installed and running.
-- In MT5: Go to **Tools -> Options -> Expert Advisors** and enable:
-  - `Allow Algorithmic Trading`
-  - `Allow DLL imports`
-- Python 3.10+ installed.
+### Step 1: Prerequisites
+1. **Windows 10/11** with **MetaTrader 5** installed, logged into your broker account, and running.
+2. In MT5, go to **Tools -> Options -> Expert Advisors** and enable:
+   - `Allow Algorithmic Trading`
+   - `Allow DLL imports`
+3. Make sure the **Algo Trading** button in the top MT5 toolbar is **Green (Enabled)**.
+4. **Python 3.10+** installed (check **"Add Python to PATH"** during installation).
 
-### Step 2: Configure Environment
+### Step 2: Clone & Install Dependencies
+```powershell
+git clone https://github.com/slizzy020k-prog/Telegram-to-MT5-bot.git
+cd Telegram-to-MT5-bot
+pip install -r requirements.txt
+```
+
+### Step 3: Get Your Telegram API Credentials & Channel IDs
+1. Go to **[my.telegram.org](https://my.telegram.org)** -> log in with your phone number -> open **API development tools** -> create an app to get your `API ID` and `API Hash`.
+2. Find your signal channel ID(s) (e.g. forward a message from the channel to `@userinfobot` or `@RawDataBot` on Telegram; supergroup/channel IDs look like `-1001234567890`).
+
+### Step 4: Configure `.env`
+Copy the example template and fill in your own details (`.env` is gitignored so your secrets stay local):
+```powershell
+copy .env.example .env
+```
 Edit `.env`:
 ```ini
 TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH=your_telegram_api_hash_here
 CHANNEL_IDS=-1001234567890
-DEFAULT_SYMBOL=XAUUSD
+DEFAULT_SYMBOL=XAUUSD.s
 MAGIC_NUMBER=777001
+DRY_RUN=false
 ```
+> **Note:** Check your broker's exact Gold symbol in MT5 Market Watch (e.g. `XAUUSD`, `XAUUSD.s`, `GOLD`).
 
-### Step 3: Run the Copier
+### Step 5: Authenticate Telegram Session (One-Time)
+Run the auth helper to log in to your Telegram account and create your local `.session` file:
+```powershell
+python auth.py
+```
+Enter your phone number and the verification code sent to your Telegram app.
+
+### Step 6: Verify MT5 Connection & Health
+With MetaTrader 5 open and Algo Trading enabled, run:
+```powershell
+python check_algo.py
+```
+Confirm all checks pass (`MT5 Terminal: CONNECTED`, `Algo Trading Button: ENABLED`, `Live Quote Available`).
+
+### Step 7: Run the Copier
 
 **Option A (24/7 Watchdog Supervisor with Auto-Restart):**
 Double-click `start_copier.bat` or run:
@@ -290,6 +322,7 @@ The console will display:
 [copier] Telegram Copier is LIVE and actively listening for signals!
 [copier.mt5] TP1 20-Pip Proximity Watcher started (1.0s loop).
 ```
+Once running, send `/status` or `/testorder` to your **Saved Messages** in Telegram to verify live end-to-end execution.
 
 ---
 
