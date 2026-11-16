@@ -99,6 +99,10 @@ REACTIVATE_PATTERNS = [
     r"\bvalid\s+again\b",
 ]
 
+TP1_HIT_REPLY_PATTERNS = [
+    r"\btp\s*1?\s+(?:was\s+)?(?:hit|smashed|reached|done)\b",
+]
+
 # ---------------------------------------------------------------------------
 # GATE 4 SIGNAL EXTRACTION PATTERNS
 # ---------------------------------------------------------------------------
@@ -316,6 +320,11 @@ def gate_3_classify_trade_management(
     # 5. Full Close / Invalidate / Cancel
     if not action and _hit(FULL_CLOSE_PATTERNS):
         action = "ACTION_FULL_CLOSE"
+        cancel_limits = True
+
+    # 6. Provider Reply "TP1 hit" / "Tp1 was hit on this" (only when replying to a signal)
+    if not action and is_reply and _hit(TP1_HIT_REPLY_PATTERNS):
+        action = "ACTION_TP1_HIT_REPLY"
         cancel_limits = True
 
     if action:

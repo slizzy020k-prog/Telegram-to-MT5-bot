@@ -499,3 +499,88 @@ def test_get_position_close_info_dry_run():
     ex.connect()
     info = ex.get_position_close_info(12345)
     assert set(info) == {"profit", "reason"}
+
+
+@pytest.mark.asyncio
+async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path):
+    """Verify exact professional risk guide table, threshold crossing alerts, and High Risk hard lot cap."""
+    from mt5_executor import calculate_risk_guide_thresholds
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    # 1. Exact professional guide rows
+    assert calculate_risk_guide_thresholds(50) == {"capital": 50.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.02, "high_risk_lots": 0.05}
+    assert calculate_risk_guide_thresholds(100) == {"capital": 100.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.05, "high_risk_lots": 0.10}
+    assert calculate_risk_guide_thresholds(200) == {"capital": 200.0, "low_risk_lots": 0.02, "mid_risk_lots": 0.10, "high_risk_lots": 0.20}
+    assert calculate_risk_guide_thresholds(500) == {"capital": 500.0, "low_risk_lots": 0.05, "mid_risk_lots": 0.25, "high_risk_lots": 0.50}
+    assert calculate_risk_guide_thresholds(1000) == {"capital": 1000.0, "low_risk_lots": 0.10, "mid_risk_lots": 0.50, "high_risk_lots": 1.00}
+
+    # Custom account amount (£120 -> High Risk = 0.12 = 3 concurrent 0.04-lot signals)
+    assert calculate_risk_guide_thresholds(120) == {"capital": 120.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.06, "high_risk_lots": 0.12}
+
+    # 2. Enforce High Risk Lot Cap on a £50 account (High Risk = 0.05 lots)
+    main.state_mgr = StateManager(tmp_path / "risk_cap_state.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 50.0
+
+    alerts = []
+    orig_notify = main.notify_saved_messages
+
+    async def cap_notify(txt):
+        alerts.append(txt)
+
+    main.notify_saved_messages = cap_notify
+    try:
+        # Signal 1: 3-layer zone (0.01 + 0.01 + 0.02 = 0.04 lots) -> passes Low (0.01) & Mid (0.02)
+        evt1 = MockTelethonEvent(msg_id=9961, text="Buy 3895-3887\nTP 3905\nSL 3875")
+        await main.handle_new_message(evt1)
+        assert main.executor.get_total_active_lots()["total_lots"] == 0.04
+        assert any("Passed LOW RISK" in a and "Passed MID RISK" in a for a in alerts)
+
+        # Signal 2: 3-layer zone when only 0.01 lot remains under 0.05 High Risk Cap
+        evt2 = MockTelethonEvent(msg_id=9962, text="Buy 3895-3887\nTP 3905\nSL 3875")
+        await main.handle_new_message(evt2)
+        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
+        assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
+        sig2 = main.state_mgr.get_signal(9962)
+        assert len(sig2["market_tickets"]) + len(sig2["pending_tickets"]) == 1
+
+        # Signal 3: 0.00 lots available -> blocked completely by High Risk Cap
+        evt3 = MockTelethonEvent(msg_id=9963, text="Buy 3895-3887\nTP 3905\nSL 3875")
+        await main.handle_new_message(evt3)
+        assert main.state_mgr.get_signal(9963) is None
+        assert any("High Risk Lot Cap Reached" in a for a in alerts)
+    finally:
+        main.notify_saved_messages = orig_notify
+
+
+@pytest.mark.asyncio
+async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path):
+    """Verify emoji reactions on old messages (>3m) are ignored and provider 'Tp1 was hit' reply triggers TP1 scaling."""
+    from datetime import datetime, timezone, timedelta
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "edit_age_state.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+
+    # 1. Old untracked message edited/reacted to 2 hours later -> ignored!
+    old_evt = MockTelethonEvent(msg_id=9971, text="Buy 3895-3887\nTP 3905\nSL 3875")
+    old_evt.message.date = datetime.now(timezone.utc) - timedelta(hours=2)
+    await main.handle_message_edited(old_evt)
+    assert main.state_mgr.get_signal(9971) is None
+
+    # 2. Provider replies "Tp1 was hit on this" to an active signal -> scales TP1 & activates runner
+    fresh_evt = MockTelethonEvent(msg_id=9972, text="Buy 3895-3887\nTP 3905\nTP2 3915\nSL 3875")
+    await main.handle_new_message(fresh_evt)
+    sig = main.state_mgr.get_signal(9972)
+    # Simulate all 3 layers filled
+    all_tkts = sig["market_tickets"] + sig["pending_tickets"]
+    main.state_mgr.update_signal(9972, {"market_tickets": all_tkts, "pending_tickets": []})
+
+    reply_evt = MockTelethonEvent(msg_id=9973, text="Tp1 was hit on this", reply_to_msg_id=9972)
+    await main.handle_new_message(reply_evt)
+    sig_after = main.state_mgr.get_signal(9972)
+    assert sig_after["tp1_reached"] is True
+    assert sig_after["status"] == "RUNNER_ACTIVE"
+    assert sig_after["runner_layer"] == "BOTTOM"

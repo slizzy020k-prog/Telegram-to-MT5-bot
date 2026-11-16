@@ -4,7 +4,7 @@ import time
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -32,6 +32,9 @@ from config import (
     STATE_FILE_PATH,
     DEDUPLICATION_WINDOW_SECONDS,
     SELL_NOW_DELAY_SECONDS,
+    MAX_NEW_EDIT_AGE_SECONDS,
+    FALLBACK_TP1_PIPS,
+    UNPRICED_TP_GRACE_SECONDS,
     TP1_LOCK_BUFFER,
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
@@ -130,6 +133,53 @@ _recent_messages: Dict[int, float] = {}
 # Delayed "Sell now" tasks awaiting limit/zone edit (msg_id -> asyncio.Task)
 _pending_sell_now_tasks: Dict[int, asyncio.Task] = {}
 
+# Last printed terminal financial/risk snapshot to avoid spamming identical lines
+_last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
+
+
+def update_live_terminal_status(force_print: bool = False) -> None:
+    """
+    Updates the Windows console title bar with live Balance, Credit, Equity & Risk Guide Lots,
+    and prints a terminal update line whenever Balance, Credit, or Active Lot Exposure changes.
+    """
+    global _last_terminal_snapshot
+    if executor.dry_run:
+        return
+    try:
+        st = executor.get_risk_exposure_status()
+        bal = st.get("balance", 0.0)
+        cred = st.get("credit", 0.0)
+        eq = st.get("equity", 0.0)
+        curr = st.get("currency", "GBP")
+        sym_char = "£" if curr == "GBP" else "$" if curr == "USD" else ""
+        tot_lots = st.get("total_lots", 0.0)
+        low_l = st.get("low_risk_lots", 0.01)
+        mid_l = st.get("mid_risk_lots", 0.01)
+        high_l = st.get("high_risk_lots", 0.01)
+
+        title_str = (
+            f"[XAUUSD COPIER] Bal: {sym_char}{bal:.2f} | Cred: {sym_char}{cred:.2f} | "
+            f"Eq: {sym_char}{eq:.2f} | Lots: {tot_lots:.2f}/{high_l:.2f} "
+            f"(Low:{low_l:.2f} Mid:{mid_l:.2f} High:{high_l:.2f})"
+        )
+        if os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleTitleW(title_str)
+            except Exception:
+                pass
+
+        snap = (round(bal, 2), round(cred, 2), round(tot_lots, 2))
+        if force_print or snap != _last_terminal_snapshot:
+            _last_terminal_snapshot = snap
+            logger.info(
+                f"💳 [LIVE ACCOUNT & RISK GUIDE] Balance: {bal:.2f} {curr} | Credit: {cred:.2f} {curr} | "
+                f"Equity: {eq:.2f} {curr} | Active Lots: {tot_lots:.2f}/{high_l:.2f} Max "
+                f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
+            )
+    except Exception as e:
+        logger.debug(f"Could not update live terminal status: {e}")
+
 
 def _cancel_delayed_sell_now(msg_id: int) -> bool:
     """Cancel an active 20-second delayed Sell Now timer if still waiting."""
@@ -167,6 +217,7 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
             return
 
         top_lot = LAYER_LOTS.get("TOP", 0.01)
+        prev_lots = executor.get_total_active_lots()["total_lots"]
         t1 = executor.execute_market_order(
             symbol=symbol,
             direction=direction,
@@ -184,6 +235,10 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
                 f"• Reason: `{err_reason}`"
             )
             return
+
+        new_lots = executor.get_total_active_lots()["total_lots"]
+        risk_alerts = executor.evaluate_risk_threshold_alerts(prev_lots, new_lots)
+        risk_block = ("\n\n" + "\n".join(risk_alerts)) if risk_alerts else ""
 
         layers_data = {
             "TOP": {"lot": top_lot, "target_price": None, "ticket": t1, "order_type": "MARKET", "status": "OPEN"},
@@ -203,6 +258,7 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
             f"• Direction: `{direction}` {symbol}\n"
             f"• Orders: Market=[`{t1}`] (0.01 lot)\n"
             f"• SL: `{sl}` | TP1: `{final_tp}`"
+            f"{risk_block}"
         )
     except asyncio.CancelledError:
         logger.info(f"Delayed Sell Now timer cancelled for Msg ID {msg_id} (limits/cancel arrived).")
@@ -249,6 +305,7 @@ async def tp1_proximity_watcher_task() -> None:
     while True:
         try:
             now = time.time()
+            update_live_terminal_status()
 
             # ---------------------------------------------------------------
             # 1. 30-Second Algo Trading Button Monitor
@@ -424,15 +481,68 @@ async def tp1_proximity_watcher_task() -> None:
                 if sig.get("tp1_reached", False):
                     continue
 
-                if not sig.get("market_tickets"):
-                    continue
-
+                curr_price = tick.bid if direction == "BUY" else tick.ask
                 raw_tp1 = sig.get("raw_tp1")
+
+                # Improvement #3: Fallback TP1 if an unpriced Market Now trade never received a TP edit
+                if not raw_tp1 and sig.get("market_tickets"):
+                    ts_str = sig.get("timestamp", "")
+                    try:
+                        sig_dt = datetime.fromisoformat(ts_str)
+                        if sig_dt.tzinfo is None:
+                            sig_dt = sig_dt.replace(tzinfo=timezone.utc)
+                        age_sec = (datetime.now(timezone.utc) - sig_dt).total_seconds()
+                    except Exception:
+                        age_sec = UNPRICED_TP_GRACE_SECONDS + 1.0
+
+                    if age_sec >= UNPRICED_TP_GRACE_SECONDS:
+                        pip_offset = FALLBACK_TP1_PIPS * 0.10
+                        raw_tp1 = round(curr_price + pip_offset, 2) if direction == "BUY" else round(curr_price - pip_offset, 2)
+                        final_tp = round(raw_tp1 - TP_FRONT_RUN_OFFSET, 2) if direction == "BUY" else round(raw_tp1 + TP_FRONT_RUN_OFFSET, 2)
+                        for mt in sig.get("market_tickets", []):
+                            executor.modify_position_sltp(ticket=mt, sl=None, tp=final_tp)
+                        sig["raw_tp1"] = raw_tp1
+                        sig["final_tp"] = final_tp
+                        sig["hard_broker_tp"] = final_tp
+                        sig["fallback_tp_applied"] = True
+                        state_mgr.update_signal(msg_id, sig)
+                        logger.info(f"Attached fallback TP1 ({raw_tp1}, +{FALLBACK_TP1_PIPS} pips) on unpriced Signal {msg_id}")
+                        await notify_saved_messages(
+                            f"🛡️ **Fallback TP1 Attached [ID: {msg_id}]**\n"
+                            f"• No TP edit received after {int(UNPRICED_TP_GRACE_SECONDS)}s.\n"
+                            f"• Auto-assigned TP1: `{raw_tp1}` (Broker TP: `{final_tp}`) so profit guards & trailing are active."
+                        )
+
                 if not raw_tp1:
                     continue
 
-                curr_price = tick.bid if direction == "BUY" else tick.ask
                 tp1_hit = (curr_price >= raw_tp1) if direction == "BUY" else (curr_price <= raw_tp1)
+
+                # Improvement #1: If 0 market positions filled, but price already reached TP1, cancel stale pending limits
+                if not sig.get("market_tickets"):
+                    pd_tkts = list(sig.get("pending_tickets", []))
+                    if pd_tkts and tp1_hit:
+                        for pt in pd_tkts:
+                            executor.cancel_pending_order(pt)
+                        layers = sig.get("layers", {})
+                        for lk in layers:
+                            layers[lk]["status"] = "CANCELLED"
+                        state_mgr.update_signal(
+                            msg_id,
+                            {
+                                "pending_tickets": [],
+                                "layers": layers,
+                                "status": "CLOSED",
+                            },
+                        )
+                        logger.info(f"Unfilled Zone [ID: {msg_id}] expired: TP1 ({raw_tp1}) reached before fill. Cancelled {pd_tkts}.")
+                        await notify_saved_messages(
+                            f"🚫 **Unfilled Zone Expired (TP1 Reached Without Fill) [ID: {msg_id}]**\n"
+                            f"• Symbol: `{symbol}` ({direction})\n"
+                            f"• Price hit TP1 (`{raw_tp1}`) before dipping into zone.\n"
+                            f"• Cancelled `{len(pd_tkts)}` pending limit order(s) (`{pd_tkts}`) to prevent late reversal fills."
+                        )
+                    continue
 
                 if tp1_hit:
                     logger.info(
@@ -812,6 +922,50 @@ async def handle_new_message(event):
             )
             await notify_saved_messages(alert)
 
+        # ACTION: PROVIDER REPLY "TP1 HIT" (Improvement #4)
+        elif action in ("ACTION_TP1_HIT_REPLY", "TP1_HIT_REPLY"):
+            if target_signal.get("tp1_reached") or target_signal.get("status") in ("RUNNER_ACTIVE", "CLOSED"):
+                logger.info(f"Signal {target_msg_id} already processed TP1; ignoring provider TP1 reply.")
+                return
+            if not market_tickets:
+                for pt in pending_tickets:
+                    executor.cancel_pending_order(pt)
+                for lk in layers:
+                    layers[lk]["status"] = "CANCELLED"
+                state_mgr.update_signal(
+                    target_msg_id,
+                    {"pending_tickets": [], "layers": layers, "status": "CLOSED"},
+                )
+                await notify_saved_messages(
+                    f"🚫 **Provider Replied TP1 Hit [Msg ID: {target_msg_id}]**\n"
+                    f"• No positions were filled; cancelled `{len(pending_tickets)}` unfilled pending limit(s)."
+                )
+                return
+
+            runner_t = executor.handle_tp1_scaling_and_select_runner(target_signal)
+            state_mgr.set_tp1_reached(target_msg_id, True)
+            banked_tkts = target_signal.get("last_banked_tickets", [])
+            banked_profit = sum(executor.get_position_closed_profit(t) for t in banked_tkts)
+            target_signal["banked_profit"] = banked_profit
+            state_mgr.update_signal(target_msg_id, target_signal)
+
+            fin = executor.get_account_financials()
+            curr = fin.get("currency", "GBP")
+            profit_str = format_profit(banked_profit, curr)
+            runner_info = (
+                f"\n• 🚀 **Designated Runner:** Layer `{target_signal.get('runner_layer')}` "
+                f"[Ticket #{runner_t}] (Floor: `{target_signal.get('soft_tp1_floor')}`)"
+                if runner_t
+                else "\n• All positions banked at TP1."
+            )
+            await notify_saved_messages(
+                f"🎯 **TP1 Scaling Triggered via Provider Reply [ID: {target_msg_id}]**\n"
+                f"• Symbol: `{symbol}` ({direction})\n"
+                f"• 💰 **Amount Made at TP1:** `{profit_str}`"
+                f"{runner_info}\n\n"
+                f"{fin['formatted']}"
+            )
+
         return
 
     # 2. New Signal Entry
@@ -845,6 +999,7 @@ async def handle_new_message(event):
         zone_completed = False
         is_zone = False
         max_orders = MAX_ORDERS_PER_SIGNAL
+        prev_lots = executor.get_total_active_lots()["total_lots"]
 
         if parsed.is_zone and zone:
             # Case 1: Two-Price Zone (e.g. Buy 3895-3887) -> 3 layers (0.01 / 0.01 / 0.02)
@@ -957,13 +1112,19 @@ async def handle_new_message(event):
             raw_text=raw_text,
         )
 
+        new_lots = executor.get_total_active_lots()["total_lots"]
+        risk_alerts = executor.evaluate_risk_threshold_alerts(prev_lots, new_lots)
+        risk_block = ("\n\n" + "\n".join(risk_alerts)) if risk_alerts else ""
+
         alert = (
             f"🚀 **New Signal Executed**\n"
             f"• Direction: `{direction}` {symbol}\n"
             f"• Orders: Market={market_tickets}, Pending={pending_tickets}\n"
             f"• SL: `{sl}` | TP1: `{final_tp}` (Proximity Guard: `{parsed.proximity_close_price}`)"
+            f"{risk_block}"
         )
         await notify_saved_messages(alert)
+        update_live_terminal_status()
 
 
 def _place_edit_layer_order(
@@ -1018,6 +1179,19 @@ async def handle_message_edited(event):
         if msg_id in _recent_messages and (now - _recent_messages[msg_id]) < DEDUPLICATION_WINDOW_SECONDS:
             logger.debug(f"Edited message {msg_id} not in state & within {DEDUPLICATION_WINDOW_SECONDS}s dedup; skipping.")
             return
+
+        # Improvement #2: Block emoji reactions / edits on old untracked messages from firing late trades
+        msg_date = getattr(msg, "date", None)
+        if isinstance(msg_date, datetime):
+            dt_utc = msg_date if msg_date.tzinfo is not None else msg_date.replace(tzinfo=timezone.utc)
+            age_sec = (datetime.now(timezone.utc) - dt_utc).total_seconds()
+            if age_sec > MAX_NEW_EDIT_AGE_SECONDS:
+                logger.info(
+                    f"Ignoring edit/reaction on old untracked message {msg_id} "
+                    f"(age={age_sec:.0f}s > {MAX_NEW_EDIT_AGE_SECONDS}s limit)."
+                )
+                return
+
         logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{event.chat_id}] (not in state; treating as new) ---")
         await handle_new_message(event)
         return
@@ -1759,12 +1933,20 @@ async def handle_saved_messages_command(event):
                         f" | Soft Floor: `{s.get('soft_tp1_floor')}` | TP2 Target: `{s.get('raw_tp2') or 'TP1+100 pips'}`"
                     )
 
+        risk_st = executor.get_risk_exposure_status()
+        risk_str = (
+            f"\n• Active Lots: `{risk_st['total_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` "
+            f"(Low: `{risk_st['low_risk_lots']:.2f}` | Mid: `{risk_st['mid_risk_lots']:.2f}` | "
+            f"High Cap: `{risk_st['high_risk_lots']:.2f}`)"
+        )
+
         reply_text = (
             f"🤖 **Telegram Copier System Status**\n"
             f"• State: `{'🟢 ONLINE' if mt5_ok else '🔴 MT5 DISCONNECTED'}`\n"
             f"• Algo Trading: `{algo_str}`"
             f"{acc_info}"
             f"{floating_pnl_str}"
+            f"{risk_str}"
             f"{gold_info}"
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}`"
@@ -1812,6 +1994,7 @@ async def main():
         )
     else:
         logger.info("MetaTrader 5 connection established successfully.")
+        update_live_terminal_status(force_print=True)
 
     # Initialize Telethon Client
     session_file = str(BASE_DIR / TELEGRAM_SESSION_NAME)

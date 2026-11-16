@@ -126,6 +126,16 @@ DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "5"
 # Seconds to wait on unpriced "Sell now" before market entry (to see if provider edits in limits/zone)
 SELL_NOW_DELAY_SECONDS = float(os.getenv("SELL_NOW_DELAY_SECONDS", "20"))
 
+# Max age (seconds) of an untracked message for an edit to be treated as a new signal (blocks old emoji reactions)
+MAX_NEW_EDIT_AGE_SECONDS = int(os.getenv("MAX_NEW_EDIT_AGE_SECONDS", "180"))
+
+# Fallback TP1 (in pips: 50 pips = $5.00 on Gold) if a "Buy now"/"Sell now" never gets edited with a TP
+FALLBACK_TP1_PIPS = float(os.getenv("FALLBACK_TP1_PIPS", "50"))
+UNPRICED_TP_GRACE_SECONDS = float(os.getenv("UNPRICED_TP_GRACE_SECONDS", "45"))
+
+# Dynamic Risk Guide Cap: blocks opening new lots beyond the High-Risk threshold for current account capital
+ENFORCE_HIGH_RISK_LOT_CAP = os.getenv("ENFORCE_HIGH_RISK_LOT_CAP", "true").lower() in ("true", "1", "yes")
+
 # MT5 Optional Direct Login Settings
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0")) if os.getenv("MT5_LOGIN") else None
 MT5_PASSWORD = os.getenv("MT5_PASSWORD") or None

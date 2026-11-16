@@ -26,10 +26,33 @@ from config import (
     MT5_PASSWORD,
     MT5_SERVER,
     MT5_PATH,
+    ENFORCE_HIGH_RISK_LOT_CAP,
 )
 from parser import ZoneInfo
+import math
 
 logger = logging.getLogger("copier.mt5")
+
+
+def calculate_risk_guide_thresholds(capital: float) -> Dict[str, float]:
+    """
+    Professional Risk Guide Calculator for any custom account balance:
+      £50   -> Low: 0.01 | Mid: 0.02 | High: 0.05
+      £100  -> Low: 0.01 | Mid: 0.05 | High: 0.10
+      £200  -> Low: 0.02 | Mid: 0.10 | High: 0.20
+      £500  -> Low: 0.05 | Mid: 0.25 | High: 0.50
+      £1000 -> Low: 0.10 | Mid: 0.50 | High: 1.00
+    """
+    cap = max(0.0, float(capital))
+    low_risk = max(0.01, round(math.floor((cap + 1e-9) / 100.0) * 0.01, 2))
+    mid_risk = max(0.01, round(math.floor((cap + 1e-9) / 20.0) * 0.01, 2))
+    high_risk = max(0.01, round(math.floor((cap + 1e-9) / 10.0) * 0.01, 2))
+    return {
+        "capital": round(cap, 2),
+        "low_risk_lots": low_risk,
+        "mid_risk_lots": mid_risk,
+        "high_risk_lots": high_risk,
+    }
 
 
 class MT5Executor:
@@ -43,6 +66,8 @@ class MT5Executor:
         self._connected = False
         self._symbol_cache: Dict[str, str] = {}
         self.last_error: Optional[str] = None
+        self._dry_run_capital: Optional[float] = None
+        self._dry_run_ticket_lots: Dict[int, float] = {}
 
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal."""
@@ -366,6 +391,13 @@ class MT5Executor:
     ) -> Optional[int]:
         """Execute an immediate Market Buy or Sell order."""
         self.last_error = None
+        allowed_lot, block_reason = self.check_and_cap_order_lot(lot)
+        if allowed_lot <= 0.0:
+            self.last_error = block_reason or "High Risk Lot Cap reached"
+            logger.warning(f"Market {direction} blocked by Risk Guide Cap: {self.last_error}")
+            return None
+        lot = allowed_lot
+
         resolved_sym = self.resolve_symbol(symbol)
         if not self.ensure_symbol(resolved_sym):
             self.last_error = f"Symbol {resolved_sym} not accessible"
@@ -412,6 +444,8 @@ class MT5Executor:
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
             ticket = getattr(result, "order", None)
+            if self.dry_run and ticket is not None:
+                self._dry_run_ticket_lots[ticket] = round(lot, 2)
             logger.info(
                 f"Opened Market {direction} Order #{ticket} | Symbol={resolved_sym}, "
                 f"Lot={lot}, Price={entry_price}, SL={final_sl}, TP={final_tp}"
@@ -431,6 +465,13 @@ class MT5Executor:
     ) -> Optional[int]:
         """Place a BUY LIMIT or SELL LIMIT order at the specified zone price."""
         self.last_error = None
+        allowed_lot, block_reason = self.check_and_cap_order_lot(lot)
+        if allowed_lot <= 0.0:
+            self.last_error = block_reason or "High Risk Lot Cap reached"
+            logger.warning(f"Limit {direction} @ {price} blocked by Risk Guide Cap: {self.last_error}")
+            return None
+        lot = allowed_lot
+
         resolved_sym = self.resolve_symbol(symbol)
         if not self.ensure_symbol(resolved_sym):
             self.last_error = f"Symbol {resolved_sym} not accessible"
@@ -473,6 +514,8 @@ class MT5Executor:
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
             ticket = getattr(result, "order", None)
+            if self.dry_run and ticket is not None:
+                self._dry_run_ticket_lots[ticket] = round(lot, 2)
             logger.info(
                 f"Placed Limit {direction} Order #{ticket} | Symbol={resolved_sym}, "
                 f"TargetPrice={target_price}, Lot={lot}, SL={final_sl}, TP={final_tp}"
@@ -820,6 +863,7 @@ class MT5Executor:
     def cancel_pending_order(self, ticket: int) -> bool:
         """Cancel an unfilled pending limit order."""
         if self.dry_run:
+            self._dry_run_ticket_lots.pop(ticket, None)
             logger.info(f"[DRY-RUN] Cancelled Pending Order #{ticket}")
             return True
 
@@ -847,6 +891,7 @@ class MT5Executor:
             self._cached_pos_profits = {}
 
         if self.dry_run:
+            self._dry_run_ticket_lots.pop(ticket, None)
             logger.info(f"[DRY-RUN] Closed Market Position #{ticket}")
             self._cached_pos_profits[ticket] = 1.25
             return True
@@ -984,6 +1029,137 @@ class MT5Executor:
             "currency": "GBP",
             "formatted": "• Financials unavailable",
         }
+
+    def calculate_risk_guide_thresholds(self, capital: float) -> Dict[str, float]:
+        """Delegate to module-level professional risk guide calculator."""
+        return calculate_risk_guide_thresholds(capital)
+
+    def get_total_active_lots(self) -> Dict[str, float]:
+        """Return current bot open market lots, pending limit lots, and total committed lots."""
+        if self.dry_run or not self._connected:
+            total = round(sum(self._dry_run_ticket_lots.values()), 2)
+            return {"open_lots": total, "pending_lots": 0.0, "total_lots": total}
+
+        try:
+            positions = mt5.positions_get() or []
+            orders = mt5.orders_get() or []
+            open_lots = round(sum(p.volume for p in positions if getattr(p, "magic", 0) == MAGIC_NUMBER), 2)
+            pending_lots = round(sum(o.volume_current for o in orders if getattr(o, "magic", 0) == MAGIC_NUMBER), 2)
+            return {
+                "open_lots": open_lots,
+                "pending_lots": pending_lots,
+                "total_lots": round(open_lots + pending_lots, 2),
+            }
+        except Exception as e:
+            logger.warning(f"Could not query active lots: {e}")
+            return {"open_lots": 0.0, "pending_lots": 0.0, "total_lots": 0.0}
+
+    def get_risk_exposure_status(self) -> Dict[str, Any]:
+        """
+        Compute live account financials, active lot exposure, and Professional Risk Guide
+        thresholds (Low, Mid, and High Risk Cap).
+        """
+        fin = self.get_account_financials()
+        if self.dry_run or not self._connected:
+            cap = self._dry_run_capital if self._dry_run_capital is not None else 200.0
+        else:
+            bal = fin.get("balance", 0.0)
+            cred = fin.get("credit", 0.0)
+            cap = bal if bal >= 30.0 else (bal + cred)
+
+        thresholds = calculate_risk_guide_thresholds(cap)
+        lots = self.get_total_active_lots()
+        total_lots = lots["total_lots"]
+        low_l = thresholds["low_risk_lots"]
+        mid_l = thresholds["mid_risk_lots"]
+        high_l = thresholds["high_risk_lots"]
+
+        if total_lots >= high_l - 1e-9:
+            tier = "HIGH_CAP_REACHED"
+        elif total_lots > mid_l + 1e-9:
+            tier = "ABOVE_MID_RISK"
+        elif total_lots > low_l + 1e-9:
+            tier = "ABOVE_LOW_RISK"
+        else:
+            tier = "LOW_RISK_SAFE"
+
+        return {
+            **fin,
+            **thresholds,
+            **lots,
+            "risk_tier": tier,
+            "available_lots": max(0.0, round(high_l - total_lots, 2)),
+        }
+
+    def check_and_cap_order_lot(self, requested_lot: float) -> Tuple[float, Optional[str]]:
+        """
+        Enforces the Professional Risk Guide High-Risk Cap:
+        Never allows total active + pending lots to exceed high_risk_lots.
+        """
+        if not ENFORCE_HIGH_RISK_LOT_CAP:
+            return round(requested_lot, 2), None
+
+        # In default dry-run mode without an explicit test capital override, allow normal test execution
+        if self.dry_run and self._dry_run_capital is None:
+            return round(requested_lot, 2), None
+
+        status = self.get_risk_exposure_status()
+        avail = status["available_lots"]
+        high_cap = status["high_risk_lots"]
+        total_lots = status["total_lots"]
+        cap = status["capital"]
+        curr = status.get("currency", "GBP")
+
+        if avail < 0.01 - 1e-9:
+            reason = (
+                f"High Risk Lot Cap Reached ({total_lots:.2f}/{high_cap:.2f} lots "
+                f"for {cap:.2f} {curr} account)"
+            )
+            return 0.0, reason
+
+        allowed = min(round(requested_lot, 2), avail)
+        allowed = round(math.floor((allowed + 1e-9) * 100.0) / 100.0, 2)
+        if allowed < 0.01:
+            reason = (
+                f"High Risk Lot Cap Reached ({total_lots:.2f}/{high_cap:.2f} lots "
+                f"for {cap:.2f} {curr} account)"
+            )
+            return 0.0, reason
+
+        return allowed, None
+
+    def evaluate_risk_threshold_alerts(self, prev_lots: float, new_lots: float) -> List[str]:
+        """
+        Check which Risk Guide thresholds (Low Risk, Mid Risk, High Risk Cap) were crossed
+        as total exposure increased from prev_lots to new_lots.
+        """
+        status = self.get_risk_exposure_status()
+        low_l = status["low_risk_lots"]
+        mid_l = status["mid_risk_lots"]
+        high_l = status["high_risk_lots"]
+        cap = status["capital"]
+        curr = status.get("currency", "GBP")
+
+        alerts: List[str] = []
+        if prev_lots <= low_l + 1e-9 and new_lots > low_l + 1e-9:
+            alerts.append(
+                f"📊 **Risk Guide Alert — Passed LOW RISK (`{low_l:.2f}` lots):** "
+                f"Active exposure is now `{new_lots:.2f}` lots on `{cap:.2f} {curr}` account "
+                f"(Mid Risk: `{mid_l:.2f}` | High Cap: `{high_l:.2f}`)."
+            )
+        if prev_lots <= mid_l + 1e-9 and new_lots > mid_l + 1e-9:
+            alerts.append(
+                f"⚠️ **Risk Guide Alert — Passed MID RISK (`{mid_l:.2f}` lots):** "
+                f"Active exposure is now `{new_lots:.2f}` lots (entering High Risk zone; "
+                f"hard cap is `{high_l:.2f}` lots)."
+            )
+        if prev_lots < high_l - 1e-9 and new_lots >= high_l - 1e-9:
+            alerts.append(
+                f"🚨 **MAX HIGH RISK CAP REACHED (`{new_lots:.2f} / {high_l:.2f}` lots):** "
+                f"Capital protection active for `{cap:.2f} {curr}` account — no additional lots "
+                f"will open until existing trades bank or close!"
+            )
+        return alerts
 
     def apply_selective_breakeven(
         self,
