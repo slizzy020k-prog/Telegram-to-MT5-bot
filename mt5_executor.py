@@ -1007,6 +1007,9 @@ class MT5Executor:
                 "balance": 11.03,
                 "credit": 7.03,
                 "equity": 18.06,
+                "profit": 0.0,
+                "margin": 0.0,
+                "margin_free": 18.06,
                 "currency": "GBP",
                 "formatted": (
                     "💳 **Account Update:**\n"
@@ -1022,11 +1025,17 @@ class MT5Executor:
                 bal = round(acc.balance, 2)
                 cred = round(acc.credit, 2)
                 eq = round(acc.equity, 2)
+                pnl = round(getattr(acc, "profit", 0.0), 2)
+                mgn = round(getattr(acc, "margin", 0.0), 2)
+                free_mgn = round(getattr(acc, "margin_free", eq), 2)
                 curr = acc.currency
                 return {
                     "balance": bal,
                     "credit": cred,
                     "equity": eq,
+                    "profit": pnl,
+                    "margin": mgn,
+                    "margin_free": free_mgn,
                     "currency": curr,
                     "formatted": (
                         f"💳 **Account Update:**\n"
@@ -1041,6 +1050,9 @@ class MT5Executor:
             "balance": 0.0,
             "credit": 0.0,
             "equity": 0.0,
+            "profit": 0.0,
+            "margin": 0.0,
+            "margin_free": 0.0,
             "currency": "GBP",
             "formatted": "• Financials unavailable",
         }

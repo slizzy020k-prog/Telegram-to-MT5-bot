@@ -78,6 +78,26 @@ class ColoredConsoleFormatter(logging.Formatter):
         return f"{time_str} {level_str} {name_str} {msg}"
 
 
+# Current in-place MT5 bottom status bar rendered on the console
+_current_hud_line: str = ""
+
+
+class LiveHUDStreamHandler(logging.StreamHandler):
+    """Clears the live in-place MT5 balance bar before emitting a log line, then redraws it."""
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            stream = self.stream
+            if _current_hud_line:
+                stream.write(f"\r\033[2K{msg}{self.terminator}{_current_hud_line}")
+            else:
+                stream.write(f"{msg}{self.terminator}")
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logger():
     # Enable Windows Virtual Terminal Processing for ANSI colors
     if sys.platform == "win32":
@@ -93,8 +113,8 @@ def setup_logger():
     if logger.handlers:
         return logger
 
-    # Colorful console output
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Colorful console output with pinned MT5 bottom status bar support
+    console_handler = LiveHUDStreamHandler(sys.stdout)
     console_handler.setFormatter(ColoredConsoleFormatter(
         "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
         datefmt="%H:%M:%S",
@@ -216,10 +236,11 @@ async def check_and_enforce_daily_drawdown() -> str:
 
 def update_live_terminal_status(force_print: bool = False) -> None:
     """
-    Updates the Windows console title bar with live Balance, Credit, Equity & Risk Guide Lots,
-    and prints a terminal update line whenever Balance, Credit, or Active Lot Exposure changes.
+    Renders a live, dynamically updating in-place MetaTrader 5 Trade Bar at the bottom
+    of the terminal (updating Bid/Ask, Balance, Credit, Equity, Floating P&L, Free Margin,
+    and Active Lots every second without scrolling), plus updates the console window title.
     """
-    global _last_terminal_snapshot
+    global _last_terminal_snapshot, _current_hud_line
     if executor.dry_run:
         return
     try:
@@ -227,6 +248,8 @@ def update_live_terminal_status(force_print: bool = False) -> None:
         bal = st.get("balance", 0.0)
         cred = st.get("credit", 0.0)
         eq = st.get("equity", 0.0)
+        pnl = st.get("profit", 0.0)
+        free_mgn = st.get("margin_free", eq)
         curr = st.get("currency", "GBP")
         sym_char = "£" if curr == "GBP" else "$" if curr == "USD" else ""
         tot_lots = st.get("total_lots", 0.0)
@@ -234,10 +257,14 @@ def update_live_terminal_status(force_print: bool = False) -> None:
         mid_l = st.get("mid_risk_lots", 0.01)
         high_l = st.get("high_risk_lots", 0.01)
 
+        tick = executor.get_tick(DEFAULT_SYMBOL)
+        bid_str = f"{tick.bid:.2f}" if tick and hasattr(tick, "bid") else "---"
+        ask_str = f"{tick.ask:.2f}" if tick and hasattr(tick, "ask") else "---"
+
         title_str = (
             f"[XAUUSD COPIER] Bal: {sym_char}{bal:.2f} | Cred: {sym_char}{cred:.2f} | "
-            f"Eq: {sym_char}{eq:.2f} | Lots: {tot_lots:.2f}/{high_l:.2f} "
-            f"(Low:{low_l:.2f} Mid:{mid_l:.2f} High:{high_l:.2f})"
+            f"Eq: {sym_char}{eq:.2f} | P&L: {'+' if pnl >= 0 else '-'}{sym_char}{abs(pnl):.2f} | "
+            f"Lots: {tot_lots:.2f}/{high_l:.2f}"
         )
         if os.name == "nt":
             try:
@@ -245,6 +272,21 @@ def update_live_terminal_status(force_print: bool = False) -> None:
                 ctypes.windll.kernel32.SetConsoleTitleW(title_str)
             except Exception:
                 pass
+
+        pnl_color = "\033[92m" if pnl >= 0 else "\033[91m"
+        pnl_sign = "+" if pnl >= 0 else "-"
+        _current_hud_line = (
+            f"\033[93m\033[1m[MT5 LIVE]\033[0m "
+            f"\033[96m{DEFAULT_SYMBOL}:\033[97m {bid_str}/{ask_str} \033[90m|\033[0m "
+            f"\033[97mBal:\033[93m {sym_char}{bal:.2f} \033[90m|\033[0m "
+            f"\033[97mCred:\033[96m {sym_char}{cred:.2f} \033[90m|\033[0m "
+            f"\033[97mEq:\033[1m{pnl_color} {sym_char}{eq:.2f}\033[0m \033[90m|\033[0m "
+            f"\033[97mP&L:\033[1m{pnl_color} {pnl_sign}{sym_char}{abs(pnl):.2f}\033[0m \033[90m|\033[0m "
+            f"\033[97mFreeMgn:\033[92m {sym_char}{free_mgn:.2f} \033[90m|\033[0m "
+            f"\033[97mLots:\033[93m {tot_lots:.2f}/{high_l:.2f}\033[0m"
+        )
+        sys.stdout.write(f"\r\033[2K{_current_hud_line}")
+        sys.stdout.flush()
 
         snap = (round(bal, 2), round(cred, 2), round(tot_lots, 2))
         if force_print or snap != _last_terminal_snapshot:
