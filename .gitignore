@@ -1,0 +1,18 @@
+# Secrets & Telegram Session
+.env
+*.session
+*.session-journal
+
+# Runtime State & Logs (contain trade/account data)
+signals_state.json
+sim_state.json
+*.log
+*.tmp
+*.bak*
+
+# Python & Test Caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
