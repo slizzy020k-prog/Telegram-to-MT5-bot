@@ -436,3 +436,13 @@ TP1_TOUCH_BANK_BUFFER_PIPS: float = _env_float(
 HARD_GIVEBACK_CEILING_DOLLARS: float = _env_float(
     "HARD_GIVEBACK_CEILING_DOLLARS", 3.50, min_val=0.50, max_val=50.0
 )
+
+
+# ===========================================================================
+# v3.4.2 DYNAMIC ATR TP1 TRAILING STOP
+# ===========================================================================
+TP1_TRAIL_ENABLED: bool = _env_bool("TP1_TRAIL_ENABLED", True)
+TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.5, min_val=0.1, max_val=20.0)
+TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.00, min_val=0.10, max_val=50.0)
+TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.00, min_val=0.20, max_val=100.0)
+TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.20, min_val=0.01, max_val=20.0)

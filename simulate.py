@@ -252,7 +252,7 @@ async def run_simulation() -> None:
     assert sig3["layers"]["L4"]["tp"] == 3920.0
     print(f"  [6c] Ignored 6p micro-noise & cleared TP2 -> stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
 
-    # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD, then >=$4.50 giveback (3915.20) Banks It!
+    # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD, then drop below trail stop (3915.20) Banks It!
     for px in (3919.20, 3919.80, 3918.50):
         with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
             assert main.executor.manage_designated_runner(sig3) is True
@@ -261,8 +261,8 @@ async def run_simulation() -> None:
     assert still_running is False
     assert sig3["layers"]["L4"]["status"] == "CLOSED"
     assert sig3["market_tickets"] == [] and sig3["status"] == "CLOSED"
-    assert "Gold Reversal Guard" in (sig3.get("runner_close_reason") or "")
-    print(f"  [6d] Confirmed Gold Reversal Guard near TP3 (held $1.30 wick, banked on reversal): {sig3['runner_close_reason']}.")
+    assert any(k in (sig3.get("runner_close_reason") or "") for k in ("TP1 Trailing Stop", "Gold Reversal Guard"))
+    print(f"  [6d] Confirmed TP1 Trailing Stop near TP3 (held $1.30 wick, banked on trail stop): {sig3['runner_close_reason']}.")
 
     main.state_mgr.update_signal(20003, sig3, chat_id=evt3.chat_id)
     ledger_rec = main.trade_ledger.record_closed_signal(

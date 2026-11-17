@@ -560,12 +560,13 @@ async def _execute_tp1_scaling_handoff(
     raw_tp1_val = sig.get("raw_tp1")
     if curr_price is not None and raw_tp1_val is not None:
         _cfg_mod = sys.modules.get("config")
-        if bool(getattr(_cfg_mod, "TP1_TOUCH_BANK_ENABLED", True)):
+        if bool(getattr(_cfg_mod, "TP1_TRAIL_ENABLED", True)) or bool(getattr(_cfg_mod, "TP1_TOUCH_BANK_ENABLED", True)):
             dir_u = (sig.get("direction") or "BUY").strip().upper()
             if (dir_u == "BUY" and float(curr_price) >= float(raw_tp1_val)) or (
                 dir_u == "SELL" and float(curr_price) <= float(raw_tp1_val)
             ):
                 sig["tp1_touched"] = True
+                sig["tp1_touch_price"] = float(curr_price)
     runner_t = await _mt5_call(executor.handle_tp1_scaling_and_select_runner, sig)
     state_mgr.set_tp1_reached(msg_id, True, chat_id=eff_chat)
 

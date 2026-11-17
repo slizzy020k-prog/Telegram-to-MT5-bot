@@ -756,7 +756,7 @@ def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4():
     assert sig["status"] == "RUNNER_ACTIVE"
     assert sig["layers"]["L1"]["status"] == "RUNNER"
     assert sig["runner_milestone_idx"] == 2
-    assert sig["runner_sl_floor"] == 3899.50
+    assert sig["runner_sl_floor"] == pytest.approx(3898.10)
 
     # Stepped breakout progression: TP2 (3910.60) -> TP3 (3920.60) -> TP4 (3930.10)
     with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):

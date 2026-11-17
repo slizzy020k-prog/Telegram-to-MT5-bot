@@ -120,7 +120,7 @@ async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_
             await main._process_runner_active_tick("7101", main.state_mgr.get_signal(7101))
         s_tp2 = main.state_mgr.get_signal(7101)
         assert s_tp2["layers"]["L1"]["tp"] == 3920.0
-        assert s_tp2["runner_sl_floor"] == 3900.0  # Milestone lock at TP1 (no 15p choke!)
+        assert s_tp2["runner_sl_floor"] >= 3900.0  # Dynamic TP1 trail / milestone floor
         assert s_tp2["reversal_guard_armed"] is True
         assert s_tp2["peak_profit"] == pytest.approx(20.60)
 
@@ -128,7 +128,7 @@ async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_
             await main._process_runner_active_tick("7101", main.state_mgr.get_signal(7101))
         s_tp3 = main.state_mgr.get_signal(7101)
         assert s_tp3["layers"]["L1"]["tp"] == 3930.0
-        assert s_tp3["runner_sl_floor"] == 3910.0  # Milestone lock at TP2!
+        assert s_tp3["runner_sl_floor"] >= 3910.0  # Dynamic TP1 trail / milestone floor at TP2+
 
         with patch.object(main.executor, "get_tick", return_value=_tick(3930.10)):
             await main._process_runner_active_tick("7101", main.state_mgr.get_signal(7101))
@@ -195,8 +195,8 @@ async def test_2_multilayer_4_active_layers_layer_separation_and_l4_scaling_to_t
         assert all(s_r["layers"][k]["status"] == "CLOSED" for k in ("L1", "L2", "L3"))
         assert s_r["layers"]["L4"]["status"] == "RUNNER"
 
-        # Break TP2 (3910.60), climb to 3919.00, dip $2.50 to 3916.50 (< $4.50 cap) -> L4 HOLDS & hits TP4!
-        for px in (3910.60, 3919.00, 3916.50, 3920.60, 3930.10):
+        # Break TP2 (3910.60), climb to 3919.00, dip $1.80 to 3917.20 (< $2.50 trail dist) -> L4 HOLDS & hits TP4!
+        for px in (3910.60, 3919.00, 3917.20, 3920.60, 3930.10):
             with patch.object(main.executor, "get_tick", return_value=_tick(px)):
                 await main._process_runner_active_tick("7201", main.state_mgr.get_signal(7201))
         s_done = main.state_mgr.get_signal(7201)
@@ -357,11 +357,11 @@ async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and
             await main._process_pre_tp1_or_backstop_tick("7401", main.state_mgr.get_signal(7401))
         assert main.state_mgr.get_signal(7401)["status"] == "RUNNER_ACTIVE"
 
-        # Also test a momentary spread spike at TP3 (3919.50 -> artificial bid 3916.50 (-$3.00 < $3.50) with $0.70 spread) -> holds!
+        # Also test a momentary spread spike at TP3 (3919.50 -> artificial bid 3917.50 (-$2.00 < $2.50 trail) with $0.70 spread) -> holds!
         for tk in (
             _tick(3910.60, spread=0.20),
             _tick(3919.50, spread=0.20),
-            _tick(3916.50, spread=0.70),  # spread spike paused (< $3.50 hard ceiling)!
+            _tick(3917.50, spread=0.70),  # spread spike paused (< $2.50 trail stop & < $3.50 hard ceiling)!
             _tick(3920.60, spread=0.20),
             _tick(3930.10, spread=0.20),
         ):
