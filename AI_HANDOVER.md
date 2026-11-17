@@ -32,7 +32,7 @@ This document provides a complete technical handover for any AI coding agent or 
 | `state_manager.py` | Thread-safe `StateManager` persisting `signals_state.json` via atomic `.tmp` file replacement (`_save_state_locked`). |
 | `main.py` | Async Telethon listener (`handle_new_message`, `handle_message_edited`, `handle_saved_messages_command`), 20s `"Sell now"` timer (`_delayed_sell_now_task`), live console title/log monitor (`update_live_terminal_status`), and 1-second background watcher (`tp1_proximity_watcher_task`). |
 | `start_copier.bat` | Windows batch supervisor with `color 0E` styling and a 5-second auto-restart loop (requires CRLF `\r\n` line endings and no unescaped `|` characters). |
-| `tests/` | 75-test `pytest` suite (`python -m pytest -v`) covering parser gates, 3-layer BUY/SELL LIMIT zones, immediate (`0s`) & optional delayed execution, TP1/TP2 scaling, notifications, risk guide caps, and realized daily loss cut-offs. |
+| `tests/` | 76-test `pytest` suite (`python -m pytest -v`) covering parser gates, 3-layer BUY/SELL LIMIT zones, immediate (`0s`) & optional delayed execution, TP1/TP2 scaling, notifications, risk guide caps, realized daily loss cut-offs, and keepalive/uptime guards. |
 
 ---
 

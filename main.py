@@ -50,6 +50,10 @@ from config import (
     NO_TP2_SURGE_ARM_PIPS,
     SHORTFALL_ARM_PIPS,
     SHORTFALL_PULLBACK_PIPS,
+    PREVENT_SYSTEM_SLEEP,
+    IDLE_MT5_POLL_INTERVAL_SECONDS,
+    TELEGRAM_KEEPALIVE_SECONDS,
+    CONSOLE_TITLE_UPDATES,
 )
 from parser import parse_message, SignalAction, ZoneInfo, is_tp1_hit_message
 from mt5_executor import MT5Executor
@@ -308,6 +312,10 @@ async def check_and_enforce_daily_win_target() -> str:
     if _daily_win_terminate_requested:
         return "DAILY_WIN_REACHED"
 
+    cfg = state_mgr.get_daily_win_config()
+    if not cfg.get("enabled") or float(cfg.get("target_amount") or 0.0) <= 0.0:
+        return "OK"
+
     prog = get_daily_win_progress()
     if not prog["target_reached"]:
         return "OK"
@@ -413,6 +421,14 @@ async def check_and_enforce_daily_loss_limit(exit_on_trigger: bool = True) -> st
         if exit_on_trigger:
             sys.exit(0)
         return "DAILY_LOSS_REACHED"
+
+    cfg = state_mgr.get_daily_loss_config()
+    raw_lim = cfg.get("limit_amount") if cfg.get("limit_amount") else cfg.get("daily_loss_limit", 0.0)
+    if not cfg.get("enabled") or float(raw_lim or 0.0) <= 0.0:
+        if _daily_loss_locked:
+            _daily_loss_locked = False
+            logger.info("Daily loss lock released (limit disabled).")
+        return "OK"
 
     prog = get_daily_loss_progress()
     if not prog["limit_reached"]:
@@ -615,6 +631,49 @@ async def check_and_enforce_daily_drawdown() -> str:
 _last_hud_state: Optional[Tuple[float, float, float, float, float, float]] = None
 
 
+def _set_windows_keep_awake(enable: bool) -> None:
+    """
+    Prevent Windows idle system/network sleep while the copier runs (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+    without blocking monitor sleep, and restore default power state on shutdown.
+    """
+    if os.name != "nt" or not PREVENT_SYSTEM_SLEEP:
+        return
+    try:
+        import ctypes
+        es_continuous = 0x80000000
+        es_system_required = 0x00000001
+        flags = (es_continuous | es_system_required) if enable else es_continuous
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception as e:
+        logger.debug(f"Could not set Windows execution state (enable={enable}): {e}")
+
+
+def _disable_windows_console_quickedit() -> None:
+    """
+    Disable Win32 Console QuickEdit mode so clicking inside the terminal window never freezes
+    stdout / asyncio / Telegram updates until a keypress.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        std_input_handle = -10
+        enable_quick_edit = 0x0040
+        enable_extended_flags = 0x0080
+        h_stdin = kernel32.GetStdHandle(std_input_handle)
+        if not h_stdin:
+            return
+        mode = wintypes.DWORD()
+        if kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            new_mode = (mode.value & ~enable_quick_edit) | enable_extended_flags
+            if new_mode != mode.value:
+                kernel32.SetConsoleMode(h_stdin, new_mode)
+    except Exception as e:
+        logger.debug(f"Could not disable console QuickEdit mode: {e}")
+
+
 def update_live_terminal_status(force_print: bool = False) -> None:
     """
     Renders a compact (<79 chars, never line-wraps) in-place MetaTrader 5 balance bar at the
@@ -656,7 +715,7 @@ def update_live_terminal_status(force_print: bool = False) -> None:
             f"Eq: {sym_char}{eq:.2f} | P&L: {'+' if pnl >= 0 else '-'}{sym_char}{abs(pnl):.2f} | "
             f"Lots: {tot_lots:.2f}/{high_l:.2f}"
         )
-        if os.name == "nt":
+        if os.name == "nt" and CONSOLE_TITLE_UPDATES:
             try:
                 import ctypes
                 ctypes.windll.kernel32.SetConsoleTitleW(title_str)
@@ -1143,6 +1202,33 @@ async def notify_saved_messages(text: str) -> None:
 # 1-SECOND TP1 PROXIMITY WATCHER TASK
 # ---------------------------------------------------------------------------
 
+async def _run_telegram_keepalive_check(now: float) -> None:
+    """Ping Telegram with a short timeout and cycle the socket immediately on half-open drop."""
+    if not telethon_client:
+        return
+    try:
+        if not telethon_client.is_connected():
+            logger.warning("Telegram client disconnected; attempting reconnect...")
+            await asyncio.wait_for(telethon_client.connect(), timeout=8.0)
+        else:
+            from telethon.tl.functions import PingRequest
+            await asyncio.wait_for(
+                telethon_client(PingRequest(ping_id=int(now * 1000) & 0x7FFFFFFF)),
+                timeout=5.0,
+            )
+    except Exception as tg_err:
+        logger.warning(f"Telegram keepalive failed ({tg_err}); cycling connection to recover...")
+        try:
+            await asyncio.wait_for(telethon_client.disconnect(), timeout=4.0)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(telethon_client.connect(), timeout=8.0)
+            logger.info("Telegram connection recovered cleanly after keepalive cycle.")
+        except Exception as rec_err:
+            logger.debug(f"Telegram reconnect attempt deferred: {rec_err}")
+
+
 async def tp1_proximity_watcher_task() -> None:
     """
     Background loop running every 1.0 second:
@@ -1153,31 +1239,38 @@ async def tp1_proximity_watcher_task() -> None:
     logger.info("TP1 20-Pip Proximity Watcher & MT5 State Reconciler started (1.0s loop).")
     last_algo_check = 0.0
     last_tg_keepalive = time.time()
+    last_account_poll = 0.0
+    has_live_exposure = False
 
     while True:
         try:
             now = time.time()
-            update_live_terminal_status()
-            await check_and_enforce_daily_drawdown()
-            if await check_and_enforce_daily_win_target() == "DAILY_WIN_REACHED":
-                break
-            if await check_and_enforce_daily_loss_limit(exit_on_trigger=False) == "DAILY_LOSS_REACHED":
-                break
+            active_signals = state_mgr.get_active_signals()
+
+            # Poll heavy MT5 account/drawdown/HUD checks at 1.0s when active trades exist,
+            # and gently at IDLE_MT5_POLL_INTERVAL_SECONDS (5.0s) when completely flat to save CPU/IPC.
+            if active_signals or has_live_exposure or (now - last_account_poll >= IDLE_MT5_POLL_INTERVAL_SECONDS):
+                last_account_poll = now
+                update_live_terminal_status()
+                await check_and_enforce_daily_drawdown()
+                if await check_and_enforce_daily_win_target() == "DAILY_WIN_REACHED":
+                    break
+                if await check_and_enforce_daily_loss_limit(exit_on_trigger=False) == "DAILY_LOSS_REACHED":
+                    break
+                if not executor.dry_run and executor.is_connected():
+                    has_live_exposure = bool(
+                        executor.get_live_positions(DEFAULT_SYMBOL)
+                        or executor.get_live_orders(DEFAULT_SYMBOL)
+                    )
+                else:
+                    has_live_exposure = False
 
             # ---------------------------------------------------------------
-            # 0. 45-Second Telegram TCP Keepalive Ping (Prevents WinError 64 NAT Drops)
+            # 0. Active Telegram TCP Keepalive + Dead-Socket Recovery
             # ---------------------------------------------------------------
-            if now - last_tg_keepalive >= 45.0:
+            if now - last_tg_keepalive >= TELEGRAM_KEEPALIVE_SECONDS:
                 last_tg_keepalive = now
-                if telethon_client:
-                    try:
-                        if not telethon_client.is_connected():
-                            await telethon_client.connect()
-                        else:
-                            from telethon.tl.functions import PingRequest
-                            await telethon_client(PingRequest(ping_id=int(now * 1000) & 0x7FFFFFFF))
-                    except Exception as tg_err:
-                        logger.debug(f"Telegram keepalive ping reconnect check: {tg_err}")
+                await _run_telegram_keepalive_check(now)
 
             # ---------------------------------------------------------------
             # 1. 30-Second Algo Trading Button Monitor
@@ -3311,6 +3404,8 @@ async def main():
     )
 
     logger.info("Copier event handlers registered. Starting Telethon client...")
+    _disable_windows_console_quickedit()
+    _set_windows_keep_awake(True)
     await telethon_client.start()
     try:
         # Warm Telegram entity/channel access_hash cache so all monitored CHANNEL_IDS receive live updates
@@ -3339,6 +3434,7 @@ async def main():
         unexpected_exit = True
         logger.exception(f"Unexpected error in copier loop: {e}")
     finally:
+        _set_windows_keep_awake(False)
         proximity_task.cancel()
         try:
             await proximity_task

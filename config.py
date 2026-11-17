@@ -163,6 +163,16 @@ ENFORCE_HIGH_RISK_LOT_CAP = os.getenv("ENFORCE_HIGH_RISK_LOT_CAP", "true").lower
 DAILY_LOSS_PAUSE_PCT = float(os.getenv("DAILY_LOSS_PAUSE_PCT", "50.0"))
 EMERGENCY_CUTOFF_LOSS_PCT = float(os.getenv("EMERGENCY_CUTOFF_LOSS_PCT", "90.0"))
 
+# Runtime Uptime, Power & Gaming/UI Impact Controls:
+# - PREVENT_SYSTEM_SLEEP: keeps Windows system/network awake while running (allows monitor sleep)
+# - IDLE_MT5_POLL_INTERVAL_SECONDS: throttles MT5 account/drawdown IPC polling when 0 trades/limits are active
+# - TELEGRAM_KEEPALIVE_SECONDS: active PingRequest + timeout cycle to recover quickly after Wi-Fi drops
+# - CONSOLE_TITLE_UPDATES: toggles Win32 SetConsoleTitleW window title-bar updates
+PREVENT_SYSTEM_SLEEP = os.getenv("PREVENT_SYSTEM_SLEEP", "true").lower() in ("true", "1", "yes")
+IDLE_MT5_POLL_INTERVAL_SECONDS = max(1.0, float(os.getenv("IDLE_MT5_POLL_INTERVAL_SECONDS") or "5.0"))
+TELEGRAM_KEEPALIVE_SECONDS = max(5.0, float(os.getenv("TELEGRAM_KEEPALIVE_SECONDS") or "20.0"))
+CONSOLE_TITLE_UPDATES = os.getenv("CONSOLE_TITLE_UPDATES", "true").lower() in ("true", "1", "yes")
+
 # MT5 Optional Direct Login Settings
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0")) if os.getenv("MT5_LOGIN") else None
 MT5_PASSWORD = os.getenv("MT5_PASSWORD") or None

@@ -762,3 +762,48 @@ async def test_spec_9_buy_limit_and_sell_limit_live_activation_and_stops_fallbac
         for p in reversed(env["patches"]):
             p.stop()
         _reset_main(tmp_path, "spec9_cleanup.json")
+
+
+@pytest.mark.asyncio
+async def test_spec_10_idle_mt5_skip_keepawake_and_keepalive_recovery(tmp_path):
+    """
+    Verify uptime & low-overhead fixes:
+    - Disabled dailywin / dailyloss skip expensive history_deals_get calls completely.
+    - Windows keep-awake and console QuickEdit helpers execute safely without errors.
+    - Keepalive failure triggers clean disconnect -> connect socket recovery.
+    """
+    _reset_main(tmp_path, "spec10.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+
+    orig_tg = main.telethon_client
+    orig_keepalive = main.TELEGRAM_KEEPALIVE_SECONDS
+    try:
+        with patch.object(main.executor, "get_realized_today_pnl", wraps=main.executor.get_realized_today_pnl) as spy_realized, \
+             patch.object(main.executor, "get_daily_drawdown_status", wraps=main.executor.get_daily_drawdown_status) as spy_dd:
+            assert await main.check_and_enforce_daily_win_target() == "OK"
+            assert await main.check_and_enforce_daily_loss_limit(exit_on_trigger=False) == "OK"
+            assert spy_realized.call_count == 0
+            assert spy_dd.call_count == 0
+
+        # Power / console helpers must never raise
+        main._set_windows_keep_awake(True)
+        main._set_windows_keep_awake(False)
+        main._disable_windows_console_quickedit()
+
+        # Keepalive failure triggers disconnect + connect recovery
+        mock_tg = MagicMock()
+        mock_tg.is_connected.return_value = True
+        mock_tg.side_effect = TimeoutError("dead socket")
+        mock_tg.disconnect = AsyncMock(return_value=None)
+        mock_tg.connect = AsyncMock(return_value=None)
+        main.telethon_client = mock_tg
+
+        await main._run_telegram_keepalive_check(time.time())
+
+        assert mock_tg.disconnect.await_count == 1
+        assert mock_tg.connect.await_count == 1
+    finally:
+        main.TELEGRAM_KEEPALIVE_SECONDS = orig_keepalive
+        main.telethon_client = orig_tg
+        _reset_main(tmp_path, "spec10_cleanup.json")
