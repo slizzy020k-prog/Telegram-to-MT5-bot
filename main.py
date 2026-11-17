@@ -1246,24 +1246,19 @@ async def tp1_proximity_watcher_task() -> None:
         try:
             now = time.time()
             active_signals = state_mgr.get_active_signals()
+            update_live_terminal_status()
+            if not executor.dry_run and _last_hud_state is not None:
+                has_live_exposure = (_last_hud_state[4] > 0.0)
 
-            # Poll heavy MT5 account/drawdown/HUD checks at 1.0s when active trades exist,
-            # and gently at IDLE_MT5_POLL_INTERVAL_SECONDS (5.0s) when completely flat to save CPU/IPC.
+            # Throttle heavy history_deals_get drawdown/limit checks at IDLE_MT5_POLL_INTERVAL_SECONDS (5s)
+            # when flat, while staying on 1.0s speed whenever active signals or open exposure exist.
             if active_signals or has_live_exposure or (now - last_account_poll >= IDLE_MT5_POLL_INTERVAL_SECONDS):
                 last_account_poll = now
-                update_live_terminal_status()
                 await check_and_enforce_daily_drawdown()
                 if await check_and_enforce_daily_win_target() == "DAILY_WIN_REACHED":
                     break
                 if await check_and_enforce_daily_loss_limit(exit_on_trigger=False) == "DAILY_LOSS_REACHED":
                     break
-                if not executor.dry_run and executor.is_connected():
-                    has_live_exposure = bool(
-                        executor.get_live_positions(DEFAULT_SYMBOL)
-                        or executor.get_live_orders(DEFAULT_SYMBOL)
-                    )
-                else:
-                    has_live_exposure = False
 
             # ---------------------------------------------------------------
             # 0. Active Telegram TCP Keepalive + Dead-Socket Recovery
