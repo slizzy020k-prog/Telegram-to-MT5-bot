@@ -710,14 +710,19 @@ class StateManager:
         self,
         symbol: Optional[str] = None,
         chat_id: Optional[int | str] = None,
+        prefer_open_positions: bool = False,
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """Get the most recent active/pending signal (optionally scoped to chat_id and symbol)."""
+        """Get the most recent active/pending signal (strictly scoped to chat_id when provided)."""
         target_sym = symbol.upper() if symbol else None
+        target_base_sym = target_sym.split(".", 1)[0].split("_", 1)[0] if target_sym else None
         priority_statuses = _ACTIVE_STATUSES + _PENDING_STATUSES
 
         def _matches(data: Dict[str, Any], allow_null_chat: bool = True) -> bool:
-            if target_sym is not None and (data.get("symbol") or "").upper() != target_sym:
-                return False
+            if target_sym is not None:
+                rec_sym = (data.get("symbol") or "").upper()
+                rec_base_sym = rec_sym.split(".", 1)[0].split("_", 1)[0] if rec_sym else ""
+                if rec_sym != target_sym and (not rec_base_sym or rec_base_sym != target_base_sym):
+                    return False
             if chat_id is not None:
                 rec_chat = data.get("chat_id")
                 if rec_chat is None:
@@ -725,12 +730,24 @@ class StateManager:
                 return _chat_ids_match(rec_chat, chat_id)
             return True
 
+        def _has_open_positions(data: Dict[str, Any]) -> bool:
+            return bool(data.get("market_tickets") or data.get("runner_tickets") or data.get("runner_ticket"))
+
         with self._lock:
             signal_items = [
                 (k, v) for k, v in self._state.items()
                 if not str(k).startswith("_") and isinstance(v, dict)
             ]
             sorted_items = sorted(signal_items, key=self._sort_key, reverse=True)
+            if prefer_open_positions:
+                if chat_id is not None:
+                    for msg_id, data in sorted_items:
+                        if data.get("status") in _ACTIVE_STATUSES and _has_open_positions(data) and _matches(data, allow_null_chat=False):
+                            return msg_id, copy.deepcopy(data)
+                for msg_id, data in sorted_items:
+                    if data.get("status") in _ACTIVE_STATUSES and _has_open_positions(data) and _matches(data, allow_null_chat=True):
+                        return msg_id, copy.deepcopy(data)
+
             if chat_id is not None:
                 for msg_id, data in sorted_items:
                     if data.get("status") in priority_statuses and _matches(data, allow_null_chat=False):

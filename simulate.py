@@ -152,12 +152,14 @@ async def run_simulation() -> None:
         )
 
     # -----------------------------------------------------------------------
-    # STEP 4: Selective Breakeven (BE on L1, L2, L3; L4 untouched)
+    # STEP 4: All-Layers Breakeven (BE on L1, L2, L3, L4 + Armed Pending Layers)
     # -----------------------------------------------------------------------
-    print("\n[STEP 4] Testing Selective Breakeven Command ('BE')...")
+    print("\n[STEP 4] Testing All-Layers Breakeven Command ('BE')...")
     evt4 = MockTelethonEvent(msg_id=20004, text="BE", reply_to_msg_id=20003)
     await main.handle_new_message(evt4)
-    print("  [OK] Selective Breakeven applied to BE_LAYERS=['L1','L2','L3']; L4 (0.02) untouched.")
+    sig4_chk = main.state_mgr.get_signal(20003, chat_id=evt3.chat_id)
+    assert sig4_chk["status"] == "BE_APPLIED" and sig4_chk["be_armed"] is True
+    print("  [OK] Breakeven applied to open layers & armed across BE_LAYERS=['L1','L2','L3','L4'].")
 
     # -----------------------------------------------------------------------
     # STEP 5: Delayed "Buy now" -> Edited with 4-Layer Zone
@@ -425,8 +427,55 @@ async def run_simulation() -> None:
         f"replaced synthetic TP1 -> {sig_late['raw_tp1']}, and set SL -> {sig_late['sl']}!"
     )
 
+    # -----------------------------------------------------------------------
+    # STEP 10: Standalone Per-Channel Breakeven (No Reply + Channel Isolation + All 4 Layers)
+    # -----------------------------------------------------------------------
+    print("\n[STEP 10] Testing Standalone Per-Channel Breakeven (No Reply, All 4 Layers, Channel Isolation)...")
+    chan_alpha = -1004369388188
+    chan_beta = -1003712081715
+    main.CHANNEL_IDS = list({*main.CHANNEL_IDS, chan_alpha, chan_beta})
+    main.state_mgr.create_signal(
+        message_id=20030,
+        chat_id=chan_alpha,
+        symbol=config.DEFAULT_SYMBOL,
+        direction="BUY",
+        entry_type="ZONE",
+        layers={
+            "L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9801, "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3888.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9802, "status": "FILLED"},
+            "L3": {"lot": 0.01, "target_price": 3886.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9803, "status": "FILLED"},
+            "L4": {"lot": 0.02, "target_price": 3884.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9804, "status": "FILLED"},
+        },
+        market_tickets=[9801, 9802, 9803, 9804],
+        pending_tickets=[],
+        sl=3870.0,
+    )
+    main.state_mgr.create_signal(
+        message_id=20031,
+        chat_id=chan_beta,
+        symbol=config.DEFAULT_SYMBOL,
+        direction="SELL",
+        entry_type="ZONE",
+        layers={
+            "L1": {"lot": 0.01, "target_price": 3910.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9901, "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3912.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9902, "status": "FILLED"},
+            "L3": {"lot": 0.01, "target_price": 3914.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9903, "status": "FILLED"},
+            "L4": {"lot": 0.02, "target_price": 3916.0, "tp": 3900.0, "tp_stage": "TP1", "ticket": 9904, "status": "FILLED"},
+        },
+        market_tickets=[9901, 9902, 9903, 9904],
+        pending_tickets=[],
+        sl=3930.0,
+    )
+    evt10 = MockTelethonEvent(msg_id=20032, text="Go breakeven!", reply_to_msg_id=None, chat_id=chan_alpha)
+    await main.handle_new_message(evt10)
+    sig_alpha = main.state_mgr.get_signal(20030, chat_id=chan_alpha)
+    sig_beta = main.state_mgr.get_signal(20031, chat_id=chan_beta)
+    assert sig_alpha["status"] == "BE_APPLIED" and sig_alpha["be_done_tickets"] == [9801, 9802, 9803, 9804]
+    assert sig_beta["status"] == "ACTIVE" and not sig_beta.get("be_done_tickets")
+    print("  [OK] Standalone 'Go breakeven!' protected all 4 layers (9801..9804) in Channel Alpha ONLY; Channel Beta untouched!")
+
     print("\n" + "=" * 72)
-    print("  ALL 9 v3.3.2 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("  ALL 10 v3.3.3 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
     print("=" * 72)
 
 

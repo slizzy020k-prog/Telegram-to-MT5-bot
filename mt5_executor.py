@@ -2717,7 +2717,13 @@ class MT5Executor:
         direction: str,
         fallback_entry: Optional[float] = None,
     ) -> Optional[float]:
-        """Move an open position's SL to entry +/- offset_value while keeping its TP intact."""
+        """
+        Move an open position's SL to entry +/- offset_value while keeping its TP intact.
+        - Forward-only ratchet: never loosens an SL that is already at or tighter than BE.
+        - Instant 0ms stop-level fallback: if broker rejects `entry +/- offset_value` with
+          `10016 Invalid stops` because live price is narrowly inside the commission buffer,
+          immediately falls back to exact `entry` (`0.0p`) in the same call.
+        """
         if self.dry_run:
             self.modify_position_sltp(ticket=ticket, sl=None, tp=None)
             if fallback_entry is not None:
@@ -2733,11 +2739,63 @@ class MT5Executor:
         p = pos[0]
         price_open = _num(getattr(p, "price_open", 0.0), 0.0)
         p_tp = _num(getattr(p, "tp", 0.0), 0.0)
+        cur_sl = _num(getattr(p, "sl", 0.0), 0.0)
         is_buy = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
         new_sl = round(price_open + offset_value, digits) if is_buy else round(price_open - offset_value, digits)
+
+        # Forward-only SL ratchet: never loosen a position whose SL is already at or past BE
+        if is_buy and cur_sl > 0.0 and cur_sl >= new_sl - 1e-6:
+            return cur_sl
+        if not is_buy and cur_sl > 0.0 and cur_sl <= new_sl + 1e-6:
+            return cur_sl
+
         if self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p_tp):
             return new_sl
+
+        # Instant 0ms fallback to exact entry (0.0p) when +offset_value is inside broker stops_level
+        if offset_value > 0.0 and price_open > 0.0:
+            exact_sl = round(price_open, digits)
+            if is_buy and cur_sl > 0.0 and cur_sl >= exact_sl - 1e-6:
+                return cur_sl
+            if not is_buy and cur_sl > 0.0 and cur_sl <= exact_sl + 1e-6:
+                return cur_sl
+            if exact_sl != new_sl and self.modify_position_sltp(ticket=ticket, sl=exact_sl, tp=p_tp):
+                logger.info(
+                    f"Ticket #{ticket} moved to exact-entry BE {exact_sl} "
+                    f"(0.0p instant fallback; +{offset_value:.2f} buffer rejected by stops_level)"
+                )
+                return exact_sl
+
         return None
+
+    def _resolve_be_layer_names(
+        self,
+        layers: Dict[str, Dict[str, Any]],
+        eff_be_layers: List[str],
+    ) -> List[str]:
+        """Resolve configured BE layer names across both v3.0 4-layer and legacy 3-layer dicts."""
+        is_legacy = _is_legacy_3layer_dict(layers)
+        resolved_names: List[str] = []
+        for raw_name in eff_be_layers:
+            up = str(raw_name).strip().upper()
+            if is_legacy:
+                if up in layers and up not in resolved_names:
+                    resolved_names.append(up)
+                elif up in ("L1", "L2"):
+                    mapped = _V3_TO_LEGACY_LAYER[up]
+                    if mapped in layers and mapped not in resolved_names:
+                        resolved_names.append(mapped)
+                elif up == "L4" and "BOTTOM" in layers and "BOTTOM" not in resolved_names:
+                    resolved_names.append("BOTTOM")
+                # Note: L3 alone does not map to BOTTOM so explicit ["L1","L2","L3"] keeps legacy BOTTOM untouched.
+            else:
+                if up in layers and up not in resolved_names:
+                    resolved_names.append(up)
+                elif up in LEGACY_LAYER_MAP and LEGACY_LAYER_MAP[up] in layers:
+                    mapped_v3 = LEGACY_LAYER_MAP[up]
+                    if mapped_v3 not in resolved_names:
+                        resolved_names.append(mapped_v3)
+        return resolved_names
 
     def apply_selective_breakeven(
         self,
@@ -2748,9 +2806,9 @@ class MT5Executor:
         be_offset_pips: Optional[float] = None,
     ) -> List[int]:
         """
-        Selective Breakeven:
-        - v3.0 4-layer signals: moves L1, L2, L3 (default BE_LAYERS) to BE, leaving L4 (0.02) untouched.
-        - Legacy 3-layer signals: moves TOP and MID to BE, leaving BOTTOM untouched.
+        Breakeven across configured layers:
+        - Default `BE_LAYERS` (`["L1", "L2", "L3", "L4"]`): moves ALL 4 layers (including L4 0.02) to BE.
+        - Explicit `be_layers` subset (e.g. `["TOP", "MID"]`): moves only the requested layers.
         Pending orders remain active. Returns list of tickets modified to BE.
         """
         pip_size = self.get_pip_size(symbol)
@@ -2760,24 +2818,7 @@ class MT5Executor:
         digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
 
         eff_be_layers = list(be_layers) if be_layers is not None else list(_cfg("BE_LAYERS", BE_LAYERS))
-        is_legacy = _is_legacy_3layer_dict(layers)
-
-        resolved_names: List[str] = []
-        for raw_name in eff_be_layers:
-            up = str(raw_name).strip().upper()
-            if is_legacy:
-                if up in layers:
-                    resolved_names.append(up)
-                elif up in ("L1", "L2"):
-                    mapped = _V3_TO_LEGACY_LAYER[up]
-                    if mapped in layers:
-                        resolved_names.append(mapped)
-                # Note: in legacy 3-layer mode, L3 does not map to BOTTOM (BOTTOM stays untouched).
-            else:
-                if up in layers:
-                    resolved_names.append(up)
-                elif up in LEGACY_LAYER_MAP and LEGACY_LAYER_MAP[up] in layers:
-                    resolved_names.append(LEGACY_LAYER_MAP[up])
+        resolved_names = self._resolve_be_layer_names(layers, eff_be_layers)
 
         modified_tickets: List[int] = []
         seen_tickets = set()
@@ -2801,11 +2842,191 @@ class MT5Executor:
             new_sl = self._move_ticket_to_be(ticket, offset_value, digits, direction)
             if new_sl is not None:
                 modified_tickets.append(ticket)
+                layer["be_sl"] = new_sl
                 logger.info(
-                    f"Layer {layer_name} (Ticket #{ticket}) moved to BE: NewSL={new_sl} (+{eff_offset_pips} pips offset)"
+                    f"Layer {layer_name} (Ticket #{ticket}) moved to BE: NewSL={new_sl} (+{eff_offset_pips} pips target)"
                 )
 
         return modified_tickets
+
+    def apply_signal_breakeven(
+        self,
+        signal_data: Dict[str, Any],
+        be_layers: Optional[List[str]] = None,
+        be_offset_pips: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fast, all-layer signal breakeven with live fill-race promotion & deferred retry tracking:
+        - Moves all open target layers (default L1..L4) + any open market/runner tickets on this signal to BE.
+        - Checks live `mt5.positions_get(ticket=t)` even for tickets still in `pending_tickets` in case a
+          limit filled milliseconds before the 1s reconciler ran, promoting filled tickets immediately.
+        - Never cancels unfilled pending orders.
+        - Never loosens an already-trailed runner SL (forward-only ratchet).
+        - Tracks `be_done_tickets` and `deferred_tickets` (open positions temporarily underwater / inside
+          broker `stops_level`) so the 0.5s watcher can snap deferred tickets to BE automatically.
+        """
+        symbol = signal_data.get("symbol", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        layers = signal_data.get("layers") or {}
+
+        pip_size = self.get_pip_size(symbol)
+        eff_offset_pips = float(be_offset_pips) if be_offset_pips is not None else float(_cfg("BE_OFFSET_PIPS", BE_OFFSET_PIPS))
+        offset_value = eff_offset_pips * pip_size
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+
+        eff_be_layers = list(be_layers) if be_layers is not None else list(_cfg("BE_LAYERS", BE_LAYERS))
+        upper_be_set = {str(x).strip().upper() for x in eff_be_layers}
+        all_layers_mode = {"L1", "L2", "L3", "L4"}.issubset(upper_be_set) or {"TOP", "MID", "BOTTOM"}.issubset(upper_be_set)
+
+        resolved_names = self._resolve_be_layer_names(layers, eff_be_layers)
+        candidates: List[Tuple[int, Optional[str]]] = []
+        seen_tickets = set()
+
+        for layer_name in resolved_names:
+            layer = layers.get(layer_name)
+            if not isinstance(layer, dict):
+                continue
+            if str(layer.get("status") or "").upper() in ("CLOSED", "CANCELLED"):
+                continue
+            ticket = layer.get("ticket")
+            if ticket and ticket not in seen_tickets:
+                seen_tickets.add(ticket)
+                candidates.append((int(ticket), layer_name))
+
+        if all_layers_mode:
+            ticket_to_layer = {
+                int(ld["ticket"]): lk
+                for lk, ld in layers.items()
+                if isinstance(ld, dict) and ld.get("ticket") is not None
+            }
+            extra_pool = list(signal_data.get("market_tickets") or []) + list(signal_data.get("runner_tickets") or [])
+            if signal_data.get("runner_ticket") is not None:
+                extra_pool.append(signal_data["runner_ticket"])
+            for raw_t in extra_pool:
+                if raw_t is None:
+                    continue
+                t_int = int(raw_t)
+                if t_int not in seen_tickets:
+                    seen_tickets.add(t_int)
+                    candidates.append((t_int, ticket_to_layer.get(t_int)))
+
+        mk_tickets = [int(t) for t in (signal_data.get("market_tickets") or []) if t is not None]
+        pd_tickets = [int(t) for t in (signal_data.get("pending_tickets") or []) if t is not None]
+        be_done_set = {int(t) for t in (signal_data.get("be_done_tickets") or []) if t is not None}
+
+        modified_tickets: List[int] = []
+        deferred_tickets: List[int] = []
+        promoted_tickets: List[int] = []
+        applied_sls: Dict[int, float] = {}
+
+        if self.dry_run:
+            has_ticket_lists = bool(mk_tickets or pd_tickets)
+            for ticket, layer_name in candidates:
+                if has_ticket_lists and ticket in pd_tickets and ticket not in mk_tickets:
+                    continue
+                layer_obj = layers.get(layer_name) if layer_name else None
+                entry_ref = (
+                    _num(layer_obj.get("target_price"), 0.0)
+                    if isinstance(layer_obj, dict) and layer_obj.get("target_price") is not None
+                    else _num(signal_data.get("recorded_entry_price"), 0.0)
+                )
+                if entry_ref > 0.0:
+                    calc_sl = round(entry_ref + offset_value, digits) if is_buy else round(entry_ref - offset_value, digits)
+                    if isinstance(layer_obj, dict):
+                        prev_be = _num(layer_obj.get("be_sl"), 0.0)
+                        if is_buy and prev_be > 0.0 and prev_be > calc_sl:
+                            calc_sl = prev_be
+                        elif not is_buy and prev_be > 0.0 and prev_be < calc_sl:
+                            calc_sl = prev_be
+                        layer_obj["be_sl"] = calc_sl
+                    applied_sls[ticket] = calc_sl
+                if ticket not in be_done_set:
+                    logger.info(
+                        f"[DRY-RUN] Moved Layer {layer_name or 'OPEN'} (Ticket #{ticket}) to Breakeven (+{eff_offset_pips} pips offset)"
+                    )
+                    modified_tickets.append(ticket)
+                    be_done_set.add(ticket)
+            signal_data["be_done_tickets"] = sorted(be_done_set)
+            signal_data["be_deferred_tickets"] = []
+            return {
+                "modified_tickets": modified_tickets,
+                "deferred_tickets": [],
+                "promoted_tickets": [],
+                "be_done_tickets": sorted(be_done_set),
+                "applied_sls": applied_sls,
+            }
+
+        buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
+        for ticket, layer_name in candidates:
+            with self._mt5_lock:
+                pos = mt5.positions_get(ticket=ticket)
+            if not pos:
+                # Unfilled pending order or already closed on broker; leave pending orders untouched
+                continue
+
+            # Catch sub-second fill race if a pending limit filled before 1s reconciler ran
+            if ticket in pd_tickets:
+                pd_tickets = [t for t in pd_tickets if t != ticket]
+                if ticket not in mk_tickets:
+                    mk_tickets.append(ticket)
+                if layer_name and isinstance(layers.get(layer_name), dict):
+                    layers[layer_name]["status"] = "FILLED"
+                promoted_tickets.append(ticket)
+                logger.info(
+                    f"Instant BE fill-race catch: Pending #{ticket} ({layer_name}) already filled on MT5; promoting & protecting now."
+                )
+
+            p0 = pos[0]
+            p_open = _num(getattr(p0, "price_open", 0.0), 0.0)
+            p_sl = _num(getattr(p0, "sl", 0.0), 0.0)
+            pos_is_buy = _int_num(getattr(p0, "type", buy_order_type), buy_order_type) == buy_order_type
+            if ticket in be_done_set and p_open > 0.0:
+                if (pos_is_buy and p_sl >= p_open - 1e-6) or (not pos_is_buy and p_sl > 0.0 and p_sl <= p_open + 1e-6):
+                    applied_sls[ticket] = p_sl
+                    continue
+
+            new_sl = self._move_ticket_to_be(ticket, offset_value, digits, direction)
+            if new_sl is not None:
+                modified_tickets.append(ticket)
+                be_done_set.add(ticket)
+                applied_sls[ticket] = new_sl
+                if layer_name and isinstance(layers.get(layer_name), dict):
+                    layers[layer_name]["be_sl"] = new_sl
+                logger.info(
+                    f"Layer {layer_name or 'OPEN'} (Ticket #{ticket}) moved to BE: NewSL={new_sl}"
+                )
+            else:
+                deferred_tickets.append(ticket)
+                logger.warning(
+                    f"Layer {layer_name or 'OPEN'} (Ticket #{ticket}) open at {p_open} but inside stops_level / underwater; "
+                    f"armed for 0.5s auto-BE retry."
+                )
+
+        if promoted_tickets:
+            signal_data["market_tickets"] = mk_tickets
+            signal_data["pending_tickets"] = pd_tickets
+
+        if signal_data.get("status") == "RUNNER_ACTIVE" and applied_sls:
+            cur_floor = signal_data.get("runner_sl_floor")
+            best_be_sl = max(applied_sls.values()) if is_buy else min(applied_sls.values())
+            if cur_floor is None:
+                signal_data["runner_sl_floor"] = best_be_sl
+            else:
+                cur_floor_f = float(cur_floor)
+                if (is_buy and best_be_sl > cur_floor_f) or (not is_buy and best_be_sl < cur_floor_f):
+                    signal_data["runner_sl_floor"] = best_be_sl
+
+        signal_data["be_done_tickets"] = sorted(be_done_set)
+        signal_data["be_deferred_tickets"] = deferred_tickets
+        return {
+            "modified_tickets": modified_tickets,
+            "deferred_tickets": deferred_tickets,
+            "promoted_tickets": promoted_tickets,
+            "be_done_tickets": sorted(be_done_set),
+            "applied_sls": applied_sls,
+        }
 
     def apply_breakeven_worst_hold_layers(
         self,

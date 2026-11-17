@@ -259,7 +259,7 @@ RUNNER_CLEAN_BREAK_PIPS: float = _env_float(
 # TP1 Scaling, Breakeven & Pending Order Policy
 CANCEL_PENDING_ON_TP1: bool = _env_bool("CANCEL_PENDING_ON_TP1", True)
 BE_AFTER_TP1: bool = _env_bool("BE_AFTER_TP1", True)
-_default_be_layers = ["L1", "L2", "L3"]
+_default_be_layers = ["L1", "L2", "L3", "L4"]
 BE_LAYERS: List[str] = [
     str(item).strip().upper()
     for item in _parse_json_list("BE_LAYERS", _default_be_layers)

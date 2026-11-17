@@ -65,17 +65,20 @@ VICTORY_RECAP_BLOCKERS = [
 # GATE 3 TRADE MANAGEMENT INTENT PATTERNS
 # ---------------------------------------------------------------------------
 
-BREAKEVEN_PATTERNS = [
-    r"\bbe\b",
-    r"\bbreakeven\b",
-    r"\bbreak\s+even\b",
-    r"\bsl\s+to\s+entry\b",
-    r"\bsl\s+to\s+be\b",
-    r"\brisk\s+free\b",
-    r"\bmove\s+sl\s+(?:to\s+)?(?:entry|be|break\s*even)\b",
+_UNAMBIGUOUS_BE_PATTERNS = [
+    r"\bbreakevens?\b",
+    r"\bbreak[\s\-]+evens?\b",
+    r"\brisk[\s\-]+free\b",
+    r"\bsl\s+(?:to|at)\s+entry\b",
+    r"\bstops?\s+(?:to|at)\s+entry\b",
+    r"\bsl\s+(?:to|at)\s+be\b",
+    r"\b(?:go|set|move|put|shift|lock|bring|all|layers?|entries|entry|stops?|sl)\s+(?:your\s+|all\s+|the\s+)?(?:sl\s+|stops?\s+|entries\s+|layers?\s+)?(?:to\s+|at\s+|on\s+)?be\b",
+    r"\bbe\s+(?:now|all|layers?|entries|your\s+entries|on\s+all|on\s+layers?|everyone|guys|lads|team|people)\b",
+    r"\b(?:move|set|put)\s+(?:your\s+)?(?:sl|stop\s*loss|stops?)\s+(?:to\s+|at\s+)?(?:entry|be|break[\s\-]*even)\b",
     r"^\s*move\s+sl\s*[!.]*\s*$",
-    r"\bset\s+sl\s+(?:to\s+)?(?:entry|be|break\s*even)\b",
 ]
+
+BREAKEVEN_PATTERNS = [r"\bbe\b"] + _UNAMBIGUOUS_BE_PATTERNS
 
 WORST_HOLD_PATTERNS = [
     r"\bclose\s+worst\b",
@@ -587,6 +590,21 @@ def _has_real_trade_structure(text: str) -> bool:
     return False
 
 
+def _is_unambiguous_breakeven_cmd(lower: str) -> bool:
+    """
+    Return True when `lower` contains an explicit breakeven command (without needing a reply),
+    excluding priced new-signal entries and past-tense 'entry was' recaps.
+    """
+    words = lower.split()
+    if not words or len(words) > 30:
+        return False
+    if DIRECTION_PATTERN.search(lower) and re.search(r"\b\d{4}(?:\.\d+)?\b", lower):
+        return False
+    if re.search(r"\bentry\s+was\b|\blast\s+night\b|\byesterday\b", lower):
+        return False
+    return any(re.search(p, lower) for p in _UNAMBIGUOUS_BE_PATTERNS)
+
+
 def gate_2_check_announcements_and_recaps(
     text: str,
     is_reply: bool = False,
@@ -599,7 +617,7 @@ def gate_2_check_announcements_and_recaps(
     2. Hard account / lot sizing tables & 'how to' questions.
     3. Standalone risk disclaimers ('high risk', 'manage your risk', 'vip') ONLY when
        no real Gold trade/target structure is present.
-    4. Past-tense victory recaps (unless is_reply or is_edit).
+    4. Past-tense victory recaps (unless is_reply, is_edit, short TP milestone, or explicit BE command).
     """
     upper = text.upper()
     lower = text.lower()
@@ -631,7 +649,7 @@ def gate_2_check_announcements_and_recaps(
             and not re.search(r"\b\d{4}(?:\.\d+)?\b", lower)
             and detect_tp_milestone_hit(lower) in (1, 2, 3)
         )
-        if not is_short_tp_milestone_cmd:
+        if not is_short_tp_milestone_cmd and not _is_unambiguous_breakeven_cmd(lower):
             for pattern in VICTORY_RECAP_BLOCKERS:
                 if re.search(pattern, lower):
                     logger.info(f"Gate 2 Reject (Victory Recap): Matched pattern '{pattern}'")
@@ -667,13 +685,14 @@ def gate_3_classify_trade_management(
     word_count = len(lower.split())
     has_direction = bool(DIRECTION_PATTERN.search(lower))
     has_4digit_price = bool(re.search(r"\b\d{4}(?:\.\d+)?\b", lower))
+    unambig_be = _is_unambiguous_breakeven_cmd(lower)
 
     if not effective_is_reply:
         # Non-reply chatter must never act on a live trade by accident:
         # 1) Anything that looks like a priced entry signal is NOT a management command.
         if has_direction and has_4digit_price:
             return None
-        # 2) Long messages are conversation, not commands (except explicit TP-milestone-hit edits).
+        # 2) Long messages are conversation, not commands (except explicit TP-milestone-hit edits or unambiguous BE commands).
         if word_count > 10:
             edit_hit_stage = detect_tp_milestone_hit(lower) if is_edit else None
             if edit_hit_stage == 1:
@@ -688,7 +707,7 @@ def gate_3_classify_trade_management(
                 action = "ACTION_TP3_HIT"
                 cancel_limits = False
                 tp_hit_stage = 3
-            else:
+            elif not unambig_be:
                 return None
 
     # Ambiguous single words (e.g. "be careful", "cut your losses", "exit early") are only
@@ -721,7 +740,7 @@ def gate_3_classify_trade_management(
     )
     if not action and is_tp1_eligible:
         hit_stage = detect_tp_milestone_hit(lower)
-        if hit_stage == 1:
+        if hit_stage == 1 and (effective_is_reply or is_edit or not unambig_be):
             action = "ACTION_TP1_HIT_REPLY"
             cancel_limits = True
             tp_hit_stage = 1

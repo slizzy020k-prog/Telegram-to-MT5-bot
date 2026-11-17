@@ -3024,6 +3024,7 @@ async def tp1_proximity_watcher_task() -> None:
     has_live_exposure = False
 
     while True:
+        any_deferred_be = False
         try:
             now = time.time()
             # Priority 0: Pull out deleted signals ASAP at the very top of every loop iteration
@@ -3079,6 +3080,51 @@ async def tp1_proximity_watcher_task() -> None:
                     sig = state_mgr.get_signal(msg_id, chat_id=sig_chat)
                     if not sig or sig.get("status") == "CLOSED":
                         continue
+
+                    # Priority 1: Fast Armed-Breakeven Sweep (snaps deferred / newly-filled layers to BE in <=0.5s)
+                    if sig.get("be_armed"):
+                        be_done = {int(t) for t in (sig.get("be_done_tickets") or []) if t is not None}
+                        open_unprotected = [
+                            int(t) for t in (sig.get("market_tickets") or []) if t is not None and int(t) not in be_done
+                        ]
+                        if open_unprotected or sig.get("be_deferred_tickets"):
+                            res_be = await _mt5_call(
+                                executor.apply_signal_breakeven,
+                                sig,
+                                BE_LAYERS,
+                                BE_OFFSET_PIPS,
+                            )
+                            newly_mod = res_be.get("modified_tickets", [])
+                            still_def = res_be.get("deferred_tickets", [])
+                            if newly_mod or still_def != (sig.get("be_deferred_tickets") or []):
+                                state_mgr.update_signal(
+                                    msg_id,
+                                    {
+                                        "layers": sig.get("layers", {}),
+                                        "market_tickets": sig.get("market_tickets", []),
+                                        "pending_tickets": sig.get("pending_tickets", []),
+                                        "be_done_tickets": res_be.get("be_done_tickets", []),
+                                        "be_deferred_tickets": still_def,
+                                        **(
+                                            {"runner_sl_floor": sig["runner_sl_floor"]}
+                                            if sig.get("runner_sl_floor") is not None
+                                            else {}
+                                        ),
+                                    },
+                                    chat_id=sig_chat,
+                                )
+                                if newly_mod:
+                                    logger.info(
+                                        f"⚡ Fast Armed-BE Sweep protected deferred/filled tickets {newly_mod} on Msg ID {msg_id}!"
+                                    )
+                                    await notify_saved_messages(
+                                        f"🛡️ **Armed Breakeven Auto-Applied [ID: {msg_id}]**\n"
+                                        f"• Channel: `{sig_chat}` | Symbol: `{sig.get('symbol', DEFAULT_SYMBOL)}`\n"
+                                        f"• Newly Protected Tickets: `{newly_mod}`"
+                                    )
+                            if still_def:
+                                any_deferred_be = True
+
                     if sig.get("status") == "RUNNER_ACTIVE":
                         await _process_runner_active_tick(msg_id, sig)
                     else:
@@ -3089,7 +3135,7 @@ async def tp1_proximity_watcher_task() -> None:
         except Exception as e:
             logger.error(f"Error in TP1 proximity watcher: {e}")
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5 if any_deferred_be else 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -3307,20 +3353,46 @@ async def _handle_trade_management_action(
     pending_tickets = list(target_signal.get("pending_tickets", []))
 
     if action in ("ACTION_BREAKEVEN", "BREAKEVEN"):
-        await _mt5_call(
-            executor.apply_selective_breakeven,
-            layers=layers,
-            symbol=symbol,
-            direction=direction,
-            be_layers=BE_LAYERS,
-            be_offset_pips=BE_OFFSET_PIPS,
+        res_be = await _mt5_call(
+            executor.apply_signal_breakeven,
+            target_signal,
+            BE_LAYERS,
+            BE_OFFSET_PIPS,
         )
-        state_mgr.update_signal(target_msg_id, {"status": "BE_APPLIED"}, chat_id=target_chat_id)
+        mod_tkts = res_be.get("modified_tickets", [])
+        def_tkts = res_be.get("deferred_tickets", [])
+        prev_status = target_signal.get("status", "ACTIVE")
+        new_status = "RUNNER_ACTIVE" if prev_status == "RUNNER_ACTIVE" else "BE_APPLIED"
+        updates_be: Dict[str, Any] = {
+            "status": new_status,
+            "layers": target_signal.get("layers", layers),
+            "market_tickets": target_signal.get("market_tickets", market_tickets),
+            "pending_tickets": target_signal.get("pending_tickets", pending_tickets),
+            "be_armed": True,
+            "be_done_tickets": res_be.get("be_done_tickets", []),
+            "be_deferred_tickets": def_tkts,
+        }
+        if target_signal.get("runner_sl_floor") is not None:
+            updates_be["runner_sl_floor"] = target_signal["runner_sl_floor"]
+        state_mgr.update_signal(target_msg_id, updates_be, chat_id=target_chat_id)
+
+        defer_note = (
+            f"\n• ⚡ **Armed Auto-BE (0.5s Sweep):** Tickets `{def_tkts}` will snap to BE the instant price clears entry!"
+            if def_tkts
+            else ""
+        )
+        pend_tkts_now = target_signal.get("pending_tickets", pending_tickets)
+        pend_note = (
+            f"\n• ⏳ **Pending Layers Armed:** `{pend_tkts_now}` will auto-BE if filled."
+            if pend_tkts_now
+            else ""
+        )
         await notify_saved_messages(
-            f"🛡️ **Selective Breakeven Applied**\n"
-            f"• Symbol: `{symbol}` ({direction})\n"
-            f"• Layers Protected: `{BE_LAYERS}` (+{BE_OFFSET_PIPS} pips commission buffer)\n"
-            f"• Runner Layer (L4 / 0.02) remains at original SL until TP1."
+            f"🛡️ **Selective Breakeven Applied — All Layers [ID: {target_msg_id}]**\n"
+            f"• Channel: `{target_chat_id}` | Symbol: `{symbol}` ({direction})\n"
+            f"• Layers Protected: `{BE_LAYERS}` (+{BE_OFFSET_PIPS} pips / 0.0p instant fallback)\n"
+            f"• Modified Tickets: `{mod_tkts}`"
+            f"{defer_note}{pend_note}"
         )
 
     elif action in ("ACTION_CLOSE_WORST_HOLD_LAYERS", "CLOSE_WORST_HOLD_LAYERS"):
@@ -3669,42 +3741,91 @@ async def _handle_new_message_unlocked(event: Any) -> None:
     target_msg_id = None
     target_chat_id = chat_id
     if reply_to_id is not None:
-        target_signal = state_mgr.get_signal(reply_to_id, chat_id=chat_id)
-        if target_signal:
+        cand_sig = state_mgr.get_signal(reply_to_id, chat_id=chat_id)
+        if cand_sig and (
+            chat_id is None
+            or cand_sig.get("chat_id") is None
+            or _chat_ids_match(cand_sig.get("chat_id"), chat_id)
+        ):
+            target_signal = cand_sig
             target_msg_id = str(reply_to_id)
-            target_chat_id = target_signal.get("chat_id", chat_id)
+            target_chat_id = cand_sig.get("chat_id", chat_id)
 
     is_forward = getattr(msg, "forward", None) is not None
-    tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
-    live_price = getattr(tick, "bid", None) if tick else None
+    # Fast path: run pure-CPU Gates 1-3 first without blocking on an MT5 `get_tick` IPC call.
+    # Only fetch `get_tick` when Gate 4 extracts a NEW_SIGNAL that needs Gate 5 live-price validation.
     parsed = parse_message(
         raw_text,
         message_id=msg_id,
         is_reply=is_reply_evt,
         reply_to_msg_id=reply_to_id,
         is_forward=is_forward,
-        live_price=live_price,
+        live_price=None,
     )
 
     if parsed is None:
         logger.info(f"Message ID {msg_id} filtered out (noise, recap, or ignored symbol).")
         return
 
+    if parsed.event_type == "NEW_SIGNAL" or parsed.is_entry:
+        tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
+        live_price = getattr(tick, "bid", None) if tick else None
+        if live_price is not None:
+            parsed = parse_message(
+                raw_text,
+                message_id=msg_id,
+                is_reply=is_reply_evt,
+                reply_to_msg_id=reply_to_id,
+                is_forward=is_forward,
+                live_price=live_price,
+            )
+            if parsed is None:
+                return
+
     # 1. Trade Management Commands
     if parsed.event_type == "TRADE_MANAGEMENT" or parsed.is_management:
         action = parsed.management_action
-        logger.info(f"Processing Trade Management: {action} [Msg ID: {msg_id}]")
+        logger.info(f"Processing Trade Management: {action} [Msg ID: {msg_id} | Chat: {chat_id}]")
 
         if not target_signal:
-            res = state_mgr.get_latest_signal(symbol=parsed.symbol, chat_id=chat_id)
-            if not res and chat_id is not None:
-                res = state_mgr.get_latest_signal(symbol=parsed.symbol)
+            prefer_open = action in (
+                "ACTION_BREAKEVEN",
+                "BREAKEVEN",
+                "ACTION_PARTIAL_CLOSE",
+                "PARTIAL_CLOSE",
+                "ACTION_CLOSE_WORST_HOLD_LAYERS",
+                "CLOSE_WORST_HOLD_LAYERS",
+                "ACTION_TRAIL_SL",
+                "TRAIL_SL",
+                "ACTION_TP2_HIT",
+                "TP2_HIT",
+                "ACTION_TP3_HIT",
+                "TP3_HIT",
+            )
+            # Strictly scoped to `chat_id` — NEVER falls back across other channels!
+            res = state_mgr.get_latest_signal(
+                symbol=parsed.symbol,
+                chat_id=chat_id,
+                prefer_open_positions=prefer_open,
+            )
             if res:
                 target_msg_id, target_signal = res
                 target_chat_id = target_signal.get("chat_id", chat_id)
 
         if not target_signal or target_msg_id is None:
-            logger.warning(f"No target trade found in state to apply {action}. (Reply ID: {reply_to_id})")
+            logger.warning(
+                f"No target trade found in channel {chat_id} to apply {action}. (Reply ID: {reply_to_id})"
+            )
+            return
+
+        if (
+            chat_id is not None
+            and target_signal.get("chat_id") is not None
+            and not _chat_ids_match(target_signal.get("chat_id"), chat_id)
+        ):
+            logger.warning(
+                f"Blocked cross-channel {action}: message chat {chat_id} != signal chat {target_signal.get('chat_id')}"
+            )
             return
 
         same_signal = (
@@ -5920,18 +6041,35 @@ async def handle_saved_messages_command(event: Any) -> None:
                         )
                         await event.reply(alert)
                 elif mgmt_act.management_action == "ACTION_BREAKEVEN":
-                    layers = fresh_sig.get("layers", {})
-                    await _mt5_call(
-                        executor.apply_selective_breakeven,
-                        layers=layers,
-                        symbol=fresh_sig.get("symbol", DEFAULT_SYMBOL),
-                        direction=fresh_sig.get("direction", "BUY"),
-                        be_layers=BE_LAYERS,
-                        be_offset_pips=BE_OFFSET_PIPS,
+                    res_be = await _mt5_call(
+                        executor.apply_signal_breakeven,
+                        fresh_sig,
+                        BE_LAYERS,
+                        BE_OFFSET_PIPS,
                     )
-                    state_mgr.update_signal(target_mid, {"status": "BE_APPLIED", "layers": layers}, chat_id=target_chat)
+                    prev_st = fresh_sig.get("status", "ACTIVE")
+                    new_st = "RUNNER_ACTIVE" if prev_st == "RUNNER_ACTIVE" else "BE_APPLIED"
+                    state_mgr.update_signal(
+                        target_mid,
+                        {
+                            "status": new_st,
+                            "layers": fresh_sig.get("layers", {}),
+                            "market_tickets": fresh_sig.get("market_tickets", []),
+                            "pending_tickets": fresh_sig.get("pending_tickets", []),
+                            "be_armed": True,
+                            "be_done_tickets": res_be.get("be_done_tickets", []),
+                            "be_deferred_tickets": res_be.get("deferred_tickets", []),
+                            **(
+                                {"runner_sl_floor": fresh_sig["runner_sl_floor"]}
+                                if fresh_sig.get("runner_sl_floor") is not None
+                                else {}
+                            ),
+                        },
+                        chat_id=target_chat,
+                    )
                     await event.reply(
-                        f"🛡️ **Selective Breakeven Applied (Saved Messages Prompt) [ID: {target_mid}]**"
+                        f"🛡️ **Selective Breakeven Applied (Saved Messages Prompt) [ID: {target_mid}]** "
+                        f"— Layers `{BE_LAYERS}` | Modified: `{res_be.get('modified_tickets', [])}`"
                     )
                 elif mgmt_act.management_action == "ACTION_PARTIAL_CLOSE":
                     symbol = fresh_sig.get("symbol", DEFAULT_SYMBOL)
