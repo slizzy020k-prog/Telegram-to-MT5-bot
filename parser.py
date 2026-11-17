@@ -1,16 +1,22 @@
-import re
 import logging
-from typing import Optional, List, Dict, Any, Tuple
+import re
+from typing import Any, Dict, List, Optional, Sequence
+
 from config import (
-    DEFAULT_SYMBOL,
-    IGNORED_SYMBOLS,
-    SINGLE_PRICE_LOT,
-    TP_FRONT_RUN_OFFSET,
-    TP1_CLOSE_PROXIMITY_PIPS,
-    MAX_SL_PIPS,
     ALLOW_FORWARDS,
+    DEFAULT_SYMBOL,
+    DEFAULT_TP_STEP_PIPS,
+    IGNORED_SYMBOLS,
     LAYER_LOTS,
     MAX_ORDERS_PER_SIGNAL,
+    MAX_SL_PIPS,
+    SINGLE_PRICE_LOT,
+    TP2_STEP_PIPS,
+    TP3_STEP_PIPS,
+    TP4_STEP_PIPS,
+    TP5_STEP_PIPS,
+    TP1_CLOSE_PROXIMITY_PIPS,
+    TP_FRONT_RUN_OFFSET,
 )
 
 logger = logging.getLogger("copier.parser")
@@ -31,17 +37,17 @@ ACCOUNT_RISK_BLOCKERS = [
 ]
 
 VICTORY_RECAP_BLOCKERS = [
-    r"\btp\d*\s+hit\b",                           # "TP1 hit", "TP hit"
-    r"\bsmashed\b",                               # "TP smashed"
-    r"\bpips\s+(?:secured|booked|smashed|profit)\b",  # "50 pips secured"
-    r"\bprofit\s+(?:secured|booked|banked|taken)\b",   # "profit booked"
-    r"\bbooked\s+\d",                             # "booked 50 pips"
-    r"\bsecured\s+\d",                            # "secured 100 pips"
-    r"\bboom\b",                                  # "BOOM 🚀"
-    r"\bvip\b",                                   # VIP announcement posts
-    r"\bentry\s+was\b",                           # "Buy entry was 3895"
+    r"\btp\d*\s+hit\b",                              # "TP1 hit", "TP hit"
+    r"\bsmashed\b",                                  # "TP smashed"
+    r"\bpips\s+(?:secured|booked|smashed|profit)\b", # "50 pips secured"
+    r"\bprofit\s+(?:secured|booked|banked|taken)\b", # "profit booked"
+    r"\bbooked\s+\d",                                # "booked 50 pips"
+    r"\bsecured\s+\d",                               # "secured 100 pips"
+    r"\bboom\b",                                     # "BOOM 🚀"
+    r"\bvip\b",                                      # VIP announcement posts
+    r"\bentry\s+was\b",                              # "Buy entry was 3895"
     r"\bwas\s+(?:a\s+)?(?:great|good|perfect|beautiful)\b",
-    r"\+\s*\d+\s*pips?\b",                        # "+50 pips"
+    r"\+\s*\d+\s*pips?\b",                           # "+50 pips"
 ]
 
 # ---------------------------------------------------------------------------
@@ -81,7 +87,7 @@ PARTIAL_CLOSE_PATTERNS = [
 ]
 
 FULL_CLOSE_PATTERNS = [
-    r"^\s*close\s*[!.]*\s*$",                     # bare "close" (whole message only)
+    r"^\s*close\s*[!.]*\s*$",                        # bare "close" (whole message only)
     r"\bclose\s+all\b",
     r"\bclose\s+now\b",
     r"\bexit\b",
@@ -129,6 +135,7 @@ def is_tp1_hit_message(text: Optional[str]) -> bool:
         return False
     return any(re.search(p, lower) for p in TP1_HIT_REPLY_PATTERNS)
 
+
 # ---------------------------------------------------------------------------
 # GATE 4 SIGNAL EXTRACTION PATTERNS
 # ---------------------------------------------------------------------------
@@ -139,53 +146,158 @@ DIRECTION_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Order-type detection patterns (distinguishing STOP orders from LIMIT orders)
+_STOP_ORDER_PATTERN = re.compile(
+    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?\s+stops?|stop\s+(?:order|entry))\b",
+    re.IGNORECASE,
+)
+_LIMIT_ORDER_PATTERN = re.compile(
+    r"\b(?:limits?|(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?\s+limits?)\b",
+    re.IGNORECASE,
+)
+
 # Zone pattern: 3895-3887, 3895 - 3887, 3895 to 3887, 3895/3887
 ZONE_PATTERN = re.compile(
     r"(\d{2,6}(?:\.\d+)?)\s*(?:-|–|—|/|\bto\b)\s*(\d{2,6}(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
-# Single price entry (e.g. "Buy limit 3920", "Buy xauusd limit 3840", "Sell limits @ 3860")
+# Single price entry (e.g. "Buy limit 3920", "Buy xauusd stop 3900", "Sell limits @ 3860")
 SINGLE_PRICE_PATTERN = re.compile(
     r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?(?:\s+(?:limits?|stops?))?|(?:limits?|stops?|entry|entries|zone|price))\s*(?:(?:at|around|near|zone|area|@|:|=|-)\s*)*(\d{2,6}(?:\.\d+)?)\b(?!\s*(?:pips?|%|lots?)\b)",
     re.IGNORECASE,
 )
 
-# Take Profit pattern: TP1, TP 1, TP#1, Target 1, etc. (never matching 'TP1💥50 PIPs')
+# Take Profit pattern: TP1..TP9, TP 1, TP#1, Target 1, etc. (never matching 'TP1💥50 PIPs')
 TP_PATTERN = re.compile(
     r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 
-# Stop Loss pattern
+# Stop Loss patterns (explicit SL/Stoploss + standalone Stop excluding "Buy stop <price>")
+_EXPLICIT_SL_PATTERN = re.compile(
+    r"\b(?:sl|stop\s*loss|stoploss)\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_STANDALONE_STOP_SL_PATTERN = re.compile(
+    r"\bstop\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 SL_PATTERN = re.compile(
-    r"\b(?:sl|stop\s*loss|stoploss|stop)\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    r"\b(?:sl|stop\s*loss|stoploss|(?<!buy\s)(?<!sell\s)(?<!long\s)(?<!short\s)stop)\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
 
+# ---------------------------------------------------------------------------
+# 4-TIER ZONE & TP1-TP5 DERIVATION HELPERS
+# ---------------------------------------------------------------------------
+
+def _decimals_for_pip(pip_size: float) -> int:
+    """Return rounding decimals appropriate for pip_size (minimum 2 for Gold)."""
+    if pip_size <= 0:
+        return 2
+    formatted = f"{pip_size:.8f}".rstrip("0").rstrip(".")
+    return max(2, len(formatted.split(".")[1]) if "." in formatted else 0)
+
+
+def compute_zone_4tiers(
+    top: float,
+    bottom: float,
+    direction: str = "BUY",
+    digits: int = 2,
+) -> Dict[str, float]:
+    """
+    Split a price zone across [0%, 33.3%, 66.7%, 100%] into 4 ordered layer entries:
+      - BUY  (top -> bottom): L1=top, L2=top-1/3, L3=top-2/3, L4=bottom
+      - SELL (bottom -> top): L1=bottom, L2=bottom+1/3, L3=bottom+2/3, L4=top
+    """
+    hi = round(max(float(top), float(bottom)), digits)
+    lo = round(min(float(top), float(bottom)), digits)
+    span = hi - lo
+    is_buy = (direction or "BUY").upper() == "BUY"
+    weights = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
+    if is_buy:
+        prices = [round(hi - w * span, digits) for w in weights]
+    else:
+        prices = [round(lo + w * span, digits) for w in weights]
+    return {"L1": prices[0], "L2": prices[1], "L3": prices[2], "L4": prices[3]}
+
+
+def derive_tp_levels(
+    tps: Sequence[float],
+    direction: str = "BUY",
+    pip_size: float = 0.10,
+    step_pips: Optional[Sequence[float]] = None,
+) -> Dict[str, float]:
+    """
+    Build deterministic TP1..TP5 target dictionary from extracted TPs.
+    Returns {} if tps is empty; otherwise fills missing targets up to TP5 sequentially.
+    """
+    if not tps:
+        return {}
+    digits = _decimals_for_pip(pip_size)
+    base = [round(float(val), digits) for val in list(tps)[:5]]
+
+    steps = (
+        [float(s) for s in step_pips]
+        if step_pips is not None
+        else [float(TP2_STEP_PIPS), float(TP3_STEP_PIPS), float(TP4_STEP_PIPS), float(TP5_STEP_PIPS)]
+    )
+    while len(steps) < 4:
+        steps.append(float(DEFAULT_TP_STEP_PIPS))
+
+    sign = 1.0 if (direction or "BUY").upper() == "BUY" else -1.0
+    for idx in range(len(base), 5):
+        step = steps[idx - 1]
+        base.append(round(base[-1] + sign * step * pip_size, digits))
+
+    return {f"TP{i + 1}": base[i] for i in range(5)}
+
+
+def _extract_sl(text: str) -> Optional[float]:
+    """Extract stop-loss price without misclassifying 'Buy stop <price>' as SL."""
+    explicit_match = _EXPLICIT_SL_PATTERN.search(text)
+    if explicit_match:
+        return float(explicit_match.group(1))
+    scrubbed = _STOP_ORDER_PATTERN.sub(" ", text)
+    stop_match = _STANDALONE_STOP_SL_PATTERN.search(scrubbed)
+    if stop_match:
+        return float(stop_match.group(1))
+    return None
+
+
 class ZoneInfo:
-    """Helper representing a 3-tier price entry zone."""
+    """Helper representing an entry zone with legacy (top/mid/bottom) and v3.0 4-tier (L1..L4) access."""
 
-    def __init__(self, top: float, mid: float, bottom: float):
-        self.top = round(float(top), 2)
+    def __init__(self, top: float, mid: float, bottom: float, direction: str = "BUY"):
+        hi = round(max(float(top), float(bottom)), 2)
+        lo = round(min(float(top), float(bottom)), 2)
+        self.top = hi
         self.mid = round(float(mid), 2)
-        self.bottom = round(float(bottom), 2)
+        self.bottom = lo
+        self.direction = (direction or "BUY").upper()
+        self.tiers: Dict[str, float] = compute_zone_4tiers(self.top, self.bottom, self.direction)
 
-    def to_dict(self) -> Dict[str, float]:
+    def get_tiers(self, direction: Optional[str] = None) -> Dict[str, float]:
+        """Return 4-layer entry prices ordered L1..L4 for the given direction."""
+        return compute_zone_4tiers(self.top, self.bottom, direction or self.direction)
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "top": self.top,
             "mid": self.mid,
             "bottom": self.bottom,
+            "tiers": dict(self.tiers),
         }
 
-    def __repr__(self):
-        return f"ZoneInfo(top={self.top}, mid={self.mid}, bottom={self.bottom})"
+    def __repr__(self) -> str:
+        return f"ZoneInfo(top={self.top}, mid={self.mid}, bottom={self.bottom}, tiers={self.tiers})"
 
 
 class SignalAction(dict):
     """
-    Standardized Action Object implementing PARSER_SPEC JSON contract.
+    Standardized Action Object implementing PARSER_SPEC & v3.0 JSON contract.
     Inherits from dict while exposing attribute access for seamless dot notation.
     """
 
@@ -199,6 +311,18 @@ class SignalAction(dict):
                     return tiers.get(name)
                 if self.get("single_price") is not None:
                     return self.get("single_price")
+            if name == "tiers":
+                zone_tiers = self.get("zone_tiers")
+                if zone_tiers and isinstance(zone_tiers, dict):
+                    return zone_tiers
+                entry_tiers = self.get("entry_tiers")
+                if entry_tiers and isinstance(entry_tiers, dict):
+                    return compute_zone_4tiers(
+                        entry_tiers["top"],
+                        entry_tiers["bottom"],
+                        self.get("direction", "BUY"),
+                    )
+                return None
             if name == "single_price":
                 return self.get("single_price")
             if name == "is_zone":
@@ -209,12 +333,33 @@ class SignalAction(dict):
                 return self.get("event_type") == "TRADE_MANAGEMENT"
             if name == "is_market":
                 return bool(self.get("is_instant_now", False))
+            if name == "is_limit_order":
+                return bool(self.get("is_limit_order", False))
+            if name == "is_stop_order":
+                return bool(self.get("is_stop_order", False))
+            if name == "order_intent":
+                if self.get("is_stop_order"):
+                    return "STOP"
+                if self.get("is_limit_order"):
+                    return "LIMIT"
+                if self.get("is_instant_now"):
+                    return "MARKET"
+                return "AUTO"
+            if name == "tp_levels":
+                return self.get("tp_levels") or {}
+            if name == "explicit_tps":
+                return self.get("explicit_tps") or []
             if name == "broker_symbol":
                 return self.get("symbol")
             if name == "zone":
                 tiers = self.get("entry_tiers")
                 if tiers:
-                    return ZoneInfo(top=tiers["top"], mid=tiers["mid"], bottom=tiers["bottom"])
+                    return ZoneInfo(
+                        top=tiers["top"],
+                        mid=tiers["mid"],
+                        bottom=tiers["bottom"],
+                        direction=self.get("direction", "BUY"),
+                    )
                 return None
             if name == "is_noise":
                 return False
@@ -428,32 +573,8 @@ def extract_tps(text: str, direction: str = "BUY") -> List[float]:
     return unlabeled
 
 
-def gate_4_extract_signal(
-    text: str,
-    message_id: int = 0,
-    is_edit: bool = False,
-) -> Optional[SignalAction]:
-    """
-    Gate 4: New Signal Extraction.
-    Defaults to DEFAULT_SYMBOL (XAUUSD) for any valid directional trigger verb.
-    Extracts 3-tier zones (top, mid, bottom), SL, and TP1 front-run levels.
-    """
-    # 1. Direction Verb Detection
-    dir_match = DIRECTION_PATTERN.search(text)
-    if not dir_match:
-        logger.debug("Gate 4 Reject: No valid directional verb detected.")
-        return None
-
-    matched_verb = dir_match.group(1).upper()
-    if any(buy_kw in matched_verb for buy_kw in ("BUY", "LONG")):
-        direction = "BUY"
-    else:
-        direction = "SELL"
-
-    # 2. Symbol resolution - defaults straight to XAUUSD
-    symbol = DEFAULT_SYMBOL
-
-    # 3. Entry Zone & Price Split (strip standalone TP/SL lines and inline trailing TP/SL clauses)
+def _strip_entry_text(text: str) -> str:
+    """Extract only entry-relevant segments before TP/SL clauses for zone/price parsing."""
     clean_lines = []
     for line in text.splitlines():
         stripped = line.strip()
@@ -471,14 +592,44 @@ def gate_4_extract_signal(
         )[0].strip()
         if entry_part:
             clean_lines.append(entry_part)
-    zone_search_text = " \n ".join(clean_lines)
+    return " \n ".join(clean_lines)
+
+
+def gate_4_extract_signal(
+    text: str,
+    message_id: int = 0,
+    is_edit: bool = False,
+) -> Optional[SignalAction]:
+    """
+    Gate 4: New Signal Extraction (v3.0 4-Layer + TP1-TP5 + STOP/LIMIT).
+    Defaults to DEFAULT_SYMBOL (XAUUSD) for any valid directional trigger verb.
+    Extracts zones (with 4-tier L1..L4 mapping), single-price LIMIT/STOP,
+    market-now entries, SL, explicit TPs, and deterministic TP1..TP5 targets.
+    """
+    # 1. Direction Verb Detection
+    dir_match = DIRECTION_PATTERN.search(text)
+    if not dir_match:
+        logger.debug("Gate 4 Reject: No valid directional verb detected.")
+        return None
+
+    matched_verb = dir_match.group(1).upper()
+    direction = "BUY" if any(kw in matched_verb for kw in ("BUY", "LONG")) else "SELL"
+
+    # 2. Symbol resolution - defaults straight to XAUUSD
+    symbol = DEFAULT_SYMBOL
+
+    # 3. Entry Zone, Price & Order Intent Detection
+    zone_search_text = _strip_entry_text(text)
+
+    is_stop_order = bool(_STOP_ORDER_PATTERN.search(zone_search_text))
+    is_limit_order = False if is_stop_order else bool(_LIMIT_ORDER_PATTERN.search(zone_search_text))
 
     zone_match = ZONE_PATTERN.search(zone_search_text)
     entry_tiers = None
+    zone_tiers = None
     single_price = None
     is_zone = False
     is_instant_now = False
-    is_limit_order = bool(re.search(r"\b(?:limits?|buy\s+limits?|sell\s+limits?)\b", zone_search_text, re.IGNORECASE))
     max_orders = MAX_ORDERS_PER_SIGNAL
 
     if zone_match:
@@ -494,12 +645,12 @@ def gate_4_extract_signal(
                 "mid": mid_price,
                 "bottom": bottom_price,
             }
+            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
             is_zone = True
-            max_orders = 3
         else:
             zone_match = None
 
-    # Multi-line / comma / '&' / repeated-limit entry extraction (e.g. "Buy limits:\n3840\n3830", "Buy limits 3840 & 3830")
+    # Multi-line / comma / '&' / repeated-limit entry extraction (e.g. "Buy limits:\n3840\n3830")
     distinct_levels: List[float] = []
     if not is_zone:
         for num_m in re.finditer(
@@ -519,42 +670,46 @@ def gate_4_extract_signal(
                 "mid": mid_price,
                 "bottom": bottom_price,
             }
+            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
             is_zone = True
-            max_orders = 3
 
     if not is_zone:
-        # Check for single-price entry limit (e.g. "Sell limit 3920", "Buy xauusd limit 3840", "Buy limits 3840")
+        # Check for single-price entry limit or stop (e.g. "Sell limit 3920", "Buy stop 3900")
         single_match = SINGLE_PRICE_PATTERN.search(zone_search_text)
         if single_match:
             price = float(single_match.group(1))
             if price >= 10.0:
                 single_price = round(price, 2)
                 is_zone = False
-                max_orders = 1  # Locked to 1 order for single-price entries
         elif len(distinct_levels) == 1:
             single_price = distinct_levels[0]
             is_zone = False
-            max_orders = 1
         else:
             # No zone or single price found -> instant market entry ("Buy now")
             is_instant_now = True
-            max_orders = 1
 
-    # 4. Take Profit & Proximity Trigger (Gold: 1 pip = $0.10, 20 pips = $2.00)
-    tps = extract_tps(text, direction=direction)
-    raw_tp1 = None
-    raw_tp2 = None
-    raw_tp3 = None
+    if is_stop_order:
+        order_intent = "STOP"
+    elif is_limit_order:
+        order_intent = "LIMIT"
+    elif is_instant_now:
+        order_intent = "MARKET"
+    else:
+        order_intent = "AUTO"
+
+    # 4. Take Profit (TP1..TP5) & Proximity Trigger (Gold: 1 pip = $0.10)
+    explicit_tps = extract_tps(text, direction=direction)
+    tp_levels = derive_tp_levels(explicit_tps, direction=direction)
+    raw_tp1 = tp_levels.get("TP1")
+    raw_tp2 = tp_levels.get("TP2")
+    raw_tp3 = tp_levels.get("TP3")
+    raw_tp4 = tp_levels.get("TP4")
+    raw_tp5 = tp_levels.get("TP5")
     final_tp = None
     proximity_close_price = None
 
-    if tps:
-        raw_tp1 = tps[0]
-        if len(tps) > 1:
-            raw_tp2 = tps[1]
-        if len(tps) > 2:
-            raw_tp3 = tps[2]
-        pip_distance_20 = TP1_CLOSE_PROXIMITY_PIPS * 0.10  # 2.00 points
+    if raw_tp1 is not None:
+        pip_distance_20 = TP1_CLOSE_PROXIMITY_PIPS * 0.10  # 2.00 points on XAUUSD
         if direction == "BUY":
             final_tp = round(raw_tp1 - TP_FRONT_RUN_OFFSET, 2)
             proximity_close_price = round(raw_tp1 - pip_distance_20, 2)
@@ -563,10 +718,9 @@ def gate_4_extract_signal(
             proximity_close_price = round(raw_tp1 + pip_distance_20, 2)
 
     # 5. Stop Loss
-    sl_match = SL_PATTERN.search(text)
-    raw_sl = float(sl_match.group(1)) if sl_match else None
+    raw_sl = _extract_sl(text)
 
-    action = SignalAction({
+    return SignalAction({
         "event_type": "NEW_SIGNAL",
         "message_id": message_id,
         "is_edit": is_edit,
@@ -575,21 +729,27 @@ def gate_4_extract_signal(
         "is_zone": is_zone,
         "is_instant_now": is_instant_now,
         "is_limit_order": is_limit_order,
+        "is_stop_order": is_stop_order,
+        "order_intent": order_intent,
         "single_price": single_price,
-        "layer_lots": LAYER_LOTS,
+        "layer_lots": dict(LAYER_LOTS),
         "max_orders": max_orders,
         "entry_tiers": entry_tiers,
+        "zone_tiers": zone_tiers,
         "sl": raw_sl,
         "sl_valid": False,
+        "explicit_tps": explicit_tps,
+        "tp_levels": tp_levels,
         "raw_tp1": raw_tp1,
         "raw_tp2": raw_tp2,
         "raw_tp3": raw_tp3,
+        "raw_tp4": raw_tp4,
+        "raw_tp5": raw_tp5,
         "final_tp": final_tp,
+        "tp_stage": "TP1",
         "proximity_close_price": proximity_close_price,
         "raw_text": text,
     })
-
-    return action
 
 
 def gate_5_validate_price_sanity(
@@ -710,11 +870,11 @@ def parse_message(
     live_price: Optional[float] = None,
 ) -> Optional[SignalAction]:
     """
-    Main 6-Gate Sequential Pipeline conforming to PARSER_SPEC.md.
+    Main 6-Gate Sequential Pipeline conforming to PARSER_SPEC.md and ARCHITECTURE_v3.md.
     Gate 1: Forward & Empty Message Check
     Gate 2: Announcement, Recap & Ignored Symbol Filter
-    Gate 3: Trade Management & Reply Classifier (BE, Close, Reactivate)
-    Gate 4: New Signal Extraction (Defaults to XAUUSD)
+    Gate 3: Trade Management & Reply Classifier (BE, Close, Reactivate, TP1 Hit)
+    Gate 4: New Signal Extraction (Defaults to XAUUSD, 4-Layer & TP1-TP5)
     Gate 5: Price & Typo Sanity Validation
     """
     if not gate_1_check_forward_and_empty(text, is_forward=is_forward):
@@ -755,9 +915,11 @@ def parse_message(
 
     logger.info(
         f"Pipeline Output: {validated_action['event_type']} | {validated_action['direction']} "
-        f"{validated_action['symbol']} | Tiers={validated_action['entry_tiers']} | "
+        f"{validated_action['symbol']} ({validated_action['order_intent']}) | "
+        f"Tiers={validated_action['zone_tiers'] or validated_action['entry_tiers']} | "
         f"SL={validated_action['sl']} (valid={validated_action['sl_valid']}) | "
-        f"FinalTP={validated_action['final_tp']} | ProximityClose={validated_action['proximity_close_price']}"
+        f"TPs={validated_action['tp_levels']} | FinalTP={validated_action['final_tp']} | "
+        f"ProximityClose={validated_action['proximity_close_price']}"
     )
 
     return validated_action

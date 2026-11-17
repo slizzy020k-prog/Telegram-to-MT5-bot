@@ -25,13 +25,14 @@ class MockTelethonEvent:
 
 def test_scenario_a_asymmetric_zone_execution():
     """
-    Scenario A: Zone posted immediately:
+    Scenario A (v3.0 4-Layer Zone):
     "Buy 3895-3887, TP 3900, SL 3875"
-    Must place exactly 3 orders:
-    - Layer 1 (TOP): 0.01 lot at 3895.00
-    - Layer 2 (MID): 0.01 lot at 3891.00
-    - Layer 3 (BOTTOM): 0.02 lot at 3887.00
-    Total exposure = 0.04 lot. All target TP1 - 0.50 (3899.50).
+    Must place 4 orders split across [0%, 33.3%, 66.7%, 100%]:
+    - L1: 0.01 lot at 3895.00 -> TP1 - 0.50 (3899.50)
+    - L2: 0.01 lot at 3892.33 -> TP2 (3910.00)
+    - L3: 0.01 lot at 3889.67 -> TP3 (3920.00)
+    - L4: 0.02 lot at 3887.00 -> TP5 ceiling (3940.00)
+    Total exposure = 0.05 lot.
     """
     executor = MT5Executor(dry_run=True)
     executor.connect()
@@ -45,34 +46,39 @@ def test_scenario_a_asymmetric_zone_execution():
     assert parsed.final_tp == 3899.50
     assert parsed.proximity_close_price == 3898.00
 
-    market_tickets, pending_tickets, layers_data = executor.execute_3layer_zone(
+    market_tickets, pending_tickets, layers_data = executor.execute_4layer_zone(
         symbol=parsed.symbol,
         direction=parsed.direction,
         zone=parsed.zone,
         sl=parsed.sl,
         final_tp=parsed.final_tp,
         raw_tp1=parsed.raw_tp1,
+        tp_levels=parsed.tp_levels,
     )
 
     total_orders = len(market_tickets) + len(pending_tickets)
-    assert total_orders == 3
-    assert layers_data["TOP"]["lot"] == 0.01
-    assert layers_data["MID"]["lot"] == 0.01
-    assert layers_data["BOTTOM"]["lot"] == 0.02
+    assert total_orders == 4
+    assert layers_data["L1"]["lot"] == 0.01
+    assert layers_data["L2"]["lot"] == 0.01
+    assert layers_data["L3"]["lot"] == 0.01
+    assert layers_data["L4"]["lot"] == 0.02
+    assert layers_data["L1"]["target_price"] == 3895.00
+    assert layers_data["L2"]["target_price"] == 3892.33
+    assert layers_data["L3"]["target_price"] == 3889.67
+    assert layers_data["L4"]["target_price"] == 3887.00
 
     total_lots = round(sum(l["lot"] for l in layers_data.values()), 2)
-    assert total_lots == 0.04
+    assert total_lots == 0.05
 
 
 def test_scenario_b_edit_workflow(tmp_path):
     """
-    Scenario B:
-    1. 'Buy now' posted first -> Layer 1 (0.01 Market) placed.
+    Scenario B (v3.0 4-Layer Edit Workflow):
+    1. Delayed 'Buy now' -> L1 (0.01 Market) placed initially.
     2. Edited later with 'Buy 3895-3887, TP 3900, SL 3875':
-       - Order #1 SL updated to 3875.0, TP to 3899.50.
-       - Layer 2 (0.01 Mid Limit at 3891.00) and Layer 3 (0.02 Bottom Limit at 3887.00) placed.
-       - Total orders strictly capped at 3 (0.04 total exposure).
-    3. Subsequent edit: Hard guard prevents 4th order, only modifies SL/TP.
+       - L1 SL updated to 3875.0, TP to 3899.50.
+       - L2 (0.01 @ 3892.33 -> TP2), L3 (0.01 @ 3889.67 -> TP3), L4 (0.02 @ 3887.00 -> TP5) placed.
+       - Total orders strictly capped at 4 (0.05 total exposure).
     """
     state_file = tmp_path / "test_state_b.json"
     state_mgr = StateManager(state_file)
@@ -87,21 +93,19 @@ def test_scenario_b_edit_workflow(tmp_path):
     assert parsed_1.is_entry is True
     assert parsed_1.is_market is True
 
-    top_lot = LAYER_LOTS["TOP"]  # 0.01
+    l1_lot = LAYER_LOTS["L1"]  # 0.01
     t1 = executor.execute_market_order(
         symbol=parsed_1.symbol,
         direction=parsed_1.direction,
-        lot=top_lot,
+        lot=l1_lot,
         sl=parsed_1.sl,
         tp=parsed_1.final_tp,
-        comment="TG Layer 1 (Market Now)",
+        comment="TG L1 (Market Now)",
     )
     assert t1 is not None
 
     layers = {
-        "TOP": {"lot": top_lot, "target_price": None, "ticket": t1, "order_type": "MARKET", "status": "OPEN"},
-        "MID": {"lot": LAYER_LOTS["MID"], "target_price": None, "ticket": None, "order_type": "LIMIT", "status": "PENDING"},
-        "BOTTOM": {"lot": LAYER_LOTS["BOTTOM"], "target_price": None, "ticket": None, "order_type": "LIMIT", "status": "PENDING"},
+        "L1": {"lot": l1_lot, "target_price": None, "ticket": t1, "order_type": "MARKET", "status": "OPEN"},
     }
 
     state_mgr.create_signal(
@@ -130,48 +134,60 @@ def test_scenario_b_edit_workflow(tmp_path):
     assert parsed_edit.zone is not None
     assert parsed_edit.sl == 3875.0
     assert parsed_edit.final_tp == 3899.50
+    tiers = parsed_edit.zone.get_tiers("BUY")
 
     # Modify existing Order #1
     for t in sig_step1["market_tickets"]:
         assert executor.modify_position_sltp(t, sl=parsed_edit.sl, tp=parsed_edit.final_tp) is True
 
-    # Place remaining limit orders (slots_left = 3 - 1 = 2)
+    # Place remaining 3 limit orders (slots_left = 4 - 1 = 3)
     t2 = executor.place_limit_order(
         symbol="XAUUSD",
         direction="BUY",
-        price=parsed_edit.zone.mid,
-        lot=LAYER_LOTS["MID"],  # 0.01
+        price=tiers["L2"],
+        lot=LAYER_LOTS["L2"],
         sl=parsed_edit.sl,
-        tp=parsed_edit.final_tp,
+        tp=parsed_edit.raw_tp2,
     )
     t3 = executor.place_limit_order(
         symbol="XAUUSD",
         direction="BUY",
-        price=parsed_edit.zone.bottom,
-        lot=LAYER_LOTS["BOTTOM"],  # 0.02
+        price=tiers["L3"],
+        lot=LAYER_LOTS["L3"],
         sl=parsed_edit.sl,
-        tp=parsed_edit.final_tp,
+        tp=parsed_edit.raw_tp3,
+    )
+    t4 = executor.place_limit_order(
+        symbol="XAUUSD",
+        direction="BUY",
+        price=tiers["L4"],
+        lot=LAYER_LOTS["L4"],
+        sl=parsed_edit.sl,
+        tp=parsed_edit.raw_tp5,
     )
 
-    layers["MID"] = {"lot": LAYER_LOTS["MID"], "target_price": parsed_edit.zone.mid, "ticket": t2, "order_type": "LIMIT", "status": "PENDING"}
-    layers["BOTTOM"] = {"lot": LAYER_LOTS["BOTTOM"], "target_price": parsed_edit.zone.bottom, "ticket": t3, "order_type": "LIMIT", "status": "PENDING"}
+    layers["L2"] = {"lot": LAYER_LOTS["L2"], "target_price": tiers["L2"], "tp": parsed_edit.raw_tp2, "ticket": t2, "order_type": "LIMIT", "status": "PENDING"}
+    layers["L3"] = {"lot": LAYER_LOTS["L3"], "target_price": tiers["L3"], "tp": parsed_edit.raw_tp3, "ticket": t3, "order_type": "LIMIT", "status": "PENDING"}
+    layers["L4"] = {"lot": LAYER_LOTS["L4"], "target_price": tiers["L4"], "tp": parsed_edit.raw_tp5, "ticket": t4, "order_type": "LIMIT", "status": "PENDING"}
 
     state_mgr.update_signal(
         msg_id,
         {
-            "pending_tickets": [t2, t3],
+            "pending_tickets": [t2, t3, t4],
             "layers": layers,
             "zone_completed": True,
             "sl": parsed_edit.sl,
             "final_tp": parsed_edit.final_tp,
+            "tp_levels": parsed_edit.tp_levels,
         },
     )
 
     sig_step2 = state_mgr.get_signal(msg_id)
     total_step2 = len(sig_step2["market_tickets"]) + len(sig_step2["pending_tickets"])
-    assert total_step2 == 3
+    assert total_step2 == 4
     assert sig_step2["zone_completed"] is True
     assert sig_step2["final_tp"] == 3899.50
+    assert round(sum(l["lot"] for l in sig_step2["layers"].values()), 2) == 0.05
 
 
 def test_selective_breakeven():
@@ -263,8 +279,11 @@ async def test_end_to_end_event_handlers(tmp_path):
     assert sig_a["symbol"] in ("XAUUSD", "XAUUSD.s")
     assert sig_a["final_tp"] == 3899.50
     assert sig_a["proximity_close_price"] == 3898.00
-    assert len(sig_a["market_tickets"]) + len(sig_a["pending_tickets"]) == 3
-    assert sig_a["layers"]["BOTTOM"]["lot"] == 0.02
+    assert len(sig_a["market_tickets"]) + len(sig_a["pending_tickets"]) == 4
+    assert sig_a["layers"]["L4"]["lot"] == 0.02
+    assert sig_a["tp_levels"] == {
+        "TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0
+    }
 
     # 4. Reply BE on Scenario A
     be_reply = MockTelethonEvent(
@@ -288,7 +307,7 @@ async def test_end_to_end_event_handlers(tmp_path):
     await handle_new_message(reactivate_reply)
     sig_a_reactivated = main.state_mgr.get_signal(1003)
     assert sig_a_reactivated["status"] == "ACTIVE"
-    assert len(sig_a_reactivated["market_tickets"]) + len(sig_a_reactivated["pending_tickets"]) == 3
+    assert len(sig_a_reactivated["market_tickets"]) + len(sig_a_reactivated["pending_tickets"]) == 4
 
     # 6. Concurrent Second Signal: Must execute immediately even with trade 1003 still active
     scen_second_evt = MockTelethonEvent(

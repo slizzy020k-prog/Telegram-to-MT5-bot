@@ -31,8 +31,16 @@ def test_spec_test_1_standard_zone_signal():
     assert res.proximity_close_price == 3898.00  # 3900 - 2.00 ($2.00 / 20 pips buffer)
     assert res.sl == 3875.0
     assert res.sl_valid is True
-    assert res["max_orders"] == 3
+    assert res["max_orders"] == 4
     assert res.is_zone is True
+    assert res.tp_levels == {
+        "TP1": 3900.0,
+        "TP2": 3910.0,
+        "TP3": 3920.0,
+        "TP4": 3930.0,
+        "TP5": 3940.0,
+    }
+    assert res.zone_tiers == {"L1": 3895.0, "L2": 3892.33, "L3": 3889.67, "L4": 3887.0}
 
 
 def test_xauusd_default_without_symbol_name():
@@ -47,7 +55,7 @@ def test_xauusd_default_without_symbol_name():
     assert res1.direction == "BUY"
     assert res1.top == 3895.0
     assert res1.is_zone is True
-    assert res1.max_orders == 3
+    assert res1.max_orders == 4
 
     # 2. Buy limit with zone
     res2 = parse_message("Buy limit 3895-3887 \n Tp 3900 \n Sl 3875")
@@ -56,14 +64,14 @@ def test_xauusd_default_without_symbol_name():
     assert res2.direction == "BUY"
     assert res2.is_zone is True
 
-    # 3. Sell limit single price
+    # 3. Sell limit single price (v3.0 splits across 4 layers)
     res3 = parse_message("Sell limit 3920 \n Tp 3910 \n Sl 3930")
     assert res3 is not None
     assert res3.symbol in ("XAUUSD", "XAUUSD.s")
     assert res3.direction == "SELL"
     assert res3.single_price == 3920.0
     assert res3.is_zone is False
-    assert res3.max_orders == 1
+    assert res3.max_orders == 4
     assert res3.final_tp == 3910.50
     assert res3.proximity_close_price == 3912.00  # 3910 + 2.00 for SELL
 

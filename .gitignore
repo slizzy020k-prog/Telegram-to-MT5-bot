@@ -6,6 +6,9 @@
 # Runtime State & Logs (contain trade/account data)
 signals_state.json
 sim_state.json
+trades_ledger.jsonl
+*.jsonl
+*.lock
 *.log
 *.tmp
 *.bak*

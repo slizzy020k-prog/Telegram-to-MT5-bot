@@ -1,21 +1,43 @@
 import asyncio
 import logging
-import time
-from unittest.mock import MagicMock
+import os
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-# Force DRY_RUN for simulation
-import config
-config.DRY_RUN = True
+# Isolate logs, state, ledger, and lock into a disposable temp dir BEFORE importing config/main.
+_SIM_TEMP_DIR = tempfile.TemporaryDirectory(prefix="xauusd_copier_sim_")
+_SIM_DIR = Path(_SIM_TEMP_DIR.name)
+os.environ["DRY_RUN"] = "true"
+os.environ["LOG_FILE_PATH"] = str(_SIM_DIR / "sim_copier.log")
+os.environ["STATE_FILE_PATH"] = str(_SIM_DIR / "sim_signals_state.json")
+os.environ["TRADES_LEDGER_PATH"] = str(_SIM_DIR / "sim_trades_ledger.jsonl")
+os.environ["LOCK_FILE_PATH"] = str(_SIM_DIR / "sim_copier.lock")
 
-from mt5_executor import MT5Executor
-from state_manager import StateManager
-from parser import parse_message, ZoneInfo
-from main import handle_new_message, handle_message_edited
-import main
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+import config  # noqa: E402
+import main  # noqa: E402
+from mt5_executor import MT5Executor  # noqa: E402
+from startup_checks import (  # noqa: E402
+    acquire_single_instance_lock,
+    release_single_instance_lock,
+    validate_environment,
+)
+from state_manager import StateManager  # noqa: E402
+from trade_ledger import TradeLedger  # noqa: E402
 
 
 class MockTelethonEvent:
-    def __init__(self, msg_id: int, text: str, reply_to_msg_id: int = None, chat_id: int = -1001234567890):
+    def __init__(
+        self,
+        msg_id: int,
+        text: str,
+        reply_to_msg_id: int = None,
+        chat_id: int = -1001234567890,
+    ):
         self.chat_id = chat_id
         self.message = MagicMock()
         self.message.id = msg_id
@@ -24,135 +46,246 @@ class MockTelethonEvent:
         self.message.forward = None
 
 
-async def run_simulation():
-    print("=" * 70)
-    print("  🚀 TELEGRAM-TO-MT5 XAUUSD SIGNAL COPIER - LIVE SIMULATION")
-    print("=" * 70)
+def _make_tick(bid: float, ask: float) -> MagicMock:
+    tick = MagicMock()
+    tick.bid = bid
+    tick.ask = ask
+    return tick
 
-    # Use dry-run executor and fresh temporary simulation state
-    sim_state_path = config.BASE_DIR / "sim_state.json"
-    if sim_state_path.exists():
-        sim_state_path.unlink()
 
-    main.state_mgr = StateManager(sim_state_path)
+def _shutdown_sim_loggers() -> None:
+    """Close file handlers pointing at the temp dir so Windows can delete temp files cleanly."""
+    for name in ("copier", "telethon"):
+        log_obj = logging.getLogger(name)
+        for handler in list(log_obj.handlers):
+            if isinstance(handler, logging.FileHandler):
+                try:
+                    handler.close()
+                except Exception:
+                    pass
+                log_obj.removeHandler(handler)
+
+
+async def run_simulation() -> None:
+    print("=" * 72)
+    print("  TELEGRAM-TO-MT5 XAUUSD SIGNAL COPIER v3.1 - ISOLATED LIVE SIMULATION")
+    print("=" * 72)
+    print(f"  Temp Isolation Dir : {_SIM_DIR}")
+    print(f"  Dry-Run Enforced   : {config.DRY_RUN}")
+    assert config.DRY_RUN is True
+    assert Path(config.LOG_FILE_PATH).parent == _SIM_DIR
+    assert Path(config.STATE_FILE_PATH).parent == _SIM_DIR
+    assert Path(config.TRADES_LEDGER_PATH).parent == _SIM_DIR
+
+    main.state_mgr = StateManager(_SIM_DIR / "sim_signals_state.json")
+    main.trade_ledger = TradeLedger(_SIM_DIR / "sim_trades_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
 
     # -----------------------------------------------------------------------
-    # TEST 1: Noise & Victory Recap Blocker
+    # STEP 0: Startup Preflight Checks & Single-Instance Mutex Lock
     # -----------------------------------------------------------------------
-    print("\n[STEP 1] Testing Noise & Victory Recap Blocker...")
-    noise_text = "49/50 trades won here by me this week! + 16,780 pips confirmed 🏦🏧 Manage your risk!"
-    print(f"  Incoming Message: \"{noise_text}\"")
-    evt1 = MockTelethonEvent(msg_id=20001, text=noise_text)
-    await handle_new_message(evt1)
-    sig1 = main.state_mgr.get_signal(20001)
-    assert sig1 is None
-    print("  ✅ Result: Ignored completely by Gate 2. Zero false orders placed.")
+    print("\n[STEP 0] Testing Startup Preflight & Single-Instance Lock...")
+    env_check = validate_environment(check_packages=True)
+    assert env_check["ok"], f"Preflight failed: {env_check}"
+    sim_lock = acquire_single_instance_lock(config.LOCK_FILE_PATH)
+    assert sim_lock is not None
+    dup_lock = acquire_single_instance_lock(config.LOCK_FILE_PATH)
+    assert dup_lock is None
+    release_single_instance_lock(sim_lock)
+    print("  [OK] Preflight passed & duplicate instance lock contended cleanly.")
 
     # -----------------------------------------------------------------------
-    # TEST 2: Ignored Pair Blocker (Non-Gold)
+    # STEP 1: Noise & Victory Recap Blocker
+    # -----------------------------------------------------------------------
+    print("\n[STEP 1] Testing Noise & Victory Recap Blocker (Gate 2)...")
+    noise_text = "49/50 trades won here by me this week! + 16,780 pips confirmed! Manage your risk!"
+    evt1 = MockTelethonEvent(msg_id=20001, text=noise_text)
+    await main.handle_new_message(evt1)
+    assert main.state_mgr.get_signal(20001, chat_id=evt1.chat_id) is None
+    print("  [OK] Ignored completely by Gate 2. Zero false orders placed.")
+
+    # -----------------------------------------------------------------------
+    # STEP 2: Ignored Pair Blocker (Non-Gold)
     # -----------------------------------------------------------------------
     print("\n[STEP 2] Testing Non-Gold Pair Filter (IGNORED_SYMBOLS)...")
     forex_text = "Buy EURUSD 1.0850 \n TP 1.0900 \n SL 1.0800"
-    print(f"  Incoming Message: \"{forex_text}\"")
     evt2 = MockTelethonEvent(msg_id=20002, text=forex_text)
-    await handle_new_message(evt2)
-    sig2 = main.state_mgr.get_signal(20002)
-    assert sig2 is None
-    print("  ✅ Result: Blocked immediately. Only Gold (XAUUSD) trades are allowed.")
+    await main.handle_new_message(evt2)
+    assert main.state_mgr.get_signal(20002, chat_id=evt2.chat_id) is None
+    print("  [OK] Blocked immediately. Only Gold (XAUUSD) trades are allowed.")
 
     # -----------------------------------------------------------------------
-    # TEST 3: Scenario A - 3-Layer Asymmetric Zone Entry (XAUUSD Default)
+    # STEP 3: 4-Layer Zone Entry [0.01, 0.01, 0.01, 0.02] Initially at TP1
     # -----------------------------------------------------------------------
-    print("\n[STEP 3] Testing Scenario A: 3-Layer Zone Entry (0.01 / 0.01 / 0.02)...")
-    signal_text = "Buy 3895-3887 \n TP 3900 \n SL 3875"
-    print(f"  Incoming Message: \"{signal_text}\"")
+    print("\n[STEP 3] Testing 4-Layer Zone Entry [0.01, 0.01, 0.01, 0.02] Initially at TP1...")
+    signal_text = "Buy 3895-3887 \n TP 3900 \n TP 3910 \n SL 3875"
     evt3 = MockTelethonEvent(msg_id=20003, text=signal_text)
-    await handle_new_message(evt3)
+    await main.handle_new_message(evt3)
 
-    sig3 = main.state_mgr.get_signal(20003)
+    sig3 = main.state_mgr.get_signal(20003, chat_id=evt3.chat_id)
     assert sig3 is not None
     layers = sig3["layers"]
-    print(f"  ✅ Signal Parsed & Placed on {sig3['symbol']}:")
-    print(f"     • Layer 1 (TOP):    Lot={layers['TOP']['lot']} | Price={layers['TOP']['target_price']} | Ticket={layers['TOP']['ticket']}")
-    print(f"     • Layer 2 (MID):    Lot={layers['MID']['lot']} | Price={layers['MID']['target_price']} | Ticket={layers['MID']['ticket']}")
-    print(f"     • Layer 3 (BOTTOM): Lot={layers['BOTTOM']['lot']} | Price={layers['BOTTOM']['target_price']} | Ticket={layers['BOTTOM']['ticket']}")
-    print(f"     • Hard MT5 TP (TP1 - 0.50): {sig3['final_tp']}")
-    print(f"     • 20-Pip Proximity Trigger: {sig3['proximity_close_price']} ($2.00 before TP1)")
-    print(f"     • Total Lots Exposure: {sum(l['lot'] for l in layers.values()):.2f} / 0.04 max")
+    assert list(layers.keys()) == ["L1", "L2", "L3", "L4"]
+    assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.01, 0.01, 0.01, 0.02]
+    assert sig3["tp_levels"] == {
+        "TP1": 3900.0,
+        "TP2": 3910.0,
+        "TP3": 3920.0,
+        "TP4": 3930.0,
+        "TP5": 3940.0,
+    }
+    assert all(layers[k]["tp"] == 3899.50 and layers[k]["tp_stage"] == "TP1" for k in ("L1", "L2", "L3", "L4"))
+    total_lots = round(sum(l["lot"] for l in layers.values()), 2)
+    assert total_lots == 0.05
+    print(f"  [OK] Placed 4 layers on {sig3['symbol']} initially at TP1 (Total {total_lots:.2f} lots):")
+    for k in ("L1", "L2", "L3", "L4"):
+        l_info = layers[k]
+        print(
+            f"     - {k}: Lot={l_info['lot']:.2f} | Entry={l_info['target_price']} "
+            f"| TP={l_info['tp']} ({l_info['tp_stage']}) | Type={l_info['order_type']} | Ticket={l_info['ticket']}"
+        )
 
     # -----------------------------------------------------------------------
-    # TEST 4: Selective Breakeven (BE on TOP & MID only)
+    # STEP 4: Selective Breakeven (BE on L1, L2, L3; L4 untouched)
     # -----------------------------------------------------------------------
     print("\n[STEP 4] Testing Selective Breakeven Command ('BE')...")
-    be_text = "BE"
-    print(f"  Incoming Reply: \"{be_text}\" (replying to Signal 20003)")
-    evt4 = MockTelethonEvent(msg_id=20004, text=be_text, reply_to_msg_id=20003)
-    await handle_new_message(evt4)
-
-    sig4 = main.state_mgr.get_signal(20003)
-    print("  ✅ Selective Breakeven Executed:")
-    print("     • Layer 1 (0.01 TOP): Moved SL to Entry + 2.0 pips buffer.")
-    print("     • Layer 2 (0.01 MID): Moved SL to Entry + 2.0 pips buffer.")
-    print("     • Layer 3 (0.02 BOTTOM): UNTOUCHED at original SL 3875.0 (protected from pullbacks).")
+    evt4 = MockTelethonEvent(msg_id=20004, text="BE", reply_to_msg_id=20003)
+    await main.handle_new_message(evt4)
+    print("  [OK] Selective Breakeven applied to BE_LAYERS=['L1','L2','L3']; L4 (0.02) untouched.")
 
     # -----------------------------------------------------------------------
-    # TEST 5: Scenario B - "Buy now" held with recorded point -> Zone edited later
+    # STEP 5: Delayed "Buy now" -> Edited with 4-Layer Zone
     # -----------------------------------------------------------------------
-    print("\n[STEP 5] Testing Scenario B: 'Buy now' held (recorded point) -> Edited later with Zone...")
+    print("\n[STEP 5] Testing Delayed 'Buy now' -> Edited with 4-Layer Zone...")
     orig_delay = main.SELL_NOW_DELAY_SECONDS
     main.SELL_NOW_DELAY_SECONDS = 20.0
     try:
-        buy_now_text = "Buy now"
-        print(f"  [5a] Initial Post: \"{buy_now_text}\"")
-        evt5a = MockTelethonEvent(msg_id=20005, text=buy_now_text)
-        await handle_new_message(evt5a)
-        sig5a = main.state_mgr.get_signal(20005)
+        evt5a = MockTelethonEvent(msg_id=20005, text="Buy now")
+        await main.handle_new_message(evt5a)
+        sig5a = main.state_mgr.get_signal(20005, chat_id=evt5a.chat_id)
         assert sig5a is not None and sig5a["status"] in ("PENDING", "PENDING_DELAY")
-        print(f"     • Recorded Entry Point: {sig5a['recorded_entry_price']} | Status: {sig5a['status']} (awaiting zone/delay)")
 
-        print("  [5b] Provider edits message within delay window with Zone & SL/TP:")
         edit_text = "Buy 3895-3887 \n TP 3900 \n SL 3875"
-        print(f"  Edited Message: \"{edit_text}\"")
         evt5b = MockTelethonEvent(msg_id=20005, text=edit_text)
-        await handle_message_edited(evt5b)
-        sig5b = main.state_mgr.get_signal(20005)
+        await main.handle_message_edited(evt5b)
+        sig5b = main.state_mgr.get_signal(20005, chat_id=evt5b.chat_id)
         assert sig5b["status"] == "ACTIVE"
-        assert len(sig5b["market_tickets"]) + len(sig5b["pending_tickets"]) == 3
+        assert len(sig5b["market_tickets"]) + len(sig5b["pending_tickets"]) == 4
+        assert round(sum(v["lot"] for v in sig5b["layers"].values()), 2) == 0.05
     finally:
         main.SELL_NOW_DELAY_SECONDS = orig_delay
-    print(f"  ✅ Edit State Machine Handled:")
-    print(f"     • Layer 1: SL updated to 3875.0, TP updated to 3899.50")
-    print(f"     • Layer 2 (0.01 Mid Limit): Placed at 3891.00")
-    print(f"     • Layer 3 (0.02 Bottom Limit): Placed at 3887.00")
-    print(f"     • Hard Cap: Exactly 3 orders total (0.04 lots).")
+    print("  [OK] Delayed 'Buy now' converted cleanly to 4-layer Zone (4 orders, 0.05 lots).")
 
     # -----------------------------------------------------------------------
-    # TEST 6: 20-Pip TP1 Proximity Auto-Close ($2.00 / 20 Pips Before TP1)
+    # STEP 6: Dynamic Multi-Layer Scaling (N=1 Single-Layer + N=4 Multi-Layer)
     # -----------------------------------------------------------------------
-    print("\n[STEP 6] Testing 20-Pip TP1 Proximity Auto-Close...")
-    print("  Simulating live Gold tick reaching 3898.00 (TP1 is 3900.00, buffer is $2.00)...")
-    main.executor.apply_proximity_close(
-        market_tickets=sig3["market_tickets"],
-        pending_tickets=sig3["pending_tickets"],
+    print("\n[STEP 6] Testing Dynamic Runner Scaling (N=1 -> L1 & N=4 -> L4) + Anti-Choke Guard...")
+    # [6a] Single-layer (N=1): only L1 filled -> L1 dynamically becomes deepest runner & scales TP1->TP4
+    sig_single = {
+        "symbol": config.DEFAULT_SYMBOL,
+        "direction": "BUY",
+        "recorded_entry_price": 3890.0,
+        "layers": {
+            "L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9501, "order_type": "MARKET", "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3888.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9502, "order_type": "LIMIT", "status": "PENDING"},
+        },
+        "market_tickets": [9501],
+        "pending_tickets": [9502],
+        "final_tp": 3899.5,
+        "raw_tp1": 3900.0,
+        "raw_tp2": 3910.0,
+        "raw_tp3": 3920.0,
+        "raw_tp4": 3930.0,
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+    }
+    main.executor.prepare_deepest_runners_for_tp_breakout(sig_single, live_price=3899.30)
+    assert sig_single["layers"]["L1"]["tp"] == 3910.0
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+        rt_1 = main.executor.handle_tp1_scaling_and_select_runner(sig_single)
+    assert rt_1 == 9501 and sig_single["runner_layers"] == ["L1"] and sig_single["last_banked_tickets"] == []
+    for px in (3910.60, 3920.60):
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+            assert main.executor.manage_designated_runner(sig_single) is True
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+        assert main.executor.manage_designated_runner(sig_single) is False
+    assert sig_single["tp4_reached"] is True and sig_single["status"] == "CLOSED"
+    print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP3->TP4!")
+
+    # [6b] Full 4-layer trade: L1..L3 bank at TP1, L4 runner scales TP2->TP3 with Anti-Choke noise immunity
+    all_tickets = []
+    for k in ("L1", "L2", "L3", "L4"):
+        layers[k]["status"] = "OPEN"
+        layers[k]["order_type"] = "MARKET"
+        all_tickets.append(layers[k]["ticket"])
+    sig3["market_tickets"] = list(all_tickets)
+    sig3["pending_tickets"] = []
+    main.state_mgr.update_signal(
+        20003,
+        {"layers": layers, "market_tickets": list(all_tickets), "pending_tickets": []},
+        chat_id=evt3.chat_id,
     )
-    main.state_mgr.set_tp1_reached(20003, True)
-    main.state_mgr.update_signal(20003, {"status": "CLOSED", "market_tickets": [], "pending_tickets": []})
-    sig_closed = main.state_mgr.get_signal(20003)
-    print("  ✅ Proximity Auto-Close Triggered:")
-    print("     • All open positions closed at market to bank profit before resistance.")
-    print("     • All pending limit orders cancelled.")
-    print("     • Trade marked CLOSED in state.")
 
-    # Clean up temp state
-    if sim_state_path.exists():
-        sim_state_path.unlink()
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3898.20, 3898.40)):
+        runner_t = main.executor.handle_tp1_scaling_and_select_runner(sig3)
+    assert runner_t == layers["L4"]["ticket"]
+    assert sig3["status"] == "RUNNER_ACTIVE"
+    assert sig3["runner_layer"] == "L4"
+    assert all(sig3["layers"][lk]["status"] == "CLOSED" for lk in ("L1", "L2", "L3"))
+    assert sig3["market_tickets"] == [runner_t]
+    assert sig3["layers"]["L4"]["tp"] == 3910.0
+    print(f"  [6b] TP1 Scaling (N=4): L1..L3 closed at TP1, L4 #{runner_t} active -> TP2=3910.0.")
 
-    print("\n" + "=" * 70)
-    print("  🎉 ALL 6 SIMULATION TESTS PASSED WITH 100% SUCCESS!")
-    print("=" * 70)
+    # Clean breakthrough past TP1 -> TP2, then 6-pip micro-noise near TP2 must NOT choke L4!
+    for px in (3900.60, 3909.30, 3908.70, 3910.60):
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+            assert main.executor.manage_designated_runner(sig3) is True
+    assert "TP2" in sig3["runner_cleared_milestones"]
+    assert sig3["runner_milestone_name"] == "TP3"
+    assert sig3["layers"]["L4"]["tp"] == 3920.0
+    print(f"  [6c] Ignored 6p micro-noise & cleared TP2 -> stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
+
+    # Approach TP3 (3920.0) within strict 10p buffer ($1.00 -> >= 3919.0) -> arm -> peak 3919.80 -> 2-tick 13p reversal -> Bank It!
+    for px in (3919.20, 3919.80, 3918.50):
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+            assert main.executor.manage_designated_runner(sig3) is True
+    assert sig3["runner_reversal_ticks"] == 1
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3918.50, 3918.70)):
+        still_running = main.executor.manage_designated_runner(sig3)
+    assert still_running is False
+    assert sig3["layers"]["L4"]["status"] == "CLOSED"
+    assert sig3["market_tickets"] == [] and sig3["status"] == "CLOSED"
+    assert "Bank It" in (sig3.get("runner_close_reason") or "")
+    print(f"  [6d] Confirmed 2-tick Reversal Guard near TP3: {sig3['runner_close_reason']}.")
+
+    main.state_mgr.update_signal(20003, sig3, chat_id=evt3.chat_id)
+    ledger_rec = main.trade_ledger.record_closed_signal(
+        signal_key=f"{evt3.chat_id}:20003",
+        signal_data=sig3,
+        realized_pnl=64.50,
+        exit_reason=sig3["runner_close_reason"],
+        currency="GBP",
+        dry_run=True,
+    )
+    stats = main.trade_ledger.get_stats()
+    assert ledger_rec["total_lots"] == 0.05
+    assert stats["total_trades"] == 1 and stats["wins"] == 1
+    assert (_SIM_DIR / "sim_copier.log").exists()
+    assert (_SIM_DIR / "sim_signals_state.json").exists()
+    assert (_SIM_DIR / "sim_trades_ledger.jsonl").exists()
+    print(
+        f"  [6e] TradeLedger recorded closed 4-layer trade -> stats={stats['total_trades']} win(s), "
+        f"PnL=+{stats['total_realized_pnl']:.2f} GBP (win_rate={stats['win_rate_pct']}%)."
+    )
+
+    print("\n" + "=" * 72)
+    print("  ALL 7 v3.1 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_simulation())
+    try:
+        asyncio.run(run_simulation())
+    finally:
+        _shutdown_sim_loggers()
+        _SIM_TEMP_DIR.cleanup()

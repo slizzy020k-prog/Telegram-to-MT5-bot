@@ -370,10 +370,10 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
         await asyncio.sleep(0.12)
         sig_active = main.state_mgr.get_signal(9801)
         assert sig_active["status"] == "ACTIVE"
-        assert len(sig_active["market_tickets"]) == 1
+        assert len(sig_active["market_tickets"]) == 4
         assert sig_active["direction"] == "SELL"
 
-        # 2. Sell now WITH zone edit within timer -> cancels timer & executes zone limits
+        # 2. Sell now WITH zone edit within timer -> cancels timer & executes 4-layer zone limits
         evt_sell2 = MockTelethonEvent(msg_id=9803, text="Sell now")
         await main.handle_new_message(evt_sell2)
         assert main.state_mgr.get_signal(9803)["status"] == "PENDING"
@@ -384,7 +384,7 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
         sig_zone = main.state_mgr.get_signal(9803)
         assert sig_zone["status"] == "ACTIVE"
         assert sig_zone["is_zone"] is True
-        assert len(sig_zone["pending_tickets"]) == 3
+        assert len(sig_zone["pending_tickets"]) == 4
 
         # 3. Failed Buy now order (e.g. No money) must NOT save ACTIVE signal
         alerts = []
@@ -534,25 +534,38 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path):
 
     main.notify_saved_messages = cap_notify
     try:
-        # Signal 1: 3-layer zone (0.01 + 0.01 + 0.02 = 0.04 lots) -> passes Low (0.01) & Mid (0.02)
+        # Signal 1 on £50: 4-layer zone (0.01+0.01+0.01+0.02 = 0.05 lots) -> passes Low, Mid & hits 0.05 High Cap!
         evt1 = MockTelethonEvent(msg_id=9961, text="Buy 3895-3887\nTP 3905\nSL 3875")
         await main.handle_new_message(evt1)
-        assert main.executor.get_total_active_lots()["total_lots"] == 0.04
-        assert any("Passed LOW RISK" in a and "Passed MID RISK" in a for a in alerts)
+        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
+        assert any("Passed LOW RISK" in a and "Passed MID RISK" in a and "MAX HIGH RISK CAP REACHED" in a for a in alerts)
 
-        # Signal 2: 3-layer zone when only 0.01 lot remains under 0.05 High Risk Cap
+        # Signal 2 on £50: 0.00 lots available -> blocked completely by High Risk Cap
         evt2 = MockTelethonEvent(msg_id=9962, text="Buy 3895-3887\nTP 3905\nSL 3875")
         await main.handle_new_message(evt2)
-        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
-        assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
-        sig2 = main.state_mgr.get_signal(9962)
-        assert len(sig2["market_tickets"]) + len(sig2["pending_tickets"]) == 1
-
-        # Signal 3: 0.00 lots available -> blocked completely by High Risk Cap
-        evt3 = MockTelethonEvent(msg_id=9963, text="Buy 3895-3887\nTP 3905\nSL 3875")
-        await main.handle_new_message(evt3)
-        assert main.state_mgr.get_signal(9963) is None
+        assert main.state_mgr.get_signal(9962) is None
         assert any("High Risk Lot Cap Reached" in a for a in alerts)
+
+        # 3. Atomic partial cap on a £80 account (High Risk = 0.08 lots): 0.05 + capped 0.03 -> 0.08, then blocked!
+        alerts.clear()
+        main.state_mgr = StateManager(tmp_path / "risk_cap_state_80.json")
+        main.executor = MT5Executor(dry_run=True)
+        main.executor.connect()
+        main.executor._dry_run_capital = 80.0
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=9964, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=9965, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.executor.get_total_active_lots()["total_lots"] == 0.08
+        sig_partial = main.state_mgr.get_signal(9965)
+        assert sig_partial is not None
+        assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) == 3
+        assert round(sum(l["lot"] for l in sig_partial["layers"].values()), 2) == 0.03
+        assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=9966, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.state_mgr.get_signal(9966) is None
     finally:
         main.notify_saved_messages = orig_notify
 
@@ -573,20 +586,27 @@ async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path):
     await main.handle_message_edited(old_evt)
     assert main.state_mgr.get_signal(9971) is None
 
-    # 2. Provider replies "Tp1 was hit on this" to an active signal -> scales TP1 & activates runner
+    # 2. Provider replies "Tp1 was hit on this" to an active signal -> scales TP1 & activates L4 runner
     fresh_evt = MockTelethonEvent(msg_id=9972, text="Buy 3895-3887\nTP 3905\nTP2 3915\nSL 3875")
     await main.handle_new_message(fresh_evt)
     sig = main.state_mgr.get_signal(9972)
-    # Simulate all 3 layers filled
+    # Simulate all 4 layers filled
     all_tkts = sig["market_tickets"] + sig["pending_tickets"]
-    main.state_mgr.update_signal(9972, {"market_tickets": all_tkts, "pending_tickets": []})
+    for lk in ("L1", "L2", "L3", "L4"):
+        sig["layers"][lk]["status"] = "OPEN"
+    main.state_mgr.update_signal(9972, {"market_tickets": all_tkts, "pending_tickets": [], "layers": sig["layers"]})
 
     reply_evt = MockTelethonEvent(msg_id=9973, text="Tp1 was hit on this", reply_to_msg_id=9972)
     await main.handle_new_message(reply_evt)
     sig_after = main.state_mgr.get_signal(9972)
     assert sig_after["tp1_reached"] is True
     assert sig_after["status"] == "RUNNER_ACTIVE"
-    assert sig_after["runner_layer"] == "BOTTOM"
+    assert sig_after["runner_layer"] == "L4"
+    assert sig_after["layers"]["L1"]["status"] == "CLOSED"
+    assert sig_after["layers"]["L2"]["status"] == "CLOSED"
+    assert sig_after["layers"]["L3"]["status"] == "CLOSED"
+    assert len(sig_after["market_tickets"]) == 1  # Dynamic deepest runner L4 retained at TP2
+    assert sig_after["layers"]["L4"]["tp"] == 3915.0
 
 
 @pytest.mark.asyncio
@@ -604,14 +624,14 @@ async def test_two_stage_daily_loss_50pct_hold_and_90pct_emergency_cutoff(tmp_pa
     main.executor._dry_run_capital = 120.0
     main._daily_50pct_alert_date = None
 
-    # Open an initial signal (3 layers) while loss is 0%
+    # Open an initial signal (4 layers) while loss is 0%
     evt1 = MockTelethonEvent(msg_id=9981, text="Buy 3895-3887\nTP 3905\nSL 3875")
     await main.handle_new_message(evt1)
     sig1 = main.state_mgr.get_signal(9981)
     assert sig1["status"] == "ACTIVE"
     open_mk = list(sig1["market_tickets"])
     open_pd = list(sig1["pending_tickets"])
-    assert len(open_mk) + len(open_pd) == 3
+    assert len(open_mk) + len(open_pd) == 4
 
     alerts = []
     orig_notify = main.notify_saved_messages
@@ -668,12 +688,12 @@ async def test_daily_win_command_and_auto_session_termination(tmp_path):
     main._awaiting_dailywin_input = False
     main._daily_win_terminate_requested = False
 
-    # Open an active trade (3 layers)
+    # Open an active trade (4 layers)
     sig_evt = MockTelethonEvent(msg_id=9991, text="Buy 3895-3887\nTP 3905\nSL 3875")
     await main.handle_new_message(sig_evt)
     sig = main.state_mgr.get_signal(9991)
     assert sig["status"] == "ACTIVE"
-    assert len(sig["market_tickets"]) + len(sig["pending_tickets"]) == 3
+    assert len(sig["market_tickets"]) + len(sig["pending_tickets"]) == 4
 
     alerts = []
     orig_notify = main.notify_saved_messages
@@ -804,7 +824,7 @@ async def test_recorded_market_point_bad_position_guard_and_tp1_hit_cancellation
 
             sig_entered = main.state_mgr.get_signal(10103)
             assert sig_entered["status"] == "ACTIVE"
-            assert len(sig_entered["market_tickets"]) == 1
+            assert len(sig_entered["market_tickets"]) == 4
 
         # 3. 'Buy now' recorded at 3895.00 (opposite rule): in legacy recovery-wait mode,
         #    if price spiked to 3899.00, holds off until price pulls back <= 3895.00, then activates!
@@ -830,7 +850,7 @@ async def test_recorded_market_point_bad_position_guard_and_tp1_hit_cancellation
 
             sig_buy_entered = main.state_mgr.get_signal(10104)
             assert sig_buy_entered["status"] == "ACTIVE"
-            assert len(sig_buy_entered["market_tickets"]) == 1
+            assert len(sig_buy_entered["market_tickets"]) == 4
     finally:
         main.NOW_PRICE_GUARD_ABORT_ON_MISMATCH = orig_abort
         main.SELL_NOW_DELAY_SECONDS = orig_delay
@@ -1289,15 +1309,15 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
         assert s3["status"] == "ABORTED_PRICE_GUARD" and s3["market_tickets"] == []
 
         # 4a. Unfilled zone pending limits cancelled via REPLY "TP1 ✅"
-        buy_above_zone = MagicMock(bid=3896.8, ask=3897.0)  # Above top 3895 -> all 3 limits PENDING
+        buy_above_zone = MagicMock(bid=3896.8, ask=3897.0)  # Above top 3895 -> all 4 limits PENDING
         with patch.object(main.executor, "get_tick", return_value=buy_above_zone), \
              patch.object(main.executor, "cancel_pending_order", wraps=main.executor.cancel_pending_order) as cancel_spy:
             await main.handle_new_message(MockTelethonEvent(msg_id=12105, text="Buy 3895-3887\nTP 3900\nSL 3875"))
             sz = main.state_mgr.get_signal(12105)
             assert sz["market_tickets"] == []
-            assert len(sz["pending_tickets"]) == 3
+            assert len(sz["pending_tickets"]) == 4
             await main.handle_new_message(MockTelethonEvent(msg_id=12106, text="TP1 ✅", reply_to_msg_id=12105))
-            assert cancel_spy.call_count == 3
+            assert cancel_spy.call_count == 4
         sz_after = main.state_mgr.get_signal(12105)
         assert sz_after["status"] == "INVALIDATED_TP1" and sz_after["tp1_reached"] is True and sz_after["pending_tickets"] == []
 
@@ -1305,9 +1325,9 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
         with patch.object(main.executor, "get_tick", return_value=buy_above_zone), \
              patch.object(main.executor, "cancel_pending_order", wraps=main.executor.cancel_pending_order) as cancel_spy2:
             await main.handle_new_message(MockTelethonEvent(msg_id=12107, text="Buy 3895-3887\nTP 3900\nSL 3875"))
-            assert len(main.state_mgr.get_signal(12107)["pending_tickets"]) == 3
+            assert len(main.state_mgr.get_signal(12107)["pending_tickets"]) == 4
             await main.handle_message_edited(MockTelethonEvent(msg_id=12107, text="Target 1 hit"))
-            assert cancel_spy2.call_count == 3
+            assert cancel_spy2.call_count == 4
         assert main.state_mgr.get_signal(12107)["status"] == "INVALIDATED_TP1"
         assert main.state_mgr.get_signal(12107)["tp1_reached"] is True
 
@@ -1328,18 +1348,23 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
         assert s_watch["tp1_reached"] is True
         assert s_watch["pending_tickets"] == []
 
-        # 4d. Mixed market + pending limits: reply "TP1 hit" closes market TOP, cancels pending MID+BOTTOM
-        tick_mixed = MagicMock(bid=3894.5, ask=3894.8)  # Below TOP 3895, above MID 3891 -> 1 market, 2 pending
+        # 4d. Mixed market + pending limits: reply "TP1 hit" cancels pending L2, L3, L4
+        #     and dynamically promotes the single surviving filled L1 into RUNNER_ACTIVE toward TP2..TP4
+        tick_mixed = MagicMock(bid=3894.5, ask=3894.8)  # Below L1 3895, above L2 3892.33 -> 1 market, 3 pending
         with patch.object(main.executor, "get_tick", return_value=tick_mixed):
             await main.handle_new_message(MockTelethonEvent(msg_id=12109, text="Buy 3895-3887\nTP 3900\nSL 3875"))
         s_mix = main.state_mgr.get_signal(12109)
-        assert len(s_mix["market_tickets"]) == 1 and len(s_mix["pending_tickets"]) == 2
+        assert len(s_mix["market_tickets"]) == 1 and len(s_mix["pending_tickets"]) == 3
+        l1_ticket = s_mix["market_tickets"][0]
         await main.handle_new_message(MockTelethonEvent(msg_id=12110, text="TP1 hit", reply_to_msg_id=12109))
         s_mix_after = main.state_mgr.get_signal(12109)
         assert s_mix_after["tp1_reached"] is True
         assert s_mix_after["pending_tickets"] == []
-        assert s_mix_after["market_tickets"] == []
-        assert s_mix_after["status"] == "CLOSED"
+        assert s_mix_after["market_tickets"] == [l1_ticket]
+        assert s_mix_after["runner_layer"] == "L1"
+        assert s_mix_after["runner_layers"] == ["L1"]
+        assert s_mix_after["status"] == "RUNNER_ACTIVE"
+        assert s_mix_after["layers"]["L1"]["tp"] == s_mix_after["raw_tp2"]
     finally:
         main.NOW_PRICE_GUARD_ABORT_ON_MISMATCH = orig_abort
         main.SELL_NOW_DELAY_SECONDS = orig_delay

@@ -21,6 +21,7 @@ import mt5_executor as ex_mod
 from config import DEFAULT_SYMBOL, MAGIC_NUMBER
 from mt5_executor import MT5Executor
 from state_manager import StateManager
+from trade_ledger import TradeLedger
 
 
 def _make_event(msg_id: int, text: str, reply_to_msg_id=None, chat_id=-1001234567890):
@@ -124,6 +125,7 @@ def _reset_main(tmp_path, filename: str):
     main._awaiting_dailyloss_input = False
     main._daily_50pct_alert_date = None
     main.state_mgr = StateManager(tmp_path / filename)
+    main.trade_ledger = TradeLedger(tmp_path / f"{filename}.ledger.jsonl")
 
 
 @pytest.mark.asyncio
@@ -169,7 +171,7 @@ async def test_spec_1_sell_now_price_guard_mocked_mt5_and_telethon(tmp_path, cap
 
         sig_exec = main.state_mgr.get_signal(101)
         assert sig_exec["status"] == "ACTIVE"
-        assert len(sig_exec["market_tickets"]) == 1
+        assert len(sig_exec["market_tickets"]) == 4
         assert any(r.get("action") == mt5.TRADE_ACTION_DEAL and r.get("type") == mt5.ORDER_TYPE_SELL for r in env["sent_requests"])
         assert any("[PRICE GUARD]" in rec.message and "SELL" in rec.message and "2650.0" in rec.message and "2651.2" in rec.message and "Action: EXECUTED" in rec.message for rec in caplog.records)
 
@@ -239,7 +241,7 @@ async def test_spec_2_buy_now_price_guard_mocked_mt5_and_telethon(tmp_path, capl
 
         sig_exec = main.state_mgr.get_signal(201)
         assert sig_exec["status"] == "ACTIVE"
-        assert len(sig_exec["market_tickets"]) == 1
+        assert len(sig_exec["market_tickets"]) == 4
         assert any(r.get("action") == mt5.TRADE_ACTION_DEAL and r.get("type") == mt5.ORDER_TYPE_BUY for r in env["sent_requests"])
         assert any("[PRICE GUARD]" in rec.message and "BUY" in rec.message and "2650.0" in rec.message and "2649.1" in rec.message and "Action: EXECUTED" in rec.message for rec in caplog.records)
 
@@ -320,7 +322,7 @@ async def test_spec_3_tp1_invalidation_via_reply_removes_pending_without_closing
         sz = main.state_mgr.get_signal(303)
         assert sz["market_tickets"] == []
         pending_tkts = list(sz["pending_tickets"])
-        assert len(pending_tkts) == 3
+        assert len(pending_tkts) == 4
 
         env["sent_requests"].clear()
         await main.handle_new_message(_make_event(304, "TP1 hit", reply_to_msg_id=303))
@@ -414,7 +416,7 @@ async def test_spec_4_tp1_invalidation_via_live_market_price_mid_delay_and_zone(
         await main.handle_new_message(_make_event(402, "Buy 2645-2640\nTP1 2655\nSL 2630"))
         sz = main.state_mgr.get_signal(402)
         pending_tkts = list(sz["pending_tickets"])
-        assert len(pending_tkts) == 3
+        assert len(pending_tkts) == 4
         for pt in pending_tkts:
             env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
 
@@ -502,6 +504,7 @@ async def test_spec_5_daily_realized_loss_limit_mocked_mt5_and_telethon(tmp_path
             SimpleNamespace(entry=1, type=3, time=now_srv - 25, profit=-200.0, commission=0.0, swap=0.0, fee=0.0),
             SimpleNamespace(entry=1, type=mt5.DEAL_TYPE_SELL, time=now_srv - 10, profit=-104.0, commission=-0.50, swap=-0.50, fee=0.0),
         ])
+        main.executor.invalidate_realized_pnl_cache()
 
         with pytest.raises(SystemExit) as exit_info:
             await main.check_and_enforce_daily_loss_limit(exit_on_trigger=True)
@@ -576,27 +579,29 @@ async def test_spec_7_zero_delay_immediate_now_execution(tmp_path):
         main.executor = MT5Executor(dry_run=False)
         main.executor.connect()
 
-        # 1. Immediate Buy now -> enters Market BUY on arrival without PENDING timer
+        # 1. Immediate Buy now -> enters 4-layer Market BUY on arrival without PENDING timer
         await main.handle_new_message(_make_event(701, "Buy xauusd now\nSL 3835\nTP 3860"))
         assert main._pending_sell_now_tasks == {}
         s_buy = main.state_mgr.get_signal(701)
         assert s_buy is not None
         assert s_buy["status"] == "ACTIVE"
-        assert len(s_buy["market_tickets"]) == 1
+        assert len(s_buy["market_tickets"]) == 4
         assert s_buy["pending_tickets"] == []
 
-        # 2. Immediate Sell now -> enters Market SELL immediately
+        # 2. Immediate Sell now -> enters 4-layer Market SELL immediately
         await main.handle_new_message(_make_event(702, "Sell now"))
         assert main._pending_sell_now_tasks == {}
         s_sell = main.state_mgr.get_signal(702)
         assert s_sell is not None
         assert s_sell["status"] == "ACTIVE"
-        assert len(s_sell["market_tickets"]) == 1
+        assert len(s_sell["market_tickets"]) == 4
 
-        # 3. Follow-up zone edit seamlessly places Layers 2 & 3 limits
+        # 3. Follow-up zone edit updates SL/TP on all 4 layers without exceeding 4 orders
         await main.handle_message_edited(_make_event(702, "Sell 3850-3855\nSL 3865\nTP 3840"))
         s_edit = main.state_mgr.get_signal(702)
-        assert len(s_edit["market_tickets"]) + len(s_edit["pending_tickets"]) == 3
+        assert len(s_edit["market_tickets"]) + len(s_edit["pending_tickets"]) == 4
+        assert s_edit["sl"] == 3865.0
+        assert s_edit["layers"]["L1"]["tp"] == 3840.50
     finally:
         main.SELL_NOW_DELAY_SECONDS = orig_delay
         for p in reversed(env["patches"]):
@@ -678,11 +683,11 @@ async def test_spec_9_buy_limit_and_sell_limit_live_activation_and_stops_fallbac
         s_buy = main.state_mgr.get_signal(9101, chat_id=-1003712081715)
         assert s_buy is not None
         assert s_buy["status"] == "ACTIVE"
-        assert len(s_buy["pending_tickets"]) == 3
+        assert len(s_buy["pending_tickets"]) == 4
         assert s_buy["tp1_guard_armed"] is False
 
         buy_reqs = [r for r in env["sent_requests"] if r.get("action") == mt5.TRADE_ACTION_PENDING and r.get("type") == mt5.ORDER_TYPE_BUY_LIMIT]
-        assert sorted(r["price"] for r in buy_reqs) == [3830.0, 3835.0, 3840.0]
+        assert sorted(r["price"] for r in buy_reqs) == [3830.0, 3833.33, 3836.67, 3840.0]
 
         for pt in s_buy["pending_tickets"]:
             env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
@@ -694,21 +699,21 @@ async def test_spec_9_buy_limit_and_sell_limit_live_activation_and_stops_fallbac
         s_sell = main.state_mgr.get_signal(9102, chat_id=-1004369388188)
         assert s_sell is not None
         assert s_sell["status"] == "ACTIVE"
-        assert len(s_sell["pending_tickets"]) == 3
+        assert len(s_sell["pending_tickets"]) == 4
         assert s_sell["tp1_guard_armed"] is False
 
         sell_reqs = [r for r in env["sent_requests"] if r.get("action") == mt5.TRADE_ACTION_PENDING and r.get("type") == mt5.ORDER_TYPE_SELL_LIMIT]
-        assert sorted(r["price"] for r in sell_reqs) == [3860.0, 3865.0, 3870.0]
+        assert sorted(r["price"] for r in sell_reqs) == [3860.0, 3863.33, 3866.67, 3870.0]
 
         for pt in s_sell["pending_tickets"]:
             env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
 
-        # 3. Single-price plural "Sell limits 3862"
+        # 3. Single-price plural "Sell limits 3862" -> 4 pending orders at 3862
         await main.handle_new_message(
             _make_event(9103, "Sell limits 3862\nSL 3875\nTP 3855", chat_id=-1004369388188)
         )
         s_single_sell = main.state_mgr.get_signal(9103, chat_id=-1004369388188)
-        assert s_single_sell is not None and len(s_single_sell["pending_tickets"]) == 1
+        assert s_single_sell is not None and len(s_single_sell["pending_tickets"]) == 4
         for pt in s_single_sell["pending_tickets"]:
             env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
 
