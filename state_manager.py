@@ -107,6 +107,9 @@ class StateManager:
         if base_key.startswith("_"):
             return base_key
 
+        if not for_create and ":" in base_key and isinstance(self._state.get(base_key), dict):
+            return base_key
+
         if for_create:
             if eff_chat is None:
                 return base_key

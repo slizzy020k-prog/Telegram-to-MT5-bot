@@ -123,8 +123,8 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 # Deduplication window in seconds
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "5"))
 
-# Seconds to wait on unpriced "Sell now" / "Buy now" before market entry (to see if provider edits in limits/zone)
-SELL_NOW_DELAY_SECONDS = max(0.0, float(os.getenv("SELL_NOW_DELAY_SECONDS") or "20"))
+# Seconds to wait on unpriced "Sell now" / "Buy now" before market entry (0 = execute immediately)
+SELL_NOW_DELAY_SECONDS = max(0.0, float(os.getenv("SELL_NOW_DELAY_SECONDS") or "0"))
 
 # Polling interval (seconds) inside the delayed "Buy now" / "Sell now" window for mid-delay TP1 checks
 DELAYED_POLL_INTERVAL_SECONDS = max(

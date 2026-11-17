@@ -724,6 +724,61 @@ def _tick_hit_tp1(tick: Any, direction: str, tp1_price: Optional[float]) -> bool
     return False
 
 
+def _is_strictly_pending_limit_setup(
+    tick: Any,
+    direction: str,
+    zone: Any = None,
+    single_price: Optional[float] = None,
+) -> bool:
+    """Return True if all planned entry tiers are pending limit orders away from live market."""
+    if not tick:
+        return False
+    dir_up = str(direction or "").upper()
+    ref_px = (
+        getattr(zone, "top", None)
+        if (zone is not None and dir_up == "BUY")
+        else (getattr(zone, "bottom", None) if zone is not None else single_price)
+    )
+    if not isinstance(ref_px, (int, float)) or isinstance(ref_px, bool):
+        return False
+    if dir_up == "BUY":
+        ask = getattr(tick, "ask", None)
+        return isinstance(ask, (int, float)) and not isinstance(ask, bool) and float(ask) > float(ref_px)
+    if dir_up == "SELL":
+        bid = getattr(tick, "bid", None)
+        return isinstance(bid, (int, float)) and not isinstance(bid, bool) and float(bid) < float(ref_px)
+    return False
+
+
+def _compute_initial_tp1_guard_armed(
+    tick: Any,
+    direction: str,
+    raw_tp1: Optional[float],
+    has_market: bool,
+) -> bool:
+    """
+    Arm live-price TP1 invalidation immediately when market positions exist or live price starts
+    on the pre-TP1 side. When a deep BUY/SELL LIMIT starts with live price already beyond TP1,
+    wait until price moves back across TP1 toward the limit zone before arming invalidation.
+    """
+    if has_market or raw_tp1 is None or not tick:
+        return True
+    try:
+        tp_val = float(raw_tp1)
+    except (TypeError, ValueError):
+        return True
+    dir_up = str(direction or "").upper()
+    if dir_up == "BUY":
+        ask = getattr(tick, "ask", None)
+        if isinstance(ask, (int, float)) and not isinstance(ask, bool):
+            return float(ask) < tp_val
+    elif dir_up == "SELL":
+        bid = getattr(tick, "bid", None)
+        if isinstance(bid, (int, float)) and not isinstance(bid, bool):
+            return float(bid) > tp_val
+    return True
+
+
 def _normalize_task_msg_id(msg_id: Any, chat_id: Optional[int | str] = None) -> Tuple[Any, Optional[int | str]]:
     """Unpack composite 'chat_id:msg_id' or tuple keys into (numeric/raw msg_id, chat_id)."""
     if isinstance(msg_id, tuple) and len(msg_id) == 2:
@@ -1338,15 +1393,39 @@ async def tp1_proximity_watcher_task() -> None:
                 tp1_hit = (curr_price >= raw_tp1) if direction == "BUY" else (curr_price <= raw_tp1)
 
                 # Improvement #1 / Trigger 2: If 0 market positions filled and pending limits remain,
-                # invalidate immediately once live market price reaches raw_tp1 (bid or ask).
+                # invalidate once live market price reaches raw_tp1 (when pre-TP1 guard is armed).
                 if not sig.get("market_tickets"):
                     pd_tkts = list(sig.get("pending_tickets", []))
-                    if pd_tkts and _tick_hit_tp1(tick, direction, raw_tp1):
-                        await invalidate_signal_tp1(
-                            msg_id,
-                            reason="Market Price Reached TP1",
-                            chat_id=sig.get("chat_id"),
-                        )
+                    if pd_tkts:
+                        if not sig.get("tp1_guard_armed", True):
+                            entry_ref = None
+                            z = sig.get("zone")
+                            if isinstance(z, dict):
+                                entry_ref = z.get("top") if direction == "BUY" else z.get("bottom")
+                            elif isinstance(sig.get("layers"), dict):
+                                entry_ref = sig["layers"].get("TOP", {}).get("target_price")
+                            margin = (
+                                min(1.5, abs(float(raw_tp1) - float(entry_ref)) * 0.5)
+                                if isinstance(entry_ref, (int, float))
+                                else 0.5
+                            )
+                            if direction == "BUY":
+                                ask_val = getattr(tick, "ask", None)
+                                if isinstance(ask_val, (int, float)) and not isinstance(ask_val, bool) and float(ask_val) <= round(float(raw_tp1) - margin, 2):
+                                    sig["tp1_guard_armed"] = True
+                                    state_mgr.update_signal(msg_id, {"tp1_guard_armed": True}, chat_id=sig.get("chat_id"))
+                            elif direction == "SELL":
+                                bid_val = getattr(tick, "bid", None)
+                                if isinstance(bid_val, (int, float)) and not isinstance(bid_val, bool) and float(bid_val) >= round(float(raw_tp1) + margin, 2):
+                                    sig["tp1_guard_armed"] = True
+                                    state_mgr.update_signal(msg_id, {"tp1_guard_armed": True}, chat_id=sig.get("chat_id"))
+
+                        if sig.get("tp1_guard_armed", True) and _tick_hit_tp1(tick, direction, raw_tp1):
+                            await invalidate_signal_tp1(
+                                msg_id,
+                                reason="Market Price Reached TP1",
+                                chat_id=sig.get("chat_id"),
+                            )
                     continue
 
                 if tp1_hit:
@@ -1811,6 +1890,8 @@ async def handle_new_message(event):
             direction=direction,
             raw_tp1=parsed.raw_tp1,
             sl=sl,
+            zone=zone,
+            single_price=parsed.single_price,
         )
         if not passed:
             logger.warning(f"Pre-flight safety check failed for Msg ID {msg_id}: {reason}")
@@ -1830,6 +1911,7 @@ async def handle_new_message(event):
         max_orders = MAX_ORDERS_PER_SIGNAL
         prev_lots = executor.get_total_active_lots()["total_lots"]
 
+        initial_price = None
         if parsed.is_zone and zone:
             # Case 1: Two-Price Zone (e.g. Buy 3895-3887) -> 3 layers (0.01 / 0.01 / 0.02)
             market_tickets, pending_tickets, layers_data = executor.execute_3layer_zone(
@@ -1858,10 +1940,35 @@ async def handle_new_message(event):
             zone_completed = False
             is_zone = False
             max_orders = 1
+        elif float(SELL_NOW_DELAY_SECONDS) <= 0.0:
+            # Case 3 (Immediate mode, SELL_NOW_DELAY_SECONDS == 0): execute 0.01 market order immediately
+            now_tick = executor.get_tick(symbol)
+            initial_price = _get_live_entry_price(now_tick, direction)
+            top_lot = LAYER_LOTS.get("TOP", 0.01)
+            t1 = executor.execute_market_order(
+                symbol=symbol,
+                direction=direction,
+                lot=top_lot,
+                sl=sl,
+                tp=final_tp,
+                comment="TG Layer 1 (Market Now)",
+            )
+            if t1:
+                market_tickets = [t1]
+                layers_data = {
+                    "TOP": {
+                        "lot": top_lot,
+                        "target_price": None,
+                        "ticket": t1,
+                        "order_type": "MARKET",
+                        "status": "OPEN",
+                    }
+                }
+            zone_completed = False
+            is_zone = False
+            max_orders = 1
         else:
-            # Case 3: Instant market entry without price ("Buy now" / "Sell now")
-            # Snapshot live entry price at arrival (bid for SELL, ask for BUY),
-            # then wait SELL_NOW_DELAY_SECONDS while polling for zone edits or TP1 invalidation.
+            # Case 3 (Delayed mode, SELL_NOW_DELAY_SECONDS > 0): snapshot entry & hold for timer
             now_tick = executor.get_tick(symbol)
             initial_price = _get_live_entry_price(now_tick, direction)
 
@@ -1925,6 +2032,10 @@ async def handle_new_message(event):
             )
             return
 
+        arm_tick = executor.get_tick(symbol)
+        tp1_guard_armed = _compute_initial_tp1_guard_armed(
+            arm_tick, direction, parsed.raw_tp1, bool(market_tickets)
+        )
         state_mgr.create_signal(
             message_id=msg_id,
             chat_id=chat_id,
@@ -1946,6 +2057,9 @@ async def handle_new_message(event):
             final_tp=final_tp,
             proximity_close_price=parsed.proximity_close_price,
             raw_text=raw_text,
+            initial_price=initial_price,
+            recorded_entry_price=initial_price,
+            tp1_guard_armed=tp1_guard_armed,
         )
 
         new_lots = executor.get_total_active_lots()["total_lots"]
@@ -2087,8 +2201,11 @@ async def handle_message_edited(event):
 
     # Handle edit arriving during Sell Now / Buy Now delay window
     if curr_status in ("PENDING", "PENDING_DELAY"):
-        # If the edit provides a TP1 that live price has ALREADY reached, invalidate and do not enter!
-        if raw_tp1 is not None and tick and _tick_hit_tp1(tick, direction, raw_tp1):
+        is_pending_pullback = _is_strictly_pending_limit_setup(
+            tick, direction, zone=parsed.zone, single_price=parsed.single_price
+        )
+        # If the edit provides a TP1 that live price has ALREADY reached (and not a deep pullback limit), invalidate
+        if not is_pending_pullback and raw_tp1 is not None and tick and _tick_hit_tp1(tick, direction, raw_tp1):
             await invalidate_signal_tp1(msg_id, reason="Market Price Reached TP1", chat_id=chat_id)
             state_mgr.update_signal(msg_id, {"raw_text": raw_text}, chat_id=chat_id)
             return
@@ -2098,6 +2215,8 @@ async def handle_message_edited(event):
                 direction=direction,
                 raw_tp1=raw_tp1,
                 sl=new_sl,
+                zone=parsed.zone,
+                single_price=parsed.single_price,
             )
             if not passed:
                 _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
@@ -2145,6 +2264,9 @@ async def handle_message_edited(event):
                     "layers": l_data,
                     "market_tickets": mk_tkts,
                     "pending_tickets": pd_tkts,
+                    "tp1_guard_armed": _compute_initial_tp1_guard_armed(
+                        executor.get_tick(symbol), direction, raw_tp1, bool(mk_tkts)
+                    ),
                     "raw_text": raw_text,
                 },
                 chat_id=chat_id,
@@ -2186,6 +2308,9 @@ async def handle_message_edited(event):
                     "layers": l_data,
                     "market_tickets": mk_tkts,
                     "pending_tickets": pd_tkts,
+                    "tp1_guard_armed": _compute_initial_tp1_guard_armed(
+                        executor.get_tick(symbol), direction, raw_tp1, bool(mk_tkts)
+                    ),
                     "raw_text": raw_text,
                 },
                 chat_id=chat_id,
@@ -3187,6 +3312,11 @@ async def main():
 
     logger.info("Copier event handlers registered. Starting Telethon client...")
     await telethon_client.start()
+    try:
+        # Warm Telegram entity/channel access_hash cache so all monitored CHANNEL_IDS receive live updates
+        await telethon_client.get_dialogs(limit=100)
+    except Exception as dlg_err:
+        logger.debug(f"Telethon dialog cache warmup note: {dlg_err}")
     logger.info("Telegram Copier is LIVE and actively listening for signals!")
 
     # Start 1-second TP1 Proximity Watcher in background

@@ -102,13 +102,15 @@ REACTIVATE_PATTERNS = [
 _TP1_TARGET_RE = r"(?:tp(?:\s*#?\s*1)?|target\s*#?\s*1|take\s*profit\s*#?\s*1|(?:first|1st)\s+(?:tp|target|take\s*profit))"
 _TP1_VERB_RE = r"(?:hit|hits|hitted|smashed|reached|done|cleared|achieved|completed|complete|taken|banked|secured|booked|touched|tagged|crushed)"
 _TP1_AUX_RE = r"(?:(?:was|is|got|just|has\s+been|have\s+been)\s+)?"
-_TP1_NOT_PRICE_AFTER = r"(?!\s*[:=@\-]?\s*\d{3,6}(?:\.\d+)?\b(?!\s*pips?\b))"
+_TP1_NOT_PRICE_AFTER = r"(?!\s*(?:[:=@\-]|[\u2600-\U0001FAFF])?\s*\d{3,6}(?:\.\d+)?\b(?!\s*pips?\b))"
+_TP1_EMOJI_RE = r"[✅✔️☑️💥🔥🚀🎯💰👏🎉🏆💵🤑]+"
 
 TP1_HIT_REPLY_PATTERNS = [
     rf"(?i)\b{_TP1_TARGET_RE}\s*{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
     rf"(?i)\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{_TP1_TARGET_RE}\b",
-    rf"(?i)\b{_TP1_TARGET_RE}\s*[✅✔️☑️]+{_TP1_NOT_PRICE_AFTER}",
-    rf"(?i)[✅✔️☑️]+\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
+    rf"(?i)\b{_TP1_TARGET_RE}{_TP1_NOT_PRICE_AFTER}\s*{_TP1_EMOJI_RE}\s*(?:\+?\s*\d{{1,4}}\s*pips?\b)?",
+    rf"(?i){_TP1_EMOJI_RE}\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
+    rf"(?i)\b{_TP1_TARGET_RE}\s*\+?\s*\d{{1,4}}\s*pips?\b",
 ]
 
 _TP1_NEGATION_RE = re.compile(
@@ -131,9 +133,9 @@ def is_tp1_hit_message(text: Optional[str]) -> bool:
 # GATE 4 SIGNAL EXTRACTION PATTERNS
 # ---------------------------------------------------------------------------
 
-# Expanded direction verbs supporting limits and stops
+# Expanded direction verbs supporting singular/plural limits and stops
 DIRECTION_PATTERN = re.compile(
-    r"\b(buy\s+limit|sell\s+limit|buy\s+stop|sell\s+stop|buy|sell|long|short)\b",
+    r"\b(buy\s+limits?|sell\s+limits?|buy\s+stops?|sell\s+stops?|buy|sell|long|short)\b",
     re.IGNORECASE,
 )
 
@@ -143,15 +145,15 @@ ZONE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Single price entry (e.g. "Buy limit 3920" or "Sell 3920")
+# Single price entry (e.g. "Buy limit 3920", "Buy xauusd limit 3840", "Sell limits @ 3860")
 SINGLE_PRICE_PATTERN = re.compile(
-    r"\b(?:buy\s+limit|sell\s+limit|buy\s+stop|sell\s+stop|buy|sell|long|short|entry|price)\s*[@:=]?\s*(\d{2,6}(?:\.\d+)?)",
+    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?(?:\s+(?:limits?|stops?))?|(?:limits?|stops?|entry|entries|zone|price))\s*(?:(?:at|around|near|zone|area|@|:|=|-)\s*)*(\d{2,6}(?:\.\d+)?)\b(?!\s*(?:pips?|%|lots?)\b)",
     re.IGNORECASE,
 )
 
-# Take Profit pattern: TP1, TP#1, Target 1, etc.
+# Take Profit pattern: TP1, TP 1, TP#1, Target 1, etc. (never matching 'TP1💥50 PIPs')
 TP_PATTERN = re.compile(
-    r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s+)|\s+([1-9])\s*[:=@\-\.]\s*|\s*[:=@\-]?\s*)(\d{2,6}(?:\.\d+)?)",
+    r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 
@@ -451,12 +453,24 @@ def gate_4_extract_signal(
     # 2. Symbol resolution - defaults straight to XAUUSD
     symbol = DEFAULT_SYMBOL
 
-    # 3. Entry Zone & Price Split
-    clean_lines = [
-        line.strip()
-        for line in text.splitlines()
-        if not re.match(r"^(?:tp\d*|sl|stop|take)\b", line.strip(), re.IGNORECASE)
-    ]
+    # 3. Entry Zone & Price Split (strip standalone TP/SL lines and inline trailing TP/SL clauses)
+    clean_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or re.match(
+            r"^(?:tp\d*|sl|stop\s*loss|stoploss|stop|take\s*profit|target\d*)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            continue
+        entry_part = re.split(
+            r"\b(?:tp\d*|take\s*profit\d*|target\d*|sl|stop\s*loss|stoploss)\b",
+            stripped,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        if entry_part:
+            clean_lines.append(entry_part)
     zone_search_text = " \n ".join(clean_lines)
 
     zone_match = ZONE_PATTERN.search(zone_search_text)
@@ -464,6 +478,7 @@ def gate_4_extract_signal(
     single_price = None
     is_zone = False
     is_instant_now = False
+    is_limit_order = bool(re.search(r"\b(?:limits?|buy\s+limits?|sell\s+limits?)\b", zone_search_text, re.IGNORECASE))
     max_orders = MAX_ORDERS_PER_SIGNAL
 
     if zone_match:
@@ -484,8 +499,31 @@ def gate_4_extract_signal(
         else:
             zone_match = None
 
+    # Multi-line / comma / '&' / repeated-limit entry extraction (e.g. "Buy limits:\n3840\n3830", "Buy limits 3840 & 3830")
+    distinct_levels: List[float] = []
     if not is_zone:
-        # Check for single-price entry limit (e.g. "Sell limit 3920" or "Buy 3895")
+        for num_m in re.finditer(
+            r"(?<![.\d])(\d{3,6}(?:\.\d+)?)(?![.\d])(?!\s*(?:pips?|%|lots?|x)\b)",
+            zone_search_text,
+            re.IGNORECASE,
+        ):
+            val = round(float(num_m.group(1)), 2)
+            if val >= 100.0 and val not in distinct_levels:
+                distinct_levels.append(val)
+        if len(distinct_levels) >= 2 and (max(distinct_levels) - min(distinct_levels)) <= 100.0:
+            top_price = max(distinct_levels)
+            bottom_price = min(distinct_levels)
+            mid_price = round((top_price + bottom_price) / 2.0, 2)
+            entry_tiers = {
+                "top": top_price,
+                "mid": mid_price,
+                "bottom": bottom_price,
+            }
+            is_zone = True
+            max_orders = 3
+
+    if not is_zone:
+        # Check for single-price entry limit (e.g. "Sell limit 3920", "Buy xauusd limit 3840", "Buy limits 3840")
         single_match = SINGLE_PRICE_PATTERN.search(zone_search_text)
         if single_match:
             price = float(single_match.group(1))
@@ -493,6 +531,10 @@ def gate_4_extract_signal(
                 single_price = round(price, 2)
                 is_zone = False
                 max_orders = 1  # Locked to 1 order for single-price entries
+        elif len(distinct_levels) == 1:
+            single_price = distinct_levels[0]
+            is_zone = False
+            max_orders = 1
         else:
             # No zone or single price found -> instant market entry ("Buy now")
             is_instant_now = True
@@ -532,6 +574,7 @@ def gate_4_extract_signal(
         "direction": direction,
         "is_zone": is_zone,
         "is_instant_now": is_instant_now,
+        "is_limit_order": is_limit_order,
         "single_price": single_price,
         "layer_lots": LAYER_LOTS,
         "max_orders": max_orders,

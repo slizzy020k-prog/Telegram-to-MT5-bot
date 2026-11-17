@@ -365,19 +365,21 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 
 ---
 
-## 10. Latest Behaviour Updates (v2.2)
+## 10. Latest Behaviour Updates (v2.2.2)
 
-### Recorded Market Point, Post-Delay Price Guard & Dual TP1 Invalidation
-- Unpriced **`"Sell now"`** and **`"Buy now"`** snapshot `initial_price` (`tick.bid` for SELL, `tick.ask` for BUY), `tp1_price`, `is_zone_order=False`, and `chat_id` (multi-channel `(chat_id, message_id)` collision isolation) with `status = "PENDING"`, then wait `SELL_NOW_DELAY_SECONDS` (`20s`).
-- **Dual TP1 Invalidation (`INVALIDATED_TP1`):**
-  - **Trigger 1 — Telegram Reply / Edit / Alert:** If a reply (`"TP1 hit"`, `"Tp1 ✅"`, etc.) or edit arrives while delayed (`PENDING`) or while zone limit orders remain unfilled, immediately aborts the delay and removes unfilled pending orders via `mt5.TRADE_ACTION_REMOVE` (without closing already-filled active positions), logging `[TP1 INVALIDATED]`.
-  - **Trigger 2 — Live MT5 Market Price Check:** Polls `executor.get_tick()` every `DELAYED_POLL_INTERVAL_SECONDS` (`0.25s`) during the delay and every `1.0s` while zone limit orders remain unfilled; if live `bid`/`ask` reaches `tp1_price` (`BUY` `>= TP1`, `SELL` `<= TP1`), immediately invalidates (`INVALIDATED_TP1`) and removes pending limits via `TRADE_ACTION_REMOVE`.
-- **Zone / Limit Edit within the Delay:** Cancels the timer and runs `executor.check_preflight()` before placing the 3-layer zone or single limit order.
-- **Post-Delay Price Validation (`T = delay_seconds`):**
-  - **SELL NOW:** Executes iff post-delay `bid >= initial_price`; if `bid < initial_price`, aborts immediately (`ABORTED_PRICE_GUARD`) to avoid selling late after a dump.
-  - **BUY NOW:** Executes iff post-delay `ask <= initial_price`; if `ask > initial_price`, aborts immediately (`ABORTED_PRICE_GUARD`) to avoid buying the top after a spike.
-  - Logs `[PRICE GUARD] {symbol} | {direction} | Initial: {X} | Post-Delay: {Y} | Action: EXECUTED/ABORTED`.
-- **Thread/Async Safety (`MT5Executor._mt5_lock`):** All `MetaTrader5` API calls across the codebase run exclusively through `MT5Executor` protected by a re-entrant `threading.RLock`.
+### Immediate Market Execution (`SELL_NOW_DELAY_SECONDS=0`) & Optional Delay Price Guard
+- **`SELL_NOW_DELAY_SECONDS = 0` (Default):** Unpriced **`"Buy now"`** / **`"Sell now"`** / **`"Buy xauusd now"`** signals execute **immediately** (`0.01` lot market entry inside `handle_new_message`, `status = "ACTIVE"`) as soon as the message arrives, with zero timer wait. Follow-up zone edits seamlessly attach Layers 2 & 3 limits.
+- **Optional Post-Delay Price Guard (`SELL_NOW_DELAY_SECONDS > 0`):** When a delay is configured, signals snapshot `initial_price`, `tp1_price`, `is_zone_order=False`, and `chat_id` (`(chat_id, message_id)` collision isolation) with `status = "PENDING"`, validate post-delay price direction (`SELL`: `bid >= initial_price`, `BUY`: `ask <= initial_price`), or invalidate on TP1 hit.
+
+### Guaranteed BUY LIMIT / SELL LIMIT Activation & Exact TP1 Extraction
+- **Expanded Limit & Zone Parsing (`parser.py`):** Supports `BUY LIMIT`, `SELL LIMIT`, plural `BUY LIMITS` / `SELL LIMITS`, symbol-in-between formats (`Buy xauusd limit 3840`, `Sell xauusd limit at 3860`), multi-line / `&`-separated limits (`Buy limits 3840 & 3830`, `Sell limits:\n3860\n3870`), spaced `TP 1 3843` targets, and emoji+pips TP1 triggers like **`"TP1💥50 PIPs"`** (without mistaking `50` pips for a TP price).
+- **Pending Limit Pre-Flight & Pre-TP1 Watcher Survival (`mt5_executor.py`, `main.py`):**
+  - `check_preflight()` recognizes strictly pending limit setups (`BUY LIMIT` below `ask` / `SELL LIMIT` above `bid`) so valid pending limits whose `TP1` sits between live market and the limit zone are **not** falsely rejected as `"within 20 pips of TP1"`.
+  - `_compute_initial_tp1_guard_armed()` + `tp1_proximity_watcher_task()` defer live-price TP1 invalidation until price crosses back toward the pending limit zone, preventing fresh `BUY LIMIT` / `SELL LIMIT` orders from being prematurely deleted.
+  - Broker `trade_stops_level` (`10016 Invalid stops`) boundary fallback (`_place_limit_with_stops_fallback`) routes to market execution if live price touches/crosses within broker stops distance of a limit tier.
+- **Dual TP1 Invalidation (`INVALIDATED_TP1`) & Thread Safety (`_mt5_lock`):**
+  - Both Telegram reply/edit triggers (`"TP1 hit"`, `"TP1💥50 PIPs"`, `"Tp1 ✅"`) and armed live MT5 tick triggers remove unfilled pending limits cleanly via `mt5.TRADE_ACTION_REMOVE` without touching already-filled active positions.
+  - All `MetaTrader5` API calls across the codebase run exclusively through `MT5Executor` protected by `threading.RLock`, plus `telethon_client.get_dialogs(limit=100)` warms channel entity caches on startup/reconnect.
 
 ### `"close worst entries now and hold layers"`
 - Ranks open positions by live profit, moves the **worst** one(s) to breakeven (+`BE_OFFSET_PIPS`) and leaves the **top two (bottom layers)** running.
@@ -408,4 +410,4 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 - **Realized-Only Daily Loss Limit (`/set_daily_loss`, `/status_daily_loss`, `dailyloss` in Saved Messages):** Set via `/set_daily_loss 150` or `dailyloss` -> `£150` (disable with `off`/`0`). Uses `get_realized_today_pnl()` (broker-server trading day closed `DEAL_TYPE_BUY`/`DEAL_TYPE_SELL` deals `OUT`/`INOUT`/`OUT_BY` summing `profit + swap + commission + fee` — excluding balance/credit deals and **never** triggered by open floating drawdown). Once realized P&L reaches `-limit`, sets `TRADING_HALTED = True`, cancels all pending MT5 limit/stop orders via `mt5.orders_get()` + `TRADE_ACTION_REMOVE`, posts `🛑 DAILY LOSS LIMIT HIT` to Saved Messages, disconnects Telethon, calls `mt5.shutdown()`, and exits via `sys.exit(0)` (stopping the `.bat` supervisor loop). Relaunching on the same broker day enters `LOCKED` mode until next trading day or `dailyloss off`.
 
 ### Tests
-`python -m pytest -v` -> 72 tests (including 6 Spec compliance tests in `tests/test_spec_upgrade.py`).
+`python -m pytest -v` -> 75 tests (including 9 Spec & Buy/Sell Limit compliance tests in `tests/test_spec_upgrade.py`).

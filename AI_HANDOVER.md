@@ -1,6 +1,6 @@
 # AI Handover & Architecture Reference (`AI_HANDOVER.md`)
 
-This document provides a complete technical handover for any AI coding agent or developer maintaining or extending the **Telegram-to-MT5 Autonomous XAUUSD Copier Pro (v2.1)**.
+This document provides a complete technical handover for any AI coding agent or developer maintaining or extending the **Telegram-to-MT5 Autonomous XAUUSD Copier Pro (v2.2.2)**.
 
 ---
 
@@ -32,7 +32,7 @@ This document provides a complete technical handover for any AI coding agent or 
 | `state_manager.py` | Thread-safe `StateManager` persisting `signals_state.json` via atomic `.tmp` file replacement (`_save_state_locked`). |
 | `main.py` | Async Telethon listener (`handle_new_message`, `handle_message_edited`, `handle_saved_messages_command`), 20s `"Sell now"` timer (`_delayed_sell_now_task`), live console title/log monitor (`update_live_terminal_status`), and 1-second background watcher (`tp1_proximity_watcher_task`). |
 | `start_copier.bat` | Windows batch supervisor with `color 0E` styling and a 5-second auto-restart loop (requires CRLF `\r\n` line endings and no unescaped `|` characters). |
-| `tests/` | 57-test `pytest` suite (`pytest tests -o pythonpath=. -v`) covering parser gates, 3-layer execution, edits, TP1 scaling, runner trailing, notifications, risk guide caps, and daily drawdown cut-offs. |
+| `tests/` | 75-test `pytest` suite (`python -m pytest -v`) covering parser gates, 3-layer BUY/SELL LIMIT zones, immediate (`0s`) & optional delayed execution, TP1/TP2 scaling, notifications, risk guide caps, and realized daily loss cut-offs. |
 
 ---
 
@@ -56,16 +56,15 @@ This document provides a complete technical handover for any AI coding agent or 
 
 ---
 
-### B. Recorded Market Point, Post-Delay Price Guard & Dual TP1 Invalidation (`"Sell now"` / `"Buy now"` / Zones)
-- Both unpriced **`"Sell now"`** and **`"Buy now"`** record `chat_id`, `status = "PENDING"`, `initial_price` (`recorded_entry_price`), `tp1_price` (`raw_tp1`), `is_zone_order=False`, `mt5_order_tickets=[]`, and spawn `_delayed_sell_now_task(msg_id, chat_id=chat_id)` tracked per `(chat_id, msg_id)`.
-- `StateManager._resolve_key()` avoids collisions across multiple channels posting identical `message_id`s by indexing `(chat_id, msg_id)` first (`f"{chat_id}:{msg_id}"` on cross-channel conflicts).
-- **Dual TP1 Invalidation (`invalidate_signal_tp1()` -> `status = "INVALIDATED_TP1"`):**
-  - **Trigger 1 (Telegram Reply/Edit/Alert):** Replies (`event.is_reply`) or edits matching `"TP1 hit"` on a delayed (`PENDING`) or unfilled zone signal abort the delay and remove pending limits via `mt5.TRADE_ACTION_REMOVE` (never closing already-filled positions), logging `[TP1 INVALIDATED] {symbol} | Reason: {reason} | Setup Deleted.`.
-  - **Trigger 2 (Live MT5 Tick):** `_delayed_sell_now_task` polls every `DELAYED_POLL_INTERVAL_SECONDS` (`0.25s`, scaled cleanly in tests) and `tp1_proximity_watcher_task` monitors unfilled zone limits every `1s`; if `tp1_price` is reached (`BUY` `bid >= tp1 or ask >= tp1`; `SELL` `ask <= tp1 or bid <= tp1`), immediately calls `invalidate_signal_tp1(..., reason="Market Price Reached TP1")`.
-- **If edited with a zone or limit price within the delay:** Cancels timer, runs `executor.check_preflight()`, and places the 3-layer zone or single limit order (`status = "ACTIVE"`).
-- **Post-Delay Price Validation (`NOW_PRICE_GUARD_ABORT_ON_MISMATCH = True`):**
-  - At `T = delay_seconds`, fetches fresh tick (`current_price`). `SELL` executes iff `bid >= initial_price` (else aborts immediately with `status = "ABORTED_PRICE_GUARD"`); `BUY` executes iff `ask <= initial_price` (else aborts immediately). Logs `[PRICE GUARD] {symbol} | {direction} | Initial: {X} | Post-Delay: {Y} | Action: EXECUTED|ABORTED`.
-- On startup in `main()`, any orphaned `PENDING` / `PENDING_DELAY` records from a prior run are closed safely. All `MetaTrader5` API calls across the codebase run through `MT5Executor._mt5_lock` (`threading.RLock`).
+### B. Immediate Execution (`SELL_NOW_DELAY_SECONDS=0`), Optional Delay Guard & Buy/Sell Limit Activation
+- **Immediate Execution Default (`SELL_NOW_DELAY_SECONDS = 0`):** Unpriced **`"Sell now"`** / **`"Buy now"`** signals execute immediately inside `handle_new_message` (`0.01` Market order, `status = "ACTIVE"`) with zero timer delay. Follow-up zone edits attach Layers 2 & 3 limits seamlessly.
+- **Optional Delay Price Guard (`SELL_NOW_DELAY_SECONDS > 0`):** Snapshots `chat_id`, `status = "PENDING"`, `initial_price`, `tp1_price`, `is_zone_order=False`, and validates post-delay price (`SELL`: `bid >= initial_price`; `BUY`: `ask <= initial_price`) or aborts with `ABORTED_PRICE_GUARD`.
+- **Buy/Sell Limit Parsing, Pre-Flight & Pre-TP1 Watcher Guard:**
+  - `parser.py` handles `BUY LIMIT`, `SELL LIMIT`, plural `BUY LIMITS` / `SELL LIMITS`, symbol-in-between limits (`Buy xauusd limit 3840`), `&`/newline-separated multi-limits, spaced `TP 1 <price>`, and `"TP1💥50 PIPs"` triggers (without extracting `50` as a TP price).
+  - `MT5Executor.check_preflight()` permits pending `BUY LIMIT` (`ask > entry_top`) and `SELL LIMIT` (`bid < entry_bottom`) setups whose `raw_tp1` lies between current market and the pending zone; `_place_limit_with_stops_fallback()` falls back to Market entry if broker `trade_stops_level` (`10016 Invalid stops`) triggers on a boundary tick.
+  - `_compute_initial_tp1_guard_armed()` + `tp1_proximity_watcher_task()` defer live-price TP1 invalidation until price crosses back toward the pending limit zone (`tp1_guard_armed=False` -> `True`).
+- **Dual TP1 Invalidation (`invalidate_signal_tp1()` -> `status = "INVALIDATED_TP1"`):** Replies/edits matching `is_tp1_hit_message()` or armed live MT5 ticks remove unfilled pending limits via `mt5.TRADE_ACTION_REMOVE` without touching already-filled active positions.
+- **Entity Cache & Thread Safety:** `StateManager._resolve_key()` isolates `(chat_id, msg_id)` across channels, `telethon_client.get_dialogs(limit=100)` warms channel `access_hash` caches on startup, and all `MetaTrader5` API calls serialize through `MT5Executor._mt5_lock` (`threading.RLock`).
 
 ---
 

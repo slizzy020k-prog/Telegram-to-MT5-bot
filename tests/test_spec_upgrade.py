@@ -559,3 +559,206 @@ async def test_spec_6_multichannel_chat_id_message_id_collision_isolation(tmp_pa
     finally:
         main.SELL_NOW_DELAY_SECONDS = orig_delay
         _reset_main(tmp_path, "spec6_cleanup.json")
+
+
+@pytest.mark.asyncio
+async def test_spec_7_zero_delay_immediate_now_execution(tmp_path):
+    """When SELL_NOW_DELAY_SECONDS=0, Buy/Sell now execute immediately with 0 pending timer."""
+    _reset_main(tmp_path, "spec7.json")
+    tick_ref = {"tick": SimpleNamespace(bid=3850.20, ask=3850.70, time=1794886034)}
+    env = _build_mock_mt5_env(tick_ref, order_counter_start=7000)
+
+    orig_delay = main.SELL_NOW_DELAY_SECONDS
+    main.SELL_NOW_DELAY_SECONDS = 0.0
+    for p in env["patches"]:
+        p.start()
+    try:
+        main.executor = MT5Executor(dry_run=False)
+        main.executor.connect()
+
+        # 1. Immediate Buy now -> enters Market BUY on arrival without PENDING timer
+        await main.handle_new_message(_make_event(701, "Buy xauusd now\nSL 3835\nTP 3860"))
+        assert main._pending_sell_now_tasks == {}
+        s_buy = main.state_mgr.get_signal(701)
+        assert s_buy is not None
+        assert s_buy["status"] == "ACTIVE"
+        assert len(s_buy["market_tickets"]) == 1
+        assert s_buy["pending_tickets"] == []
+
+        # 2. Immediate Sell now -> enters Market SELL immediately
+        await main.handle_new_message(_make_event(702, "Sell now"))
+        assert main._pending_sell_now_tasks == {}
+        s_sell = main.state_mgr.get_signal(702)
+        assert s_sell is not None
+        assert s_sell["status"] == "ACTIVE"
+        assert len(s_sell["market_tickets"]) == 1
+
+        # 3. Follow-up zone edit seamlessly places Layers 2 & 3 limits
+        await main.handle_message_edited(_make_event(702, "Sell 3850-3855\nSL 3865\nTP 3840"))
+        s_edit = main.state_mgr.get_signal(702)
+        assert len(s_edit["market_tickets"]) + len(s_edit["pending_tickets"]) == 3
+    finally:
+        main.SELL_NOW_DELAY_SECONDS = orig_delay
+        for p in reversed(env["patches"]):
+            p.stop()
+        _reset_main(tmp_path, "spec7_cleanup.json")
+
+
+def test_spec_8_buy_sell_limit_variants_and_tp1_extraction():
+    """Verify all Buy/Sell Limit (singular/plural/spaced/multiline) and TP1 patterns."""
+    from parser import parse_message, is_tp1_hit_message, extract_tps
+
+    # 1. Channel signal style: double spaces + BUY LIMIT zone + multi-TP
+    p1 = parse_message(
+        "BUY LIMIT  3840-3830\nSL 3820 \nTP 3843\nTP 3850\nTP 3853",
+        message_id=12972,
+        live_price=3850.0,
+    )
+    assert p1 is not None and p1.is_zone is True and p1.direction == "BUY"
+    assert p1.entry_tiers == {"top": 3840.0, "mid": 3835.0, "bottom": 3830.0}
+    assert p1.raw_tp1 == 3843.0 and p1.final_tp == 3842.5 and p1.sl == 3820.0
+
+    # 2. SELL LIMIT zone
+    p2 = parse_message("SELL LIMIT  3860-3870\nSL 3880\nTP 3857\nTP 3850", message_id=12973, live_price=3850.0)
+    assert p2 is not None and p2.is_zone is True and p2.direction == "SELL"
+    assert p2.entry_tiers == {"top": 3870.0, "mid": 3865.0, "bottom": 3860.0}
+    assert p2.raw_tp1 == 3857.0 and p2.final_tp == 3857.5 and p2.sl == 3880.0
+
+    # 3. Symbol between Buy/Sell and limit
+    p3 = parse_message("Buy xauusd limit 3840\nSL 3820\nTP 3850", message_id=12974, live_price=3850.0)
+    assert p3 is not None and p3.single_price == 3840.0 and p3.is_instant_now is False and p3.direction == "BUY"
+
+    p4 = parse_message("Sell xauusd limit at 3860\nSL 3875\nTP 3850", message_id=12975, live_price=3850.0)
+    assert p4 is not None and p4.single_price == 3860.0 and p4.is_instant_now is False and p4.direction == "SELL"
+
+    # 4. Plural limits with & / newline + "TP 1 3843" spaced TP1
+    p5 = parse_message("Buy limits 3840 & 3830\nSL 3820\nTP 1 3843", message_id=12976, live_price=3850.0)
+    assert p5 is not None and p5.is_zone is True
+    assert p5.entry_tiers == {"top": 3840.0, "mid": 3835.0, "bottom": 3830.0}
+    assert p5.raw_tp1 == 3843.0
+
+    p6 = parse_message("Sell limits:\n3860\n3870\nSL 3880\nTP 1 3850", message_id=12977, live_price=3845.0)
+    assert p6 is not None and p6.is_zone is True and p6.direction == "SELL"
+    assert p6.entry_tiers == {"top": 3870.0, "mid": 3865.0, "bottom": 3860.0}
+    assert p6.raw_tp1 == 3850.0
+
+    # 5. "TP1💥50 PIPs" triggers TP1 hit without being misparsed as price 50
+    assert is_tp1_hit_message("TP1💥50 PIPs") is True
+    assert extract_tps("TP1💥50 PIPs") == []
+    assert is_tp1_hit_message("TP3💥380 PIPs") is False
+    assert is_tp1_hit_message("TP1 🎯 3850") is False
+    tp1_mgmt = parse_message("TP1💥50 PIPs", message_id=9688, is_reply=True, reply_to_msg_id=9687)
+    assert tp1_mgmt is not None and tp1_mgmt.management_action == "ACTION_TP1_HIT_REPLY"
+
+
+@pytest.mark.asyncio
+async def test_spec_9_buy_limit_and_sell_limit_live_activation_and_stops_fallback(tmp_path):
+    """
+    Verify BUY LIMIT and SELL LIMIT with TP1 between limit & market:
+    - check_preflight PASSES (not falsely rejected for 'within 20 pips of TP1')
+    - All 3 LIMIT orders place cleanly on MT5
+    - tp1_proximity_watcher_task does NOT delete them immediately when price starts past TP1
+    - Once price crosses toward entry zone and bounces back to TP1 without fill, watcher invalidates
+    - Retcode 10016 (Invalid stops) right at entry boundary falls back to Market entry instead of dropping
+    """
+    _reset_main(tmp_path, "spec9.json")
+    tick_ref = {"tick": SimpleNamespace(bid=3850.23, ask=3850.75, time=1794886034)}
+    env = _build_mock_mt5_env(tick_ref, order_counter_start=9100)
+
+    for p in env["patches"]:
+        p.start()
+    try:
+        main.executor = MT5Executor(dry_run=False)
+        main.executor.connect()
+
+        # 1. BUY LIMIT 3840-3830, SL 3820, TP 3843 while live ask = 3850.75 (> TP1 3843)
+        await main.handle_new_message(
+            _make_event(9101, "BUY LIMIT  3840-3830\nSL 3820 \nTP 3843\nTP 3850", chat_id=-1003712081715)
+        )
+        s_buy = main.state_mgr.get_signal(9101, chat_id=-1003712081715)
+        assert s_buy is not None
+        assert s_buy["status"] == "ACTIVE"
+        assert len(s_buy["pending_tickets"]) == 3
+        assert s_buy["tp1_guard_armed"] is False
+
+        buy_reqs = [r for r in env["sent_requests"] if r.get("action") == mt5.TRADE_ACTION_PENDING and r.get("type") == mt5.ORDER_TYPE_BUY_LIMIT]
+        assert sorted(r["price"] for r in buy_reqs) == [3830.0, 3835.0, 3840.0]
+
+        for pt in s_buy["pending_tickets"]:
+            env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
+
+        # 2. SELL LIMIT 3860-3870, SL 3880, TP 3857 while live bid = 3850.23 (< TP1 3857)
+        await main.handle_new_message(
+            _make_event(9102, "SELL LIMIT 3860-3870\nSL 3880\nTP 3857\nTP 3850", chat_id=-1004369388188)
+        )
+        s_sell = main.state_mgr.get_signal(9102, chat_id=-1004369388188)
+        assert s_sell is not None
+        assert s_sell["status"] == "ACTIVE"
+        assert len(s_sell["pending_tickets"]) == 3
+        assert s_sell["tp1_guard_armed"] is False
+
+        sell_reqs = [r for r in env["sent_requests"] if r.get("action") == mt5.TRADE_ACTION_PENDING and r.get("type") == mt5.ORDER_TYPE_SELL_LIMIT]
+        assert sorted(r["price"] for r in sell_reqs) == [3860.0, 3865.0, 3870.0]
+
+        for pt in s_sell["pending_tickets"]:
+            env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
+
+        # 3. Single-price plural "Sell limits 3862"
+        await main.handle_new_message(
+            _make_event(9103, "Sell limits 3862\nSL 3875\nTP 3855", chat_id=-1004369388188)
+        )
+        s_single_sell = main.state_mgr.get_signal(9103, chat_id=-1004369388188)
+        assert s_single_sell is not None and len(s_single_sell["pending_tickets"]) == 1
+        for pt in s_single_sell["pending_tickets"]:
+            env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
+
+        # 4. Run watcher while tick stays at 3850.23/3850.75 -> NONE of the BUY/SELL limits get falsely killed!
+        watcher = asyncio.create_task(main.tp1_proximity_watcher_task())
+        try:
+            await asyncio.sleep(0.15)
+            assert main.state_mgr.get_signal(9101, chat_id=-1003712081715)["status"] == "ACTIVE"
+            assert main.state_mgr.get_signal(9102, chat_id=-1004369388188)["status"] == "ACTIVE"
+            assert main.state_mgr.get_signal(9103, chat_id=-1004369388188)["status"] == "ACTIVE"
+
+            # Now dip to 3841.0 (below 3843 TP1, near 3840 entry) -> arms BUY LIMIT guard, then bounce to 3843.2 -> invalidates 9101!
+            tick_ref["tick"] = SimpleNamespace(bid=3840.6, ask=3841.1, time=1794886035)
+            await asyncio.sleep(1.1)
+            assert main.state_mgr.get_signal(9101, chat_id=-1003712081715)["tp1_guard_armed"] is True
+
+            tick_ref["tick"] = SimpleNamespace(bid=3843.1, ask=3843.6, time=1794886036)
+            await asyncio.sleep(1.1)
+            assert main.state_mgr.get_signal(9101, chat_id=-1003712081715)["status"] == "INVALIDATED_TP1"
+            assert main.state_mgr.get_signal(9102, chat_id=-1004369388188)["status"] == "ACTIVE"
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
+
+        # 5. Stops-level (10016 Invalid stops) boundary fallback on limit -> Market order
+        tick_ref["tick"] = SimpleNamespace(bid=3850.20, ask=3850.75, time=1794886037)
+        orig_order_send = ex_mod.mt5.order_send
+        call_idx = {"n": 0}
+
+        def _stops_fail_then_market(req):
+            call_idx["n"] += 1
+            if req.get("action") == mt5.TRADE_ACTION_PENDING:
+                return SimpleNamespace(retcode=10016, order=0, comment="Invalid stops")
+            return orig_order_send(req)
+
+        with patch.object(ex_mod.mt5, "order_send", side_effect=_stops_fail_then_market):
+            mk, pd, layers = main.executor.execute_single_price_order(
+                symbol=DEFAULT_SYMBOL,
+                direction="BUY",
+                price=3850.60,
+                lot=0.01,
+                sl=3835.0,
+                final_tp=3860.0,
+            )
+            assert len(mk) == 1 and pd == []
+            assert layers["TOP"]["order_type"] == "MARKET"
+    finally:
+        for p in reversed(env["patches"]):
+            p.stop()
+        _reset_main(tmp_path, "spec9_cleanup.json")

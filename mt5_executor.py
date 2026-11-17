@@ -292,6 +292,8 @@ class MT5Executor:
         direction: str,
         raw_tp1: Optional[float] = None,
         sl: Optional[float] = None,
+        zone: Any = None,
+        single_price: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """
         Pre-Flight Safety Checks:
@@ -299,8 +301,9 @@ class MT5Executor:
         2. Algo Trading enabled & Daily Drawdown below 50% pause threshold.
         3. Trade mode full (market open) & valid live tick quote.
         4. Safe Price Window Check:
-           - Upper bound: not within 20 pips of TP1 (move not already finished).
-           - Lower bound: at least 20 pips away from SL.
+           - For immediate market / active zone entries: not within 20 pips of TP1 or < 20 pips from SL.
+           - For pending LIMIT setups away from market (BUY LIMIT below ask / SELL LIMIT above bid):
+             validates setup against entry zone instead of blocking when live price starts on the TP1 side.
         (Spread caps and signal concurrency limits disabled: all signals execute).
         """
         direction_norm = (direction or "BUY").strip().upper()
@@ -354,7 +357,28 @@ class MT5Executor:
         spread_points = round((ask - bid) / point, 1)
         logger.info(f"Pre-flight check: Current spread on {resolved} is {spread_points} points.")
 
-        # 3. Safe Price Window Check (Gold: 1 pip = 0.10 => 20 pips = 2.00 points)
+        # Determine if ALL planned orders are strictly pending limits away from live market
+        is_pending_limit = False
+        limit_ref = None
+        if zone is not None:
+            limit_ref = getattr(zone, "top", None) if direction_norm == "BUY" else getattr(zone, "bottom", None)
+        elif single_price is not None:
+            limit_ref = single_price
+
+        if isinstance(limit_ref, (int, float)) and not isinstance(limit_ref, bool):
+            if direction_norm == "BUY" and ask > float(limit_ref):
+                is_pending_limit = True
+            elif direction_norm == "SELL" and bid < float(limit_ref):
+                is_pending_limit = True
+
+        if is_pending_limit:
+            logger.info(
+                f"Pre-flight OK for pending {direction_norm} LIMIT @ {limit_ref} "
+                f"(live bid={bid}, ask={ask}, TP1={raw_tp1}, SL={sl})."
+            )
+            return True, "Pre-flight checks passed"
+
+        # 3. Safe Price Window Check for Market / Active Entries (Gold: 1 pip = 0.10 => 20 pips = 2.00 points)
         pip_size = self.get_pip_size(resolved)
         pip_20 = TP1_CLOSE_PROXIMITY_PIPS * pip_size
         sl_pip_20 = MIN_SL_BUFFER_PIPS * pip_size
@@ -663,6 +687,82 @@ class MT5Executor:
             return ticket
         return None
 
+    def _place_limit_with_stops_fallback(
+        self,
+        symbol: str,
+        direction: str,
+        target_price: float,
+        lot: float,
+        sl: Optional[float],
+        tp: Optional[float],
+        limit_comment: str,
+        market_comment: str,
+    ) -> Tuple[Optional[int], str]:
+        """
+        Place a pending LIMIT order; if the broker rejects only because live price is already
+        touching or inside trade_stops_level of target_price (retcode 10016 Invalid stops),
+        fall back to immediate Market entry so boundary limit layers still activate.
+        """
+        t = self.place_limit_order(
+            symbol=symbol, direction=direction, price=target_price, lot=lot,
+            sl=sl, tp=tp, comment=limit_comment,
+        )
+        if t:
+            return t, "LIMIT"
+
+        if self.dry_run:
+            return None, "FAILED"
+
+        fresh_tick = self.get_tick(symbol)
+        sym_info = self.get_symbol_info(symbol)
+        point = _num(getattr(sym_info, "point", 0.01), 0.01) or 0.01
+        stops_lvl = _int_num(getattr(sym_info, "trade_stops_level", 0), 0)
+        tolerance = max(stops_lvl * point, 0.25)
+        if fresh_tick:
+            is_buy = direction.upper() == "BUY"
+            ask = getattr(fresh_tick, "ask", None)
+            bid = getattr(fresh_tick, "bid", None)
+            near_or_crossed = (
+                (is_buy and isinstance(ask, (int, float)) and ask <= target_price + tolerance)
+                or (not is_buy and isinstance(bid, (int, float)) and bid >= target_price - tolerance)
+            )
+            if near_or_crossed:
+                logger.info(
+                    f"Limit {direction} @ {target_price} within stops/crossed ({ask if is_buy else bid}); "
+                    f"falling back to Market entry."
+                )
+                mt = self.execute_market_order(
+                    symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
+                )
+                if mt:
+                    return mt, "MARKET"
+        return None, "FAILED"
+
+    def _execute_layer_price(
+        self,
+        symbol: str,
+        direction: str,
+        target_price: float,
+        lot: float,
+        sl: Optional[float],
+        tp: Optional[float],
+        tick: Any,
+        market_comment: str,
+        limit_comment: str,
+    ) -> Tuple[Optional[int], str]:
+        """Route a single layer or entry price to MARKET if already crossed, else LIMIT (with stops fallback)."""
+        is_buy = direction == "BUY"
+        should_market = (tick.ask <= target_price) if is_buy else (tick.bid >= target_price)
+        if should_market:
+            t = self.execute_market_order(
+                symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
+            )
+            return (t, "MARKET") if t else (None, "FAILED")
+        return self._place_limit_with_stops_fallback(
+            symbol=symbol, direction=direction, target_price=target_price, lot=lot,
+            sl=sl, tp=tp, limit_comment=limit_comment, market_comment=market_comment,
+        )
+
     def execute_single_price_order(
         self,
         symbol: str,
@@ -718,40 +818,24 @@ class MT5Executor:
             f"Executing Single-Price Order for {direction_norm} {resolved_sym}: Price={price}, Lot={lot}, TP={final_tp}, SL={sl}"
         )
 
-        if direction_norm == "BUY":
-            if ask <= price:
-                t1 = self.execute_market_order(
-                    symbol=resolved_sym, direction="BUY", lot=lot,
-                    sl=sl, tp=final_tp, comment="TG Single (Market)",
-                )
-                if t1:
-                    market_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "MARKET", "status": "OPEN"}
+        t1, o_type = self._execute_layer_price(
+            symbol=resolved_sym,
+            direction=direction_norm,
+            target_price=price,
+            lot=lot,
+            sl=sl,
+            tp=final_tp,
+            tick=tick,
+            market_comment="TG Single (Market)",
+            limit_comment="TG Single (Limit)",
+        )
+        if t1:
+            if o_type == "MARKET":
+                market_tickets.append(t1)
+                layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "MARKET", "status": "OPEN"}
             else:
-                t1 = self.place_limit_order(
-                    symbol=resolved_sym, direction="BUY", price=price, lot=lot,
-                    sl=sl, tp=final_tp, comment="TG Single (Limit)",
-                )
-                if t1:
-                    pending_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
-        else:  # SELL
-            if bid >= price:
-                t1 = self.execute_market_order(
-                    symbol=resolved_sym, direction="SELL", lot=lot,
-                    sl=sl, tp=final_tp, comment="TG Single (Market)",
-                )
-                if t1:
-                    market_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t1 = self.place_limit_order(
-                    symbol=resolved_sym, direction="SELL", price=price, lot=lot,
-                    sl=sl, tp=final_tp, comment="TG Single (Limit)",
-                )
-                if t1:
-                    pending_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
+                pending_tickets.append(t1)
+                layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
 
         return market_tickets, pending_tickets, layers_data
 
@@ -835,114 +919,37 @@ class MT5Executor:
         )
 
         if direction == "BUY":
-            # Layer 1: TOP (0.01 lot)
-            if tick.ask <= top_price:
-                t1 = self.execute_market_order(
-                    symbol=symbol, direction="BUY", lot=top_lot,
-                    sl=sl, tp=top_tp, comment="TG Layer 1 (Top Market)",
-                )
-                if t1:
-                    market_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": top_lot, "target_price": top_price, "ticket": t1, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t1 = self.place_limit_order(
-                    symbol=symbol, direction="BUY", price=top_price, lot=top_lot,
-                    sl=sl, tp=top_tp, comment="TG Layer 1 (Top Limit)",
-                )
-                if t1:
-                    pending_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": top_lot, "target_price": top_price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
-
-            # Layer 2: MID (0.01 lot)
-            if tick.ask <= mid_price:
-                t2 = self.execute_market_order(
-                    symbol=symbol, direction="BUY", lot=mid_lot,
-                    sl=sl, tp=mid_tp, comment="TG Layer 2 (Mid Market)",
-                )
-                if t2:
-                    market_tickets.append(t2)
-                    layers_data["MID"] = {"lot": mid_lot, "target_price": mid_price, "ticket": t2, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t2 = self.place_limit_order(
-                    symbol=symbol, direction="BUY", price=mid_price, lot=mid_lot,
-                    sl=sl, tp=mid_tp, comment="TG Layer 2 (Mid Limit)",
-                )
-                if t2:
-                    pending_tickets.append(t2)
-                    layers_data["MID"] = {"lot": mid_lot, "target_price": mid_price, "ticket": t2, "order_type": "LIMIT", "status": "PENDING"}
-
-            # Layer 3: BOTTOM (0.02 lot)
-            if tick.ask <= bottom_price:
-                t3 = self.execute_market_order(
-                    symbol=symbol, direction="BUY", lot=bottom_lot,
-                    sl=sl, tp=bottom_tp, comment="TG Layer 3 (Bottom Market)",
-                )
-                if t3:
-                    market_tickets.append(t3)
-                    layers_data["BOTTOM"] = {"lot": bottom_lot, "target_price": bottom_price, "ticket": t3, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t3 = self.place_limit_order(
-                    symbol=symbol, direction="BUY", price=bottom_price, lot=bottom_lot,
-                    sl=sl, tp=bottom_tp, comment="TG Layer 3 (Bottom Limit)",
-                )
-                if t3:
-                    pending_tickets.append(t3)
-                    layers_data["BOTTOM"] = {"lot": bottom_lot, "target_price": bottom_price, "ticket": t3, "order_type": "LIMIT", "status": "PENDING"}
-
+            layer_specs = [
+                ("TOP", top_price, top_lot, top_tp, "TG Layer 1 (Top Market)", "TG Layer 1 (Top Limit)"),
+                ("MID", mid_price, mid_lot, mid_tp, "TG Layer 2 (Mid Market)", "TG Layer 2 (Mid Limit)"),
+                ("BOTTOM", bottom_price, bottom_lot, bottom_tp, "TG Layer 3 (Bottom Market)", "TG Layer 3 (Bottom Limit)"),
+            ]
         else:  # SELL
-            # Layer 1: BOTTOM entry on SELL (0.01 lot)
-            if tick.bid >= bottom_price:
-                t1 = self.execute_market_order(
-                    symbol=symbol, direction="SELL", lot=top_lot,
-                    sl=sl, tp=top_tp, comment="TG Layer 1 (Bottom Market)",
-                )
-                if t1:
-                    market_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": top_lot, "target_price": bottom_price, "ticket": t1, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t1 = self.place_limit_order(
-                    symbol=symbol, direction="SELL", price=bottom_price, lot=top_lot,
-                    sl=sl, tp=top_tp, comment="TG Layer 1 (Bottom Limit)",
-                )
-                if t1:
-                    pending_tickets.append(t1)
-                    layers_data["TOP"] = {"lot": top_lot, "target_price": bottom_price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
+            layer_specs = [
+                ("TOP", bottom_price, top_lot, top_tp, "TG Layer 1 (Bottom Market)", "TG Layer 1 (Bottom Limit)"),
+                ("MID", mid_price, mid_lot, mid_tp, "TG Layer 2 (Mid Market)", "TG Layer 2 (Mid Limit)"),
+                ("BOTTOM", top_price, bottom_lot, bottom_tp, "TG Layer 3 (Top Market)", "TG Layer 3 (Top Limit)"),
+            ]
 
-            # Layer 2: MID (0.01 lot)
-            if tick.bid >= mid_price:
-                t2 = self.execute_market_order(
-                    symbol=symbol, direction="SELL", lot=mid_lot,
-                    sl=sl, tp=mid_tp, comment="TG Layer 2 (Mid Market)",
-                )
-                if t2:
-                    market_tickets.append(t2)
-                    layers_data["MID"] = {"lot": mid_lot, "target_price": mid_price, "ticket": t2, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t2 = self.place_limit_order(
-                    symbol=symbol, direction="SELL", price=mid_price, lot=mid_lot,
-                    sl=sl, tp=mid_tp, comment="TG Layer 2 (Mid Limit)",
-                )
-                if t2:
-                    pending_tickets.append(t2)
-                    layers_data["MID"] = {"lot": mid_lot, "target_price": mid_price, "ticket": t2, "order_type": "LIMIT", "status": "PENDING"}
-
-            # Layer 3: TOP (0.02 lot)
-            if tick.bid >= top_price:
-                t3 = self.execute_market_order(
-                    symbol=symbol, direction="SELL", lot=bottom_lot,
-                    sl=sl, tp=bottom_tp, comment="TG Layer 3 (Top Market)",
-                )
-                if t3:
-                    market_tickets.append(t3)
-                    layers_data["BOTTOM"] = {"lot": bottom_lot, "target_price": top_price, "ticket": t3, "order_type": "MARKET", "status": "OPEN"}
-            else:
-                t3 = self.place_limit_order(
-                    symbol=symbol, direction="SELL", price=top_price, lot=bottom_lot,
-                    sl=sl, tp=bottom_tp, comment="TG Layer 3 (Top Limit)",
-                )
-                if t3:
-                    pending_tickets.append(t3)
-                    layers_data["BOTTOM"] = {"lot": bottom_lot, "target_price": top_price, "ticket": t3, "order_type": "LIMIT", "status": "PENDING"}
+        for l_name, target_px, l_lot, l_tp, mk_comment, lim_comment in layer_specs:
+            t, o_type = self._execute_layer_price(
+                symbol=symbol,
+                direction=direction,
+                target_price=target_px,
+                lot=l_lot,
+                sl=sl,
+                tp=l_tp,
+                tick=tick,
+                market_comment=mk_comment,
+                limit_comment=lim_comment,
+            )
+            if t:
+                if o_type == "MARKET":
+                    market_tickets.append(t)
+                    layers_data[l_name] = {"lot": l_lot, "target_price": target_px, "ticket": t, "order_type": "MARKET", "status": "OPEN"}
+                else:
+                    pending_tickets.append(t)
+                    layers_data[l_name] = {"lot": l_lot, "target_price": target_px, "ticket": t, "order_type": "LIMIT", "status": "PENDING"}
 
         return market_tickets, pending_tickets, layers_data
 
