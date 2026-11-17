@@ -1,14 +1,18 @@
 # Secrets & Telegram Session
 .env
 *.session
+*.session*
 *.session-journal
 
 # Runtime State & Logs (contain trade/account data)
 signals_state.json
+signals_state.json*
 sim_state.json
 trades_ledger.jsonl
 *.jsonl
+copier.lock
 *.lock
+copier.log*
 *.log
 *.tmp
 *.bak*

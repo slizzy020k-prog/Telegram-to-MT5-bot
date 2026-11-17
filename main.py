@@ -80,6 +80,8 @@ from config import (
     CATCHUP_MAX_MESSAGES,
     CATCHUP_MARKET_MAX_AGE_SECONDS,
     CATCHUP_MARKET_MAX_SLIPPAGE_PIPS,
+    CLOSE_ON_SIGNAL_DELETED,
+    DELETED_SIGNAL_POLL_INTERVAL_SECONDS,
     PREVENT_SYSTEM_SLEEP,
     IDLE_MT5_POLL_INTERVAL_SECONDS,
     TELEGRAM_KEEPALIVE_SECONDS,
@@ -94,7 +96,7 @@ from parser import (
     compute_zone_4tiers,
 )
 from mt5_executor import MT5Executor
-from state_manager import StateManager
+from state_manager import StateManager, _chat_ids_match
 from trade_ledger import TradeLedger
 from startup_checks import (
     DUPLICATE_INSTANCE_EXIT_CODE,
@@ -219,6 +221,9 @@ BOT_START_TIME = time.time()
 
 # In-memory deduplication tracking ((chat_id, msg_id) or msg_id -> process_timestamp)
 _recent_messages: Dict[Any, float] = {}
+
+# Out-of-order tombstone map for deleted Telegram signal messages ((chat_id, msg_id) -> deleted_timestamp)
+_deleted_messages: Dict[Any, float] = {}
 
 # Per-(loop, chat_id, msg_id) asyncio locks preventing handler/edit/delay races
 _signal_locks: Dict[Tuple[int, Any, str], asyncio.Lock] = {}
@@ -1195,16 +1200,68 @@ async def _update_live_terminal_status_async(force_print: bool = False) -> None:
 
 
 def _safe_chat_id(event: Any) -> Optional[int | str]:
-    """Extract JSON-safe chat_id from Telethon or mock event (ignoring unconfigured MagicMock)."""
+    """Extract JSON-safe chat_id from Telethon or mock event (including channel delete updates)."""
     raw_cid = getattr(event, "chat_id", None)
     if isinstance(raw_cid, (int, str)) and not isinstance(raw_cid, bool):
         return raw_cid
+    orig_upd = getattr(event, "original_update", None)
+    ch_id = getattr(orig_upd, "channel_id", None) if orig_upd is not None else getattr(event, "channel_id", None)
+    if isinstance(ch_id, int) and not isinstance(ch_id, bool) and ch_id > 0:
+        return int(f"-100{ch_id}")
     return None
 
 
 def _get_dedup_key(chat_id: Optional[int | str], msg_id: Any) -> Any:
     """Build per-channel deduplication key."""
     return (chat_id, msg_id) if chat_id is not None else msg_id
+
+
+def _record_deleted_tombstone(chat_id: Optional[int | str], msg_id: Any) -> None:
+    """Record a deleted message tombstone so out-of-order NewMessage/MessageEdited events cannot resurrect it."""
+    now = time.time()
+    if len(_deleted_messages) > 500:
+        cutoff = now - 600.0
+        for k in [k for k, ts in _deleted_messages.items() if ts < cutoff]:
+            _deleted_messages.pop(k, None)
+    mid_norm, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id)
+    _deleted_messages[(eff_chat, mid_norm)] = now
+    if eff_chat is None:
+        _deleted_messages[(None, mid_norm)] = now
+
+
+def _is_supergroup_chat_id(chat_id: Any) -> bool:
+    """Return True when chat_id is a Telegram channel/supergroup (-100...) with its own message ID sequence."""
+    return chat_id is not None and not isinstance(chat_id, bool) and str(chat_id).strip().startswith("-100")
+
+
+def _is_message_tombstoned(chat_id: Optional[int | str], msg_id: Any) -> bool:
+    """Return True if (chat_id, msg_id) has been recorded as deleted in Telegram."""
+    if not _deleted_messages:
+        return False
+    now = time.time()
+    cutoff = now - 600.0
+    mid_norm, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id)
+    direct = _deleted_messages.get((eff_chat, mid_norm))
+    if direct is not None and direct >= cutoff:
+        return True
+    if not _is_supergroup_chat_id(eff_chat):
+        bare = _deleted_messages.get((None, mid_norm))
+        if bare is not None and bare >= cutoff:
+            return True
+    mid_str = str(mid_norm)
+    for (k_chat, k_mid), ts in list(_deleted_messages.items()):
+        if ts < cutoff:
+            _deleted_messages.pop((k_chat, k_mid), None)
+            continue
+        if str(k_mid) != mid_str:
+            continue
+        if k_chat is not None and eff_chat is not None and _chat_ids_match(k_chat, eff_chat):
+            return True
+        if eff_chat is None and k_chat is not None:
+            return True
+        if k_chat is None and not _is_supergroup_chat_id(eff_chat):
+            return True
+    return False
 
 
 def _get_live_entry_price(tick: Any, direction: str) -> Optional[float]:
@@ -1571,7 +1628,7 @@ async def _delayed_sell_now_task(
                     )
                     break
 
-            await asyncio.sleep(min(float(DELAYED_POLL_INTERVAL_SECONDS), max(0.01, delay_total)))
+            await asyncio.sleep(step)
 
         # Execute 4-layer market entry under lock
         async with _get_signal_lock(chat_id, msg_id):
@@ -1827,13 +1884,286 @@ def _evaluate_catchup_staleness(
     return None
 
 
+async def _close_deleted_signal_unlocked(
+    msg_id: Any,
+    sig: Dict[str, Any],
+    chat_id: Optional[int | str] = None,
+    source_label: str = "Telegram Delete Event",
+) -> bool:
+    """
+    Take out (close open positions + cancel pending orders) a signal whose Telegram message was deleted.
+    Caller must hold `_get_signal_lock(eff_chat, raw_mid)`.
+    """
+    if not CLOSE_ON_SIGNAL_DELETED or not isinstance(sig, dict):
+        return False
+
+    raw_mid, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id if chat_id is not None else sig.get("chat_id"))
+    has_open_tickets = bool(sig.get("market_tickets") or sig.get("pending_tickets"))
+    if (
+        sig.get("status") in ("CLOSED", "FULL_CLOSED", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD")
+        and not has_open_tickets
+    ):
+        return False
+
+    _cancel_delayed_sell_now(raw_mid, chat_id=eff_chat)
+    _cancel_delayed_sell_now(msg_id, chat_id=eff_chat)
+    _record_deleted_tombstone(eff_chat, raw_mid)
+
+    res = await _mt5_call(executor.close_signal_exposure, sig)
+    closed_tkts = list((res or {}).get("closed_tickets") or [])
+    cancelled_ords = list((res or {}).get("cancelled_orders") or [])
+
+    if closed_tkts:
+        await _account_closed_tickets(sig, closed_tkts)
+
+    closed_set = set(closed_tkts)
+    layers = copy.deepcopy(sig.get("layers") or {})
+    for lk, l_data in layers.items():
+        if not isinstance(l_data, dict):
+            continue
+        lt = l_data.get("ticket")
+        st = str(l_data.get("status") or "").upper()
+        if lt in closed_set or st in ("OPEN", "FILLED", "RUNNER", "CLOSED", "BANKED") or st.startswith("CLOSED"):
+            l_data["status"] = "CLOSED"
+        else:
+            l_data["status"] = "CANCELLED"
+
+    close_reason_str = f"Signal Deleted ({source_label})"
+    updates: Dict[str, Any] = {
+        "status": "CLOSED",
+        "deleted_from_chat": True,
+        "close_reason": close_reason_str,
+        "runner_close_reason": close_reason_str,
+        "market_tickets": [],
+        "pending_tickets": [],
+        "runner_tickets": [],
+        "runner_ticket": None,
+        "runner_layers": [],
+        "runner_layer": None,
+        "runner_proximity_armed": False,
+        "runner_reversal_ticks": 0,
+        "shortfall_armed": False,
+        "shortfall_reversal_ticks": 0,
+        "tp2_shortfall_armed": False,
+        "layers": layers,
+        "accounted_tickets": sig.get("accounted_tickets", []),
+        "banked_profit": sig.get("banked_profit", 0.0),
+    }
+    sig.update(updates)
+    state_mgr.update_signal(msg_id, updates, chat_id=eff_chat)
+
+    fin = await _mt5_call(executor.get_account_financials)
+    curr = fin.get("currency", "GBP")
+    await _record_signal_to_ledger(raw_mid, sig, exit_reason=close_reason_str, currency=curr)
+
+    total_pnl = float(sig.get("banked_profit") or 0.0)
+    pnl_str = format_profit(total_pnl, curr)
+    symbol = sig.get("symbol", DEFAULT_SYMBOL)
+    direction = sig.get("direction", "BUY")
+
+    logger.warning(
+        f"🗑️ Signal Deleted [{source_label}] [ID: {raw_mid}] in Chat [{eff_chat}]: "
+        f"Closed={closed_tkts}, Cancelled={cancelled_ords}, RealizedPnL={pnl_str}"
+    )
+    await notify_saved_messages(
+        f"🗑️ **Signal Deleted in Chat — Trade Taken Out! [ID: {raw_mid}]**\n"
+        f"• Symbol: `{symbol}` ({direction}) | Source: `{source_label}`\n"
+        f"• Closed Market Positions: `{closed_tkts}`\n"
+        f"• Cancelled Pending Orders: `{cancelled_ords}`\n"
+        f"• 💰 **Realized P&L:** `{pnl_str}`\n\n"
+        f"{fin['formatted']}"
+    )
+    await _update_live_terminal_status_async()
+    await check_and_enforce_daily_loss_limit(exit_on_trigger=False)
+    return True
+
+
+async def _verify_message_deleted_on_telegram(sig_chat: Any, msg_id: int) -> bool:
+    """
+    Verify via Telegram `get_messages` whether `msg_id` was actually deleted in `sig_chat`
+    (used when basic-group `UpdateDeleteMessages` arrives with `chat_id=None`).
+    """
+    if sig_chat is None or telethon_client is None:
+        return True
+    get_msgs_fn = getattr(telethon_client, "get_messages", None)
+    if not callable(get_msgs_fn):
+        return True
+    try:
+        raw_res = get_msgs_fn(sig_chat, ids=[int(msg_id)])
+        if inspect.isawaitable(raw_res):
+            fetched = await asyncio.wait_for(raw_res, timeout=8.0)
+        else:
+            fetched = raw_res
+    except Exception as err:
+        logger.debug(f"Delete verification get_messages note for chat {sig_chat} msg {msg_id}: {err}")
+        return False
+
+    if fetched is None:
+        return True
+    if isinstance(fetched, (list, tuple)):
+        if len(fetched) == 0:
+            return True
+        if len(fetched) == 1:
+            item = fetched[0]
+            if item is None or type(item).__name__ == "MessageEmpty":
+                return True
+            if getattr(item, "id", None) == int(msg_id):
+                return False
+        for item in fetched:
+            if item is not None and type(item).__name__ != "MessageEmpty" and getattr(item, "id", None) == int(msg_id):
+                return False
+        return True
+    if type(fetched).__name__ == "MessageEmpty":
+        return True
+    if getattr(fetched, "id", None) == int(msg_id):
+        return False
+    return True
+
+
+async def handle_message_deleted(event: Any) -> None:
+    """
+    Real-time handler for `events.MessageDeleted`:
+    Immediately closes open positions and cancels pending orders for any deleted signal message.
+    """
+    if not CLOSE_ON_SIGNAL_DELETED or event is None:
+        return
+
+    raw_ids = getattr(event, "deleted_ids", None)
+    if not isinstance(raw_ids, (list, tuple, set)):
+        single_id = getattr(event, "deleted_id", None)
+        if single_id is not None:
+            raw_ids = [single_id]
+        else:
+            orig_upd = getattr(event, "original_update", None)
+            raw_ids = getattr(orig_upd, "messages", None) or []
+
+    deleted_ids: List[int] = []
+    for x in raw_ids:
+        if isinstance(x, int) and not isinstance(x, bool) and x > 0:
+            if x not in deleted_ids:
+                deleted_ids.append(x)
+        elif isinstance(x, str) and x.strip().isdigit() and int(x.strip()) > 0:
+            val = int(x.strip())
+            if val not in deleted_ids:
+                deleted_ids.append(val)
+
+    if not deleted_ids:
+        return
+
+    chat_id = _safe_chat_id(event)
+    is_monitored_chat = chat_id is not None and any(_chat_ids_match(ch, chat_id) for ch in CHANNEL_IDS)
+    if is_monitored_chat:
+        for did in deleted_ids:
+            _record_deleted_tombstone(chat_id, did)
+
+    for did in deleted_ids:
+        matches = state_mgr.find_matching_signals_for_delete(did, chat_id=chat_id)
+        if not matches and chat_id is None:
+            _record_deleted_tombstone(None, did)
+            continue
+        for sig_key, sig_snap in matches:
+            sig_chat = sig_snap.get("chat_id")
+            if chat_id is not None and not is_monitored_chat:
+                if sig_chat is None or not _chat_ids_match(sig_chat, chat_id):
+                    continue
+            if chat_id is None and sig_chat is not None:
+                if not await _verify_message_deleted_on_telegram(sig_chat, int(did)):
+                    logger.debug(
+                        f"Ignored unverified chat_id=None delete for msg {did} (still exists in channel {sig_chat})."
+                    )
+                    continue
+            eff_chat = sig_chat if sig_chat is not None else chat_id
+            raw_mid, _ = _normalize_task_msg_id(sig_key, chat_id=eff_chat)
+            async with _get_signal_lock(eff_chat, raw_mid):
+                fresh_sig = state_mgr.get_signal(sig_key, chat_id=eff_chat)
+                if fresh_sig is None:
+                    fresh_sig = state_mgr.get_signal(raw_mid, chat_id=eff_chat)
+                if fresh_sig is not None:
+                    await _close_deleted_signal_unlocked(
+                        sig_key,
+                        fresh_sig,
+                        chat_id=eff_chat,
+                        source_label="Telegram Delete Event",
+                    )
+
+
+async def poll_deleted_active_signals(source_label: str = "Periodic Sweep") -> int:
+    """
+    Batch-verify open/pending signals against Telegram `get_messages(chat_id, ids=...)`
+    so signal deletions missed while offline or dropped by socket updates are closed automatically.
+    """
+    if not CLOSE_ON_SIGNAL_DELETED or not telethon_client:
+        return 0
+    get_msgs_fn = getattr(telethon_client, "get_messages", None)
+    if not callable(get_msgs_fn):
+        return 0
+
+    open_or_pending = state_mgr.get_open_or_pending_signals()
+    if not open_or_pending:
+        return 0
+
+    by_chat: Dict[Any, List[Tuple[str, Dict[str, Any], int]]] = {}
+    for sig_key, sig_data in open_or_pending:
+        raw_mid, eff_chat = _normalize_task_msg_id(sig_key, chat_id=sig_data.get("chat_id"))
+        if eff_chat is None or not isinstance(raw_mid, int) or isinstance(raw_mid, bool) or raw_mid <= 0:
+            continue
+        by_chat.setdefault(eff_chat, []).append((sig_key, sig_data, int(raw_mid)))
+
+    if not by_chat:
+        return 0
+
+    closed_count = 0
+    for sig_chat, entries in by_chat.items():
+        check_ids = [item[2] for item in entries]
+        try:
+            raw_res = get_msgs_fn(sig_chat, ids=check_ids)
+            if inspect.isawaitable(raw_res):
+                fetched = await asyncio.wait_for(raw_res, timeout=8.0)
+            else:
+                fetched = raw_res
+        except Exception as err:
+            logger.debug(f"Deleted-signal poll skipped for chat {sig_chat} ({source_label}): {err}")
+            continue
+
+        if not isinstance(fetched, (list, tuple)) or len(fetched) != len(check_ids):
+            continue
+
+        # Mock-safe authoritative check: every non-None item must be MessageEmpty or match check_ids[i]
+        authoritative = True
+        for idx, item in enumerate(fetched):
+            if item is None or type(item).__name__ == "MessageEmpty":
+                continue
+            if getattr(item, "id", None) != check_ids[idx]:
+                authoritative = False
+                break
+        if not authoritative:
+            continue
+
+        for idx, item in enumerate(fetched):
+            if item is None or type(item).__name__ == "MessageEmpty":
+                sig_key, _, raw_mid = entries[idx]
+                async with _get_signal_lock(sig_chat, raw_mid):
+                    fresh_sig = state_mgr.get_signal(sig_key, chat_id=sig_chat)
+                    if fresh_sig is None:
+                        fresh_sig = state_mgr.get_signal(raw_mid, chat_id=sig_chat)
+                    if fresh_sig is not None and await _close_deleted_signal_unlocked(
+                        sig_key,
+                        fresh_sig,
+                        chat_id=sig_chat,
+                        source_label=source_label,
+                    ):
+                        closed_count += 1
+
+    return closed_count
+
+
 async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
     """
     Replay bounded recent messages missed while offline/disconnected across CHANNEL_IDS.
     Enforces CATCHUP_WINDOW_SECONDS, CATCHUP_MAX_MESSAGES, persisted (chat_id, msg_id)
-    watermarks, and strict stale-market age/slippage guards.
+    watermarks, strict stale-market age/slippage guards, and deleted-signal sweeps.
     """
-    summary = {"replayed": 0, "edits": 0, "skipped_stale": 0, "channels": 0}
+    summary = {"replayed": 0, "edits": 0, "skipped_stale": 0, "deleted": 0, "channels": 0}
     if session_trading_blocked() or not telethon_client:
         return summary
     if int(CATCHUP_WINDOW_SECONDS) <= 0 or int(CATCHUP_MAX_MESSAGES) <= 0:
@@ -1844,6 +2174,7 @@ async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
         return summary
 
     async with _get_catchup_lock():
+        summary["deleted"] = await poll_deleted_active_signals(source_label=f"Catch-Up ({reason})")
         now_utc = datetime.now(timezone.utc)
         tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
         pip_size = await _mt5_call(executor.get_pip_size, DEFAULT_SYMBOL)
@@ -1944,15 +2275,17 @@ async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
                 last_seen_id = msg_id
                 summary["replayed"] += 1
 
-        if summary["replayed"] or summary["edits"] or summary["skipped_stale"]:
+        if summary["replayed"] or summary["edits"] or summary["skipped_stale"] or summary["deleted"]:
             logger.info(
                 f"Reconnect catch-up ({reason}) finished: "
-                f"replayed={summary['replayed']}, edits={summary['edits']}, skipped_stale={summary['skipped_stale']}"
+                f"replayed={summary['replayed']}, edits={summary['edits']}, "
+                f"skipped_stale={summary['skipped_stale']}, deleted={summary['deleted']}"
             )
             await notify_saved_messages(
                 f"🔄 **Reconnect Catch-Up Summary (`{reason}`)**\n"
                 f"• Replayed Signals/Commands: `{summary['replayed']}` | Missed Edits: `{summary['edits']}`\n"
-                f"• Rejected Stale/Slipped Market Signals: `{summary['skipped_stale']}`"
+                f"• Deleted Signals Closed: `{summary['deleted']}` | "
+                f"Rejected Stale/Slipped Market Signals: `{summary['skipped_stale']}`"
             )
         return summary
 
@@ -2597,6 +2930,7 @@ async def tp1_proximity_watcher_task() -> None:
     last_algo_check = 0.0
     last_tg_keepalive = time.time()
     last_account_poll = 0.0
+    last_deleted_poll = time.time()
     has_live_exposure = False
 
     while True:
@@ -2625,6 +2959,15 @@ async def tp1_proximity_watcher_task() -> None:
             if now - last_tg_keepalive >= TELEGRAM_KEEPALIVE_SECONDS:
                 last_tg_keepalive = now
                 await _run_telegram_keepalive_check(now)
+
+            if (
+                CLOSE_ON_SIGNAL_DELETED
+                and float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS) > 0.0
+                and (now - last_deleted_poll >= float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS))
+            ):
+                last_deleted_poll = now
+                if state_mgr.get_open_or_pending_signals():
+                    await poll_deleted_active_signals(source_label="Periodic Sweep")
 
             if now - last_algo_check >= CHECK_ALGO_TRADING_INTERVAL:
                 last_algo_check = now
@@ -3005,6 +3348,9 @@ async def _handle_new_message_unlocked(event: Any) -> None:
     msg_id = msg.id
     raw_text = msg.message or ""
     chat_id = _safe_chat_id(event)
+    if CLOSE_ON_SIGNAL_DELETED and _is_message_tombstoned(chat_id, msg_id):
+        logger.info(f"Message ID {msg_id} in Chat [{chat_id}] was already deleted (tombstoned); skipping NewMessage.")
+        return
     reply_to_id = _extract_reply_to_id(msg)
     is_reply_evt = (getattr(event, "is_reply", None) is True) or (reply_to_id is not None)
 
@@ -3371,6 +3717,9 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     msg_id = msg.id
     raw_text = msg.message or ""
     chat_id = _safe_chat_id(event)
+    if CLOSE_ON_SIGNAL_DELETED and _is_message_tombstoned(chat_id, msg_id):
+        logger.info(f"Edited message ID {msg_id} in Chat [{chat_id}] was already deleted (tombstoned); skipping edit.")
+        return
 
     existing_signal = state_mgr.get_signal(msg_id, chat_id=chat_id)
 
@@ -3997,7 +4346,7 @@ async def handle_saved_messages_command(event: Any) -> None:
         for prefix in (
             "🏆", "🚀", "🛡️", "💰", "🚪", "🎯", "⚠️", "❌", "⏳", "✏️", "🏦", "🚨",
             "🧪", "🏃", "✅", "📋", "🤖", "⚪", "🚫", "🔄", "ℹ️", "💳", "🛑", "🔒",
-            "🟢", "🔴", "🩺",
+            "🟢", "🔴", "🩺", "🗑️",
         )
     ):
         return
@@ -4185,6 +4534,8 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"• Algo Trading: `{'🟢 ENABLED' if algo_ok else '🔴 DISABLED'}`\n"
             f"• Telegram Client: `{'🟢 CONNECTED' if tg_connected else '⚪ OFFLINE'}` | "
             f"Reconnects: `{_telegram_reconnect_count}`\n"
+            f"• Deleted-Signal Guard: `{'🟢 ON' if CLOSE_ON_SIGNAL_DELETED else '⚪ OFF'}` "
+            f"(Sweep: `{DELETED_SIGNAL_POLL_INTERVAL_SECONDS}s`)\n"
             f"• Runner FSM Mode: `{RUNNER_PROXIMITY_MODE}` "
             f"(Buf: `{RUNNER_PROXIMITY_BUFFER_PIPS}` pips / `{RUNNER_PROXIMITY_BUFFER_PCT}%`, "
             f"MidrangeClamp: `{RUNNER_MAX_MIDRANGE_RATIO}`, "
@@ -4696,6 +5047,10 @@ async def main() -> None:
         telethon_client.add_event_handler(
             handle_message_edited,
             events.MessageEdited(chats=CHANNEL_IDS),
+        )
+        telethon_client.add_event_handler(
+            handle_message_deleted,
+            events.MessageDeleted(),
         )
         telethon_client.add_event_handler(
             handle_saved_messages_command,

@@ -4,7 +4,7 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import config as _config
 
@@ -17,6 +17,34 @@ _TERMINAL_STATUSES = {"CLOSED", "FULL_CLOSED", "INVALIDATED_TP1", "ABORTED_PRICE
 LEGACY_TO_V3_LAYER: Dict[str, str] = {"TOP": "L1", "MID": "L2", "BOTTOM": "L4"}
 V3_TO_LEGACY_LAYER: Dict[str, str] = {"L1": "TOP", "L2": "MID", "L4": "BOTTOM"}
 _DEFAULT_BASE_LOTS: List[float] = [0.01, 0.01, 0.01, 0.02]
+
+
+def _normalize_chat_id_variants(chat_id: Any) -> Set[str]:
+    """Build canonical string variants for a Telegram chat/channel ID (-100<id>, -<id>, <id>)."""
+    if chat_id is None or isinstance(chat_id, bool):
+        return set()
+    raw = str(chat_id).strip()
+    if not raw:
+        return set()
+    variants: Set[str] = {raw}
+    digits = raw.lstrip("-")
+    if digits.isdigit():
+        variants.add(digits)
+        variants.add(f"-{digits}")
+        variants.add(f"-100{digits}")
+        if digits.startswith("100") and len(digits) > 3:
+            bare = digits[3:]
+            variants.add(bare)
+            variants.add(f"-{bare}")
+            variants.add(f"-100{bare}")
+    return variants
+
+
+def _chat_ids_match(stored_chat: Any, query_chat: Any) -> bool:
+    """Return True if stored_chat and query_chat refer to the same Telegram chat/channel."""
+    if stored_chat is None or query_chat is None:
+        return False
+    return bool(_normalize_chat_id_variants(stored_chat) & _normalize_chat_id_variants(query_chat))
 
 
 def _default_layer_lots() -> Dict[str, float]:
@@ -279,7 +307,7 @@ class StateManager:
             and isinstance(self._state.get(raw_input), dict)
         ):
             rec = self._state[raw_input]
-            if chat_id is None or rec.get("chat_id") is None or str(rec.get("chat_id")) == str(chat_id):
+            if chat_id is None or rec.get("chat_id") is None or _chat_ids_match(rec.get("chat_id"), chat_id):
                 return raw_input
 
         base_key, eff_chat = self._unpack_id(message_id, chat_id)
@@ -296,7 +324,7 @@ class StateManager:
             if not isinstance(existing, dict):
                 return base_key
             ex_chat = existing.get("chat_id")
-            if ex_chat is None or str(ex_chat) == str(eff_chat):
+            if ex_chat is None or _chat_ids_match(ex_chat, eff_chat):
                 return base_key
             return comp_key
 
@@ -304,10 +332,14 @@ class StateManager:
             comp_key = f"{eff_chat}:{base_key}"
             if isinstance(self._state.get(comp_key), dict):
                 return comp_key
+            for v_chat in _normalize_chat_id_variants(eff_chat):
+                alt_comp = f"{v_chat}:{base_key}"
+                if isinstance(self._state.get(alt_comp), dict):
+                    return alt_comp
             existing = self._state.get(base_key)
             if isinstance(existing, dict):
                 ex_chat = existing.get("chat_id")
-                if ex_chat is None or str(ex_chat) == str(eff_chat):
+                if ex_chat is None or _chat_ids_match(ex_chat, eff_chat):
                     return base_key
             return comp_key
 
@@ -605,6 +637,50 @@ class StateManager:
                 if data.get("status") in _ACTIVE_STATUSES:
                     active.append((msg_id, copy.deepcopy(data)))
             return active
+
+    def get_open_or_pending_signals(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return all active or pending non-terminal signals (skips _ metadata keys)."""
+        open_statuses = set(_ACTIVE_STATUSES) | set(_PENDING_STATUSES)
+        with self._lock:
+            results: List[Tuple[str, Dict[str, Any]]] = []
+            for key, data in self._state.items():
+                if str(key).startswith("_") or not isinstance(data, dict):
+                    continue
+                if data.get("status") in open_statuses:
+                    results.append((key, copy.deepcopy(data)))
+            return results
+
+    def find_matching_signals_for_delete(
+        self,
+        message_id: int | str | Tuple[Any, Any],
+        chat_id: Optional[int | str] = None,
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """
+        Find non-terminal signal records matching a deleted Telegram message_id (and optional chat_id).
+        Handles -100<id> <-> bare channel_id normalization and basic-group chat_id=None events.
+        """
+        base_key, eff_chat = self._unpack_id(message_id, chat_id)
+        if base_key.startswith("_"):
+            return []
+
+        with self._lock:
+            matches: List[Tuple[str, Dict[str, Any]]] = []
+            for key, rec in self._state.items():
+                if str(key).startswith("_") or not isinstance(rec, dict):
+                    continue
+                rec_base, rec_key_chat = self._unpack_id(key, rec.get("chat_id"))
+                if rec_base != base_key:
+                    continue
+                has_open_tickets = bool(rec.get("market_tickets") or rec.get("pending_tickets"))
+                if rec.get("status") in _TERMINAL_STATUSES and not has_open_tickets:
+                    continue
+                rec_chat = rec.get("chat_id") if rec.get("chat_id") is not None else rec_key_chat
+                if eff_chat is not None:
+                    if rec_chat is None or _chat_ids_match(rec_chat, eff_chat):
+                        matches.append((key, copy.deepcopy(rec)))
+                else:
+                    matches.append((key, copy.deepcopy(rec)))
+            return matches
 
     def count_open_signals(self) -> int:
         """Count active open signals (skips _ metadata keys and non-dict entries)."""

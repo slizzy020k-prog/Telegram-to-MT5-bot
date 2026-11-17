@@ -398,6 +398,13 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"RUNNER_MAX_MIDRANGE_RATIO must be in (0, 1], got {midrange_ratio!r}."
         )
 
+    if hasattr(cfg, "CLOSE_ON_SIGNAL_DELETED"):
+        close_on_del = getattr(cfg, "CLOSE_ON_SIGNAL_DELETED")
+        if not isinstance(close_on_del, bool):
+            errors.append(
+                f"CLOSE_ON_SIGNAL_DELETED must be a bool, got {close_on_del!r}."
+            )
+
     non_negative_fields = (
         "TP_FRONT_RUN_OFFSET",
         "TP1_CLOSE_PROXIMITY_PIPS",
@@ -417,6 +424,7 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
         "CATCHUP_MARKET_MAX_AGE_SECONDS",
         "CATCHUP_MARKET_MAX_SLIPPAGE_PIPS",
         "DAILY_PNL_CACHE_TTL_SECONDS",
+        "DELETED_SIGNAL_POLL_INTERVAL_SECONDS",
     )
     for field in non_negative_fields:
         val = getattr(cfg, field, 0.0)

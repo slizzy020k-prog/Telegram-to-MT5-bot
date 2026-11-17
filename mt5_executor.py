@@ -2910,6 +2910,135 @@ class MT5Executor:
 
     apply_full_close = apply_proximity_close
 
+    def close_signal_exposure(self, signal_data: Dict[str, Any]) -> Dict[str, List[int]]:
+        """
+        Surgically close all open market positions and cancel all unfilled pending orders
+        belonging ONLY to `signal_data` (never sweeping unrelated active signals by MAGIC_NUMBER).
+        Guards against pending-to-market fill races by checking live MT5 positions first.
+        """
+        if not isinstance(signal_data, dict):
+            return {"closed_tickets": [], "cancelled_orders": []}
+
+        accounted_set = {
+            _int_num(x, 0)
+            for x in (signal_data.get("accounted_tickets") or [])
+            if _int_num(x, 0) > 0
+        }
+
+        all_signal_tickets: List[int] = []
+        all_set = set()
+        known_market_list: List[int] = []
+        known_market_set = set()
+        known_pending_list: List[int] = []
+        known_pending_set = set()
+
+        def _add_all(val: Any) -> int:
+            t_int = _int_num(val, 0)
+            if t_int > 0 and t_int not in accounted_set and t_int not in all_set:
+                all_set.add(t_int)
+                all_signal_tickets.append(t_int)
+            return t_int if (t_int > 0 and t_int not in accounted_set) else 0
+
+        def _add_market(val: Any) -> None:
+            t_int = _add_all(val)
+            if t_int > 0 and t_int not in known_market_set:
+                known_market_set.add(t_int)
+                known_market_list.append(t_int)
+
+        def _add_pending(val: Any) -> None:
+            t_int = _add_all(val)
+            if t_int > 0 and t_int not in known_pending_set:
+                known_pending_set.add(t_int)
+                known_pending_list.append(t_int)
+
+        for t in (signal_data.get("market_tickets") or []):
+            _add_market(t)
+        for t in (signal_data.get("runner_tickets") or []):
+            _add_market(t)
+        if signal_data.get("runner_ticket") is not None:
+            _add_market(signal_data.get("runner_ticket"))
+
+        for t in (signal_data.get("pending_tickets") or []):
+            _add_pending(t)
+
+        for t in (signal_data.get("mt5_order_tickets") or []):
+            _add_all(t)
+
+        layers = signal_data.get("layers")
+        if isinstance(layers, dict):
+            for l_info in layers.values():
+                if not isinstance(l_info, dict):
+                    continue
+                lt = l_info.get("ticket")
+                st = str(l_info.get("status") or "").strip().upper()
+                if st in ("OPEN", "FILLED", "RUNNER"):
+                    _add_market(lt)
+                elif st == "PENDING":
+                    _add_pending(lt)
+                else:
+                    _add_all(lt)
+
+        closed_tickets: List[int] = []
+        cancelled_orders: List[int] = []
+
+        if self.dry_run or not self._ensure_connected():
+            for t in known_market_list:
+                if self.close_market_position(t):
+                    closed_tickets.append(t)
+            closed_set = set(closed_tickets)
+            for t in known_pending_list:
+                if t not in closed_set and t not in known_market_set:
+                    if self.cancel_pending_order(t):
+                        cancelled_orders.append(t)
+        else:
+            live_pos_ids = set()
+            live_ord_ids = set()
+            try:
+                with self._mt5_lock:
+                    positions = mt5.positions_get() or []
+                    orders = mt5.orders_get() or []
+                live_pos_ids = {
+                    _int_num(getattr(p, "ticket", 0), 0)
+                    for p in positions
+                    if _int_num(getattr(p, "ticket", 0), 0) > 0
+                }
+                live_ord_ids = {
+                    _int_num(getattr(o, "ticket", 0), 0)
+                    for o in orders
+                    if _int_num(getattr(o, "ticket", 0), 0) > 0
+                }
+            except Exception as e:
+                logger.warning(f"close_signal_exposure: could not query live positions/orders: {e}")
+
+            for t in all_signal_tickets:
+                if t in live_pos_ids:
+                    if self.close_market_position(t):
+                        closed_tickets.append(t)
+                elif t in live_ord_ids:
+                    if self.cancel_pending_order(t):
+                        cancelled_orders.append(t)
+                    else:
+                        recheck_pos = None
+                        try:
+                            with self._mt5_lock:
+                                recheck_pos = mt5.positions_get(ticket=t)
+                        except Exception:
+                            recheck_pos = None
+                        if recheck_pos and self.close_market_position(t):
+                            closed_tickets.append(t)
+                else:
+                    if t in known_market_set:
+                        if self.close_market_position(t):
+                            closed_tickets.append(t)
+                    elif t in known_pending_set:
+                        if self.cancel_pending_order(t):
+                            cancelled_orders.append(t)
+
+        if closed_tickets:
+            self.invalidate_realized_pnl_cache()
+
+        return {"closed_tickets": closed_tickets, "cancelled_orders": cancelled_orders}
+
     def _compute_initial_tp1_floor(
         self,
         signal_data: Dict[str, Any],

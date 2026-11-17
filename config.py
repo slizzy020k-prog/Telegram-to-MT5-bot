@@ -309,6 +309,12 @@ CATCHUP_MARKET_MAX_SLIPPAGE_PIPS: float = _env_float(
     "CATCHUP_MARKET_MAX_SLIPPAGE_PIPS", 15.0, min_val=0.0, max_val=500.0
 )
 
+# Deleted-Signal Trade Protection (auto-closes positions & cancels pending orders when signal is deleted)
+CLOSE_ON_SIGNAL_DELETED: bool = _env_bool("CLOSE_ON_SIGNAL_DELETED", True)
+DELETED_SIGNAL_POLL_INTERVAL_SECONDS: float = _env_float(
+    "DELETED_SIGNAL_POLL_INTERVAL_SECONDS", 15.0, min_val=0.0, max_val=3600.0
+)
+
 # Realized Daily PnL Cache TTL (explicitly invalidated on every close)
 DAILY_PNL_CACHE_TTL_SECONDS: float = _env_float(
     "DAILY_PNL_CACHE_TTL_SECONDS", 5.0, min_val=0.0, max_val=300.0

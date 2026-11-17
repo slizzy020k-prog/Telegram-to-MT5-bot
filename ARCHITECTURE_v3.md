@@ -1,7 +1,7 @@
-# XAUUSD Copier v3.1 — Architecture & API Contract
+# XAUUSD Copier v3.2 — Architecture & API Contract
 
-**Status:** LOCKED (v3.1 Dynamic Stepped Scaling & Calibrated Anti-Choke Update)  
-**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), Strict Activation Zone + Anti-Choke Reversal Guard, Async Concurrency, Ledger & Safety Hardening.
+**Status:** LOCKED (v3.2 Deleted-Signal Trade Protection Update)  
+**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), Strict Activation Zone + Anti-Choke Reversal Guard, Deleted-Signal Trade Protection, Async Concurrency, Ledger & Safety Hardening.
 
 ---
 
@@ -216,3 +216,44 @@ Transitions on every 1s tick (`BUY` shown; `SELL` symmetric), applied across **a
   - Methods: `append_trade(record)`, `record_closed_signal(signal_key, signal_data, realized_pnl, exit_reason, currency="GBP", dry_run=False, extra=None)`, `read_trades(limit=None)`, `get_stats(server_date=None)`.
   - Schema v3 fields: `schema_version`, `closed_at`, `opened_at`, `signal_key`, `chat_id`, `message_id`, `symbol`, `direction`, `entry_type`, `total_lots`, `filled_lots`, `tickets`, `layers_filled`, `highest_milestone_cleared`, `runner_layer`, `exit_reason`, `realized_pnl`, `currency`, `dry_run`.
 - **`/health` Command (`main.py`)**: reports uptime, single-instance lock status, MT5 connection & ping latency (`ms`), Algo Trading status, Telegram reconnect count, active signals & runner milestone state, and `TradeLedger.get_stats()` summary.
+
+---
+
+## 5. Deleted-Signal Trade Protection (v3.2)
+
+Automatically liquidates open positions and cancels pending orders for any active or pending signal whose source Telegram message is deleted from its monitored channel/chat, so pulled or deleted setups never stay open to hit Stop Loss.
+
+### 5.1 Configuration & Preflight Contracts (`config.py`, `startup_checks.py`)
+- `CLOSE_ON_SIGNAL_DELETED: bool = _env_bool("CLOSE_ON_SIGNAL_DELETED", True)` — master toggle for automatic close/cancel on signal deletion.
+- `DELETED_SIGNAL_POLL_INTERVAL_SECONDS: float = _env_float("DELETED_SIGNAL_POLL_INTERVAL_SECONDS", 15.0, min_val=0.0, max_val=3600.0)` — periodic Telegram message-existence verification cadence (`0.0` disables periodic polling while preserving real-time `events.MessageDeleted`).
+- `startup_checks.validate_environment()` verifies `DELETED_SIGNAL_POLL_INTERVAL_SECONDS >= 0` (`non_negative_fields`) and `isinstance(CLOSE_ON_SIGNAL_DELETED, bool)` when present.
+
+### 5.2 State Lookup & Telegram Channel ID Normalization (`state_manager.py`)
+- **`_chat_ids_match(stored_chat: Any, query_chat: Any) -> bool`:**
+  - Matches exact string equality AND Telegram channel ID normalization (`-100<id>` <-> `<id>` / `-<id>`) so `UpdateDeleteChannelMessages.channel_id` and `event.chat_id` always resolve against `stored_chat`.
+- **`StateManager.get_open_or_pending_signals(self) -> List[Tuple[str, Dict[str, Any]]]`:**
+  - Returns deep-copied `(key, data)` for all non-`_`-prefixed dict records with `data.get("status") in (_ACTIVE_STATUSES + _PENDING_STATUSES)`.
+- **`StateManager.find_matching_signals_for_delete(self, message_id: int | str, chat_id: Optional[int | str] = None) -> List[Tuple[str, Dict[str, Any]]]`:**
+  - Unpacks `base_key, eff_chat = self._unpack_id(message_id, chat_id)`.
+  - Scans non-`_`-prefixed dict records whose unpacked message ID equals `base_key` and whose `status` is NOT in `_TERMINAL_STATUSES` (or still holds non-empty `market_tickets` / `pending_tickets`):
+    - If `eff_chat is not None`: includes records where `rec.get("chat_id") is None` or `_chat_ids_match(rec.get("chat_id"), eff_chat)`.
+    - If `eff_chat is None`: includes all matching non-terminal records for `base_key` so the caller can verify message absence via Telegram `get_messages` before closing.
+
+### 5.3 Surgical Per-Signal Exposure Close (`mt5_executor.py`)
+- **`MT5Executor.close_signal_exposure(self, signal_data: Dict[str, Any]) -> Dict[str, List[int]]`:**
+  - Collects unique positive integer tickets belonging **strictly** to `signal_data` (`market_tickets`, `runner_tickets`, `runner_ticket`, `pending_tickets`, `mt5_order_tickets`, and `layers[k]["ticket"]`), excluding `accounted_tickets`.
+  - Tracks `known_market_set` (`market_tickets`, `runner_tickets`, `runner_ticket`, layers in `OPEN`/`FILLED`/`RUNNER`) and `known_pending_set` (`pending_tickets`, layers in `PENDING`).
+  - **Isolation Invariant:** NEVER sweeps unrelated active bot positions/orders by `MAGIC_NUMBER`.
+  - **Dry-Run / Disconnected:** closes `known_market_set` via `close_market_position(t)`, then cancels `known_pending_set - closed_tickets - known_market_set` via `cancel_pending_order(t)`.
+  - **Live MT5 (`_mt5_lock`):** queries `mt5.positions_get()` and `mt5.orders_get()` for `live_pos_ids` and `live_ord_ids`. For each signal ticket `t`:
+    1. If `t in live_pos_ids` (catches pending orders that just filled!): closes via `close_market_position(t)`.
+    2. Elif `t in live_ord_ids`: cancels via `cancel_pending_order(t)`; if cancel returns `False`, re-checks `mt5.positions_get(ticket=t)` and closes via `close_market_position(t)` if newly filled.
+    3. Else (e.g. mocked unit test where `positions_get`/`orders_get` is empty): falls back to `known_market_set` -> `close_market_position(t)` or `known_pending_set` -> `cancel_pending_order(t)`.
+  - Calls `self.invalidate_realized_pnl_cache()` whenever `closed_tickets` is non-empty.
+  - Returns `{"closed_tickets": List[int], "cancelled_orders": List[int]}`.
+
+### 5.4 Event Handler, Tombstone Guard, Reconnect/Periodic Sweep & Accounting (`main.py`)
+- **`handle_message_deleted(event)`:** registered on `events.MessageDeleted()`. Ignores events outside monitored `CHANNEL_IDS` when `event.chat_id` is set; supports `event.chat_id is None` (basic-group deletes) by verifying candidate `(sig_chat, msg_id)` absence via `telethon_client.get_messages(sig_chat, ids=...)` (treating `None` / empty result as deleted).
+- **Out-of-Order Tombstone Guard (`_deleted_messages`):** records deleted `(chat_id, msg_id)` keys (and bare `msg_id` when chat unknown) so delayed/out-of-order `NewMessage`, `MessageEdited`, or catch-up events cannot re-open a deleted signal; cancels any active `_delayed_sell_now_task`.
+- **Reconnect & Periodic Sweep (`poll_deleted_active_signals()`):** runs during `run_reconnect_catchup` and periodically inside `tp1_proximity_watcher_task` every `DELETED_SIGNAL_POLL_INTERVAL_SECONDS` (`15.0s`), batch-checking `state_mgr.get_open_or_pending_signals()` against Telegram `get_messages` so deletes missed while offline are caught automatically.
+- **Unified Close, Accounting & Ledger:** acquires per-`(chat_id, msg_id)` `asyncio.Lock`, invokes `_mt5_call(executor.close_signal_exposure, sig)`, accumulates closed position PnL into `banked_profit` / `accounted_tickets`, sets `status = "CLOSED"`, clears `market_tickets`, `pending_tickets`, `runner_tickets`, `runner_ticket`, records to `TradeLedger` ONLY when positions actually closed (`closed_tickets` or prior `accounted_tickets` — skipping purely unfilled/pending setups), and alerts Saved Messages.

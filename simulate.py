@@ -278,8 +278,43 @@ async def run_simulation() -> None:
         f"PnL=+{stats['total_realized_pnl']:.2f} GBP (win_rate={stats['win_rate_pct']}%)."
     )
 
+    # -----------------------------------------------------------------------
+    # STEP 7: Deleted Signal in Chat -> Immediate Trade Take-Out
+    # -----------------------------------------------------------------------
+    print("\n[STEP 7] Testing Deleted Signal in Chat -> Immediate Trade Take-Out (handle_message_deleted)...")
+    evt_del_target = MockTelethonEvent(msg_id=20007, text="Buy 3895-3887 \n TP 3905 \n SL 3875")
+    evt_keep_alive = MockTelethonEvent(msg_id=20008, text="Buy 3896-3886 \n TP 3906 \n SL 3874")
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3894.70, 3895.00)):
+        await main.handle_new_message(evt_del_target)
+        await main.handle_new_message(evt_keep_alive)
+
+    sig_del_before = main.state_mgr.get_signal(20007, chat_id=evt_del_target.chat_id)
+    sig_keep_before = main.state_mgr.get_signal(20008, chat_id=evt_keep_alive.chat_id)
+    assert sig_del_before is not None and len(sig_del_before["market_tickets"]) == 1 and len(sig_del_before["pending_tickets"]) == 3
+    assert sig_keep_before is not None and len(sig_keep_before["market_tickets"]) == 1 and len(sig_keep_before["pending_tickets"]) == 3
+
+    from types import SimpleNamespace
+    del_event = SimpleNamespace(deleted_ids=[20007], chat_id=evt_del_target.chat_id)
+    await main.handle_message_deleted(del_event)
+
+    sig_del_after = main.state_mgr.get_signal(20007, chat_id=evt_del_target.chat_id)
+    sig_keep_after = main.state_mgr.get_signal(20008, chat_id=evt_keep_alive.chat_id)
+    assert sig_del_after["status"] == "CLOSED"
+    assert sig_del_after["deleted_from_chat"] is True
+    assert sig_del_after["market_tickets"] == [] and sig_del_after["pending_tickets"] == []
+    assert sig_del_after["ledger_recorded"] is True
+    assert sig_keep_after["status"] == "ACTIVE"
+    assert len(sig_keep_after["market_tickets"]) == 1 and len(sig_keep_after["pending_tickets"]) == 3
+    stats_after_del = main.trade_ledger.get_stats()
+    assert stats_after_del["total_trades"] == 2
+    print(
+        f"  [OK] Deleted Signal #20007 closed immediately (status={sig_del_after['status']}, "
+        f"deleted_from_chat={sig_del_after['deleted_from_chat']}), Ledger={stats_after_del['total_trades']} trades, "
+        f"while unrelated Signal #20008 remained {sig_keep_after['status']}!"
+    )
+
     print("\n" + "=" * 72)
-    print("  ALL 7 v3.1 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("  ALL 7 v3.1 + STEP 7 v3.2 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
     print("=" * 72)
 
 
