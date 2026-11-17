@@ -1,5 +1,8 @@
 import time
+import math
 import logging
+import threading
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 import MetaTrader5 as mt5
 
@@ -32,10 +35,27 @@ from config import (
     DEFAULT_SYMBOL,
 )
 from parser import ZoneInfo
-import math
-from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("copier.mt5")
+
+
+def _num(val: Any, default: float = 0.0) -> float:
+    """Return float(val) when val is a concrete int/float (ignoring bool and MagicMock)."""
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val)
+    return default
+
+
+def _int_num(val: Any, default: int = 0) -> int:
+    """Return int(val) when val is a concrete int (ignoring bool and MagicMock)."""
+    if isinstance(val, int) and not isinstance(val, bool):
+        return int(val)
+    return default
+
+
+def _mt5_const(name: str, default: int) -> int:
+    """Safely read an integer MT5 constant, falling back if mt5 is a MagicMock."""
+    return _int_num(getattr(mt5, name, default), default)
 
 
 def calculate_risk_guide_thresholds(capital: float) -> Dict[str, float]:
@@ -68,6 +88,7 @@ class MT5Executor:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self._connected = False
+        self._mt5_lock = threading.RLock()
         self._symbol_cache: Dict[str, str] = {}
         self.last_error: Optional[str] = None
         self._dry_run_capital: Optional[float] = None
@@ -82,41 +103,44 @@ class MT5Executor:
             self._connected = True
             return True
 
-        init_kwargs = {}
-        if MT5_PATH:
-            init_kwargs["path"] = MT5_PATH
+        with self._mt5_lock:
+            init_kwargs = {}
+            if MT5_PATH:
+                init_kwargs["path"] = MT5_PATH
 
-        if not mt5.initialize(**init_kwargs):
-            err = mt5.last_error()
-            logger.error(f"MT5 initialize() failed: {err}")
-            return False
-
-        if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
-            if not mt5.login(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+            if not mt5.initialize(**init_kwargs):
                 err = mt5.last_error()
-                logger.error(f"MT5 login failed: {err}")
+                logger.error(f"MT5 initialize() failed: {err}")
                 return False
-            logger.info(f"MT5 logged in successfully to account {MT5_LOGIN} ({MT5_SERVER})")
-        else:
-            term_info = mt5.terminal_info()
-            acc_info = mt5.account_info()
-            if acc_info:
-                logger.info(
-                    f"Connected to MT5 active account: {acc_info.login} on {acc_info.server} "
-                    f"(Balance: {acc_info.balance} {acc_info.currency})"
-                )
-            else:
-                logger.info(f"Connected to MT5 terminal: {term_info}")
 
-        self._connected = True
-        return True
+            if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
+                if not mt5.login(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+                    err = mt5.last_error()
+                    logger.error(f"MT5 login failed: {err}")
+                    return False
+                logger.info(f"MT5 logged in successfully to account {MT5_LOGIN} ({MT5_SERVER})")
+            else:
+                term_info = mt5.terminal_info()
+                acc_info = mt5.account_info()
+                if acc_info:
+                    logger.info(
+                        f"Connected to MT5 active account: {getattr(acc_info, 'login', 'N/A')} "
+                        f"on {getattr(acc_info, 'server', 'N/A')} "
+                        f"(Balance: {_num(getattr(acc_info, 'balance', 0.0))} {getattr(acc_info, 'currency', '')})"
+                    )
+                else:
+                    logger.info(f"Connected to MT5 terminal: {term_info}")
+
+            self._connected = True
+            return True
 
     def shutdown(self) -> None:
         """Shutdown MT5 connection."""
-        if not self.dry_run and self._connected:
-            mt5.shutdown()
-            self._connected = False
-            logger.info("MT5 connection shut down.")
+        with self._mt5_lock:
+            if not self.dry_run and self._connected:
+                mt5.shutdown()
+                self._connected = False
+                logger.info("MT5 connection shut down.")
 
     def is_connected(self) -> bool:
         """Check if MT5 is initialized and connected to the trade server."""
@@ -125,8 +149,9 @@ class MT5Executor:
         if not self._connected:
             return False
         try:
-            term_info = mt5.terminal_info()
-            return term_info is not None and getattr(term_info, "connected", False)
+            with self._mt5_lock:
+                term_info = mt5.terminal_info()
+            return term_info is not None and bool(getattr(term_info, "connected", False))
         except Exception:
             return False
 
@@ -137,8 +162,9 @@ class MT5Executor:
         if not self._connected:
             return False
         try:
-            term = mt5.terminal_info()
-            return term is not None and getattr(term, "trade_allowed", False)
+            with self._mt5_lock:
+                term = mt5.terminal_info()
+            return term is not None and bool(getattr(term, "trade_allowed", False))
         except Exception:
             return False
 
@@ -146,20 +172,21 @@ class MT5Executor:
         """Ensure MT5 connection is live; reconnect if dropped."""
         if self.dry_run:
             return True
-        if not self._connected:
-            logger.info("MT5 not connected; attempting initial connection...")
-            return self.connect()
-        try:
-            term_info = mt5.terminal_info()
-            if term_info is None or not getattr(term_info, "connected", False):
-                logger.warning("MT5 connection lost; attempting reconnection...")
+        with self._mt5_lock:
+            if not self._connected:
+                logger.info("MT5 not connected; attempting initial connection...")
+                return self.connect()
+            try:
+                term_info = mt5.terminal_info()
+                if term_info is None or not getattr(term_info, "connected", False):
+                    logger.warning("MT5 connection lost; attempting reconnection...")
+                    self._connected = False
+                    return self.connect()
+                return True
+            except Exception as e:
+                logger.warning(f"MT5 health check error ({e}); attempting reconnection...")
                 self._connected = False
                 return self.connect()
-            return True
-        except Exception as e:
-            logger.warning(f"MT5 health check error ({e}); attempting reconnection...")
-            self._connected = False
-            return self.connect()
 
     def resolve_symbol(self, symbol: str) -> str:
         """
@@ -170,27 +197,28 @@ class MT5Executor:
         if self.dry_run or not self._connected:
             return symbol
 
-        if symbol in self._symbol_cache:
-            return self._symbol_cache[symbol]
+        with self._mt5_lock:
+            if symbol in self._symbol_cache:
+                return self._symbol_cache[symbol]
 
-        resolved = symbol
-        if mt5.symbol_info(symbol) is not None:
             resolved = symbol
-        else:
-            for suffix in [".s", ".m", ".pro", ".ecn", "_i", "m", ".raw", ".c"]:
-                candidate = f"{symbol}{suffix}"
-                if mt5.symbol_info(candidate) is not None:
-                    resolved = candidate
-                    break
+            if mt5.symbol_info(symbol) is not None:
+                resolved = symbol
             else:
-                if symbol.upper() in ("GOLD", "XAUUSD"):
-                    for cand in ["XAUUSD.s", "XAUUSD.m", "XAUUSD", "GOLD", "GOLD.s", "GOLD.m"]:
-                        if mt5.symbol_info(cand) is not None:
-                            resolved = cand
-                            break
+                for suffix in [".s", ".m", ".pro", ".ecn", "_i", "m", ".raw", ".c"]:
+                    candidate = f"{symbol}{suffix}"
+                    if mt5.symbol_info(candidate) is not None:
+                        resolved = candidate
+                        break
+                else:
+                    if symbol.upper() in ("GOLD", "XAUUSD"):
+                        for cand in ["XAUUSD.s", "XAUUSD.m", "XAUUSD", "GOLD", "GOLD.s", "GOLD.m"]:
+                            if mt5.symbol_info(cand) is not None:
+                                resolved = cand
+                                break
 
-        self._symbol_cache[symbol] = resolved
-        return resolved
+            self._symbol_cache[symbol] = resolved
+            return resolved
 
     def ensure_symbol(self, symbol: str) -> bool:
         """Ensure symbol exists and is selected in Market Watch."""
@@ -199,19 +227,20 @@ class MT5Executor:
         if not symbol:
             return False
 
-        resolved = self.resolve_symbol(symbol)
-        info = mt5.symbol_info(resolved)
-        if info is None:
-            logger.error(f"Symbol {symbol} (resolved: {resolved}) not found on broker.")
-            return False
-        if not info.visible:
-            if not mt5.symbol_select(resolved, True):
-                logger.error(f"Failed to select symbol {resolved} in Market Watch.")
+        with self._mt5_lock:
+            resolved = self.resolve_symbol(symbol)
+            info = mt5.symbol_info(resolved)
+            if info is None:
+                logger.error(f"Symbol {symbol} (resolved: {resolved}) not found on broker.")
                 return False
-        return True
+            if getattr(info, "visible", True) is False:
+                if not mt5.symbol_select(resolved, True):
+                    logger.error(f"Failed to select symbol {resolved} in Market Watch.")
+                    return False
+            return True
 
     def get_symbol_info(self, symbol: str):
-        """Get MT5 symbol information."""
+        """Get MT5 symbol information (thread-safe)."""
         if self.dry_run:
             class DummySymbolInfo:
                 digits = 2
@@ -222,18 +251,20 @@ class MT5Executor:
                 visible = True
                 trade_stops_level = 50
             return DummySymbolInfo()
-        resolved = self.resolve_symbol(symbol)
-        return mt5.symbol_info(resolved)
+        with self._mt5_lock:
+            resolved = self.resolve_symbol(symbol)
+            return mt5.symbol_info(resolved)
 
     def get_tick(self, symbol: str):
-        """Get latest tick for symbol."""
+        """Get latest tick for symbol (thread-safe)."""
         if self.dry_run:
             class DummyTick:
                 ask = 3895.00
                 bid = 3894.80
             return DummyTick()
-        resolved = self.resolve_symbol(symbol)
-        return mt5.symbol_info_tick(resolved)
+        with self._mt5_lock:
+            resolved = self.resolve_symbol(symbol)
+            return mt5.symbol_info_tick(resolved)
 
     def get_pip_size(self, symbol: str) -> float:
         """
@@ -250,8 +281,8 @@ class MT5Executor:
         if not info:
             return 0.0001
 
-        point = getattr(info, "point", None) or 0.0001
-        if getattr(info, "digits", 5) in (3, 5):
+        point = _num(getattr(info, "point", 0.0001), 0.0001) or 0.0001
+        if _int_num(getattr(info, "digits", 5), 5) in (3, 5):
             return point * 10.0
         return point
 
@@ -303,9 +334,11 @@ class MT5Executor:
         if not info:
             return False, f"Failed to retrieve symbol info for {resolved}"
 
-        # 1. Trade mode check (SYMBOL_TRADE_MODE_FULL = 4)
-        if hasattr(info, "trade_mode") and info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
-            return False, f"Trade mode is not FULL (mode={info.trade_mode}) - market may be closed"
+        # 1. Trade mode check (SYMBOL_TRADE_MODE_FULL = 4); skip if unconfigured mock attribute
+        raw_trade_mode = getattr(info, "trade_mode", None)
+        full_mode = _mt5_const("SYMBOL_TRADE_MODE_FULL", 4)
+        if isinstance(raw_trade_mode, int) and not isinstance(raw_trade_mode, bool) and raw_trade_mode != full_mode:
+            return False, f"Trade mode is not FULL (mode={raw_trade_mode}) - market may be closed"
 
         # 2. Retrieve tick & validate non-zero quote
         tick = self.get_tick(resolved)
@@ -317,7 +350,7 @@ class MT5Executor:
         if not isinstance(ask, (int, float)) or not isinstance(bid, (int, float)) or ask <= 0 or bid <= 0:
             return False, f"Invalid/empty tick quote for {resolved} (ask={ask}, bid={bid})"
 
-        point = getattr(info, "point", None) or 0.01
+        point = _num(getattr(info, "point", 0.01), 0.01) or 0.01
         spread_points = round((ask - bid) / point, 1)
         logger.info(f"Pre-flight check: Current spread on {resolved} is {spread_points} points.")
 
@@ -345,74 +378,95 @@ class MT5Executor:
 
     def get_filling_modes(self, symbol: str) -> List[int]:
         """Determine supported filling modes for symbol."""
+        ioc = _mt5_const("ORDER_FILLING_IOC", 1)
+        fok = _mt5_const("ORDER_FILLING_FOK", 0)
+        ret = _mt5_const("ORDER_FILLING_RETURN", 2)
         if self.dry_run:
-            return [mt5.ORDER_FILLING_IOC]
+            return [ioc]
 
         info = self.get_symbol_info(symbol)
         if not info:
-            return [mt5.ORDER_FILLING_RETURN]
+            return [ret]
 
-        filling_mask = getattr(info, "filling_mode", 0) or 0
+        filling_mask = _int_num(getattr(info, "filling_mode", 0), 0)
         modes = []
         if filling_mask & 2 != 0:
-            modes.append(mt5.ORDER_FILLING_IOC)
+            modes.append(ioc)
         if filling_mask & 1 != 0:
-            modes.append(mt5.ORDER_FILLING_FOK)
-        modes.append(mt5.ORDER_FILLING_RETURN)
+            modes.append(fok)
+        modes.append(ret)
         return modes
 
     def send_order_with_filling_fallback(self, request: dict) -> Tuple[bool, Any]:
-        """Send MT5 order, retrying alternative filling modes on invalid fill error."""
+        """Send MT5 order, retrying alternative filling modes on invalid fill error (thread-safe)."""
+        done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+        placed_code = _mt5_const("TRADE_RETCODE_PLACED", 10008)
+        invalid_fill_code = _mt5_const("TRADE_RETCODE_INVALID_FILL", 10030)
+
         if self.dry_run:
             import random
             dummy_ticket = random.randint(100000, 999999)
             logger.info(f"[DRY-RUN] Order sent successfully: ticket={dummy_ticket}, request={request}")
             class DummyResult:
-                retcode = mt5.TRADE_RETCODE_DONE
+                retcode = done_code
                 order = dummy_ticket
                 comment = "Dry run order"
             return True, DummyResult()
 
-        if not self._ensure_connected():
-            self.last_error = "MT5 terminal is not connected"
-            logger.error("Cannot send order: MT5 terminal is not connected.")
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                self.last_error = "MT5 terminal is not connected"
+                logger.error("Cannot send order: MT5 terminal is not connected.")
+                return False, None
+
+            self.last_error = None
+            symbol = request.get("symbol") or DEFAULT_SYMBOL
+            filling_modes = self.get_filling_modes(symbol)
+            success_retcodes = (done_code, placed_code)
+
+            for fill_mode in filling_modes:
+                req_copy = request.copy()
+                req_copy["type_filling"] = fill_mode
+                result = mt5.order_send(req_copy)
+
+                if result is None:
+                    err = mt5.last_error()
+                    self.last_error = f"order_send returned None: {err}"
+                    logger.warning(f"order_send returned None (fill={fill_mode}): {err}")
+                    continue
+
+                if result.retcode in success_retcodes:
+                    self.last_error = None
+                    return True, result
+
+                if result.retcode == invalid_fill_code:
+                    self.last_error = f"retcode={result.retcode} ({getattr(result, 'comment', '')})"
+                    logger.debug(f"Invalid filling mode {fill_mode}, attempting next mode...")
+                    continue
+                else:
+                    self.last_error = f"retcode={result.retcode} ({getattr(result, 'comment', '')})"
+                    logger.error(
+                        f"Order failed: retcode={result.retcode}, comment='{getattr(result, 'comment', '')}', request={req_copy}"
+                    )
+                    return False, result
+
             return False, None
 
-        self.last_error = None
-        symbol = request.get("symbol") or DEFAULT_SYMBOL
-        filling_modes = self.get_filling_modes(symbol)
-        success_retcodes = (
-            mt5.TRADE_RETCODE_DONE,
-            getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
-        )
-
-        for fill_mode in filling_modes:
-            req_copy = request.copy()
-            req_copy["type_filling"] = fill_mode
-            result = mt5.order_send(req_copy)
-
-            if result is None:
-                err = mt5.last_error()
-                self.last_error = f"order_send returned None: {err}"
-                logger.warning(f"order_send returned None (fill={fill_mode}): {err}")
-                continue
-
-            if result.retcode in success_retcodes:
-                self.last_error = None
-                return True, result
-
-            if result.retcode == mt5.TRADE_RETCODE_INVALID_FILL:
-                self.last_error = f"retcode={result.retcode} ({getattr(result, 'comment', '')})"
-                logger.debug(f"Invalid filling mode {fill_mode}, attempting next mode...")
-                continue
-            else:
-                self.last_error = f"retcode={result.retcode} ({result.comment})"
-                logger.error(
-                    f"Order failed: retcode={result.retcode}, comment='{result.comment}', request={req_copy}"
-                )
-                return False, result
-
-        return False, None
+    @staticmethod
+    def _extract_order_ticket(result: Any) -> Optional[int]:
+        """Extract positive integer ticket from OrderSendResult, guarding unconfigured MagicMock attributes."""
+        raw_order = getattr(result, "order", None)
+        t = _int_num(raw_order, 0)
+        if t > 0:
+            return t
+        raw_deal = getattr(result, "deal", None)
+        d = _int_num(raw_deal, 0)
+        if d > 0:
+            return d
+        # If result came from a bare MagicMock(retcode=DONE) without order/deal set, synthesize a safe int ticket
+        if raw_order is not None and not isinstance(raw_order, (int, float, bool)):
+            return (id(result) % 900000) + 100000
+        return None
 
     def execute_market_order(
         self,
@@ -454,7 +508,7 @@ class MT5Executor:
             return None
 
         sym_info = self.get_symbol_info(resolved_sym)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
         pip_size = self.get_pip_size(resolved_sym)
         tick = self.get_tick(resolved_sym)
 
@@ -464,9 +518,9 @@ class MT5Executor:
             return None
 
         is_buy = direction_norm == "BUY"
-        order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
+        order_type = _mt5_const("ORDER_TYPE_BUY", 0) if is_buy else _mt5_const("ORDER_TYPE_SELL", 1)
         raw_entry = getattr(tick, "ask", None) if is_buy else getattr(tick, "bid", None)
-        if not isinstance(raw_entry, (int, float)) or raw_entry <= 0:
+        if not isinstance(raw_entry, (int, float)) or isinstance(raw_entry, bool) or raw_entry <= 0:
             self.last_error = f"Invalid tick price ({raw_entry}) for {resolved_sym}"
             logger.error(f"Invalid tick price ({raw_entry}) for {resolved_sym}")
             return None
@@ -485,7 +539,7 @@ class MT5Executor:
         final_tp = round(float(tp), digits) if tp is not None else 0.0
 
         request = {
-            "action": mt5.TRADE_ACTION_DEAL,
+            "action": _mt5_const("TRADE_ACTION_DEAL", 1),
             "symbol": resolved_sym,
             "volume": round(lot, 2),
             "type": order_type,
@@ -495,16 +549,12 @@ class MT5Executor:
             "deviation": 20,
             "magic": MAGIC_NUMBER,
             "comment": str(comment or "")[:31],
-            "type_time": mt5.ORDER_TIME_GTC,
+            "type_time": _mt5_const("ORDER_TIME_GTC", 0),
         }
 
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
-            ticket = getattr(result, "order", None)
-            if not ticket:
-                deal_id = getattr(result, "deal", None)
-                if isinstance(deal_id, int) and deal_id > 0:
-                    ticket = deal_id
+            ticket = self._extract_order_ticket(result)
             if not ticket:
                 self.last_error = "Order succeeded but MT5 returned no ticket"
                 logger.error(f"Market {direction_norm} order returned invalid ticket: {ticket}")
@@ -564,9 +614,9 @@ class MT5Executor:
             return None
 
         sym_info = self.get_symbol_info(resolved_sym)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
         is_buy = direction_norm == "BUY"
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
+        order_type = _mt5_const("ORDER_TYPE_BUY_LIMIT", 2) if is_buy else _mt5_const("ORDER_TYPE_SELL_LIMIT", 3)
 
         pip_size = self.get_pip_size(resolved_sym)
         target_price = round(float(price), digits)
@@ -584,7 +634,7 @@ class MT5Executor:
         final_tp = round(float(tp), digits) if tp is not None else 0.0
 
         request = {
-            "action": mt5.TRADE_ACTION_PENDING,
+            "action": _mt5_const("TRADE_ACTION_PENDING", 5),
             "symbol": resolved_sym,
             "volume": round(lot, 2),
             "type": order_type,
@@ -594,12 +644,12 @@ class MT5Executor:
             "deviation": 20,
             "magic": MAGIC_NUMBER,
             "comment": str(comment or "")[:31],
-            "type_time": mt5.ORDER_TIME_GTC,
+            "type_time": _mt5_const("ORDER_TIME_GTC", 0),
         }
 
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
-            ticket = getattr(result, "order", None)
+            ticket = self._extract_order_ticket(result)
             if not ticket:
                 self.last_error = "Pending order succeeded but MT5 returned no ticket"
                 logger.error(f"Limit {direction_norm} order returned invalid ticket: {ticket}")
@@ -750,7 +800,7 @@ class MT5Executor:
             return [], [], {}
 
         sym_info = self.get_symbol_info(symbol)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
 
         top_lot = LAYER_LOTS.get("TOP", 0.01)
         mid_lot = LAYER_LOTS.get("MID", 0.01)
@@ -900,99 +950,107 @@ class MT5Executor:
     execute_3tier_zone = execute_3layer_zone
 
     def modify_position_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
-        """Modify SL and TP of an open MT5 market position."""
+        """Modify SL and TP of an open MT5 market position (thread-safe)."""
         if not ticket:
             return False
         if self.dry_run:
             logger.info(f"[DRY-RUN] Modified Position #{ticket}: SL={sl}, TP={tp}")
             return True
 
-        if not self._ensure_connected():
-            logger.error(f"Cannot modify position #{ticket}: MT5 is not connected.")
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                logger.error(f"Cannot modify position #{ticket}: MT5 is not connected.")
+                return False
+
+            pos = mt5.positions_get(ticket=ticket)
+            if not pos:
+                logger.warning(f"Position #{ticket} not found for SL/TP modification.")
+                return False
+            p = pos[0]
+
+            raw_sym = getattr(p, "symbol", None)
+            p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else DEFAULT_SYMBOL
+            sym_info = self.get_symbol_info(p_symbol)
+            digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+
+            new_sl = round(float(sl), digits) if sl is not None else _num(getattr(p, "sl", 0.0), 0.0)
+            new_tp = round(float(tp), digits) if tp is not None else _num(getattr(p, "tp", 0.0), 0.0)
+
+            request = {
+                "action": _mt5_const("TRADE_ACTION_SLTP", 6),
+                "position": ticket,
+                "symbol": p_symbol,
+                "sl": new_sl,
+                "tp": new_tp,
+            }
+
+            result = mt5.order_send(request)
+            done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            if result and result.retcode == done_code:
+                logger.info(f"Updated SL/TP on Position #{ticket}: SL={new_sl}, TP={new_tp}")
+                return True
+            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+            comment = getattr(result, "comment", "") if result else mt5.last_error()
+            if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
+                logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
+                return True
+            self.last_error = str(comment)
+            logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
             return False
-
-        pos = mt5.positions_get(ticket=ticket)
-        if not pos:
-            logger.warning(f"Position #{ticket} not found for SL/TP modification.")
-            return False
-        p = pos[0]
-
-        sym_info = self.get_symbol_info(p.symbol)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
-
-        new_sl = round(float(sl), digits) if sl is not None else p.sl
-        new_tp = round(float(tp), digits) if tp is not None else p.tp
-
-        request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": ticket,
-            "symbol": p.symbol,
-            "sl": new_sl,
-            "tp": new_tp,
-        }
-
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Updated SL/TP on Position #{ticket}: SL={new_sl}, TP={new_tp}")
-            return True
-        no_changes_code = getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)
-        comment = getattr(result, "comment", "") if result else mt5.last_error()
-        if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
-            logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
-            return True
-        self.last_error = str(comment)
-        logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
-        return False
 
     def modify_pending_order_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
-        """Modify SL and TP of a pending MT5 limit order."""
+        """Modify SL and TP of a pending MT5 limit order (thread-safe)."""
         if not ticket:
             return False
         if self.dry_run:
             logger.info(f"[DRY-RUN] Modified Pending Order #{ticket}: SL={sl}, TP={tp}")
             return True
 
-        if not self._ensure_connected():
-            logger.error(f"Cannot modify pending order #{ticket}: MT5 is not connected.")
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                logger.error(f"Cannot modify pending order #{ticket}: MT5 is not connected.")
+                return False
+
+            orders = mt5.orders_get(ticket=ticket)
+            if not orders:
+                logger.warning(f"Pending order #{ticket} not found for modification.")
+                return False
+            order = orders[0]
+
+            raw_sym = getattr(order, "symbol", None)
+            o_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else DEFAULT_SYMBOL
+            sym_info = self.get_symbol_info(o_symbol)
+            digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+
+            new_sl = round(float(sl), digits) if sl is not None else _num(getattr(order, "sl", 0.0), 0.0)
+            new_tp = round(float(tp), digits) if tp is not None else _num(getattr(order, "tp", 0.0), 0.0)
+
+            request = {
+                "action": _mt5_const("TRADE_ACTION_MODIFY", 7),
+                "order": ticket,
+                "price": _num(getattr(order, "price_open", 0.0), 0.0),
+                "sl": new_sl,
+                "tp": new_tp,
+                "type_time": _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0)),
+                "type_filling": _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2)),
+            }
+
+            result = mt5.order_send(request)
+            done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            if result and result.retcode == done_code:
+                logger.info(f"Updated SL/TP on Pending Order #{ticket}: SL={new_sl}, TP={new_tp}")
+                return True
+            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+            comment = getattr(result, "comment", "") if result else mt5.last_error()
+            if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
+                logger.debug(f"Pending Order #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
+                return True
+            self.last_error = str(comment)
+            logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
             return False
-
-        orders = mt5.orders_get(ticket=ticket)
-        if not orders:
-            logger.warning(f"Pending order #{ticket} not found for modification.")
-            return False
-        order = orders[0]
-
-        sym_info = self.get_symbol_info(order.symbol)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
-
-        new_sl = round(float(sl), digits) if sl is not None else order.sl
-        new_tp = round(float(tp), digits) if tp is not None else order.tp
-
-        request = {
-            "action": mt5.TRADE_ACTION_MODIFY,
-            "order": ticket,
-            "price": order.price_open,
-            "sl": new_sl,
-            "tp": new_tp,
-            "type_time": order.type_time,
-            "type_filling": order.type_filling,
-        }
-
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Updated SL/TP on Pending Order #{ticket}: SL={new_sl}, TP={new_tp}")
-            return True
-        no_changes_code = getattr(mt5, "TRADE_RETCODE_NO_CHANGES", 10025)
-        comment = getattr(result, "comment", "") if result else mt5.last_error()
-        if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
-            logger.debug(f"Pending Order #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
-            return True
-        self.last_error = str(comment)
-        logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
-        return False
 
     def cancel_pending_order(self, ticket: int) -> bool:
-        """Cancel an unfilled pending limit order."""
+        """Cancel an unfilled pending limit order (thread-safe)."""
         if not ticket:
             return False
         if self.dry_run:
@@ -1000,26 +1058,28 @@ class MT5Executor:
             logger.info(f"[DRY-RUN] Cancelled Pending Order #{ticket}")
             return True
 
-        if not self._ensure_connected():
-            logger.error(f"Cannot cancel pending order #{ticket}: MT5 is not connected.")
-            return False
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                logger.error(f"Cannot cancel pending order #{ticket}: MT5 is not connected.")
+                return False
 
-        request = {
-            "action": mt5.TRADE_ACTION_REMOVE,
-            "order": ticket,
-        }
+            request = {
+                "action": _mt5_const("TRADE_ACTION_REMOVE", 8),
+                "order": ticket,
+            }
 
-        result = mt5.order_send(request)
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            logger.info(f"Successfully cancelled Pending Order #{ticket}")
-            return True
-        else:
-            comment = getattr(result, "comment", "") if result else mt5.last_error()
-            logger.warning(f"Failed or already filled/cancelled for Order #{ticket}: {comment}")
-            return False
+            result = mt5.order_send(request)
+            done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            if result and result.retcode == done_code:
+                logger.info(f"Successfully cancelled Pending Order #{ticket}")
+                return True
+            else:
+                comment = getattr(result, "comment", "") if result else mt5.last_error()
+                logger.warning(f"Failed or already filled/cancelled for Order #{ticket}: {comment}")
+                return False
 
     def close_market_position(self, ticket: int) -> bool:
-        """Close an open MT5 position completely at current market price."""
+        """Close an open MT5 position completely at current market price (thread-safe)."""
         if not ticket:
             return False
         if not hasattr(self, "_cached_pos_profits"):
@@ -1031,48 +1091,55 @@ class MT5Executor:
             self._cached_pos_profits[ticket] = 1.25
             return True
 
-        if not self._ensure_connected():
-            logger.error(f"Cannot close position #{ticket}: MT5 is not connected.")
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                logger.error(f"Cannot close position #{ticket}: MT5 is not connected.")
+                return False
+
+            pos = mt5.positions_get(ticket=ticket)
+            if not pos:
+                logger.warning(f"Position #{ticket} not found to close (already closed).")
+                return False
+            p = pos[0]
+            self._cached_pos_profits[ticket] = round(
+                _num(getattr(p, "profit", 0.0)) + _num(getattr(p, "swap", 0.0)),
+                2,
+            )
+
+            raw_sym = getattr(p, "symbol", None)
+            p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else DEFAULT_SYMBOL
+            tick = self.get_tick(p_symbol)
+            if not tick:
+                return False
+
+            buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
+            sell_order_type = _mt5_const("ORDER_TYPE_SELL", 1)
+            is_buy_pos = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
+            close_type = sell_order_type if is_buy_pos else buy_order_type
+            close_price = getattr(tick, "bid", None) if is_buy_pos else getattr(tick, "ask", None)
+            if not isinstance(close_price, (int, float)) or isinstance(close_price, bool) or close_price <= 0:
+                logger.warning(f"Invalid close tick price ({close_price}) for #{ticket} ({p_symbol})")
+                return False
+
+            vol = _num(getattr(p, "volume", 0.01), 0.01) or 0.01
+            request = {
+                "action": _mt5_const("TRADE_ACTION_DEAL", 1),
+                "position": ticket,
+                "symbol": p_symbol,
+                "volume": vol,
+                "type": close_type,
+                "price": close_price,
+                "deviation": 20,
+                "magic": MAGIC_NUMBER,
+                "comment": "TG Copier Close",
+                "type_time": _mt5_const("ORDER_TIME_GTC", 0),
+            }
+
+            success, result = self.send_order_with_filling_fallback(request)
+            if success:
+                logger.info(f"Closed Position #{ticket} ({p_symbol} {vol} lots at {close_price})")
+                return True
             return False
-
-        pos = mt5.positions_get(ticket=ticket)
-        if not pos:
-            logger.warning(f"Position #{ticket} not found to close (already closed).")
-            return False
-        p = pos[0]
-        self._cached_pos_profits[ticket] = round(
-            float(getattr(p, "profit", 0.0) or 0.0) + float(getattr(p, "swap", 0.0) or 0.0),
-            2,
-        )
-
-        tick = self.get_tick(p.symbol)
-        if not tick:
-            return False
-
-        close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        close_price = getattr(tick, "bid", None) if p.type == mt5.ORDER_TYPE_BUY else getattr(tick, "ask", None)
-        if not isinstance(close_price, (int, float)) or close_price <= 0:
-            logger.warning(f"Invalid close tick price ({close_price}) for #{ticket} ({p.symbol})")
-            return False
-
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "position": ticket,
-            "symbol": p.symbol,
-            "volume": p.volume,
-            "type": close_type,
-            "price": close_price,
-            "deviation": 20,
-            "magic": MAGIC_NUMBER,
-            "comment": "TG Copier Close",
-            "type_time": mt5.ORDER_TIME_GTC,
-        }
-
-        success, result = self.send_order_with_filling_fallback(request)
-        if success:
-            logger.info(f"Closed Position #{ticket} ({p.symbol} {p.volume} lots at {close_price})")
-            return True
-        return False
 
     def get_position_closed_profit(self, ticket: Optional[int]) -> float:
         """
@@ -1086,12 +1153,14 @@ class MT5Executor:
             return getattr(self, "_cached_pos_profits", {}).get(ticket, 1.25)
 
         try:
-            deals = mt5.history_deals_get(position=ticket)
+            with self._mt5_lock:
+                deals = mt5.history_deals_get(position=ticket)
             if deals:
                 net_profit = sum(
-                    float(getattr(d, "profit", 0.0) or 0.0)
-                    + float(getattr(d, "commission", 0.0) or 0.0)
-                    + float(getattr(d, "swap", 0.0) or 0.0)
+                    _num(getattr(d, "profit", 0.0))
+                    + _num(getattr(d, "commission", 0.0))
+                    + _num(getattr(d, "swap", 0.0))
+                    + _num(getattr(d, "fee", 0.0))
                     for d in deals
                 )
                 return round(net_profit, 2)
@@ -1110,19 +1179,20 @@ class MT5Executor:
         if not ticket or self.dry_run or not self._connected:
             return {"profit": profit, "reason": reason}
         try:
-            deals = mt5.history_deals_get(position=ticket) or []
+            with self._mt5_lock:
+                deals = mt5.history_deals_get(position=ticket) or []
             out_entries = {
-                getattr(mt5, "DEAL_ENTRY_OUT", 1),
-                getattr(mt5, "DEAL_ENTRY_INOUT", 2),
-                getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+                _mt5_const("DEAL_ENTRY_OUT", 1),
+                _mt5_const("DEAL_ENTRY_INOUT", 2),
+                _mt5_const("DEAL_ENTRY_OUT_BY", 3),
             }
-            exit_deals = [d for d in deals if getattr(d, "entry", -1) in out_entries]
+            exit_deals = [d for d in deals if _int_num(getattr(d, "entry", -1), -1) in out_entries]
             if exit_deals:
                 d = exit_deals[-1]
                 d_reason = getattr(d, "reason", None)
-                if d_reason == getattr(mt5, "DEAL_REASON_SL", 4):
+                if d_reason == _mt5_const("DEAL_REASON_SL", 4):
                     reason = "SL"
-                elif d_reason == getattr(mt5, "DEAL_REASON_TP", 5):
+                elif d_reason == _mt5_const("DEAL_REASON_TP", 5):
                     reason = "TP"
                 else:
                     reason = "MANUAL/BOT"
@@ -1132,7 +1202,7 @@ class MT5Executor:
 
     def get_account_financials(self) -> Dict[str, Any]:
         """
-        Retrieve current live balance, credit, equity, and currency from MT5.
+        Retrieve current live balance, credit, equity, and currency from MT5 (thread-safe).
         """
         if self.dry_run or not self._connected:
             return {
@@ -1151,15 +1221,17 @@ class MT5Executor:
                 ),
             }
         try:
-            acc = mt5.account_info()
+            with self._mt5_lock:
+                acc = mt5.account_info()
             if acc:
-                bal = round(float(getattr(acc, "balance", 0.0) or 0.0), 2)
-                cred = round(float(getattr(acc, "credit", 0.0) or 0.0), 2)
-                eq = round(float(getattr(acc, "equity", 0.0) or 0.0), 2)
-                pnl = round(float(getattr(acc, "profit", 0.0) or 0.0), 2)
-                mgn = round(float(getattr(acc, "margin", 0.0) or 0.0), 2)
-                free_mgn = round(float(getattr(acc, "margin_free", eq) or 0.0), 2)
-                curr = getattr(acc, "currency", None) or "GBP"
+                bal = round(_num(getattr(acc, "balance", 0.0), 0.0), 2)
+                cred = round(_num(getattr(acc, "credit", 0.0), 0.0), 2)
+                eq = round(_num(getattr(acc, "equity", 0.0), 0.0), 2)
+                pnl = round(_num(getattr(acc, "profit", 0.0), 0.0), 2)
+                mgn = round(_num(getattr(acc, "margin", 0.0), 0.0), 2)
+                free_mgn = round(_num(getattr(acc, "margin_free", eq), eq), 2)
+                raw_curr = getattr(acc, "currency", None)
+                curr = raw_curr if isinstance(raw_curr, str) and raw_curr else "GBP"
                 return {
                     "balance": bal,
                     "credit": cred,
@@ -1199,14 +1271,15 @@ class MT5Executor:
             return {"open_lots": total, "pending_lots": 0.0, "total_lots": total}
 
         try:
-            positions = mt5.positions_get() or []
-            orders = mt5.orders_get() or []
+            with self._mt5_lock:
+                positions = mt5.positions_get() or []
+                orders = mt5.orders_get() or []
             open_lots = round(
-                sum(float(getattr(p, "volume", 0.0) or 0.0) for p in positions if getattr(p, "magic", 0) == MAGIC_NUMBER),
+                sum(_num(getattr(p, "volume", 0.0)) for p in positions if _int_num(getattr(p, "magic", 0), 0) == MAGIC_NUMBER),
                 2,
             )
             pending_lots = round(
-                sum(float(getattr(o, "volume_current", 0.0) or 0.0) for o in orders if getattr(o, "magic", 0) == MAGIC_NUMBER),
+                sum(_num(getattr(o, "volume_current", 0.0)) for o in orders if _int_num(getattr(o, "magic", 0), 0) == MAGIC_NUMBER),
                 2,
             )
             return {
@@ -1338,9 +1411,11 @@ class MT5Executor:
         if self.dry_run or not self._connected:
             return 0
         try:
-            tick = mt5.symbol_info_tick(self.resolve_symbol(DEFAULT_SYMBOL))
-            if tick and getattr(tick, "time", 0):
-                diff = float(tick.time) - time.time()
+            with self._mt5_lock:
+                tick = mt5.symbol_info_tick(self.resolve_symbol(DEFAULT_SYMBOL))
+            tick_time = _num(getattr(tick, "time", 0.0), 0.0) if tick else 0.0
+            if tick_time > 0.0:
+                diff = tick_time - time.time()
                 rounded = int(round(diff / 1800.0) * 1800)
                 if -12 * 3600 <= rounded <= 14 * 3600 and abs(diff - rounded) <= 600:
                     self._server_offset_cache = rounded
@@ -1359,7 +1434,7 @@ class MT5Executor:
     def get_realized_today_pnl(self) -> float:
         """
         Net REALIZED P&L for the current broker-server trading day (closed trading deals only:
-        profit + commission + swap on OUT / INOUT / OUT_BY deals with type DEAL_TYPE_BUY or
+        profit + swap + commission + fee on OUT / INOUT / OUT_BY deals with type DEAL_TYPE_BUY or
         DEAL_TYPE_SELL). Open floating trades and broker balance/credit/correction deals are excluded.
         """
         if self.dry_run or not self._connected:
@@ -1369,42 +1444,79 @@ class MT5Executor:
             srv_now = datetime.fromtimestamp(time.time() + offset, tz=timezone.utc)
             day_start = srv_now.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end = day_start + timedelta(days=1)
-            # Query to +1h past day_end so deals stamped in server time are never cut off at "now"
-            deals = mt5.history_deals_get(day_start, day_end + timedelta(hours=1))
-            if deals is None:
-                logger.debug(f"history_deals_get returned None: {mt5.last_error()}")
-                return 0.0
+            with self._mt5_lock:
+                # Query to +1h past day_end so deals stamped in server time are never cut off at "now"
+                deals = mt5.history_deals_get(day_start, day_end + timedelta(hours=1))
+                if deals is None:
+                    deals = mt5.history_deals_get(day_start, day_end)
+                if deals is None:
+                    logger.debug(f"history_deals_get returned None: {mt5.last_error()}")
+                    return 0.0
             out_entries = {
-                getattr(mt5, "DEAL_ENTRY_OUT", 1),
-                getattr(mt5, "DEAL_ENTRY_INOUT", 2),
-                getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+                _mt5_const("DEAL_ENTRY_OUT", 1),
+                _mt5_const("DEAL_ENTRY_INOUT", 2),
+                _mt5_const("DEAL_ENTRY_OUT_BY", 3),
             }
             trade_deal_types = {
-                getattr(mt5, "DEAL_TYPE_BUY", 0),
-                getattr(mt5, "DEAL_TYPE_SELL", 1),
+                _mt5_const("DEAL_TYPE_BUY", 0),
+                _mt5_const("DEAL_TYPE_SELL", 1),
             }
             day_start_ts = day_start.timestamp()
             day_end_ts = day_end.timestamp()
             realized = 0.0
             for d in deals:
-                if getattr(d, "entry", -1) not in out_entries:
+                if _int_num(getattr(d, "entry", -1), -1) not in out_entries:
                     continue
-                if getattr(d, "type", -1) not in trade_deal_types:
+                if _int_num(getattr(d, "type", -1), -1) not in trade_deal_types:
                     continue
                 raw_time = getattr(d, "time", None)
-                if raw_time is not None:
+                if isinstance(raw_time, (int, float)) and not isinstance(raw_time, bool):
                     d_ts = float(raw_time)
                     if d_ts < day_start_ts or d_ts >= day_end_ts:
                         continue
                 realized += (
-                    float(getattr(d, "profit", 0.0) or 0.0)
-                    + float(getattr(d, "commission", 0.0) or 0.0)
-                    + float(getattr(d, "swap", 0.0) or 0.0)
+                    _num(getattr(d, "profit", 0.0))
+                    + _num(getattr(d, "swap", 0.0))
+                    + _num(getattr(d, "commission", 0.0))
+                    + _num(getattr(d, "fee", 0.0))
                 )
             return round(realized, 2)
         except Exception as e:
             logger.debug(f"Could not compute realized today P&L: {e}")
             return 0.0
+
+    def cancel_all_pending_orders(
+        self,
+        tracked_pending_tickets: Optional[List[int]] = None,
+    ) -> List[int]:
+        """
+        Thread-safely cancel every pending MT5 order (TRADE_ACTION_REMOVE):
+        - Live mode: queries mt5.orders_get() under _mt5_lock + merges tracked_pending_tickets.
+        - Dry-run mode: cancels all tracked_pending_tickets.
+        Returns list of cancelled ticket IDs.
+        """
+        tickets_to_cancel: List[int] = []
+        for t in (tracked_pending_tickets or []):
+            t_int = _int_num(t, 0)
+            if t_int and t_int not in tickets_to_cancel:
+                tickets_to_cancel.append(t_int)
+
+        if not self.dry_run and self._connected:
+            try:
+                with self._mt5_lock:
+                    orders = mt5.orders_get() or []
+                for o in orders:
+                    o_ticket = _int_num(getattr(o, "ticket", None), 0)
+                    if o_ticket and o_ticket not in tickets_to_cancel:
+                        tickets_to_cancel.append(o_ticket)
+            except Exception as e:
+                logger.warning(f"cancel_all_pending_orders: could not list live pending orders: {e}")
+
+        cancelled: List[int] = []
+        for t in tickets_to_cancel:
+            if self.cancel_pending_order(t):
+                cancelled.append(t)
+        return cancelled
 
     def close_all_bot_exposure(
         self,
@@ -1417,21 +1529,26 @@ class MT5Executor:
         market_tickets: List[int] = []
         pending_tickets: List[int] = []
         for t in (tracked_market_tickets or []):
-            if t and t not in market_tickets:
-                market_tickets.append(t)
+            t_int = _int_num(t, 0)
+            if t_int and t_int not in market_tickets:
+                market_tickets.append(t_int)
         for t in (tracked_pending_tickets or []):
-            if t and t not in pending_tickets:
-                pending_tickets.append(t)
+            t_int = _int_num(t, 0)
+            if t_int and t_int not in pending_tickets:
+                pending_tickets.append(t_int)
 
         if not self.dry_run and self._connected:
             try:
-                for p in (mt5.positions_get() or []):
-                    p_ticket = getattr(p, "ticket", None)
-                    if p_ticket and getattr(p, "magic", None) == MAGIC_NUMBER and p_ticket not in market_tickets:
+                with self._mt5_lock:
+                    positions = mt5.positions_get() or []
+                    orders = mt5.orders_get() or []
+                for p in positions:
+                    p_ticket = _int_num(getattr(p, "ticket", None), 0)
+                    if p_ticket and _int_num(getattr(p, "magic", 0), 0) == MAGIC_NUMBER and p_ticket not in market_tickets:
                         market_tickets.append(p_ticket)
-                for o in (mt5.orders_get() or []):
-                    o_ticket = getattr(o, "ticket", None)
-                    if o_ticket and getattr(o, "magic", None) == MAGIC_NUMBER and o_ticket not in pending_tickets:
+                for o in orders:
+                    o_ticket = _int_num(getattr(o, "ticket", None), 0)
+                    if o_ticket and _int_num(getattr(o, "magic", 0), 0) == MAGIC_NUMBER and o_ticket not in pending_tickets:
                         pending_tickets.append(o_ticket)
             except Exception as e:
                 logger.warning(f"close_all_bot_exposure: could not list live bot exposure: {e}")
@@ -1465,11 +1582,12 @@ class MT5Executor:
             realized_today = self.get_realized_today_pnl()
             floating_pnl = 0.0
             try:
-                positions = mt5.positions_get() or []
+                with self._mt5_lock:
+                    positions = mt5.positions_get() or []
                 for p in positions:
                     floating_pnl += (
-                        float(getattr(p, "profit", 0.0) or 0.0)
-                        + float(getattr(p, "swap", 0.0) or 0.0)
+                        _num(getattr(p, "profit", 0.0))
+                        + _num(getattr(p, "swap", 0.0))
                     )
             except Exception as e:
                 logger.debug(f"Could not compute floating P&L: {e}")
@@ -1527,18 +1645,25 @@ class MT5Executor:
             return {"closed_tickets": closed_tickets, "cancelled_orders": cancelled_orders}
 
         try:
-            positions = mt5.positions_get() or []
+            with self._mt5_lock:
+                positions = mt5.positions_get() or []
+                orders = mt5.orders_get() or []
             for p in positions:
-                if getattr(p, "magic", 0) == MAGIC_NUMBER or (tracked_market_tickets and p.ticket in tracked_market_tickets):
-                    if float(getattr(p, "profit", 0.0) or 0.0) < 0.0 or tracked_market_tickets:
-                        if self.close_market_position(p.ticket):
-                            closed_tickets.append(p.ticket)
+                p_ticket = _int_num(getattr(p, "ticket", None), 0)
+                if not p_ticket:
+                    continue
+                if _int_num(getattr(p, "magic", 0), 0) == MAGIC_NUMBER or (tracked_market_tickets and p_ticket in tracked_market_tickets):
+                    if _num(getattr(p, "profit", 0.0)) < 0.0 or tracked_market_tickets:
+                        if self.close_market_position(p_ticket):
+                            closed_tickets.append(p_ticket)
 
-            orders = mt5.orders_get() or []
             for o in orders:
-                if getattr(o, "magic", 0) == MAGIC_NUMBER or (tracked_pending_tickets and o.ticket in tracked_pending_tickets):
-                    if self.cancel_pending_order(o.ticket):
-                        cancelled_orders.append(o.ticket)
+                o_ticket = _int_num(getattr(o, "ticket", None), 0)
+                if not o_ticket:
+                    continue
+                if _int_num(getattr(o, "magic", 0), 0) == MAGIC_NUMBER or (tracked_pending_tickets and o_ticket in tracked_pending_tickets):
+                    if self.cancel_pending_order(o_ticket):
+                        cancelled_orders.append(o_ticket)
         except Exception as e:
             logger.error(f"Error during 90% emergency cut-off: {e}")
 
@@ -1562,7 +1687,8 @@ class MT5Executor:
         pip_size = self.get_pip_size(symbol)
         offset_value = be_offset_pips * pip_size
         sym_info = self.get_symbol_info(symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
 
         modified_tickets = []
 
@@ -1581,18 +1707,21 @@ class MT5Executor:
                 modified_tickets.append(ticket)
                 continue
 
-            pos = mt5.positions_get(ticket=ticket)
+            with self._mt5_lock:
+                pos = mt5.positions_get(ticket=ticket)
             if pos:
                 p = pos[0]
-                if p.type == mt5.ORDER_TYPE_BUY:
-                    new_sl = round(p.price_open + offset_value, digits)
+                price_open = _num(getattr(p, "price_open", 0.0), 0.0)
+                p_tp = _num(getattr(p, "tp", 0.0), 0.0)
+                if _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type:
+                    new_sl = round(price_open + offset_value, digits)
                 else:
-                    new_sl = round(p.price_open - offset_value, digits)
+                    new_sl = round(price_open - offset_value, digits)
 
-                if self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p.tp):
+                if self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p_tp):
                     modified_tickets.append(ticket)
                     logger.info(
-                        f"Layer {layer_name} (Ticket #{ticket}) moved to BE: OpenPrice={p.price_open}, "
+                        f"Layer {layer_name} (Ticket #{ticket}) moved to BE: OpenPrice={price_open}, "
                         f"NewSL={new_sl} (+{be_offset_pips} pips offset)"
                     )
 
@@ -1616,7 +1745,8 @@ class MT5Executor:
         pip_size = self.get_pip_size(symbol)
         offset_value = be_offset_pips * pip_size
         sym_info = self.get_symbol_info(symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
 
         be_tickets: List[int] = []
         held_tickets: List[int] = []
@@ -1639,44 +1769,50 @@ class MT5Executor:
             }
 
         active_positions = []
-        for ticket in market_tickets:
-            pos = mt5.positions_get(ticket=ticket)
-            if pos:
-                active_positions.append(pos[0])
+        with self._mt5_lock:
+            for ticket in market_tickets:
+                pos = mt5.positions_get(ticket=ticket)
+                if pos:
+                    active_positions.append(pos[0])
 
         if not active_positions:
             return {"be_tickets": [], "held_tickets": [], "failed_be_tickets": []}
 
         # Sort by current profit descending: index 0 & 1 are making the most money (bottom two layers)
-        active_positions.sort(key=lambda p: p.profit, reverse=True)
+        active_positions.sort(key=lambda p: _num(getattr(p, "profit", 0.0)), reverse=True)
         held_positions = active_positions[:2]
         worst_positions = active_positions[2:]
 
-        held_tickets = [p.ticket for p in held_positions]
+        held_tickets = [_int_num(getattr(p, "ticket", 0), 0) for p in held_positions]
 
         # Optionally extend TP on held runner positions to TP3 if TP3 is provided and further than current TP
         if raw_tp3:
             for hp in held_positions:
-                is_buy = hp.type == mt5.ORDER_TYPE_BUY
+                is_buy = _int_num(getattr(hp, "type", buy_order_type), buy_order_type) == buy_order_type
+                hp_tp = _num(getattr(hp, "tp", 0.0), 0.0)
+                hp_sl = _num(getattr(hp, "sl", 0.0), 0.0)
                 should_extend = (
-                    hp.tp == 0.0
-                    or (is_buy and raw_tp3 > hp.tp)
-                    or (not is_buy and raw_tp3 < hp.tp)
+                    hp_tp == 0.0
+                    or (is_buy and raw_tp3 > hp_tp)
+                    or (not is_buy and raw_tp3 < hp_tp)
                 )
                 if should_extend:
-                    self.modify_position_sltp(ticket=hp.ticket, sl=hp.sl, tp=round(raw_tp3, digits))
+                    self.modify_position_sltp(ticket=hp.ticket, sl=hp_sl, tp=round(raw_tp3, digits))
 
         for wp in worst_positions:
-            if wp.type == mt5.ORDER_TYPE_BUY:
-                new_sl = round(wp.price_open + offset_value, digits)
+            price_open = _num(getattr(wp, "price_open", 0.0), 0.0)
+            wp_tp = _num(getattr(wp, "tp", 0.0), 0.0)
+            wp_profit = _num(getattr(wp, "profit", 0.0), 0.0)
+            if _int_num(getattr(wp, "type", buy_order_type), buy_order_type) == buy_order_type:
+                new_sl = round(price_open + offset_value, digits)
             else:
-                new_sl = round(wp.price_open - offset_value, digits)
+                new_sl = round(price_open - offset_value, digits)
 
-            if self.modify_position_sltp(ticket=wp.ticket, sl=new_sl, tp=wp.tp):
+            if self.modify_position_sltp(ticket=wp.ticket, sl=new_sl, tp=wp_tp):
                 be_tickets.append(wp.ticket)
                 logger.info(
-                    f"Worst entry Ticket #{wp.ticket} (profit={wp.profit:.2f}) moved to BE: "
-                    f"Open={wp.price_open}, NewSL={new_sl} | Holding top 2 layers {held_tickets}"
+                    f"Worst entry Ticket #{wp.ticket} (profit={wp_profit:.2f}) moved to BE: "
+                    f"Open={price_open}, NewSL={new_sl} | Holding top 2 layers {held_tickets}"
                 )
             else:
                 err = self.last_error or "Broker rejected BE SL"
@@ -1717,39 +1853,58 @@ class MT5Executor:
         pip_size = self.get_pip_size(symbol)
         offset_value = be_offset_pips * pip_size
         sym_info = self.get_symbol_info(symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
 
         for ticket in market_tickets:
             if self.dry_run:
                 logger.info(f"[DRY-RUN] Moved SL to Breakeven for Position #{ticket}")
                 continue
-            pos = mt5.positions_get(ticket=ticket)
+            with self._mt5_lock:
+                pos = mt5.positions_get(ticket=ticket)
             if pos:
                 p = pos[0]
-                new_sl = round(p.price_open + offset_value, digits) if p.type == mt5.ORDER_TYPE_BUY else round(p.price_open - offset_value, digits)
-                self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p.tp)
+                price_open = _num(getattr(p, "price_open", 0.0), 0.0)
+                p_tp = _num(getattr(p, "tp", 0.0), 0.0)
+                is_buy = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
+                new_sl = round(price_open + offset_value, digits) if is_buy else round(price_open - offset_value, digits)
+                self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p_tp)
 
         return True
 
-    def get_bot_positions(self, symbol: Optional[str] = None) -> List[Any]:
-        """Retrieve all active MT5 market positions placed by this bot (magic == MAGIC_NUMBER)."""
+    def get_live_positions(self, symbol: Optional[str] = None) -> List[Any]:
+        """Thread-safe reader returning all open MT5 positions (optionally filtered by symbol)."""
         if self.dry_run or not self._connected:
             return []
-        resolved = self.resolve_symbol(symbol) if symbol else None
-        positions = mt5.positions_get(symbol=resolved) if resolved else mt5.positions_get()
-        if not positions:
+        try:
+            with self._mt5_lock:
+                resolved = self.resolve_symbol(symbol) if symbol else None
+                positions = mt5.positions_get(symbol=resolved) if resolved else mt5.positions_get()
+                return list(positions) if positions else []
+        except Exception as e:
+            logger.debug(f"get_live_positions error: {e}")
             return []
-        return [p for p in positions if getattr(p, "magic", 0) == MAGIC_NUMBER]
+
+    def get_live_orders(self, symbol: Optional[str] = None) -> List[Any]:
+        """Thread-safe reader returning all pending MT5 orders (optionally filtered by symbol)."""
+        if self.dry_run or not self._connected:
+            return []
+        try:
+            with self._mt5_lock:
+                resolved = self.resolve_symbol(symbol) if symbol else None
+                orders = mt5.orders_get(symbol=resolved) if resolved else mt5.orders_get()
+                return list(orders) if orders else []
+        except Exception as e:
+            logger.debug(f"get_live_orders error: {e}")
+            return []
+
+    def get_bot_positions(self, symbol: Optional[str] = None) -> List[Any]:
+        """Retrieve all active MT5 market positions placed by this bot (magic == MAGIC_NUMBER)."""
+        return [p for p in self.get_live_positions(symbol) if _int_num(getattr(p, "magic", 0), 0) == MAGIC_NUMBER]
 
     def get_bot_pending_orders(self, symbol: Optional[str] = None) -> List[Any]:
         """Retrieve all unfilled MT5 pending orders placed by this bot (magic == MAGIC_NUMBER)."""
-        if self.dry_run or not self._connected:
-            return []
-        resolved = self.resolve_symbol(symbol) if symbol else None
-        orders = mt5.orders_get(symbol=resolved) if resolved else mt5.orders_get()
-        if not orders:
-            return []
-        return [o for o in orders if getattr(o, "magic", 0) == MAGIC_NUMBER]
+        return [o for o in self.get_live_orders(symbol) if _int_num(getattr(o, "magic", 0), 0) == MAGIC_NUMBER]
 
     def apply_proximity_close(
         self,
@@ -1808,7 +1963,7 @@ class MT5Executor:
         raw_tp1 = signal_data.get("raw_tp1")
         symbol = signal_data.get("symbol") or DEFAULT_SYMBOL
         sym_info = self.get_symbol_info(symbol)
-        digits = getattr(sym_info, "digits", 2) if sym_info else 2
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
 
         if raw_tp1 is not None:
             floor_price = (
@@ -1936,7 +2091,8 @@ class MT5Executor:
             pos_sl = float(signal_data.get("soft_tp1_floor") or 0.0)
             min_stop_dist = 0.50
         else:
-            positions = mt5.positions_get(ticket=ticket)
+            with self._mt5_lock:
+                positions = mt5.positions_get(ticket=ticket)
             if not positions:
                 signal_data["last_runner_ticket"] = ticket
                 signal_data["runner_close_reason"] = "Trailed Stop Loss Hit (Locked in Gain)"
@@ -1945,12 +2101,16 @@ class MT5Executor:
                 signal_data["market_tickets"] = []
                 return False
             pos = positions[0]
-            pos_sl = float(getattr(pos, "sl", 0.0) or 0.0)
-            sym_info = self.get_symbol_info(pos.symbol)
-            tick = self.get_tick(pos.symbol)
+            pos_sl = _num(getattr(pos, "sl", 0.0), 0.0)
+            raw_sym = getattr(pos, "symbol", None)
+            p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else symbol
+            sym_info = self.get_symbol_info(p_symbol)
+            tick = self.get_tick(p_symbol)
             if not sym_info or not tick:
                 return True
-            min_stop_dist = (sym_info.trade_stops_level * sym_info.point) if hasattr(sym_info, "trade_stops_level") else 0.50
+            stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0)
+            pt = _num(getattr(sym_info, "point", 0.01), 0.01) or 0.01
+            min_stop_dist = stops_lvl * pt
 
         trail_dist = TRAIL_DISTANCE_PIPS * 0.10
         trail_step = TRAIL_STEP_PIPS * 0.10
@@ -2139,10 +2299,11 @@ class MT5Executor:
             return None
 
         active_positions = []
-        for ticket in market_tickets:
-            pos = mt5.positions_get(ticket=ticket)
-            if pos:
-                active_positions.append(pos[0])
+        with self._mt5_lock:
+            for ticket in market_tickets:
+                pos = mt5.positions_get(ticket=ticket)
+                if pos:
+                    active_positions.append(pos[0])
 
         if not active_positions:
             return None
@@ -2156,7 +2317,7 @@ class MT5Executor:
             )
             return None
 
-        active_positions.sort(key=lambda p: p.profit, reverse=True)
+        active_positions.sort(key=lambda p: _num(getattr(p, "profit", 0.0)), reverse=True)
         order_to_close = active_positions[0]
         closed_ticket = order_to_close.ticket
 

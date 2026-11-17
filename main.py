@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import inspect
 import asyncio
 import logging
 from logging.handlers import RotatingFileHandler
@@ -32,6 +33,8 @@ from config import (
     STATE_FILE_PATH,
     DEDUPLICATION_WINDOW_SECONDS,
     SELL_NOW_DELAY_SECONDS,
+    DELAYED_POLL_INTERVAL_SECONDS,
+    NOW_PRICE_GUARD_ABORT_ON_MISMATCH,
     NOW_ENTRY_MAX_WAIT_SECONDS,
     DAILY_LOSS_CLOSE_OPEN_TRADES,
     MAX_NEW_EDIT_AGE_SECONDS,
@@ -166,17 +169,21 @@ executor = MT5Executor(dry_run=DRY_RUN)
 telethon_client: Optional[TelegramClient] = None
 BOT_START_TIME = time.time()
 
-# In-memory deduplication tracking (msg_id -> process_timestamp)
-_recent_messages: Dict[int, float] = {}
+# In-memory deduplication tracking ((chat_id, msg_id) or msg_id -> process_timestamp)
+_recent_messages: Dict[Any, float] = {}
 
-# Delayed "Sell now" tasks awaiting limit/zone edit (msg_id -> asyncio.Task)
-_pending_sell_now_tasks: Dict[int, asyncio.Task] = {}
+# Delayed "Sell now" / "Buy now" tasks awaiting limit/zone edit (msg_id or (chat_id, msg_id) -> asyncio.Task)
+_pending_sell_now_tasks: Dict[Any, asyncio.Task] = {}
+_pending_task_chats: Dict[Any, Any] = {}
 
 # Last printed terminal financial/risk snapshot to avoid spamming identical lines
 _last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
 
 # Tracks date string (YYYY-MM-DD) when 50% daily loss pause alert was last sent
 _daily_50pct_alert_date: Optional[str] = None
+
+# Global trading-halted circuit breaker (set when Daily Realized Loss Limit triggers)
+TRADING_HALTED: bool = False
 
 # Exit code signaling the launcher .bat that Daily Win Target was reached (do not auto-restart)
 DAILY_WIN_EXIT_CODE = 88
@@ -193,7 +200,7 @@ DAILY_LOSS_EXIT_CODE = 89
 # Saved Messages is waiting for the user's daily loss limit input after typing "dailyloss"
 _awaiting_dailyloss_input: bool = False
 
-# Flag set when the realized Daily Loss Limit is hit so main() exits with DAILY_LOSS_EXIT_CODE (89)
+# Flag set when the realized Daily Loss Limit is hit so main() terminates cleanly
 _daily_loss_terminate_requested: bool = False
 
 # Set when the copier is relaunched manually on the same broker day after the loss limit fired:
@@ -203,8 +210,8 @@ _daily_loss_lock_notified_date: Optional[str] = None
 
 
 def session_trading_blocked() -> bool:
-    """True when the session is terminating or locked (daily win / daily loss) -> never open new trades."""
-    return bool(_daily_win_terminate_requested or _daily_loss_terminate_requested or _daily_loss_locked)
+    """True when trading is halted/terminating or locked (daily win / daily loss) -> never open new trades."""
+    return bool(TRADING_HALTED or _daily_win_terminate_requested or _daily_loss_terminate_requested or _daily_loss_locked)
 
 
 def _trading_day_str() -> str:
@@ -220,8 +227,8 @@ def _close_all_bot_exposure_and_signals() -> Dict[str, Any]:
     Close every open bot position, cancel every bot pending order, stop all delayed
     'Sell now'/'Buy now' timers and mark all tracked signals CLOSED.
     """
-    for pending_mid in list(_pending_sell_now_tasks.keys()):
-        _cancel_delayed_sell_now(pending_mid)
+    for pending_key in list(_pending_sell_now_tasks.keys()):
+        _cancel_delayed_sell_now(pending_key)
 
     tracked_mk: List[int] = []
     tracked_pd: List[int] = []
@@ -241,7 +248,7 @@ def _close_all_bot_exposure_and_signals() -> Dict[str, Any]:
             {"status": "CLOSED", "market_tickets": [], "pending_tickets": [], "layers": layers},
         )
     for mid, s in state_mgr.get_all_signals().items():
-        if s.get("status") == "PENDING_DELAY":
+        if s.get("status") in ("PENDING", "PENDING_DELAY"):
             state_mgr.update_signal(mid, {"status": "CLOSED"})
 
     return res
@@ -345,7 +352,9 @@ async def check_and_enforce_daily_win_target() -> str:
 
     if telethon_client:
         try:
-            await telethon_client.disconnect()
+            disc_res = telethon_client.disconnect()
+            if inspect.isawaitable(disc_res):
+                await disc_res
         except Exception as e:
             logger.debug(f"Telethon disconnect on daily win exit: {e}")
 
@@ -361,7 +370,8 @@ def get_daily_loss_progress() -> Dict[str, Any]:
     cfg = state_mgr.get_daily_loss_config()
     today_str = _trading_day_str()
     enabled = bool(cfg.get("enabled", False))
-    limit_amount = round(float(cfg.get("limit_amount", 0.0)), 2)
+    raw_lim = cfg.get("limit_amount") if cfg.get("limit_amount") else cfg.get("daily_loss_limit", 0.0)
+    limit_amount = round(abs(float(raw_lim or 0.0)), 2)
 
     realized_today = round(float(executor.get_realized_today_pnl()), 2)
     realized_loss = round(max(0.0, -realized_today), 2)
@@ -372,6 +382,7 @@ def get_daily_loss_progress() -> Dict[str, Any]:
     return {
         "enabled": enabled,
         "limit_amount": limit_amount,
+        "daily_loss_limit": limit_amount,
         "realized_today_pnl": realized_today,
         "realized_loss_today": realized_loss,
         "remaining_before_limit": remaining,
@@ -383,21 +394,24 @@ def get_daily_loss_progress() -> Dict[str, Any]:
     }
 
 
-async def check_and_enforce_daily_loss_limit() -> str:
+async def check_and_enforce_daily_loss_limit(exit_on_trigger: bool = True) -> str:
     """
-    Monitor today's REALIZED P&L against the user's `dailyloss` limit (checked every second).
+    Monitor today's REALIZED P&L against the user's daily loss limit.
     - Floating losses on open trades never trigger it (only closed / Stop-Loss-hit trades count).
-    - When realized P&L <= -limit:
-        1. Cancels all pending limits & delayed entries; closes open bot positions
-           (unless DAILY_LOSS_CLOSE_OPEN_TRADES=false, then they stay on their broker SL/TP).
-        2. Marks signals CLOSED, records the trigger date and notifies Saved Messages.
-        3. Terminates the session (exit code 89) so the launcher does NOT auto-restart.
-    - If the copier is relaunched manually on the SAME broker day while still over the limit, it stays
-      online in LOCKED mode (no new trades) so `dailyloss off` / a higher limit can unlock it.
-    Returns "DAILY_LOSS_REACHED", "LOCKED" or "OK".
+    - When realized P&L <= -abs(limit):
+        1. Sets TRADING_HALTED = True, stops pending delayed timers, and cancels ALL pending MT5 orders
+           via executor.cancel_all_pending_orders (leaving open positions protected by their broker SL/TP
+           unless DAILY_LOSS_CLOSE_OPEN_TRADES=true).
+        2. Records the trigger date, notifies Saved Messages, disconnects Telethon & shuts down MT5.
+        3. Calls sys.exit(0) when exit_on_trigger=True so the launcher stops cleanly.
+    - If relaunched manually on the SAME broker day while still over the limit, enters LOCKED mode
+      (no new trades) so `dailyloss off` / `/set_daily_loss` can override.
+    Returns "DAILY_LOSS_REACHED", "LOCKED", or "OK".
     """
-    global _daily_loss_terminate_requested, _daily_loss_locked, _daily_loss_lock_notified_date
+    global TRADING_HALTED, _daily_loss_terminate_requested, _daily_loss_locked, _daily_loss_lock_notified_date
     if _daily_loss_terminate_requested:
+        if exit_on_trigger:
+            sys.exit(0)
         return "DAILY_LOSS_REACHED"
 
     prog = get_daily_loss_progress()
@@ -408,7 +422,8 @@ async def check_and_enforce_daily_loss_limit() -> str:
         return "OK"
 
     curr = prog["currency"]
-    limit_str = format_profit(-prog["limit_amount"], curr)
+    limit_amt = round(abs(float(prog["limit_amount"])), 2)
+    limit_str = format_profit(-limit_amt, curr)
     loss_str = format_profit(prog["realized_today_pnl"], curr)
 
     # Relaunched on the same broker day after the limit already fired -> LOCKED (stay online, trade nothing)
@@ -429,51 +444,76 @@ async def check_and_enforce_daily_loss_limit() -> str:
             )
         return "LOCKED"
 
+    TRADING_HALTED = True
     _daily_loss_terminate_requested = True
 
-    # 1. Stop all new / pending exposure; optionally close still-open positions
-    for pending_mid in list(_pending_sell_now_tasks.keys()):
-        _cancel_delayed_sell_now(pending_mid)
+    # 1. Stop all delayed timers & cancel ALL pending MT5 orders (optionally close filled positions)
+    for pending_key in list(_pending_sell_now_tasks.keys()):
+        _cancel_delayed_sell_now(pending_key)
+
+    all_sigs = state_mgr.get_all_signals()
+    tracked_pd: List[int] = []
+    for _, s in all_sigs.items():
+        for pt in (s.get("pending_tickets") or []):
+            if pt not in tracked_pd:
+                tracked_pd.append(pt)
+
     if DAILY_LOSS_CLOSE_OPEN_TRADES:
         res = _close_all_bot_exposure_and_signals()
+        extra_cancelled = executor.cancel_all_pending_orders(tracked_pd)
+        cancelled_orders_list = list(dict.fromkeys(res.get("cancelled_orders", []) + extra_cancelled))
+        closed_positions = len(res.get("closed_tickets", []))
     else:
-        tracked_pd: List[int] = []
-        for _, s in state_mgr.get_active_signals():
-            tracked_pd.extend(s.get("pending_tickets", []))
-        cancelled = [t for t in tracked_pd if executor.cancel_pending_order(t)]
-        res = {"closed_tickets": [], "cancelled_orders": cancelled}
-        for mid, s in state_mgr.get_active_signals():
-            state_mgr.update_signal(mid, {"pending_tickets": []})
-        for mid, s in state_mgr.get_all_signals().items():
-            if s.get("status") == "PENDING_DELAY":
-                state_mgr.update_signal(mid, {"status": "CLOSED"})
+        cancelled_orders_list = executor.cancel_all_pending_orders(tracked_pd)
+        closed_positions = 0
+        for mid, s in all_sigs.items():
+            st = s.get("status")
+            if st in ("PENDING", "PENDING_DELAY"):
+                layers = s.get("layers", {})
+                for lk in layers:
+                    if isinstance(layers[lk], dict) and layers[lk].get("status") == "PENDING":
+                        layers[lk]["status"] = "CANCELLED"
+                state_mgr.update_signal(mid, {"status": "CLOSED", "pending_tickets": [], "layers": layers})
+            elif st in ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE"):
+                layers = s.get("layers", {})
+                mk_tkts = list(s.get("market_tickets") or [])
+                for lk in layers:
+                    if isinstance(layers[lk], dict):
+                        t_val = layers[lk].get("ticket")
+                        if layers[lk].get("status") == "PENDING" or (t_val and t_val not in mk_tkts):
+                            layers[lk]["status"] = "CANCELLED"
+                updates: Dict[str, Any] = {"pending_tickets": [], "layers": layers}
+                if not mk_tkts:
+                    updates["status"] = "CLOSED"
+                state_mgr.update_signal(mid, updates)
 
-    closed_positions = len(res.get("closed_tickets", []))
-    cancelled_orders = len(res.get("cancelled_orders", []))
+    cancelled_orders = len(cancelled_orders_list)
 
     # 2. Record the trigger so a same-day manual relaunch enters LOCKED mode instead of trading again
     state_mgr.set_daily_loss_config(
         enabled=True,
-        limit_amount=prog["limit_amount"],
+        limit_amount=limit_amt,
         triggered_date=prog["date"],
         triggered_at=time.time(),
     )
 
     final_realized = round(float(executor.get_realized_today_pnl()), 2)
     fin = executor.get_account_financials()
+    headline = (
+        f"🛑 DAILY LOSS LIMIT HIT: Realized P&L is {final_realized:.2f} "
+        f"(Limit: -{limit_amt:.2f}). Pending orders canceled. Terminating bot session."
+    )
     open_note = (
-        f"• 🔒 **Open Positions Closed:** `{closed_positions}` | **Pending Limits Cancelled:** `{cancelled_orders}`\n"
+        f"• 🔒 **Open Positions Closed:** `{closed_positions}` | **Pending Orders Cancelled:** `{cancelled_orders}`\n"
         if DAILY_LOSS_CLOSE_OPEN_TRADES
-        else f"• ⏸️ **Pending Limits Cancelled:** `{cancelled_orders}` (open positions left on their broker SL/TP)\n"
+        else f"• ⏸️ **Pending Orders Cancelled:** `{cancelled_orders}` (open positions left on their broker SL/TP)\n"
     )
 
-    logger.error(
-        f"🛑 DAILY LOSS LIMIT HIT! Realized={format_profit(final_realized, curr)} (Limit={limit_str}). "
-        f"Closed={closed_positions}, Cancelled={cancelled_orders}. Terminating session!"
-    )
+    logger.error(headline)
     await notify_saved_messages(
-        f"🛑 **DAILY LOSS LIMIT HIT ({limit_str}) — SESSION TERMINATED!**\n"
-        f"• 🔻 **Realized Loss Today (closed / Stop-Loss trades):** `{format_profit(final_realized, curr)}`\n"
+        f"{headline}\n\n"
+        f"• 🔻 **Realized Loss Today (closed / Stop-Loss trades):** `{format_profit(final_realized, curr)}` "
+        f"(Limit: `{limit_str}`)\n"
         f"{open_note}"
         f"• 🛡️ **Session Terminated:** No more trading today to protect your capital.\n"
         f"• 💡 _The limit stays saved and resets automatically on the next broker trading day._\n\n"
@@ -482,9 +522,19 @@ async def check_and_enforce_daily_loss_limit() -> str:
 
     if telethon_client:
         try:
-            await telethon_client.disconnect()
+            disc_res = telethon_client.disconnect()
+            if inspect.isawaitable(disc_res):
+                await disc_res
         except Exception as e:
             logger.debug(f"Telethon disconnect on daily loss exit: {e}")
+
+    try:
+        executor.shutdown()
+    except Exception as e:
+        logger.debug(f"Executor shutdown on daily loss exit: {e}")
+
+    if exit_on_trigger:
+        sys.exit(0)
 
     return "DAILY_LOSS_REACHED"
 
@@ -630,6 +680,19 @@ def update_live_terminal_status(force_print: bool = False) -> None:
         logger.debug(f"Could not update live terminal status: {e}")
 
 
+def _safe_chat_id(event: Any) -> Optional[int | str]:
+    """Extract JSON-safe chat_id from Telethon or mock event (ignoring unconfigured MagicMock)."""
+    raw_cid = getattr(event, "chat_id", None)
+    if isinstance(raw_cid, (int, str)) and not isinstance(raw_cid, bool):
+        return raw_cid
+    return None
+
+
+def _get_dedup_key(chat_id: Optional[int | str], msg_id: Any) -> Any:
+    """Build per-channel deduplication key."""
+    return (chat_id, msg_id) if chat_id is not None else msg_id
+
+
 def _get_live_entry_price(tick: Any, direction: str) -> Optional[float]:
     """Return the relevant live entry price (bid for SELL, ask for BUY), rounded to 2 decimals."""
     if not tick:
@@ -641,125 +704,302 @@ def _get_live_entry_price(tick: Any, direction: str) -> Optional[float]:
     return None
 
 
-def _cancel_delayed_sell_now(msg_id: int) -> bool:
-    """Cancel an active delayed 'Sell now' / 'Buy now' timer if still waiting."""
-    task = _pending_sell_now_tasks.pop(int(msg_id), None)
-    if task and not task.done():
-        task.cancel()
-        return True
+def _tick_hit_tp1(tick: Any, direction: str, tp1_price: Optional[float]) -> bool:
+    """Return True when live tick bid or ask has reached tp1_price in the signal direction."""
+    if not tick or tp1_price is None:
+        return False
+    try:
+        tp_val = float(tp1_price)
+    except (TypeError, ValueError):
+        return False
+    dir_up = str(direction or "").upper()
+    bid = getattr(tick, "bid", None)
+    ask = getattr(tick, "ask", None)
+    bid_ok = isinstance(bid, (int, float)) and not isinstance(bid, bool)
+    ask_ok = isinstance(ask, (int, float)) and not isinstance(ask, bool)
+    if dir_up == "BUY":
+        return (bid_ok and float(bid) >= tp_val) or (ask_ok and float(ask) >= tp_val)
+    if dir_up == "SELL":
+        return (ask_ok and float(ask) <= tp_val) or (bid_ok and float(bid) <= tp_val)
     return False
 
 
-async def _delayed_sell_now_task(msg_id: int) -> None:
+def _normalize_task_msg_id(msg_id: Any, chat_id: Optional[int | str] = None) -> Tuple[Any, Optional[int | str]]:
+    """Unpack composite 'chat_id:msg_id' or tuple keys into (numeric/raw msg_id, chat_id)."""
+    if isinstance(msg_id, tuple) and len(msg_id) == 2:
+        t_chat, t_mid = msg_id
+        msg_id = t_mid
+        if chat_id is None:
+            chat_id = t_chat
+    elif isinstance(msg_id, str) and ":" in msg_id:
+        c_part, m_part = msg_id.rsplit(":", 1)
+        if chat_id is None:
+            chat_id = int(c_part) if c_part.lstrip("-").isdigit() else c_part
+        msg_id = m_part
+    try:
+        return int(msg_id), chat_id
+    except (TypeError, ValueError):
+        return msg_id, chat_id
+
+
+def _reserve_task_key(msg_id: Any, chat_id: Optional[int | str] = None) -> Any:
+    """Cancel any prior matching delayed task and return the collision-safe tracking key."""
+    _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
+    mid_norm, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id)
+    if mid_norm not in _pending_sell_now_tasks or _pending_task_chats.get(mid_norm) in (None, eff_chat):
+        return mid_norm
+    return (eff_chat, mid_norm)
+
+
+def _cancel_delayed_sell_now(msg_id: Any, chat_id: Optional[int | str] = None) -> bool:
+    """Cancel an active delayed 'Sell now' / 'Buy now' timer if still waiting."""
+    if isinstance(msg_id, tuple) and msg_id in _pending_sell_now_tasks:
+        task = _pending_sell_now_tasks.pop(msg_id, None)
+        _pending_task_chats.pop(msg_id, None)
+        if task and not task.done():
+            task.cancel()
+            return True
+        return False
+
+    mid_norm, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id)
+    cancelled = False
+    candidate_keys: List[Any] = []
+    if eff_chat is not None and (eff_chat, mid_norm) in _pending_sell_now_tasks:
+        candidate_keys.append((eff_chat, mid_norm))
+    if mid_norm in _pending_sell_now_tasks and (
+        eff_chat is None or _pending_task_chats.get(mid_norm) in (None, eff_chat)
+    ):
+        candidate_keys.append(mid_norm)
+    if eff_chat is None:
+        for k in list(_pending_sell_now_tasks.keys()):
+            if isinstance(k, tuple) and len(k) == 2 and k[1] == mid_norm and k not in candidate_keys:
+                candidate_keys.append(k)
+
+    for k in candidate_keys:
+        task = _pending_sell_now_tasks.pop(k, None)
+        _pending_task_chats.pop(k, None)
+        if task and not task.done():
+            task.cancel()
+            cancelled = True
+    return cancelled
+
+
+async def invalidate_signal_tp1(
+    msg_id: Any,
+    reason: str,
+    chat_id: Optional[int | str] = None,
+) -> bool:
+    """
+    Invalidate an unentered signal (PENDING/PENDING_DELAY or unfilled zone pending limits)
+    when TP1 is hit via Telegram Reply/Edit/Alert or live MT5 market price.
+    Cancels pending limit/stop orders via TRADE_ACTION_REMOVE and never closes active positions.
+    """
+    _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
+    sig = state_mgr.get_signal(msg_id, chat_id=chat_id)
+    if not sig:
+        logger.info(f"[TP1 INVALIDATED] {DEFAULT_SYMBOL} | Reason: {reason} | Setup Deleted.")
+        return False
+
+    if sig.get("status") == "INVALIDATED_TP1":
+        return False
+
+    symbol = sig.get("symbol", DEFAULT_SYMBOL)
+    direction = sig.get("direction", "BUY")
+    eff_chat = chat_id if chat_id is not None else sig.get("chat_id")
+    market_tickets = list(sig.get("market_tickets") or [])
+    pending_tickets = list(sig.get("pending_tickets") or [])
+    extra_pending = [t for t in (sig.get("mt5_order_tickets") or []) if t not in market_tickets and t not in pending_tickets]
+    all_pending = pending_tickets + extra_pending
+    layers = dict(sig.get("layers") or {})
+
+    cancelled: List[int] = []
+    for pt in all_pending:
+        if pt not in market_tickets and executor.cancel_pending_order(pt):
+            cancelled.append(pt)
+
+    for lk, l_data in layers.items():
+        if isinstance(l_data, dict):
+            t_val = l_data.get("ticket")
+            if t_val not in market_tickets and l_data.get("status") not in ("OPEN", "FILLED", "CLOSED", "BANKED"):
+                l_data["status"] = "CANCELLED"
+
+    state_mgr.update_signal(
+        msg_id,
+        {
+            "pending_tickets": [],
+            "layers": layers,
+            "tp1_reached": True,
+            "status": "INVALIDATED_TP1",
+        },
+        chat_id=eff_chat,
+    )
+
+    logger.info(f"[TP1 INVALIDATED] {symbol} | Reason: {reason} | Setup Deleted.")
+    await notify_saved_messages(
+        f"🚫 **[TP1 INVALIDATED] {symbol} ({direction}) [ID: {msg_id}]**\n"
+        f"• Reason: `{reason}`\n"
+        f"• Setup deleted before entry; cancelled `{len(all_pending)}` pending order(s)."
+    )
+    return True
+
+
+async def _delayed_sell_now_task(
+    msg_id: int,
+    chat_id: Optional[int | str] = None,
+    task_key: Any = None,
+) -> None:
     """
     Wait SELL_NOW_DELAY_SECONDS on unpriced 'Sell now' / 'Buy now':
-    1. If edited with a zone/limit or cancelled ('TP1 hit' / 'close') during the wait, exits cleanly.
-    2. After the delay (with no zone edit), compares live price against `recorded_entry_price`:
-       - For SELL: only activates when live bid >= recorded_entry_price (higher/better than recorded point).
-       - For BUY: only activates when live ask <= recorded_entry_price (lower/better than recorded point).
-    3. If TP1 is reached before entry, cancels and closes the signal without entering.
+    1. Polls every min(DELAYED_POLL_INTERVAL_SECONDS, max(0.01, delay/4)) during the wait;
+       immediately invalidates via Trigger 2 if live market price reaches tp1_price.
+    2. If edited with a zone/limit or cancelled ('TP1 hit' / 'close') during the wait, exits cleanly.
+    3. At T = delay_seconds, compares fresh live entry price against `initial_price`:
+       - SELL: favorable iff current_price >= initial_price.
+       - BUY: favorable iff current_price <= initial_price.
+       Aborts immediately (`ABORTED_PRICE_GUARD`) when NOW_PRICE_GUARD_ABORT_ON_MISMATCH=True (default).
     """
+    eff_key = task_key if task_key is not None else msg_id
     try:
-        await asyncio.sleep(SELL_NOW_DELAY_SECONDS)
-        wait_started = time.time()
-        bad_price_notified = False
+        delay_total = max(0.0, float(SELL_NOW_DELAY_SECONDS))
+        step = min(float(DELAYED_POLL_INTERVAL_SECONDS), max(0.01, delay_total / 4.0))
+        deadline = time.monotonic() + delay_total
 
         while True:
-            sig = state_mgr.get_signal(msg_id)
-            if not sig or sig.get("status") != "PENDING_DELAY" or sig.get("tp1_reached"):
+            sig = state_mgr.get_signal(msg_id, chat_id=chat_id)
+            if not sig or sig.get("status") not in ("PENDING", "PENDING_DELAY") or sig.get("tp1_reached") or sig.get("is_zone_order"):
                 return
             if session_trading_blocked():
-                state_mgr.update_signal(msg_id, {"status": "CLOSED"})
-                logger.info(f"Delayed entry [ID: {msg_id}] dropped: session is terminating / locked by a daily limit.")
+                state_mgr.update_signal(msg_id, {"status": "CLOSED"}, chat_id=chat_id)
+                logger.info(f"Delayed entry [ID: {msg_id}] dropped: session is terminating / halted / locked.")
                 return
 
             symbol = sig.get("symbol", DEFAULT_SYMBOL)
             direction = sig.get("direction", "SELL").upper()
-            sl = sig.get("sl")
-            final_tp = sig.get("final_tp")
-            raw_tp1 = sig.get("raw_tp1")
-            recorded_px = sig.get("recorded_entry_price")
-
+            tp1_price = sig.get("tp1_price") if sig.get("tp1_price") is not None else sig.get("raw_tp1")
             tick = executor.get_tick(symbol)
-            if raw_tp1 is not None and tick:
-                tp_check_px = getattr(tick, "bid", None) if direction == "BUY" else getattr(tick, "ask", None)
-                if isinstance(tp_check_px, (int, float)):
-                    tp1_already_hit = (tp_check_px >= raw_tp1) if direction == "BUY" else (tp_check_px <= raw_tp1)
-                    if tp1_already_hit:
-                        logger.info(
-                            f"Delayed {direction} Now [ID: {msg_id}] cancelled: TP1 ({raw_tp1}) already hit before entry."
-                        )
-                        state_mgr.update_signal(msg_id, {"status": "CLOSED", "tp1_reached": True})
-                        await notify_saved_messages(
-                            f"🚫 **Delayed {direction} Now Cancelled — TP1 Already Hit [ID: {msg_id}]**\n"
-                            f"• TP1 (`{raw_tp1}`) was reached before entry; trade was not entered."
-                        )
-                        return
-
-            curr_entry_px = _get_live_entry_price(tick, direction)
-
-            is_favorable = True
-            if isinstance(recorded_px, (int, float)) and not isinstance(recorded_px, bool):
-                if curr_entry_px is None:
-                    # Never bypass the Bad-Position Entry Guard on a momentary null tick
-                    is_favorable = False
-                else:
-                    rec_val = round(float(recorded_px), 2)
-                    if direction == "SELL":
-                        # For SELL: price must be higher than (or equal to) the recorded point
-                        is_favorable = curr_entry_px >= rec_val
-                    else:
-                        # For BUY (opposite): price must be lower than (or equal to) the recorded point
-                        is_favorable = curr_entry_px <= rec_val
-
-            if is_favorable:
-                break
-
-            if curr_entry_px is not None and not bad_price_notified:
-                bad_price_notified = True
-                state_mgr.update_signal(msg_id, {"awaiting_favorable_price": True})
-                cmp_desc = (
-                    f"higher (`>= {recorded_px:.2f}`)"
-                    if direction == "SELL"
-                    else f"lower (`<= {recorded_px:.2f}`)"
-                )
-                logger.info(
-                    f"Delayed {direction} Now [ID: {msg_id}] held by Bad-Position Guard: "
-                    f"live={curr_entry_px} vs recorded={recorded_px}. Waiting for {cmp_desc}."
-                )
-                await notify_saved_messages(
-                    f"🛡️ **Bad-Position Entry Guard Active [ID: {msg_id}]**\n"
-                    f"• Direction: `{direction}` {symbol}\n"
-                    f"• 📍 **Recorded Market Point:** `{recorded_px}` | **Current Price:** `{curr_entry_px}`\n"
-                    f"• Holding off `{direction.title()} now` so you do not enter in a bad position.\n"
-                    f"• Will activate automatically once price is {cmp_desc} (or cancel if TP1 is hit)."
-                )
-
-            if (time.time() - wait_started) >= NOW_ENTRY_MAX_WAIT_SECONDS:
-                logger.info(
-                    f"Delayed {direction} Now [ID: {msg_id}] expired after {NOW_ENTRY_MAX_WAIT_SECONDS:.0f}s "
-                    f"without returning to recorded price {recorded_px}."
-                )
-                state_mgr.update_signal(msg_id, {"status": "CLOSED", "awaiting_favorable_price": False})
-                await notify_saved_messages(
-                    f"🚫 **Delayed {direction} Now Expired [ID: {msg_id}]**\n"
-                    f"• Price never returned to recorded entry point (`{recorded_px}`) within "
-                    f"{NOW_ENTRY_MAX_WAIT_SECONDS:.0f}s; skipped to prevent a bad entry."
-                )
+            if tp1_price is not None and tick and _tick_hit_tp1(tick, direction, tp1_price):
+                await invalidate_signal_tp1(msg_id, reason="Market Price Reached TP1", chat_id=chat_id)
                 return
 
-            # Poll every 0.5s live (fast enough for Gold, light on the MT5 terminal); tests use tiny delays
-            await asyncio.sleep(min(0.5, max(0.02, float(SELL_NOW_DELAY_SECONDS))))
+            now_mono = time.monotonic()
+            if now_mono >= deadline:
+                break
+            await asyncio.sleep(min(step, max(0.005, deadline - now_mono)))
+
+        sig = state_mgr.get_signal(msg_id, chat_id=chat_id)
+        if not sig or sig.get("status") not in ("PENDING", "PENDING_DELAY") or sig.get("tp1_reached") or sig.get("is_zone_order"):
+            return
+        if session_trading_blocked():
+            state_mgr.update_signal(msg_id, {"status": "CLOSED"}, chat_id=chat_id)
+            return
+
+        symbol = sig.get("symbol", DEFAULT_SYMBOL)
+        direction = sig.get("direction", "SELL").upper()
+        sl = sig.get("sl")
+        final_tp = sig.get("final_tp")
+        tp1_price = sig.get("tp1_price") if sig.get("tp1_price") is not None else sig.get("raw_tp1")
+        initial_price = sig.get("initial_price") if sig.get("initial_price") is not None else sig.get("recorded_entry_price")
+
+        current_tick = executor.get_tick(symbol)
+        if tp1_price is not None and current_tick and _tick_hit_tp1(current_tick, direction, tp1_price):
+            await invalidate_signal_tp1(msg_id, reason="Market Price Reached TP1", chat_id=chat_id)
+            return
+
+        current_price = _get_live_entry_price(current_tick, direction)
+
+        if isinstance(initial_price, (int, float)) and not isinstance(initial_price, bool):
+            init_val = round(float(initial_price), 2)
+            if current_price is None:
+                is_favorable = False
+            elif direction == "SELL":
+                is_favorable = current_price >= init_val
+            else:
+                is_favorable = current_price <= init_val
+
+            if not is_favorable:
+                if NOW_PRICE_GUARD_ABORT_ON_MISMATCH:
+                    logger.info(
+                        f"[PRICE GUARD] {symbol} | {direction} | Initial: {init_val} | "
+                        f"Post-Delay: {current_price} | Action: ABORTED"
+                    )
+                    state_mgr.update_signal(
+                        msg_id,
+                        {
+                            "status": "ABORTED_PRICE_GUARD",
+                            "awaiting_favorable_price": False,
+                            "post_delay_price": current_price,
+                        },
+                        chat_id=chat_id,
+                    )
+                    await notify_saved_messages(
+                        f"🚫 **Delayed {direction.title()} Now Aborted by Price Guard [ID: {msg_id}]**\n"
+                        f"• Symbol: `{symbol}` ({direction})\n"
+                        f"• 📍 **Initial Snapshot:** `{init_val}` | **Post-Delay:** `{current_price}`\n"
+                        f"• Price moved unfavorably during the delay; trade skipped cleanly."
+                    )
+                    return
+
+                # Legacy recovery-wait mode when NOW_PRICE_GUARD_ABORT_ON_MISMATCH=false
+                wait_started = time.time()
+                bad_price_notified = False
+                while True:
+                    sig = state_mgr.get_signal(msg_id, chat_id=chat_id)
+                    if not sig or sig.get("status") not in ("PENDING", "PENDING_DELAY") or sig.get("tp1_reached"):
+                        return
+                    if session_trading_blocked():
+                        state_mgr.update_signal(msg_id, {"status": "CLOSED"}, chat_id=chat_id)
+                        return
+                    tick = executor.get_tick(symbol)
+                    if tp1_price is not None and tick and _tick_hit_tp1(tick, direction, tp1_price):
+                        await invalidate_signal_tp1(msg_id, reason="Market Price Reached TP1", chat_id=chat_id)
+                        return
+                    current_price = _get_live_entry_price(tick, direction)
+                    if current_price is not None:
+                        fav_now = (current_price >= init_val) if direction == "SELL" else (current_price <= init_val)
+                        if fav_now:
+                            break
+                        if not bad_price_notified:
+                            bad_price_notified = True
+                            state_mgr.update_signal(msg_id, {"awaiting_favorable_price": True}, chat_id=chat_id)
+                            cmp_desc = f"higher (`>= {init_val:.2f}`)" if direction == "SELL" else f"lower (`<= {init_val:.2f}`)"
+                            logger.info(
+                                f"Delayed {direction} Now [ID: {msg_id}] held by Bad-Position Guard: "
+                                f"live={current_price} vs initial={init_val}. Waiting for {cmp_desc}."
+                            )
+                            await notify_saved_messages(
+                                f"🛡️ **Bad-Position Entry Guard Active [ID: {msg_id}]**\n"
+                                f"• Direction: `{direction}` {symbol}\n"
+                                f"• 📍 **Initial Snapshot:** `{init_val}` | **Current Price:** `{current_price}`\n"
+                                f"• Waiting until price is {cmp_desc} (or cancel if TP1 is hit)."
+                            )
+                    if (time.time() - wait_started) >= NOW_ENTRY_MAX_WAIT_SECONDS:
+                        state_mgr.update_signal(
+                            msg_id,
+                            {"status": "ABORTED_PRICE_GUARD", "awaiting_favorable_price": False},
+                            chat_id=chat_id,
+                        )
+                        return
+                    await asyncio.sleep(min(float(DELAYED_POLL_INTERVAL_SECONDS), max(0.01, delay_total)))
+
+            logger.info(
+                f"[PRICE GUARD] {symbol} | {direction} | Initial: {init_val} | "
+                f"Post-Delay: {current_price} | Action: EXECUTED"
+            )
+        else:
+            logger.info(
+                f"[PRICE GUARD] {symbol} | {direction} | Initial: None | "
+                f"Post-Delay: {current_price} | Action: EXECUTED"
+            )
 
         passed, reason = executor.check_preflight(
             symbol=symbol,
             direction=direction,
-            raw_tp1=raw_tp1,
+            raw_tp1=tp1_price,
             sl=sl,
         )
         if not passed:
             logger.warning(f"Delayed {direction} Now [ID: {msg_id}] blocked by pre-flight after wait: {reason}")
-            state_mgr.update_signal(msg_id, {"status": "CLOSED"})
+            state_mgr.update_signal(msg_id, {"status": "CLOSED"}, chat_id=chat_id)
             await notify_saved_messages(f"⚠️ **Delayed {direction.title()} Now Skipped [ID: {msg_id}]**: {reason}")
             return
 
@@ -776,7 +1016,7 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
         if not t1:
             err_reason = getattr(executor, "last_error", None) or "Broker rejected order"
             logger.error(f"Delayed {direction} Now [ID: {msg_id}] failed on MT5: {err_reason}")
-            state_mgr.delete_signal(msg_id)
+            state_mgr.delete_signal(msg_id, chat_id=chat_id)
             await notify_saved_messages(
                 f"❌ **Order Rejected by MT5 [ID: {msg_id}]**\n"
                 f"• Direction: `{direction}` {symbol}\n"
@@ -802,11 +1042,12 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
                 "market_tickets": [t1],
                 "layers": layers_data,
             },
+            chat_id=chat_id,
         )
         await notify_saved_messages(
             f"🚀 **Delayed {direction.title()} Now Executed (No Limits Posted) [ID: {msg_id}]**\n"
             f"• Direction: `{direction}` {symbol}\n"
-            f"• 📍 **Recorded Point:** `{recorded_px}` | **Entered At:** `{curr_entry_px}`\n"
+            f"• 📍 **Initial Point:** `{initial_price}` | **Entered At:** `{current_price}`\n"
             f"• Orders: Market=[`{t1}`] (0.01 lot)\n"
             f"• SL: `{sl}` | TP1: `{final_tp}`"
             f"{risk_block}"
@@ -814,7 +1055,9 @@ async def _delayed_sell_now_task(msg_id: int) -> None:
     except asyncio.CancelledError:
         logger.info(f"Delayed Now timer cancelled for Msg ID {msg_id} (limits/TP1/cancel arrived).")
     finally:
-        _pending_sell_now_tasks.pop(int(msg_id), None)
+        if _pending_sell_now_tasks.get(eff_key) is asyncio.current_task():
+            _pending_sell_now_tasks.pop(eff_key, None)
+            _pending_task_chats.pop(eff_key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -834,7 +1077,9 @@ async def notify_saved_messages(text: str) -> None:
     if not NOTIFY_SAVED_MESSAGES or not telethon_client:
         return
     try:
-        await telethon_client.send_message("me", text)
+        res = telethon_client.send_message("me", text)
+        if inspect.isawaitable(res):
+            await res
     except Exception as e:
         logger.warning(f"Could not deliver notification to Saved Messages: {e}")
 
@@ -861,7 +1106,7 @@ async def tp1_proximity_watcher_task() -> None:
             await check_and_enforce_daily_drawdown()
             if await check_and_enforce_daily_win_target() == "DAILY_WIN_REACHED":
                 break
-            if await check_and_enforce_daily_loss_limit() == "DAILY_LOSS_REACHED":
+            if await check_and_enforce_daily_loss_limit(exit_on_trigger=False) == "DAILY_LOSS_REACHED":
                 break
 
             # ---------------------------------------------------------------
@@ -895,12 +1140,14 @@ async def tp1_proximity_watcher_task() -> None:
             active_signals = state_mgr.get_active_signals()
 
             if not executor.dry_run and executor.is_connected() and active_signals:
-                import MetaTrader5 as mt5
-                resolved_sym = executor.resolve_symbol(DEFAULT_SYMBOL)
-                live_positions = mt5.positions_get(symbol=resolved_sym) or []
-                live_orders = mt5.orders_get(symbol=resolved_sym) or []
-                live_pos_tickets = {p.ticket for p in live_positions}
-                live_order_tickets = {o.ticket for o in live_orders}
+                live_positions = executor.get_live_positions(DEFAULT_SYMBOL)
+                live_orders = executor.get_live_orders(DEFAULT_SYMBOL)
+                live_pos_tickets = {
+                    getattr(p, "ticket", None) for p in live_positions if getattr(p, "ticket", None) is not None
+                }
+                live_order_tickets = {
+                    getattr(o, "ticket", None) for o in live_orders if getattr(o, "ticket", None) is not None
+                }
 
                 for msg_id, sig in list(active_signals):
                     mk_tickets = list(sig.get("market_tickets", []))
@@ -1090,30 +1337,15 @@ async def tp1_proximity_watcher_task() -> None:
 
                 tp1_hit = (curr_price >= raw_tp1) if direction == "BUY" else (curr_price <= raw_tp1)
 
-                # Improvement #1: If 0 market positions filled, but price already reached TP1, cancel stale pending limits
+                # Improvement #1 / Trigger 2: If 0 market positions filled and pending limits remain,
+                # invalidate immediately once live market price reaches raw_tp1 (bid or ask).
                 if not sig.get("market_tickets"):
                     pd_tkts = list(sig.get("pending_tickets", []))
-                    if pd_tkts and tp1_hit:
-                        for pt in pd_tkts:
-                            executor.cancel_pending_order(pt)
-                        layers = sig.get("layers", {})
-                        for lk in layers:
-                            layers[lk]["status"] = "CANCELLED"
-                        state_mgr.update_signal(
+                    if pd_tkts and _tick_hit_tp1(tick, direction, raw_tp1):
+                        await invalidate_signal_tp1(
                             msg_id,
-                            {
-                                "pending_tickets": [],
-                                "layers": layers,
-                                "tp1_reached": True,
-                                "status": "CLOSED",
-                            },
-                        )
-                        logger.info(f"Unfilled Zone [ID: {msg_id}] expired: TP1 ({raw_tp1}) reached before fill. Cancelled {pd_tkts}.")
-                        await notify_saved_messages(
-                            f"🚫 **Unfilled Zone Expired (TP1 Reached Without Fill) [ID: {msg_id}]**\n"
-                            f"• Symbol: `{symbol}` ({direction})\n"
-                            f"• Price hit TP1 (`{raw_tp1}`) before dipping into zone.\n"
-                            f"• Cancelled `{len(pd_tkts)}` pending limit order(s) (`{pd_tkts}`) to prevent late reversal fills."
+                            reason="Market Price Reached TP1",
+                            chat_id=sig.get("chat_id"),
                         )
                     continue
 
@@ -1265,9 +1497,15 @@ async def handle_new_message(event):
 
     msg_id = msg.id
     raw_text = msg.message or ""
-    reply_to_id = msg.reply_to_msg_id
+    chat_id = _safe_chat_id(event)
+    raw_reply_to = getattr(msg, "reply_to_msg_id", None)
+    if not (isinstance(raw_reply_to, (int, str)) and not isinstance(raw_reply_to, bool)):
+        reply_obj = getattr(msg, "reply_to", None)
+        raw_reply_to = getattr(reply_obj, "reply_to_msg_id", None) if reply_obj else None
+    reply_to_id = raw_reply_to if isinstance(raw_reply_to, (int, str)) and not isinstance(raw_reply_to, bool) else None
+    is_reply_evt = (getattr(event, "is_reply", None) is True) or (reply_to_id is not None)
 
-    # Deduplication check
+    # Deduplication check (per channel)
     now = time.time()
     if len(_recent_messages) > 200:
         cutoff = now - 60.0
@@ -1275,23 +1513,26 @@ async def handle_new_message(event):
         for k in stale_keys:
             del _recent_messages[k]
 
-    if msg_id in _recent_messages and (now - _recent_messages[msg_id]) < DEDUPLICATION_WINDOW_SECONDS:
+    dedup_key = _get_dedup_key(chat_id, msg_id)
+    if dedup_key in _recent_messages and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS:
         logger.info(f"Message ID {msg_id} duplicate event within {DEDUPLICATION_WINDOW_SECONDS}s; skipping.")
         return
-    _recent_messages[msg_id] = now
+    _recent_messages[dedup_key] = now
 
     logger.info(
-        f"--- New Message Received [ID: {msg_id}] in Chat [{event.chat_id}] "
+        f"--- New Message Received [ID: {msg_id}] in Chat [{chat_id}] "
         f"(Reply to: {reply_to_id}) ---\nText: {raw_text}"
     )
 
     # Resolve target signal if this is a reply
     target_signal = None
     target_msg_id = None
-    if reply_to_id:
-        target_signal = state_mgr.get_signal(reply_to_id)
+    target_chat_id = chat_id
+    if reply_to_id is not None:
+        target_signal = state_mgr.get_signal(reply_to_id, chat_id=chat_id)
         if target_signal:
             target_msg_id = str(reply_to_id)
+            target_chat_id = target_signal.get("chat_id", chat_id)
 
     # 6-Gate Pipeline execution
     is_forward = getattr(msg, "forward", None) is not None
@@ -1300,7 +1541,7 @@ async def handle_new_message(event):
     parsed = parse_message(
         raw_text,
         message_id=msg_id,
-        is_reply=bool(reply_to_id),
+        is_reply=is_reply_evt,
         reply_to_msg_id=reply_to_id,
         is_forward=is_forward,
         live_price=live_price,
@@ -1320,12 +1561,13 @@ async def handle_new_message(event):
             res = state_mgr.get_latest_signal(symbol=parsed.symbol)
             if res:
                 target_msg_id, target_signal = res
+                target_chat_id = target_signal.get("chat_id", chat_id)
 
         if not target_signal:
             logger.warning(f"No target trade found in state to apply {action}. (Reply ID: {reply_to_id})")
             return
 
-        if target_signal.get("status") == "PENDING_DELAY" and action not in (
+        if target_signal.get("status") in ("PENDING", "PENDING_DELAY") and action not in (
             "ACTION_FULL_CLOSE",
             "FULL_CLOSE",
             "ACTION_TP1_HIT_REPLY",
@@ -1334,8 +1576,8 @@ async def handle_new_message(event):
             logger.info(f"Ignoring {action}: target signal {target_msg_id} is still in delay window (no open orders).")
             return
 
-        if target_signal.get("status") in ("CLOSED", "FULL_CLOSED") and action not in ("ACTION_REACTIVATE", "REACTIVATE"):
-            logger.info(f"Ignoring {action}: target signal {target_msg_id} is already CLOSED.")
+        if target_signal.get("status") in ("CLOSED", "FULL_CLOSED", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD") and action not in ("ACTION_REACTIVATE", "REACTIVATE"):
+            logger.info(f"Ignoring {action}: target signal {target_msg_id} is already terminal ({target_signal.get('status')}).")
             return
 
         symbol = target_signal.get("symbol", DEFAULT_SYMBOL)
@@ -1353,7 +1595,7 @@ async def handle_new_message(event):
                 be_layers=BE_LAYERS,
                 be_offset_pips=BE_OFFSET_PIPS,
             )
-            state_mgr.update_signal(target_msg_id, {"status": "BE_APPLIED"})
+            state_mgr.update_signal(target_msg_id, {"status": "BE_APPLIED"}, chat_id=target_chat_id)
             alert = (
                 f"🛡️ **Selective Breakeven Applied**\n"
                 f"• Symbol: `{symbol}` ({direction})\n"
@@ -1379,7 +1621,7 @@ async def handle_new_message(event):
             updates = {"hold_past_tp2": True}
             if be_tkts:
                 updates["status"] = "BE_APPLIED"
-            state_mgr.update_signal(target_msg_id, updates)
+            state_mgr.update_signal(target_msg_id, updates, chat_id=target_chat_id)
 
             fail_str = ""
             if failed_be:
@@ -1437,6 +1679,7 @@ async def handle_new_message(event):
                         "layers": layers_data,
                         "tp1_reached": False,
                     },
+                    chat_id=target_chat_id,
                 )
                 alert = (
                     f"🔄 **Zone Reactivated ('Active')**\n"
@@ -1465,6 +1708,7 @@ async def handle_new_message(event):
             state_mgr.update_signal(
                 target_msg_id,
                 {"market_tickets": market_tickets, "status": "PARTIAL_CLOSED"},
+                chat_id=target_chat_id,
             )
             alert = (
                 f"💰 **Partial Close Executed on `{symbol}` [Msg ID: {target_msg_id}]**\n"
@@ -1476,9 +1720,9 @@ async def handle_new_message(event):
 
         # ACTION: FULL CLOSE
         elif action in ("ACTION_FULL_CLOSE", "FULL_CLOSE"):
-            if target_signal.get("status") == "PENDING_DELAY":
-                _cancel_delayed_sell_now(int(target_msg_id))
-                state_mgr.update_signal(target_msg_id, {"status": "CLOSED"})
+            if target_signal.get("status") in ("PENDING", "PENDING_DELAY"):
+                _cancel_delayed_sell_now(target_msg_id, chat_id=target_chat_id)
+                state_mgr.update_signal(target_msg_id, {"status": "CLOSED"}, chat_id=target_chat_id)
                 await notify_saved_messages(
                     f"🚫 **Pending {direction.title()} Now Cancelled [Msg ID: {target_msg_id}]** before execution."
                 )
@@ -1494,6 +1738,7 @@ async def handle_new_message(event):
             state_mgr.update_signal(
                 target_msg_id,
                 {"market_tickets": [], "pending_tickets": [], "status": "CLOSED"},
+                chat_id=target_chat_id,
             )
             alert = (
                 f"🚪 **Full Close Executed on `{symbol}` [Msg ID: {target_msg_id}]**\n"
@@ -1503,10 +1748,10 @@ async def handle_new_message(event):
             )
             await notify_saved_messages(alert)
 
-        # ACTION: PROVIDER REPLY "TP1 HIT" (Improvement #4)
+        # ACTION: PROVIDER REPLY "TP1 HIT" (Trigger 1: Reply / Alert)
         elif action in ("ACTION_TP1_HIT_REPLY", "TP1_HIT_REPLY"):
-            is_unentered = target_signal.get("status") == "PENDING_DELAY" or not market_tickets
-            if not reply_to_id and not is_unentered:
+            is_unentered = target_signal.get("status") in ("PENDING", "PENDING_DELAY") or not market_tickets
+            if not is_reply_evt and not is_unentered:
                 # Standalone "TP1 hit" (not a reply) cannot be safely tied to one filled trade when several
                 # run concurrently -> only used to cancel not-yet-entered trades; live TP1 guards handle the rest.
                 logger.info(
@@ -1514,37 +1759,24 @@ async def handle_new_message(event):
                     f"price-based TP1 guards remain active."
                 )
                 return
-            _cancel_delayed_sell_now(int(target_msg_id))
-            if target_signal.get("tp1_reached") or target_signal.get("status") in ("RUNNER_ACTIVE", "CLOSED"):
+            _cancel_delayed_sell_now(target_msg_id, chat_id=target_chat_id)
+            if target_signal.get("tp1_reached") or target_signal.get("status") in ("RUNNER_ACTIVE", "CLOSED", "INVALIDATED_TP1"):
                 logger.info(f"Signal {target_msg_id} already processed TP1; ignoring provider TP1 reply.")
                 return
-            if target_signal.get("status") == "PENDING_DELAY" or not market_tickets:
-                for pt in pending_tickets:
-                    executor.cancel_pending_order(pt)
-                for lk in layers:
-                    layers[lk]["status"] = "CANCELLED"
-                state_mgr.update_signal(
+            if is_unentered:
+                await invalidate_signal_tp1(
                     target_msg_id,
-                    {
-                        "pending_tickets": [],
-                        "market_tickets": [],
-                        "layers": layers,
-                        "tp1_reached": True,
-                        "status": "CLOSED",
-                    },
-                )
-                await notify_saved_messages(
-                    f"🚫 **Provider Replied TP1 Hit [Msg ID: {target_msg_id}]**\n"
-                    f"• Trade was not entered / no positions filled; cancelled delayed entry and deleted `{len(pending_tickets)}` unfilled pending limit(s)."
+                    reason="Reply" if is_reply_evt else "Alert",
+                    chat_id=target_chat_id,
                 )
                 return
 
             runner_t = executor.handle_tp1_scaling_and_select_runner(target_signal)
-            state_mgr.set_tp1_reached(target_msg_id, True)
+            state_mgr.set_tp1_reached(target_msg_id, True, chat_id=target_chat_id)
             banked_tkts = target_signal.get("last_banked_tickets", [])
             banked_profit = sum(executor.get_position_closed_profit(t) for t in banked_tkts)
             target_signal["banked_profit"] = banked_profit
-            state_mgr.update_signal(target_msg_id, target_signal)
+            state_mgr.update_signal(target_msg_id, target_signal, chat_id=target_chat_id)
 
             fin = executor.get_account_financials()
             curr = fin.get("currency", "GBP")
@@ -1628,13 +1860,14 @@ async def handle_new_message(event):
             max_orders = 1
         else:
             # Case 3: Instant market entry without price ("Buy now" / "Sell now")
-            # Record the live market point at the moment "Sell now" / "Buy now" was sent,
-            # then wait SELL_NOW_DELAY_SECONDS (default 20s) for zone edits or TP1 hit.
+            # Snapshot live entry price at arrival (bid for SELL, ask for BUY),
+            # then wait SELL_NOW_DELAY_SECONDS while polling for zone edits or TP1 invalidation.
             now_tick = executor.get_tick(symbol)
-            recorded_entry_price = _get_live_entry_price(now_tick, direction)
+            initial_price = _get_live_entry_price(now_tick, direction)
 
             state_mgr.create_signal(
                 message_id=msg_id,
+                chat_id=chat_id,
                 symbol=symbol,
                 direction=direction,
                 layers={},
@@ -1644,33 +1877,40 @@ async def handle_new_message(event):
                 zone_completed=False,
                 max_orders=MAX_ORDERS_PER_SIGNAL,
                 is_zone=False,
+                is_zone_order=False,
                 sl=sl,
                 raw_tp1=parsed.raw_tp1,
+                tp1_price=parsed.raw_tp1,
                 raw_tp2=parsed.raw_tp2,
                 raw_tp3=parsed.raw_tp3,
                 final_tp=final_tp,
                 proximity_close_price=parsed.proximity_close_price,
                 raw_text=raw_text,
-                status="PENDING_DELAY",
-                recorded_entry_price=recorded_entry_price,
+                status="PENDING",
+                initial_price=initial_price,
+                recorded_entry_price=initial_price,
+                mt5_order_tickets=[],
             )
-            _cancel_delayed_sell_now(msg_id)
-            _pending_sell_now_tasks[msg_id] = asyncio.create_task(_delayed_sell_now_task(msg_id))
+            task_key = _reserve_task_key(msg_id, chat_id=chat_id)
+            _pending_task_chats[task_key] = chat_id
+            _pending_sell_now_tasks[task_key] = asyncio.create_task(
+                _delayed_sell_now_task(msg_id, chat_id=chat_id, task_key=task_key)
+            )
             logger.info(
-                f"Signal ID {msg_id}: Unpriced '{direction.title()} now' recorded at market point "
-                f"{recorded_entry_price} and held for {SELL_NOW_DELAY_SECONDS}s."
+                f"Signal ID {msg_id}: Unpriced '{direction.title()} now' snapshotted at initial_price="
+                f"{initial_price} and held for {SELL_NOW_DELAY_SECONDS}s."
             )
             cond_str = (
-                f"price >= `{recorded_entry_price}` (higher than recorded point)"
+                f"price >= `{initial_price}` (higher than recorded point)"
                 if direction == "SELL"
-                else f"price <= `{recorded_entry_price}` (lower than recorded point)"
+                else f"price <= `{initial_price}` (lower than recorded point)"
             )
             await notify_saved_messages(
                 f"⏳ **{direction.title()} Now Held ({int(SELL_NOW_DELAY_SECONDS)}s Timer) [ID: {msg_id}]**\n"
                 f"• Symbol: `{symbol}` ({direction})\n"
-                f"• 📍 **Recorded Market Point:** `{recorded_entry_price}`\n"
+                f"• 📍 **Initial Market Snapshot:** `{initial_price}`\n"
                 f"• Waiting {int(SELL_NOW_DELAY_SECONDS)}s for zone/limit edit or TP1 check; if no zone arrives, "
-                f"will activate 0.01 market {direction.lower()} once {cond_str}."
+                f"will validate {cond_str} before executing 0.01 market {direction.lower()}."
             )
             return
 
@@ -1687,6 +1927,7 @@ async def handle_new_message(event):
 
         state_mgr.create_signal(
             message_id=msg_id,
+            chat_id=chat_id,
             symbol=symbol,
             direction=direction,
             layers=layers_data,
@@ -1696,8 +1937,10 @@ async def handle_new_message(event):
             zone_completed=zone_completed,
             max_orders=max_orders,
             is_zone=is_zone,
+            is_zone_order=is_zone,
             sl=sl,
             raw_tp1=parsed.raw_tp1,
+            tp1_price=parsed.raw_tp1,
             raw_tp2=parsed.raw_tp2,
             raw_tp3=parsed.raw_tp3,
             final_tp=final_tp,
@@ -1760,8 +2003,9 @@ async def handle_message_edited(event):
 
     msg_id = msg.id
     raw_text = msg.message or ""
+    chat_id = _safe_chat_id(event)
 
-    existing_signal = state_mgr.get_signal(msg_id)
+    existing_signal = state_mgr.get_signal(msg_id, chat_id=chat_id)
 
     # Redundant edit filter (reactions/views)
     if existing_signal and raw_text.strip() == existing_signal.get("raw_text", "").strip():
@@ -1771,7 +2015,8 @@ async def handle_message_edited(event):
     # If message ID does not exist in state: skip silently if already processed within dedup window
     if not existing_signal:
         now = time.time()
-        if msg_id in _recent_messages and (now - _recent_messages[msg_id]) < DEDUPLICATION_WINDOW_SECONDS:
+        dedup_key = _get_dedup_key(chat_id, msg_id)
+        if dedup_key in _recent_messages and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS:
             logger.debug(f"Edited message {msg_id} not in state & within {DEDUPLICATION_WINDOW_SECONDS}s dedup; skipping.")
             return
 
@@ -1787,15 +2032,15 @@ async def handle_message_edited(event):
                 )
                 return
 
-        logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{event.chat_id}] (not in state; treating as new) ---")
+        logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] (not in state; treating as new) ---")
         await handle_new_message(event)
         return
 
-    logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{event.chat_id}] ---\nNew Text: {raw_text}")
+    logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] ---\nNew Text: {raw_text}")
 
     curr_status = existing_signal.get("status")
-    if curr_status in ("CLOSED", "FULL_CLOSED"):
-        logger.info(f"Signal {msg_id} is already CLOSED; ignoring edit.")
+    if curr_status in ("CLOSED", "FULL_CLOSED", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD"):
+        logger.info(f"Signal {msg_id} is already terminal ({curr_status}); ignoring edit.")
         return
 
     symbol = existing_signal.get("symbol", DEFAULT_SYMBOL)
@@ -1803,36 +2048,17 @@ async def handle_message_edited(event):
 
     # If the provider edited the message itself to announce "TP1 hit", cancel delayed entry / delete pending orders
     if is_tp1_hit_message(raw_text):
-        _cancel_delayed_sell_now(msg_id)
+        _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
         mk_tkts_now = list(existing_signal.get("market_tickets", []))
-        pd_tkts_now = list(existing_signal.get("pending_tickets", []))
-        layers_now = existing_signal.get("layers", {})
-        if curr_status == "PENDING_DELAY" or not mk_tkts_now:
-            for pt in pd_tkts_now:
-                executor.cancel_pending_order(pt)
-            for lk in layers_now:
-                layers_now[lk]["status"] = "CANCELLED"
-            state_mgr.update_signal(
-                msg_id,
-                {
-                    "pending_tickets": [],
-                    "market_tickets": [],
-                    "layers": layers_now,
-                    "tp1_reached": True,
-                    "status": "CLOSED",
-                    "raw_text": raw_text,
-                },
-            )
-            await notify_saved_messages(
-                f"🚫 **Edited Signal Marked TP1 Hit [ID: {msg_id}]**\n"
-                f"• Trade was not entered / no positions filled; cancelled delayed entry and deleted `{len(pd_tkts_now)}` pending limit(s)."
-            )
+        if curr_status in ("PENDING", "PENDING_DELAY") or not mk_tkts_now:
+            await invalidate_signal_tp1(msg_id, reason="Edit", chat_id=chat_id)
+            state_mgr.update_signal(msg_id, {"raw_text": raw_text}, chat_id=chat_id)
             return
         elif not existing_signal.get("tp1_reached") and curr_status != "RUNNER_ACTIVE":
             executor.handle_tp1_scaling_and_select_runner(existing_signal)
-            state_mgr.set_tp1_reached(msg_id, True)
+            state_mgr.set_tp1_reached(msg_id, True, chat_id=chat_id)
             existing_signal["raw_text"] = raw_text
-            state_mgr.update_signal(msg_id, existing_signal)
+            state_mgr.update_signal(msg_id, existing_signal, chat_id=chat_id)
             await notify_saved_messages(
                 f"🎯 **TP1 Scaling Triggered via Edited Signal [ID: {msg_id}]**\n"
                 f"• Symbol: `{symbol}` ({direction}) — Pending limits deleted & TP1 profit banked."
@@ -1860,21 +2086,12 @@ async def handle_message_edited(event):
     raw_tp3 = parsed.raw_tp3 or existing_signal.get("raw_tp3")
 
     # Handle edit arriving during Sell Now / Buy Now delay window
-    if curr_status == "PENDING_DELAY":
-        # If the edit provides a TP1 that live price has ALREADY reached, cancel and do not enter!
-        if raw_tp1 is not None and tick:
-            tp_check_px = getattr(tick, "bid", None) if direction == "BUY" else getattr(tick, "ask", None)
-            if isinstance(tp_check_px, (int, float)):
-                if (direction == "BUY" and tp_check_px >= raw_tp1) or (direction == "SELL" and tp_check_px <= raw_tp1):
-                    _cancel_delayed_sell_now(msg_id)
-                    state_mgr.update_signal(
-                        msg_id,
-                        {"status": "CLOSED", "tp1_reached": True, "raw_text": raw_text},
-                    )
-                    await notify_saved_messages(
-                        f"🚫 **Edited Zone/Signal Cancelled — TP1 (`{raw_tp1}`) Already Hit [ID: {msg_id}]**"
-                    )
-                    return
+    if curr_status in ("PENDING", "PENDING_DELAY"):
+        # If the edit provides a TP1 that live price has ALREADY reached, invalidate and do not enter!
+        if raw_tp1 is not None and tick and _tick_hit_tp1(tick, direction, raw_tp1):
+            await invalidate_signal_tp1(msg_id, reason="Market Price Reached TP1", chat_id=chat_id)
+            state_mgr.update_signal(msg_id, {"raw_text": raw_text}, chat_id=chat_id)
+            return
         if (parsed.is_zone and parsed.zone) or (parsed.single_price is not None):
             passed, reason = executor.check_preflight(
                 symbol=symbol,
@@ -1883,8 +2100,8 @@ async def handle_message_edited(event):
                 sl=new_sl,
             )
             if not passed:
-                _cancel_delayed_sell_now(msg_id)
-                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text})
+                _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
+                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 logger.warning(f"Edited delayed signal [ID: {msg_id}] blocked by pre-flight: {reason}")
                 await notify_saved_messages(
                     f"⚠️ **Edited Delayed Entry Skipped [ID: {msg_id}]**: {reason}"
@@ -1892,7 +2109,7 @@ async def handle_message_edited(event):
                 return
 
         if parsed.is_zone and parsed.zone:
-            _cancel_delayed_sell_now(msg_id)
+            _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
             zone = parsed.zone
             mk_tkts, pd_tkts, l_data = executor.execute_3layer_zone(
                 symbol=symbol,
@@ -1905,7 +2122,7 @@ async def handle_message_edited(event):
             )
             if not mk_tkts and not pd_tkts:
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order(s)"
-                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text})
+                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 await notify_saved_messages(f"❌ **Edited Zone Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`")
                 return
             state_mgr.update_signal(
@@ -1914,6 +2131,7 @@ async def handle_message_edited(event):
                     "status": "ACTIVE",
                     "sl": new_sl,
                     "raw_tp1": raw_tp1,
+                    "tp1_price": raw_tp1,
                     "raw_tp2": raw_tp2,
                     "raw_tp3": raw_tp3,
                     "final_tp": new_tp,
@@ -1921,6 +2139,7 @@ async def handle_message_edited(event):
                     "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
                     "zone": zone.to_dict(),
                     "is_zone": True,
+                    "is_zone_order": True,
                     "zone_completed": True,
                     "max_orders": 3,
                     "layers": l_data,
@@ -1928,6 +2147,7 @@ async def handle_message_edited(event):
                     "pending_tickets": pd_tkts,
                     "raw_text": raw_text,
                 },
+                chat_id=chat_id,
             )
             await notify_saved_messages(
                 f"✏️ **Delayed {direction.title()} Now → Zone Executed [ID: {msg_id}]**\n"
@@ -1936,7 +2156,7 @@ async def handle_message_edited(event):
             )
             return
         elif parsed.single_price is not None:
-            _cancel_delayed_sell_now(msg_id)
+            _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
             mk_tkts, pd_tkts, l_data = executor.execute_single_price_order(
                 symbol=symbol,
                 direction=direction,
@@ -1948,7 +2168,7 @@ async def handle_message_edited(event):
             )
             if not mk_tkts and not pd_tkts:
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order"
-                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text})
+                state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 await notify_saved_messages(f"❌ **Edited Limit Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`")
                 return
             state_mgr.update_signal(
@@ -1957,6 +2177,7 @@ async def handle_message_edited(event):
                     "status": "ACTIVE",
                     "sl": new_sl,
                     "raw_tp1": raw_tp1,
+                    "tp1_price": raw_tp1,
                     "raw_tp2": raw_tp2,
                     "raw_tp3": raw_tp3,
                     "final_tp": new_tp,
@@ -1967,6 +2188,7 @@ async def handle_message_edited(event):
                     "pending_tickets": pd_tkts,
                     "raw_text": raw_text,
                 },
+                chat_id=chat_id,
             )
             await notify_saved_messages(
                 f"✏️ **Delayed {direction.title()} Now → Limit Executed [ID: {msg_id}]**\n"
@@ -1974,12 +2196,13 @@ async def handle_message_edited(event):
             )
             return
         else:
-            # Edit added SL/TP only; update state and let the 20s timer keep waiting for limits
+            # Edit added SL/TP only; update state and let the timer keep waiting for limits
             state_mgr.update_signal(
                 msg_id,
                 {
                     "sl": new_sl,
                     "raw_tp1": raw_tp1,
+                    "tp1_price": raw_tp1,
                     "raw_tp2": raw_tp2,
                     "raw_tp3": raw_tp3,
                     "final_tp": new_tp,
@@ -1987,6 +2210,7 @@ async def handle_message_edited(event):
                     "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
                     "raw_text": raw_text,
                 },
+                chat_id=chat_id,
             )
             return
 
@@ -2014,6 +2238,7 @@ async def handle_message_edited(event):
                 "raw_tp2": raw_tp2,
                 "raw_text": raw_text,
             },
+            chat_id=chat_id,
         )
         await notify_saved_messages(
             f"✏️ **Runner Target Updated via Edit [ID: {msg_id}]**\n"
@@ -2089,6 +2314,7 @@ async def handle_message_edited(event):
             "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
             "zone": parsed.zone.to_dict() if parsed.zone else existing_signal.get("zone"),
             "is_zone": True if parsed.zone else existing_signal.get("is_zone", False),
+            "is_zone_order": True if parsed.zone else existing_signal.get("is_zone_order", existing_signal.get("is_zone", False)),
             "max_orders": 3 if parsed.zone else existing_signal.get("max_orders", 1),
             "layers": layers,
             "market_tickets": market_tickets,
@@ -2096,6 +2322,7 @@ async def handle_message_edited(event):
             "zone_completed": zone_completed,
             "raw_text": raw_text,
         },
+        chat_id=chat_id,
     )
 
     alert = (
@@ -2222,20 +2449,22 @@ async def _apply_daily_loss_input(event, raw_arg: str) -> None:
 
     await event.reply(
         f"🛡️ **Daily Loss Limit Activated: `{limit_str}`**\n"
+        f"Daily realized loss limit set to -{limit_val:.2f} {curr}.\n"
         f"• 📉 **Realized Closed P&L Today:** `{format_profit(realized_today, curr)}`\n"
         f"• 🧭 **Remaining Loss Buffer:** `{sym}{remaining:.2f} {curr}` (Triggers at `{limit_str}`)\n"
         f"• 📌 **Realized-Only Rule:** **ONLY realized closed / Stop-Loss trades** "
         f"(a negative number on the account for the day) count toward this limit — **NOT** open floating trades!\n"
-        f"• 🛑 **Auto-Termination:** Once realized daily losses reach `{limit_str}`, the copier will cancel pending orders, "
+        f"• 🛑 **Auto-Termination:** Once realized daily losses reach `{limit_str}`, the copier will cancel all pending orders, "
         f"protect capital, notify you here in Saved Messages, and terminate the session for today.\n"
-        f"• 💡 _Type `dailyloss off` anytime to disable._"
+        f"• 💡 _Type `dailyloss off` or `/set_daily_loss off` anytime to disable._"
     )
-    await check_and_enforce_daily_loss_limit()
+    await check_and_enforce_daily_loss_limit(exit_on_trigger=False)
 
 
 _KNOWN_SAVED_COMMANDS = {
     "/dailywin", "dailywin", "/daily_win", "daily_win",
     "/dailyloss", "dailyloss", "/daily_loss", "daily_loss",
+    "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/closeall", "closeall", "/panic", "panic",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
@@ -2247,6 +2476,7 @@ _KNOWN_SAVED_PREFIXES = (
     "/sim", "sim ", "sim_",
     "/dailywin ", "dailywin ", "/daily_win ", "daily_win ",
     "/dailyloss ", "dailyloss ", "/daily_loss ", "daily_loss ",
+    "/set_daily_loss ", "set_daily_loss ",
 )
 
 
@@ -2306,9 +2536,9 @@ async def handle_saved_messages_command(event):
         return
 
     # -----------------------------------------------------------------------
-    # LIVE CONTROL: dailyloss / /dailyloss (Toggle & Set Realized Daily Loss Limit)
+    # LIVE CONTROL: dailyloss / /set_daily_loss / /status_daily_loss
     # -----------------------------------------------------------------------
-    if text in ("/dailyloss", "dailyloss", "/daily_loss", "daily_loss"):
+    if text in ("/dailyloss", "dailyloss", "/daily_loss", "daily_loss", "/set_daily_loss", "set_daily_loss"):
         _awaiting_dailywin_input = False
         _awaiting_dailyloss_input = True
         prog = get_daily_loss_progress()
@@ -2332,11 +2562,42 @@ async def handle_saved_messages_command(event):
         )
         return
 
-    if text.startswith("/dailyloss ") or text.startswith("dailyloss ") or text.startswith("/daily_loss ") or text.startswith("daily_loss "):
+    if (
+        text.startswith("/dailyloss ")
+        or text.startswith("dailyloss ")
+        or text.startswith("/daily_loss ")
+        or text.startswith("daily_loss ")
+        or text.startswith("/set_daily_loss ")
+        or text.startswith("set_daily_loss ")
+    ):
         _awaiting_dailywin_input = False
         parts = raw_msg.split(None, 1)
         arg_part = parts[1] if len(parts) > 1 else ""
         await _apply_daily_loss_input(event, arg_part)
+        return
+
+    if text in ("/status_daily_loss", "status_daily_loss"):
+        _awaiting_dailywin_input = False
+        _awaiting_dailyloss_input = False
+        prog = get_daily_loss_progress()
+        curr = prog.get("currency", "GBP")
+        realized_today = prog["realized_today_pnl"]
+        if prog["enabled"] and prog["limit_amount"] > 0:
+            lim = prog["limit_amount"]
+            status_line = f"🟢 ACTIVE — Daily Loss Limit: -{lim:.2f} {curr} (`{format_profit(-lim, curr)}`)"
+            if _daily_loss_locked:
+                status_line += " 🔒 LOCKED"
+            rem_line = f"\n• 🧭 **Remaining Loss Buffer:** `{prog['remaining_before_limit']:.2f} {curr}`"
+        else:
+            status_line = "⚪ OFF (No daily realized loss limit set)"
+            rem_line = ""
+        await event.reply(
+            f"🛡️ **Daily Realized Loss Status**\n"
+            f"• Status: {status_line}\n"
+            f"• 📉 **Current Daily Realized P&L:** {realized_today:+.2f} {curr} (`{format_profit(realized_today, curr)}`)"
+            f"{rem_line}\n"
+            f"• 📌 **Note:** Open floating trades are **ignored** — only closed realized deals (SL / TP / manual closes) count toward this limit."
+        )
         return
 
     # If the user previously typed `dailywin` and is now replying with the target (e.g. "20", "£20", "off")
@@ -2745,30 +3006,22 @@ async def handle_saved_messages_command(event):
         algo_ok = executor.is_trade_allowed()
         algo_str = "🟢 ENABLED (Green play icon)" if algo_ok else "🔴 DISABLED (Click Algo Trading in MT5)"
 
-        acc_info = ""
+        fin = executor.get_account_financials()
+        acc_info = (
+            f"\n• Balance: `{fin['balance']:.2f} {fin['currency']}`\n"
+            f"• Credit: `{fin['credit']:.2f} {fin['currency']}`\n"
+            f"• Equity: `{fin['equity']:.2f} {fin['currency']}`"
+        )
         floating_pnl_str = ""
         if mt5_ok and not executor.dry_run:
-            import MetaTrader5 as mt5
-            acc = mt5.account_info()
-            if acc:
-                acc_info = (
-                    f"\n• Account: `{acc.login}` ({acc.server})\n"
-                    f"• Balance: `{acc.balance:.2f} {acc.currency}`\n"
-                    f"• Credit: `{acc.credit:.2f} {acc.currency}`\n"
-                    f"• Equity: `{acc.equity:.2f} {acc.currency}`"
-                )
-            open_pos = mt5.positions_get(symbol=executor.resolve_symbol(DEFAULT_SYMBOL))
+            open_pos = executor.get_live_positions(DEFAULT_SYMBOL)
             if open_pos:
-                bot_pnl = sum(p.profit for p in open_pos if p.magic == MAGIC_NUMBER)
-                pos_curr = acc.currency if acc else "GBP"
-                floating_pnl_str = f"\n• Floating Bot P&L: `{bot_pnl:+.2f} {pos_curr}`"
-        else:
-            fin = executor.get_account_financials()
-            acc_info = (
-                f"\n• Balance: `{fin['balance']:.2f} {fin['currency']}`\n"
-                f"• Credit: `{fin['credit']:.2f} {fin['currency']}`\n"
-                f"• Equity: `{fin['equity']:.2f} {fin['currency']}`"
-            )
+                bot_pnl = sum(
+                    float(getattr(p, "profit", 0.0) or 0.0)
+                    for p in open_pos
+                    if getattr(p, "magic", None) == MAGIC_NUMBER
+                )
+                floating_pnl_str = f"\n• Floating Bot P&L: `{bot_pnl:+.2f} {fin['currency']}`"
 
         tick = executor.get_tick(DEFAULT_SYMBOL)
         gold_info = ""
@@ -2853,7 +3106,7 @@ async def handle_saved_messages_command(event):
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}`"
             f"\n• Magic Number: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `dailywin`, `dailyloss`, `/status`, `/bank`, `/closeall`, `/sim_tp1 1|2|3`, `/sim_shortfall`, `/sim_trail 2|3`, `/testorder`"
+            f"📱 **Commands:** `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/status`, `/bank`, `/closeall`, `/sim_tp1 1|2|3`, `/sim_shortfall`, `/sim_trail 2|3`, `/testorder`"
         )
         await event.reply(reply_text)
 
@@ -2877,13 +3130,13 @@ async def main():
     if cleaned > 0:
         logger.info(f"Cleaned up {cleaned} historical closed trade(s) from state file.")
 
-    # Orphaned "Sell now" delay timers from a previous run can never fire; close them safely
+    # Orphaned "Sell now" / "Buy now" delay timers from a previous run can never fire; close them safely
     stale_delay = [
-        mid for mid, s in state_mgr.get_all_signals().items() if s.get("status") == "PENDING_DELAY"
+        mid for mid, s in state_mgr.get_all_signals().items() if s.get("status") in ("PENDING", "PENDING_DELAY")
     ]
     for mid in stale_delay:
         state_mgr.update_signal(mid, {"status": "CLOSED"})
-        logger.warning(f"Closed orphaned PENDING_DELAY signal {mid} left over from previous run (no orders were placed).")
+        logger.warning(f"Closed orphaned PENDING signal {mid} left over from previous run (no orders were placed).")
 
     # Connect to MT5
     logger.info("Connecting to MetaTrader 5...")
@@ -2939,10 +3192,22 @@ async def main():
     # Start 1-second TP1 Proximity Watcher in background
     proximity_task = asyncio.create_task(tp1_proximity_watcher_task())
 
+    unexpected_exit = False
+    user_interrupt = False
     try:
         await telethon_client.run_until_disconnected()
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown signal received. Exiting gracefully...")
+        if not (TRADING_HALTED or _daily_loss_terminate_requested or _daily_win_terminate_requested):
+            unexpected_exit = True
+    except KeyboardInterrupt:
+        user_interrupt = True
+        logger.info("Shutdown signal (Ctrl+C) received. Exiting gracefully...")
+    except SystemExit as e:
+        if e.code not in (0, None, DAILY_WIN_EXIT_CODE, DAILY_LOSS_EXIT_CODE):
+            unexpected_exit = True
+        raise
+    except Exception as e:
+        unexpected_exit = True
+        logger.exception(f"Unexpected error in copier loop: {e}")
     finally:
         proximity_task.cancel()
         try:
@@ -2951,10 +3216,14 @@ async def main():
             pass
         executor.shutdown()
         logger.info("Copier terminated.")
-        if _daily_loss_terminate_requested:
-            sys.exit(DAILY_LOSS_EXIT_CODE)
         if _daily_win_terminate_requested:
             sys.exit(DAILY_WIN_EXIT_CODE)
+        if TRADING_HALTED or _daily_loss_terminate_requested:
+            sys.exit(0)
+        if user_interrupt:
+            sys.exit(0)
+        if unexpected_exit:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -2962,6 +3231,10 @@ if __name__ == "__main__":
         asyncio.run(main())
     except SystemExit as e:
         print("\nShutdown complete.")
-        sys.exit(e.code)
+        sys.exit(e.code if e.code is not None else 0)
     except KeyboardInterrupt:
         print("\nShutdown complete.")
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"Fatal unhandled crash: {e}")
+        sys.exit(1)

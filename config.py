@@ -126,14 +126,25 @@ DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "5"
 # Seconds to wait on unpriced "Sell now" / "Buy now" before market entry (to see if provider edits in limits/zone)
 SELL_NOW_DELAY_SECONDS = max(0.0, float(os.getenv("SELL_NOW_DELAY_SECONDS") or "20"))
 
-# Bad-Position Entry Guard: after the initial delay, maximum time (seconds) to wait for live price
-# to return to the market point recorded when "Sell now"/"Buy now" was posted before expiring with no entry.
+# Polling interval (seconds) inside the delayed "Buy now" / "Sell now" window for mid-delay TP1 checks
+DELAYED_POLL_INTERVAL_SECONDS = max(
+    0.05, min(1.0, float(os.getenv("DELAYED_POLL_INTERVAL_SECONDS") or "0.25"))
+)
+
+# Bad-Position Entry Guard: abort delayed "now" market entry immediately if post-delay live price is worse
+# than the arrival market snapshot (or wait up to NOW_ENTRY_MAX_WAIT_SECONDS when set to false).
+NOW_PRICE_GUARD_ABORT_ON_MISMATCH = (
+    (os.getenv("NOW_PRICE_GUARD_ABORT_ON_MISMATCH") or "true").strip().lower() in ("true", "1", "yes")
+)
+
+# Maximum time (seconds) to wait for price recovery when NOW_PRICE_GUARD_ABORT_ON_MISMATCH=false
 NOW_ENTRY_MAX_WAIT_SECONDS = max(0.0, float(os.getenv("NOW_ENTRY_MAX_WAIT_SECONDS") or "180"))
 
-# Daily Loss Limit (configured via `dailyloss` in Saved Messages): when realized closed losses hit the limit
-# and terminate the session, close any still-open bot positions (true) or leave them on their broker SL/TP (false).
+# Daily Loss Limit (configured via `/set_daily_loss` or `dailyloss` in Saved Messages): when realized
+# closed losses hit the limit and halt the session, cancel all pending orders and leave any existing
+# filled positions protected by their broker SL/TP (`false` by default) unless set to `true`.
 DAILY_LOSS_CLOSE_OPEN_TRADES = (
-    (os.getenv("DAILY_LOSS_CLOSE_OPEN_TRADES") or "true").strip().lower() in ("true", "1", "yes")
+    (os.getenv("DAILY_LOSS_CLOSE_OPEN_TRADES") or "false").strip().lower() in ("true", "1", "yes")
 )
 
 # Max age (seconds) of an untracked message for an edit to be treated as a new signal (blocks old emoji reactions)

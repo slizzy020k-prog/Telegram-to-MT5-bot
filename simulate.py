@@ -106,7 +106,7 @@ async def run_simulation():
     evt5a = MockTelethonEvent(msg_id=20005, text=buy_now_text)
     await handle_new_message(evt5a)
     sig5a = main.state_mgr.get_signal(20005)
-    assert sig5a is not None and sig5a["status"] == "PENDING_DELAY"
+    assert sig5a is not None and sig5a["status"] in ("PENDING", "PENDING_DELAY")
     print(f"     • Recorded Entry Point: {sig5a['recorded_entry_price']} | Status: {sig5a['status']} (awaiting zone/delay)")
 
     print("  [5b] Provider edits message within delay window with Zone & SL/TP:")

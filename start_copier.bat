@@ -47,6 +47,15 @@ if %ERRORLEVEL% EQU 89 (
     pause
     exit /b 0
 )
+if %ERRORLEVEL% EQU 0 (
+    echo.
+    echo  ==============================================================================
+    echo    COPIER SESSION HALTED OR EXITED CLEANLY - NO AUTO-RESTART.
+    echo    Check Saved Messages for daily limit status or press any key to close.
+    echo  ==============================================================================
+    pause
+    exit /b 0
+)
 
 echo.
 echo  ==============================================================================

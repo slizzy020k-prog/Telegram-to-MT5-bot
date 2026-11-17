@@ -45,13 +45,14 @@ telegram-mt5-copier/
 ├── .env                    # Active credentials and configuration settings (gitignored)
 ├── .env.example            # Template configuration with placeholder values
 ├── AI_HANDOVER.md          # Complete technical handover & architecture guide for AI agents/devs
-└── tests/                  # Pytest verification suite (66 unit & integration tests)
+└── tests/                  # Pytest verification suite (72 unit & integration tests)
     ├── test_parser.py
     ├── test_state_manager.py
     ├── test_copier_scenarios.py
     ├── test_tp1_runner_and_phone_controls.py
     ├── test_profit_notifications.py
-    └── test_production_edge_cases.py
+    ├── test_production_edge_cases.py
+    └── test_spec_upgrade.py
 ```
 
 ---
@@ -82,9 +83,11 @@ telegram-mt5-copier/
 | `MAX_SL_PIPS` | `250` | Safety cap: rejects any parsed SL > 250 pips away (blocks typos like `Sl 387`) |
 | `NOTIFY_SAVED_MESSAGES` | `True` | Sends instant trade, edit, BE, proximity-close, and warning alerts to Saved Messages (`"me"`) |
 | `DEDUPLICATION_WINDOW_SECONDS` | `5` | Suppresses duplicate events received within N seconds |
-| `SELL_NOW_DELAY_SECONDS` | `20` | Seconds to hold unpriced `"Sell now"` / `"Buy now"` waiting for a zone/limit edit or `"TP1 hit"` before checking the recorded market point |
-| `NOW_ENTRY_MAX_WAIT_SECONDS` | `180` | Max seconds after the delay to wait for price to return to a favorable level vs the recorded entry point before expiring |
-| `DAILY_LOSS_CLOSE_OPEN_TRADES` | `true` | When `dailyloss` (realized loss limit) triggers, also close any open bot positions before terminating (or set `false` to leave open positions on their broker SL/TP) |
+| `SELL_NOW_DELAY_SECONDS` | `20` | Seconds to hold unpriced `"Sell now"` / `"Buy now"` waiting for a zone/limit edit or `"TP1 hit"` before running the Post-Delay Price Guard |
+| `DELAYED_POLL_INTERVAL_SECONDS` | `0.25` | Tick polling interval (seconds) inside the delay window to catch live MT5 TP1 hits immediately |
+| `NOW_PRICE_GUARD_ABORT_ON_MISMATCH` | `true` | When `true`, aborts immediately (`ABORTED_PRICE_GUARD`) at `T = delay_seconds` if price moved unfavorably vs `initial_price` |
+| `NOW_ENTRY_MAX_WAIT_SECONDS` | `180` | Legacy recovery wait cap when `NOW_PRICE_GUARD_ABORT_ON_MISMATCH=false` |
+| `DAILY_LOSS_CLOSE_OPEN_TRADES` | `false` | When `dailyloss` / `/set_daily_loss` triggers, pending MT5 orders are always cancelled; set `true` to also close already-open bot positions instead of leaving them on broker SL/TP |
 | `MAX_NEW_EDIT_AGE_SECONDS` | `180` | Max age (seconds) for an untracked message edit to be treated as a new signal (blocks old emoji reactions) |
 | `FALLBACK_TP1_PIPS` | `50` | Fallback TP1 distance (`$5.00` on Gold) attached if an unpriced market trade gets no TP edit |
 | `UNPRICED_TP_GRACE_SECONDS` | `45` | Seconds to wait before attaching `FALLBACK_TP1_PIPS` to an unpriced market order |
@@ -346,7 +349,9 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 | Command | Category | Description |
 | :--- | :--- | :--- |
 | `dailywin` / `/dailywin` | Profit Target | Interactive toggle to set a Daily Win Limit (e.g. reply `£20` or type `dailywin 20`, or `dailywin off`). Once the bot makes that profit from trading today, it closes all open trades, cancels pending limits, sends a Saved Messages notification, and terminates the session for no more trading. |
-| `dailyloss` / `/dailyloss` | Loss Limit | Interactive toggle to set a **realized-only** Daily Loss Limit (e.g. reply `£20`, `dailyloss 20`, or `dailyloss off`). Counted **strictly from closed / Stop-Loss trades** leaving a negative balance/P&L for the broker trading day (open floating trades do **not** trigger it). Once reached, cancels pending limits, notifies Saved Messages, and terminates the session (`exit 89`). |
+| `/set_daily_loss <amount>` | Loss Limit | Sets the **realized-only** Daily Loss Limit (e.g. `/set_daily_loss 150` -> `Daily realized loss limit set to -150.00 GBP.`, or `0`/`off` to disable). Persisted to `signals_state.json`. |
+| `/status_daily_loss` | Loss Limit | Reports the active realized daily loss limit, today's realized closed P&L (ignoring open floating drawdown), remaining buffer, and `TRADING_HALTED` status. |
+| `dailyloss` / `/dailyloss` | Loss Limit | Interactive alias for `/set_daily_loss` (2-step prompt `dailyloss` -> `£20`, or 1-step `dailyloss 20` / `dailyloss off`). Counted **strictly from closed MT5 trading deals**; once reached, cancels pending MT5 orders via `TRADE_ACTION_REMOVE`, alerts Saved Messages, disconnects, and exits cleanly (`sys.exit(0)`). |
 | `/status` | Diagnostics | Returns real-time health check: MT5 connection, Algo Trading button, floating bot P&L, Daily Win Limit & Daily Loss Limit status, layer states (`OPEN`/`PENDING`/`CLOSED`), shortfall guard arming, and active runner details. |
 | `/bank` | Live Control | Manually triggers the TP1 profit banking and runner scaling rule on the latest active trade. |
 | `/closeall` / `/panic` | Emergency | Emergency panic button: instantly closes all open bot positions (`MAGIC_NUMBER = 777001`) at market and deletes all pending limit orders. |
@@ -362,13 +367,17 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 
 ## 10. Latest Behaviour Updates (v2.2)
 
-### Recorded Market Point, Bad-Position Entry Guard & Delay/Zone TP1 Cancellation
-- Unpriced **`"Sell now"`** and **`"Buy now"`** record the live market entry price (`bid` for SELL, `ask` for BUY) at signal arrival and wait `SELL_NOW_DELAY_SECONDS` (`20s`) in `PENDING_DELAY`.
-- **Zone / Limit Edit within the Delay:** Cancels the timer and runs pre-flight checks before placing the 3-layer zone or single limit order.
-- **No Zone Edit After Delay (Bad-Position Guard):**
-  - **SELL:** Only activates `Sell now` when live `bid >= recorded_entry_price` (price is higher/better than when `"Sell now"` was posted). If price already dropped lower, it holds off up to `NOW_ENTRY_MAX_WAIT_SECONDS` (`180s`) instead of selling into a bad position at the bottom.
-  - **BUY (Opposite):** Only activates `Buy now` when live `ask <= recorded_entry_price` (price is lower/better than when `"Buy now"` was posted).
-- **TP1 Hit Cancellation (Delay & Zone):** If the channel posts `"TP1 hit"` / `"TP1 ✅"` (via **reply**, **edit**, or a **short standalone alert**) OR live MT5 price reaches `raw_tp1` before entry, the copier cancels the pending timer / deletes all unfilled zone pending limits and marks the signal `CLOSED` with zero entries. (If some zone layers already filled on a reply/edit/live TP1 hit, `handle_tp1_scaling_and_select_runner()` cancels all remaining pending limits and banks TP1.)
+### Recorded Market Point, Post-Delay Price Guard & Dual TP1 Invalidation
+- Unpriced **`"Sell now"`** and **`"Buy now"`** snapshot `initial_price` (`tick.bid` for SELL, `tick.ask` for BUY), `tp1_price`, `is_zone_order=False`, and `chat_id` (multi-channel `(chat_id, message_id)` collision isolation) with `status = "PENDING"`, then wait `SELL_NOW_DELAY_SECONDS` (`20s`).
+- **Dual TP1 Invalidation (`INVALIDATED_TP1`):**
+  - **Trigger 1 — Telegram Reply / Edit / Alert:** If a reply (`"TP1 hit"`, `"Tp1 ✅"`, etc.) or edit arrives while delayed (`PENDING`) or while zone limit orders remain unfilled, immediately aborts the delay and removes unfilled pending orders via `mt5.TRADE_ACTION_REMOVE` (without closing already-filled active positions), logging `[TP1 INVALIDATED]`.
+  - **Trigger 2 — Live MT5 Market Price Check:** Polls `executor.get_tick()` every `DELAYED_POLL_INTERVAL_SECONDS` (`0.25s`) during the delay and every `1.0s` while zone limit orders remain unfilled; if live `bid`/`ask` reaches `tp1_price` (`BUY` `>= TP1`, `SELL` `<= TP1`), immediately invalidates (`INVALIDATED_TP1`) and removes pending limits via `TRADE_ACTION_REMOVE`.
+- **Zone / Limit Edit within the Delay:** Cancels the timer and runs `executor.check_preflight()` before placing the 3-layer zone or single limit order.
+- **Post-Delay Price Validation (`T = delay_seconds`):**
+  - **SELL NOW:** Executes iff post-delay `bid >= initial_price`; if `bid < initial_price`, aborts immediately (`ABORTED_PRICE_GUARD`) to avoid selling late after a dump.
+  - **BUY NOW:** Executes iff post-delay `ask <= initial_price`; if `ask > initial_price`, aborts immediately (`ABORTED_PRICE_GUARD`) to avoid buying the top after a spike.
+  - Logs `[PRICE GUARD] {symbol} | {direction} | Initial: {X} | Post-Delay: {Y} | Action: EXECUTED/ABORTED`.
+- **Thread/Async Safety (`MT5Executor._mt5_lock`):** All `MetaTrader5` API calls across the codebase run exclusively through `MT5Executor` protected by a re-entrant `threading.RLock`.
 
 ### `"close worst entries now and hold layers"`
 - Ranks open positions by live profit, moves the **worst** one(s) to breakeven (+`BE_OFFSET_PIPS`) and leaves the **top two (bottom layers)** running.
@@ -396,7 +405,7 @@ Send any of the following commands directly to your **Saved Messages** (`"me"`) 
 - **Fallback TP1 on Unpriced Market Entries:** If a `"Buy now"` / `"Sell now"` trade still has no `TP` after `UNPRICED_TP_GRACE_SECONDS` (`45s`), a fallback `TP1` (`FALLBACK_TP1_PIPS = 50` pips / `$5.00`) is attached automatically.
 - **Provider Reply `"TP1 hit"` Scaling:** If the provider replies `"TP1 hit"` / `"Tp1 was hit on this"` to an active signal, TP1 scaling & runner lock trigger immediately.
 - **Daily Win Limit Toggle (`dailywin` in Saved Messages):** Type `dailywin` in Saved Messages and reply with your daily profit target (e.g. `20` or `£20`, or one-step `dailywin 20` / `dailywin off`). Once today's net trading profit (`realized + floating`) reaches the target, the copier automatically banks all open positions, cancels pending limit orders, posts a completion summary to Saved Messages, and terminates the session (exit code `88`, stopping the `.bat` supervisor loop so no more trades are taken).
-- **Realized-Only Daily Loss Limit (`dailyloss` in Saved Messages):** Type `dailyloss` (2-step prompt) or `dailyloss 20` / `dailyloss £20` / `dailyloss off` in Saved Messages. Uses `get_realized_today_pnl()` (broker-server trading day closed `BUY`/`SELL` deals only — excluding balance/credit deals and **never** triggered by open floating drawdown). Once Stop-Loss / closed losses reach `-limit`, cancels pending limits & delayed entries, closes open bot exposure (if `DAILY_LOSS_CLOSE_OPEN_TRADES=true`), notifies Saved Messages, and exits with code `89` (stopping the `.bat` supervisor loop). Relaunching on the same broker day enters `LOCKED` mode until next trading day or `dailyloss off`.
+- **Realized-Only Daily Loss Limit (`/set_daily_loss`, `/status_daily_loss`, `dailyloss` in Saved Messages):** Set via `/set_daily_loss 150` or `dailyloss` -> `£150` (disable with `off`/`0`). Uses `get_realized_today_pnl()` (broker-server trading day closed `DEAL_TYPE_BUY`/`DEAL_TYPE_SELL` deals `OUT`/`INOUT`/`OUT_BY` summing `profit + swap + commission + fee` — excluding balance/credit deals and **never** triggered by open floating drawdown). Once realized P&L reaches `-limit`, sets `TRADING_HALTED = True`, cancels all pending MT5 limit/stop orders via `mt5.orders_get()` + `TRADE_ACTION_REMOVE`, posts `🛑 DAILY LOSS LIMIT HIT` to Saved Messages, disconnects Telethon, calls `mt5.shutdown()`, and exits via `sys.exit(0)` (stopping the `.bat` supervisor loop). Relaunching on the same broker day enters `LOCKED` mode until next trading day or `dailyloss off`.
 
 ### Tests
-`python -m pytest tests -o pythonpath=. -q` -> 66 tests.
+`python -m pytest -v` -> 72 tests (including 6 Spec compliance tests in `tests/test_spec_upgrade.py`).

@@ -105,10 +105,10 @@ _TP1_AUX_RE = r"(?:(?:was|is|got|just|has\s+been|have\s+been)\s+)?"
 _TP1_NOT_PRICE_AFTER = r"(?!\s*[:=@\-]?\s*\d{3,6}(?:\.\d+)?\b(?!\s*pips?\b))"
 
 TP1_HIT_REPLY_PATTERNS = [
-    rf"\b{_TP1_TARGET_RE}\s+{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
-    rf"\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{_TP1_TARGET_RE}\b",
-    rf"\b{_TP1_TARGET_RE}\s*[✅✔️☑️]+{_TP1_NOT_PRICE_AFTER}",
-    rf"[✅✔️☑️]+\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
+    rf"(?i)\b{_TP1_TARGET_RE}\s*{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
+    rf"(?i)\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{_TP1_TARGET_RE}\b",
+    rf"(?i)\b{_TP1_TARGET_RE}\s*[✅✔️☑️]+{_TP1_NOT_PRICE_AFTER}",
+    rf"(?i)[✅✔️☑️]+\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
 ]
 
 _TP1_NEGATION_RE = re.compile(
