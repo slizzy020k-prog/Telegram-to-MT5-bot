@@ -4356,3 +4356,519 @@ class MT5Executor:
             return closed_ticket
 
         return None
+
+    def adjust_active_signal_sl_tp(
+        self,
+        signal_data: Dict[str, Any],
+        new_sl: Optional[float] = None,
+        labeled_tps: Optional[Dict[str, float]] = None,
+        unlabeled_tps: Optional[Sequence[float]] = None,
+        ratchet_sl_only: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        v3.3 Dynamic Active-Trade SL & TP1..TP5 Adjustment:
+        1. Merges labeled_tps (exact TP1..TP5 keys) and unlabeled_tps without shifting TP2 into TP1,
+           re-deriving any missing/non-monotonic higher stages up to TP5.
+        2. Validates new_sl (enforcing forward-only ratchet on RUNNER_ACTIVE when ratchet_sl_only=True
+           and live stop-level checks in live mode without blocking TP updates).
+        3. Updates open market positions (runner_tickets & non-runner layers) and unfilled pending orders.
+        """
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        pip_size = self.get_pip_size(symbol)
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+        min_stop_dist = stops_lvl * (pt or 0.01)
+
+        tick = self.get_tick(symbol)
+        live_px: Optional[float] = None
+        if tick is not None:
+            cand_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+            if isinstance(cand_px, (int, float)) and not isinstance(cand_px, bool) and cand_px > 0:
+                live_px = float(cand_px)
+
+        tp_levels = dict(self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits))
+        old_tp1 = tp_levels.get("TP1")
+
+        clean_labeled: Dict[str, float] = {}
+        if isinstance(labeled_tps, dict):
+            for k, v in labeled_tps.items():
+                up_k = str(k).strip().upper()
+                if not up_k.startswith("TP") and up_k.isdigit():
+                    up_k = f"TP{up_k}"
+                if up_k in ("TP1", "TP2", "TP3", "TP4", "TP5") and isinstance(v, numbers.Real) and not isinstance(v, bool) and float(v) > 0:
+                    clean_labeled[up_k] = round(float(v), digits)
+
+        clean_unlabeled: List[float] = [
+            round(float(x), digits)
+            for x in (unlabeled_tps or [])
+            if isinstance(x, numbers.Real) and not isinstance(x, bool) and float(x) > 0
+        ]
+
+        if clean_labeled or clean_unlabeled:
+            for k, v in clean_labeled.items():
+                tp_levels[k] = v
+
+            u_idx = 0
+            for stage_num in range(1, 6):
+                if u_idx >= len(clean_unlabeled):
+                    break
+                sk = f"TP{stage_num}"
+                if sk in clean_labeled:
+                    continue
+                tp_levels[sk] = clean_unlabeled[u_idx]
+                clean_labeled[sk] = clean_unlabeled[u_idx]
+                u_idx += 1
+
+            steps = [
+                float(_cfg("TP2_STEP_PIPS", TP2_STEP_PIPS)),
+                float(_cfg("TP3_STEP_PIPS", TP3_STEP_PIPS)),
+                float(_cfg("TP4_STEP_PIPS", TP4_STEP_PIPS)),
+                float(_cfg("TP5_STEP_PIPS", TP5_STEP_PIPS)),
+            ]
+            sign = 1.0 if is_buy else -1.0
+
+            if tp_levels.get("TP1") is None:
+                for stage_num in range(2, 6):
+                    higher = tp_levels.get(f"TP{stage_num}")
+                    if higher is not None:
+                        back_steps = sum(steps[: stage_num - 1]) * pip_size
+                        tp_levels["TP1"] = round(float(higher) - sign * back_steps, digits)
+                        break
+
+            for stage_num in range(2, 6):
+                sk = f"TP{stage_num}"
+                prev_val = tp_levels.get(f"TP{stage_num - 1}")
+                cur_val = tp_levels.get(sk)
+                step_dist = steps[stage_num - 2] * pip_size
+                if prev_val is not None:
+                    is_monotonic = (cur_val is not None) and (
+                        (is_buy and float(cur_val) > float(prev_val))
+                        or (not is_buy and float(cur_val) < float(prev_val))
+                    )
+                    if sk not in clean_labeled and not is_monotonic:
+                        tp_levels[sk] = round(float(prev_val) + sign * step_dist, digits)
+                    elif cur_val is None:
+                        tp_levels[sk] = round(float(prev_val) + sign * step_dist, digits)
+
+            signal_data["tp_levels"] = dict(tp_levels)
+            for i in range(1, 6):
+                sk = f"TP{i}"
+                if sk in tp_levels:
+                    signal_data[f"raw_tp{i}"] = tp_levels[sk]
+            if tp_levels.get("TP1") is not None:
+                signal_data["tp1_price"] = tp_levels["TP1"]
+
+            if "TP1" in clean_labeled or signal_data.get("final_tp") is None or tp_levels.get("TP1") != old_tp1:
+                if tp_levels.get("TP1") is not None:
+                    offset = float(_cfg("TP_FRONT_RUN_OFFSET", TP_FRONT_RUN_OFFSET)) * (pip_size / 0.10 if pip_size > 0 else 1.0)
+                    new_final_tp = round(tp_levels["TP1"] - offset, digits) if is_buy else round(tp_levels["TP1"] + offset, digits)
+                    signal_data["final_tp"] = new_final_tp
+                    signal_data["hard_broker_tp"] = new_final_tp
+                    prox_pips = float(_cfg("TP1_CLOSE_PROXIMITY_PIPS", TP1_CLOSE_PROXIMITY_PIPS))
+                    prox_dist = prox_pips * pip_size
+                    signal_data["proximity_close_price"] = (
+                        round(tp_levels["TP1"] - prox_dist, digits)
+                        if is_buy
+                        else round(tp_levels["TP1"] + prox_dist, digits)
+                    )
+
+        is_runner_phase = bool(signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"))
+        cur_floor = (
+            signal_data.get("runner_sl_floor")
+            if signal_data.get("runner_sl_floor") is not None
+            else signal_data.get("soft_tp1_floor")
+        )
+        eff_sl: Optional[float] = cur_floor if (is_runner_phase and cur_floor is not None) else signal_data.get("sl")
+        rejected_sl_reason: Optional[str] = None
+        sl_updated = False
+
+        if new_sl is not None and isinstance(new_sl, numbers.Real) and not isinstance(new_sl, bool) and float(new_sl) > 0:
+            cand_sl = round(float(new_sl), digits)
+            if ratchet_sl_only and is_runner_phase and cur_floor is not None:
+                worse_or_equal = (
+                    (is_buy and cand_sl <= float(cur_floor) + 1e-9)
+                    or (not is_buy and cand_sl >= float(cur_floor) - 1e-9)
+                )
+                if worse_or_equal:
+                    rejected_sl_reason = f"Ratchet guard preserved existing runner floor ({cur_floor}) over {cand_sl}"
+
+            if rejected_sl_reason is None and not self.dry_run and live_px is not None:
+                if (is_buy and cand_sl >= live_px - min_stop_dist) or (not is_buy and cand_sl <= live_px + min_stop_dist):
+                    rejected_sl_reason = f"SL {cand_sl} violates live stop distance (live={live_px}, min_dist={min_stop_dist})"
+
+            if rejected_sl_reason is None:
+                eff_sl = cand_sl
+                sl_updated = True
+                signal_data["sl"] = cand_sl
+                if is_runner_phase:
+                    signal_data["runner_sl_floor"] = cand_sl
+                    signal_data["soft_tp1_floor"] = cand_sl
+                    signal_data["broker_sl"] = cand_sl
+
+        mod_pos: List[int] = []
+        mod_ord: List[int] = []
+        layers = signal_data.get("layers") or {}
+        market_tickets = [_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0]
+        pending_tickets = [_int_num(t, 0) for t in (signal_data.get("pending_tickets") or []) if _int_num(t, 0) > 0]
+        max_stage = max(
+            1,
+            min(
+                5,
+                _int_num(
+                    signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
+                    4,
+                ),
+            ),
+        )
+
+        if is_runner_phase:
+            raw_rts = signal_data.get("runner_tickets") or (
+                [signal_data["runner_ticket"]] if signal_data.get("runner_ticket") else []
+            )
+            runner_tickets = [_int_num(t, 0) for t in raw_rts if _int_num(t, 0) > 0]
+            raw_rls = signal_data.get("runner_layers") or (
+                [signal_data["runner_layer"]] if signal_data.get("runner_layer") else []
+            )
+            runner_layers = [str(x) for x in raw_rls if x]
+
+            raw_stage = str(
+                signal_data.get("tp_stage") or signal_data.get("runner_milestone_name") or "TP2"
+            ).strip().upper()
+            if raw_stage == "TP1" and max_stage >= 2:
+                raw_stage = "TP2"
+            if raw_stage not in tp_levels:
+                m_idx_fallback = min(max_stage, max(2, _int_num(signal_data.get("runner_milestone_idx", 2), 2)))
+                raw_stage = f"TP{m_idx_fallback}"
+            runner_tp = tp_levels.get(raw_stage)
+            signal_data["tp_stage"] = raw_stage
+
+            sl_arg = eff_sl if sl_updated else None
+            for idx_r, rt in enumerate(runner_tickets):
+                lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                if self.modify_position_sltp(rt, sl=sl_arg, tp=runner_tp):
+                    if rt not in mod_pos:
+                        mod_pos.append(rt)
+                elif sl_arg is not None and runner_tp is not None:
+                    if self.modify_position_sltp(rt, sl=None, tp=runner_tp) and rt not in mod_pos:
+                        mod_pos.append(rt)
+                if l_info is not None and runner_tp is not None:
+                    l_info["tp"] = runner_tp
+                    l_info["tp_stage"] = raw_stage
+
+            runner_set = set(runner_tickets)
+            for l_name, l_data in layers.items():
+                if not isinstance(l_data, dict):
+                    continue
+                lt = _int_num(l_data.get("ticket"), 0)
+                if lt > 0 and lt in market_tickets and lt not in runner_set:
+                    l_stage = str(l_data.get("tp_stage") or "").strip().upper()
+                    if l_stage in tp_levels and l_stage != "TP1":
+                        l_tp = tp_levels.get(l_stage)
+                    elif l_name == "L2" and l_stage == "TP2":
+                        l_tp = tp_levels.get("TP2")
+                    elif l_name == "L3" and l_stage == "TP3":
+                        l_tp = tp_levels.get("TP3")
+                    else:
+                        l_tp = signal_data.get("final_tp")
+                    if self.modify_position_sltp(lt, sl=sl_arg, tp=l_tp):
+                        if lt not in mod_pos:
+                            mod_pos.append(lt)
+                    if l_tp is not None:
+                        l_data["tp"] = l_tp
+
+            m_idx = max(1, min(max_stage, _int_num(signal_data.get("runner_milestone_idx", 1), 1)))
+            m_target = tp_levels.get(f"TP{m_idx}")
+            if m_target is not None and live_px is not None:
+                anchor = self._resolve_milestone_anchor(signal_data, tp_levels, m_idx)
+                eff_buf, _ = self._compute_proximity_and_pullback(
+                    float(m_target), live_px, pip_size, anchor=anchor
+                )
+                dist = (float(m_target) - live_px) if is_buy else (live_px - float(m_target))
+                if dist > eff_buf + 1e-9:
+                    signal_data["runner_proximity_armed"] = False
+                    signal_data["runner_reversal_ticks"] = 0
+        else:
+            handled_tkts = set()
+            sl_arg = eff_sl if sl_updated else signal_data.get("sl")
+            for l_data in layers.values():
+                if not isinstance(l_data, dict):
+                    continue
+                lt = _int_num(l_data.get("ticket"), 0)
+                if lt <= 0:
+                    continue
+                l_stage = str(l_data.get("tp_stage") or "TP1").strip().upper()
+                l_tp = tp_levels.get("TP2") if l_stage == "TP2" else signal_data.get("final_tp")
+                if lt in market_tickets:
+                    handled_tkts.add(lt)
+                    if self.modify_position_sltp(lt, sl=sl_arg, tp=l_tp) and lt not in mod_pos:
+                        mod_pos.append(lt)
+                    if l_tp is not None:
+                        l_data["tp"] = l_tp
+                elif lt in pending_tickets:
+                    handled_tkts.add(lt)
+                    if self.modify_pending_order_sltp(lt, sl=sl_arg, tp=l_tp) and lt not in mod_ord:
+                        mod_ord.append(lt)
+                    if l_tp is not None:
+                        l_data["tp"] = l_tp
+
+            for mt in market_tickets:
+                if mt not in handled_tkts:
+                    if self.modify_position_sltp(mt, sl=sl_arg, tp=signal_data.get("final_tp")) and mt not in mod_pos:
+                        mod_pos.append(mt)
+            for pt in pending_tickets:
+                if pt not in handled_tkts:
+                    if self.modify_pending_order_sltp(pt, sl=sl_arg, tp=signal_data.get("final_tp")) and pt not in mod_ord:
+                        mod_ord.append(pt)
+
+            tp1_val = tp_levels.get("TP1")
+            if tp1_val is not None and live_px is not None:
+                sf_arm_dist = float(_cfg("SHORTFALL_ARM_PIPS", SHORTFALL_ARM_PIPS)) * pip_size
+                dist_tp1 = (float(tp1_val) - live_px) if is_buy else (live_px - float(tp1_val))
+                if dist_tp1 > sf_arm_dist + 1e-9:
+                    signal_data["shortfall_armed"] = False
+                    signal_data["shortfall_reversal_ticks"] = 0
+
+        return {
+            "sl": eff_sl,
+            "tp_levels": dict(tp_levels),
+            "final_tp": signal_data.get("final_tp"),
+            "tp_stage": signal_data.get("tp_stage", "TP1"),
+            "modified_positions": mod_pos,
+            "modified_orders": mod_ord,
+            "rejected_sl_reason": rejected_sl_reason,
+        }
+
+    def trail_active_signal(
+        self,
+        signal_data: Dict[str, Any],
+        milestone: Optional[str] = None,
+        trail_pips: Optional[float] = None,
+        explicit_sl_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        v3.3 On-Demand Active-Trade Trailing & Milestone Stepping:
+        - When milestone is TP1..TP4: triggers TP1 scaling handoff if not yet in RUNNER_ACTIVE,
+          marks TP1..TP{m} cleared, locks SL floor safely (clamped against live stop distance),
+          and steps runner broker TP to the next stage (or closes at ceiling if m >= max_stage).
+        - Otherwise trails SL by trail_pips (default TRAIL_DISTANCE_PIPS) or explicit_sl_price.
+        """
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        pip_size = self.get_pip_size(symbol)
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+        min_stop_dist = stops_lvl * (pt or 0.01)
+
+        tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
+        max_stage = max(
+            1,
+            min(
+                5,
+                _int_num(
+                    signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
+                    4,
+                ),
+            ),
+        )
+        signal_data["runner_max_tp_stage"] = max_stage
+
+        tick = self.get_tick(symbol)
+        live_px: Optional[float] = None
+        if tick is not None:
+            cand_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+            if isinstance(cand_px, (int, float)) and not isinstance(cand_px, bool) and cand_px > 0:
+                live_px = float(cand_px)
+
+        m_str = str(milestone or "").strip().upper()
+        if m_str.isdigit():
+            m_str = f"TP{m_str}"
+
+        if m_str in ("TP1", "TP2", "TP3", "TP4", "TP5"):
+            m_idx = int(m_str[-1])
+            if not signal_data.get("tp1_reached") and signal_data.get("market_tickets"):
+                self.handle_tp1_scaling_and_select_runner(signal_data)
+
+            raw_rts = signal_data.get("runner_tickets") or (
+                [signal_data["runner_ticket"]] if signal_data.get("runner_ticket") else []
+            )
+            runner_tickets = [_int_num(t, 0) for t in raw_rts if _int_num(t, 0) > 0]
+            raw_rls = signal_data.get("runner_layers") or (
+                [signal_data["runner_layer"]] if signal_data.get("runner_layer") else []
+            )
+            runner_layers = [str(x) for x in raw_rls if x]
+            if not runner_tickets and signal_data.get("market_tickets"):
+                runner_tickets = [_int_num(t, 0) for t in signal_data["market_tickets"] if _int_num(t, 0) > 0]
+
+            cleared = list(signal_data.get("runner_cleared_milestones") or [])
+            for i in range(1, m_idx + 1):
+                ck = f"TP{i}"
+                if ck not in cleared:
+                    cleared.append(ck)
+                signal_data[f"tp{i}_reached"] = True
+            signal_data["runner_cleared_milestones"] = cleared
+            signal_data["tp1_reached"] = True
+
+            if m_idx >= max_stage and runner_tickets:
+                self._finalize_runner_exit(
+                    signal_data,
+                    runner_tickets,
+                    runner_layers,
+                    reason=f"Target TP{m_idx} Reached (Prompt)",
+                    ceiling_stage=m_idx,
+                )
+                return {
+                    "new_sl": signal_data.get("runner_sl_floor"),
+                    "tp_stage": f"TP{m_idx}",
+                    "next_tp": tp_levels.get(f"TP{m_idx}"),
+                    "cleared_milestones": list(signal_data.get("runner_cleared_milestones") or []),
+                    "modified_tickets": [],
+                    "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
+                    "closed_runner_tickets": list(signal_data.get("last_runner_tickets") or []),
+                    "status": signal_data.get("status"),
+                }
+
+            raw_lock = float(_cfg("TP1_LOCK_BUFFER", TP1_LOCK_BUFFER))
+            lock_buf = raw_lock * (pip_size / 0.10) if pip_size > 0 else raw_lock
+            trail_dist = float(_cfg("TRAIL_DISTANCE_PIPS", TRAIL_DISTANCE_PIPS)) * pip_size
+            cur_floor = (
+                signal_data.get("runner_sl_floor")
+                if signal_data.get("runner_sl_floor") is not None
+                else signal_data.get("soft_tp1_floor")
+            )
+
+            if m_idx == 1:
+                tp1_val = tp_levels.get("TP1")
+                if tp1_val is not None:
+                    cand_floor = round(float(tp1_val) - lock_buf, digits) if is_buy else round(float(tp1_val) + lock_buf, digits)
+                else:
+                    cand_floor = self._compute_initial_tp1_floor(signal_data, symbol, direction, pip_size, digits)
+            else:
+                prev_tp = tp_levels.get(f"TP{m_idx - 1}")
+                cur_m_tp = tp_levels.get(f"TP{m_idx}")
+                cands: List[float] = []
+                if cur_floor is not None:
+                    cands.append(float(cur_floor))
+                if prev_tp is not None:
+                    cands.append(float(prev_tp))
+                if cur_m_tp is not None:
+                    cands.append((float(cur_m_tp) - trail_dist) if is_buy else (float(cur_m_tp) + trail_dist))
+                if cands:
+                    cand_floor = round(max(cands) if is_buy else min(cands), digits)
+                else:
+                    cand_floor = self._compute_initial_tp1_floor(signal_data, symbol, direction, pip_size, digits)
+
+            if live_px is not None and cand_floor is not None:
+                safe_gap = max(min_stop_dist, 2.0 * pip_size)
+                if is_buy and cand_floor > live_px - safe_gap:
+                    cand_floor = round(live_px - safe_gap, digits)
+                elif not is_buy and cand_floor < live_px + safe_gap:
+                    cand_floor = round(live_px + safe_gap, digits)
+
+            next_idx = min(max_stage, m_idx + 1)
+            next_stage = f"TP{next_idx}"
+            next_tp = tp_levels.get(next_stage)
+
+            signal_data["runner_milestone_idx"] = next_idx
+            signal_data["runner_milestone_name"] = next_stage
+            signal_data["tp_stage"] = next_stage
+            signal_data["runner_sl_floor"] = cand_floor
+            signal_data["soft_tp1_floor"] = cand_floor
+            signal_data["broker_sl"] = cand_floor
+            signal_data["sl"] = cand_floor
+            signal_data["runner_proximity_armed"] = False
+            signal_data["runner_reversal_ticks"] = 0
+            signal_data["tp2_shortfall_armed"] = False
+            if runner_tickets:
+                signal_data["status"] = "RUNNER_ACTIVE"
+
+            self._step_runner_broker_tp_and_sl(
+                signal_data,
+                runner_tickets,
+                runner_layers,
+                new_sl=cand_floor,
+                new_tp=next_tp,
+                new_stage=next_stage,
+                digits=digits,
+            )
+
+            return {
+                "new_sl": cand_floor,
+                "tp_stage": next_stage,
+                "next_tp": next_tp,
+                "cleared_milestones": list(cleared),
+                "modified_tickets": list(runner_tickets),
+                "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
+                "status": signal_data.get("status"),
+            }
+
+        eff_pips = (
+            float(trail_pips)
+            if (
+                trail_pips is not None
+                and isinstance(trail_pips, numbers.Real)
+                and not isinstance(trail_pips, bool)
+                and float(trail_pips) > 0
+            )
+            else float(_cfg("TRAIL_DISTANCE_PIPS", TRAIL_DISTANCE_PIPS))
+        )
+
+        if (
+            explicit_sl_price is not None
+            and isinstance(explicit_sl_price, numbers.Real)
+            and not isinstance(explicit_sl_price, bool)
+            and float(explicit_sl_price) > 0
+        ):
+            cand_sl = round(float(explicit_sl_price), digits)
+        else:
+            ref_px = (
+                live_px
+                if live_px is not None
+                else float(signal_data.get("recorded_entry_price") or signal_data.get("raw_tp1") or 3895.0)
+            )
+            cand_sl = round(ref_px - eff_pips * pip_size, digits) if is_buy else round(ref_px + eff_pips * pip_size, digits)
+
+        if live_px is not None:
+            if is_buy and (live_px - cand_sl) < min_stop_dist:
+                cand_sl = round(live_px - min_stop_dist, digits)
+            elif not is_buy and (cand_sl - live_px) < min_stop_dist:
+                cand_sl = round(live_px + min_stop_dist, digits)
+
+        raw_rts = signal_data.get("runner_tickets") or (
+            [signal_data["runner_ticket"]] if signal_data.get("runner_ticket") else []
+        )
+        runner_tickets = [_int_num(t, 0) for t in raw_rts if _int_num(t, 0) > 0]
+        target_tickets = (
+            runner_tickets
+            if (signal_data.get("status") == "RUNNER_ACTIVE" and runner_tickets)
+            else [_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0]
+        )
+
+        mod_tkts: List[int] = []
+        for t in target_tickets:
+            if self.modify_position_sltp(t, sl=cand_sl, tp=None):
+                mod_tkts.append(t)
+
+        signal_data["sl"] = cand_sl
+        signal_data["broker_sl"] = cand_sl
+        if signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"):
+            signal_data["runner_sl_floor"] = cand_sl
+            signal_data["soft_tp1_floor"] = cand_sl
+
+        cur_stage = str(signal_data.get("tp_stage") or signal_data.get("runner_milestone_name") or "TP1").upper()
+        return {
+            "new_sl": cand_sl,
+            "tp_stage": cur_stage,
+            "next_tp": tp_levels.get(cur_stage) or signal_data.get("final_tp"),
+            "cleared_milestones": list(signal_data.get("runner_cleared_milestones") or []),
+            "modified_tickets": mod_tkts,
+            "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
+            "status": signal_data.get("status"),
+        }

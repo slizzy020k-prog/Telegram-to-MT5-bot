@@ -1,7 +1,7 @@
-# XAUUSD Copier v3.2 — Architecture & API Contract
+# XAUUSD Copier v3.3 — Architecture & API Contract
 
-**Status:** LOCKED (v3.2 Deleted-Signal Trade Protection Update)  
-**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), Strict Activation Zone + Anti-Choke Reversal Guard, Deleted-Signal Trade Protection, Async Concurrency, Ledger & Safety Hardening.
+**Status:** LOCKED (v3.3 Back-to-Front Audit + Active-Trade SL & TP1/TP2/TP3 Adjust/Trail Prompts)  
+**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), Strict Activation Zone + Anti-Choke Reversal Guard, Deleted-Signal Trade Protection, Active-Trade SL/TP1–TP3 Adjust & Trail Prompt Control Plane, Async Concurrency, Ledger & Safety Hardening.
 
 ---
 
@@ -257,3 +257,51 @@ Automatically liquidates open positions and cancels pending orders for any activ
 - **Out-of-Order Tombstone Guard (`_deleted_messages`):** records deleted `(chat_id, msg_id)` keys (and bare `msg_id` when chat unknown) so delayed/out-of-order `NewMessage`, `MessageEdited`, or catch-up events cannot re-open a deleted signal; cancels any active `_delayed_sell_now_task`.
 - **Reconnect & Periodic Sweep (`poll_deleted_active_signals()`):** runs during `run_reconnect_catchup` and periodically inside `tp1_proximity_watcher_task` every `DELETED_SIGNAL_POLL_INTERVAL_SECONDS` (`15.0s`), batch-checking `state_mgr.get_open_or_pending_signals()` against Telegram `get_messages` so deletes missed while offline are caught automatically.
 - **Unified Close, Accounting & Ledger:** acquires per-`(chat_id, msg_id)` `asyncio.Lock`, invokes `_mt5_call(executor.close_signal_exposure, sig)`, accumulates closed position PnL into `banked_profit` / `accounted_tickets`, sets `status = "CLOSED"`, clears `market_tickets`, `pending_tickets`, `runner_tickets`, `runner_ticket`, records to `TradeLedger` ONLY when positions actually closed (`closed_tickets` or prior `accounted_tickets` — skipping purely unfilled/pending setups), and alerts Saved Messages.
+
+---
+
+## 6. Active-Trade Prompt Control Plane & Dynamic SL / TP1–TP3 Adjustment & Trailing (v3.3)
+
+Guarantees that active or pending trades (`ACTIVE`, `BE_APPLIED`, `PARTIAL_CLOSED`, `RUNNER_ACTIVE`, `PENDING`) cleanly accept dynamic **SL**, **TP1**, **TP2**, **TP3** (and **TP4/TP5**) adjustments and **trailing / milestone-stepping** commands across **all 4 control paths**: Channel Replies, concise Channel Prompts, Message Edits, and User Prompts in Telegram Saved Messages (`"me"`).
+
+### 6.1 Parser Contracts (`parser.py`)
+- **Breakeven Disambiguation (`BREAKEVEN_PATTERNS`):**
+  - Replaces bare `r"\bmove\s+sl\b"` with `r"\bmove\s+sl\s+(?:to\s+)?(?:entry|be|break\s*even)\b"` and `r"^\s*move\s+sl\s*[!.]*\s*$"` so `"Move SL to 3885"` is NEVER hijacked as Breakeven, while `"Move SL to BE"`, `"Move SL to entry"`, and bare `"Move SL"` continue matching `ACTION_BREAKEVEN`.
+- **Labeled TP Extraction & Active Merge:**
+  - **`extract_labeled_tps(text: str) -> Tuple[Dict[str, float], List[float]]`:** scans `TP_PATTERN.finditer(text)`, returning `(labeled_dict, unlabeled_list)` where numbered matches (`TP1..TP5`) map to `{"TP1": p1, ...}` and unnumbered matches (`TP 3905`) preserve order in `unlabeled_list` (keeping `extract_tps(text, direction)` 100% backward-compatible). Gate 4 `NEW_SIGNAL` `SignalAction` populates `"labeled_tps"` and `"unlabeled_tps"`.
+  - **`merge_tp_levels_for_active_signal(existing_tps, labeled_tps, unlabeled_tps=(), direction="BUY", pip_size=0.10, step_pips=None) -> Dict[str, float]`:** copies `existing_tps`, applies `labeled_tps` to their exact `TP1..TP5` keys (preserving untouched stages like `TP1` when `"TP2 3918 TP3 3930"` arrives), maps `unlabeled_tps` sequentially into `TP1..TP5` skipping keys explicitly in `labeled_tps`, and re-derives missing or non-monotonic stages above updated stages up to `TP5` using `step_pips` or `[TP2_STEP_PIPS..TP5_STEP_PIPS]`.
+- **Milestone Hit Detection (`1..3`):**
+  - **`detect_tp_milestone_hit(text: Optional[str]) -> Optional[int]`:** extends negation guard `_TP_NEGATION_RE` to `tp\s*#?\s*[1-5]` / `target\s*#?\s*[1-5]` / `(?:first|1st|second|2nd|third|3rd)`. Returns `2` (`"TP2 hit"`, `"TP 2 smashed"`, `"Target 2 reached"`, `"2nd TP hit"`, `"TP2 ✅"`), `3` (`"TP3 hit"`, `"Target 3 reached"`, `"3rd TP hit"`, `"TP3 ✅"`), `1` (`is_tp1_hit_message`), or `None` (never matching `"TP2 3910"` target-price lines).
+- **Gate 2 & Gate 3 Active-Trade Prompt Classification:**
+  - Gate 2 permits short `<= 8`-word `detect_tp_milestone_hit(lower) in (1, 2, 3)` alerts (without direction or 4-digit prices) through `VICTORY_RECAP_BLOCKERS`.
+  - Gate 3 emits:
+    - `"ACTION_TP1_HIT_REPLY"` (stage `1`), `"ACTION_TP2_HIT"` (`tp_hit_stage=2`), `"ACTION_TP3_HIT"` (`tp_hit_stage=3`).
+    - `"ACTION_TRAIL_SL"` (without direction verb, on reply/edit or `word_count <= 20`): matches `trail` / `trail sl` / `lock profit` / `lock tp1..4`, extracting `trail_milestone` (`"TP1".."TP4"`), `trail_price` (`>= 500.0`, non-TP price), `trail_pips` (`1..500`), plus optional `labeled_tps` / `unlabeled_tps`.
+    - `"ACTION_ADJUST_TARGETS"` (without direction verb, on reply/edit or `word_count <= 20`): extracts `sl = _extract_sl(text)` (Gold sanity check `>= 500.0`) and `labeled_tps, unlabeled_tps = extract_labeled_tps(text)`, returning `SignalAction(event_type="TRADE_MANAGEMENT", management_action="ACTION_ADJUST_TARGETS", sl=adj_sl, sl_valid=(adj_sl is not None and adj_sl >= 500.0), labeled_tps=labeled_tps, unlabeled_tps=unlabeled_tps, explicit_tps=..., cancel_pending_limits=False)`.
+
+### 6.2 Broker-Safe Target Adjust & Trail Methods (`mt5_executor.py`)
+- **`MT5Executor.adjust_active_signal_sl_tp(self, signal_data, new_sl=None, labeled_tps=None, unlabeled_tps=None, ratchet_sl_only=False) -> Dict[str, Any]`:**
+  - Merges `labeled_tps` / `unlabeled_tps` via `merge_tp_levels_for_active_signal`, syncs `tp_levels`, `raw_tp1..raw_tp5`, `tp1_price`, and recomputes `final_tp` / `hard_broker_tp` when `TP1` changes.
+  - **Ratchet vs Explicit Override:** when `ratchet_sl_only=True` (channel edits during `RUNNER_ACTIVE`), enforces one-way protection against `runner_sl_floor` / `soft_tp1_floor` (never lowering/loosening a trailed SL); when `ratchet_sl_only=False` (explicit adjust prompt), updates SL directly.
+  - **Stop-Level Validation:** checks broker `min_stop_dist = trade_stops_level * point` against live tick; if SL violates stop distance, records `rejected_sl_reason` while still applying valid TP updates.
+  - **Stage-Aware MT5 Updates:**
+    - `RUNNER_ACTIVE` / `tp1_reached=True`: updates all `runner_tickets` with `(sl=eff_sl, tp=tp_levels[stage_key])` (minimum `"TP2"` if `max_stage >= 2`), updates any non-runner open `market_tickets` (`L2->TP2`, `L3->TP3`), and disarms `runner_proximity_armed` / `runner_reversal_ticks` if active `TP{milestone_idx}` moved beyond `eff_buffer`.
+    - Pre-TP1 (`ACTIVE` / `BE_APPLIED` / `PARTIAL_CLOSED` / `PENDING`): updates `market_tickets` (`modify_position_sltp`) and `pending_tickets` (`modify_pending_order_sltp`) with `TP2` (if `tp_stage == "TP2"`) else `final_tp`, syncing `l_data["tp"]`; resets `shortfall_armed` / `shortfall_reversal_ticks` if `TP1` moved beyond `SHORTFALL_ARM_PIPS * pip_size`.
+  - Returns `{"sl", "tp_levels", "final_tp", "tp_stage", "modified_positions", "modified_orders", "rejected_sl_reason"}`.
+- **`MT5Executor.trail_active_signal(self, signal_data, milestone=None, trail_pips=None, explicit_sl_price=None) -> Dict[str, Any]`:**
+  - **Milestone Stepping (`"TP1".."TP4"`):** executes `handle_tp1_scaling_and_select_runner` first if `not tp1_reached`; marks `TP1..TP{m_idx}` cleared; closes runners at ceiling if `m_idx >= max_stage`; computes locked floor (`TP1 ± lock_buf` or `max/min(cur_floor, TP{m-1}, TP{m} ± trail_dist)`) clamped safely inside `min_stop_dist` from live price; steps to `next_stage = f"TP{min(max_stage, m_idx + 1)}"` via `_step_runner_broker_tp_and_sl(...)`, disarming proximity & resetting `runner_reversal_ticks = 0`.
+  - **Pip-Distance / Explicit SL Trail:** computes `cand_sl` from `explicit_sl_price` or `live_px -/+ eff_pips * pip_size` (clamped by `min_stop_dist`), modifies active `runner_tickets` (if `RUNNER_ACTIVE`) or `market_tickets`, and syncs `runner_sl_floor` / `soft_tp1_floor` / `broker_sl` / `sl`.
+  - Returns `{"new_sl", "tp_stage", "next_tp", "cleared_milestones", "modified_tickets", "banked_tickets", "status"}`.
+
+### 6.3 Channel & Saved Messages (`"me"`) Control Plane (`main.py`)
+- **Channel Replies / Prompts & Message Edits:**
+  - `ACTION_ADJUST_TARGETS` invokes `_mt5_call(executor.adjust_active_signal_sl_tp, ..., ratchet_sl_only=False)` under `_get_signal_lock`.
+  - `ACTION_TRAIL_SL` applies optional `labeled_tps`/`unlabeled_tps` first, then `_mt5_call(executor.trail_active_signal, ...)`, updating state, accounting closed/banked tickets (`TradeLedger` if ceiling closed), and notifying Saved Messages.
+  - `ACTION_TP2_HIT` / `ACTION_TP3_HIT` invoke `trail_active_signal(..., milestone="TP2"|"TP3")` to bank/advance runners cleanly toward `TP3`/`TP4`.
+  - `_handle_message_edited_unlocked` delegates live SL/TP edits in both `RUNNER_ACTIVE` and pre-TP1 active states to `adjust_active_signal_sl_tp(..., ratchet_sl_only=True)` so edits adjust `SL`, `TP1`, `TP2`, `TP3`, `TP4`, `TP5` on MT5 while preserving one-way runner SL ratchets.
+- **Saved Messages (`"me"`) Prompt Commands:**
+  - All active-trade prompts are registered in `_KNOWN_SAVED_COMMANDS` / `_KNOWN_SAVED_PREFIXES` (preventing capture by `_awaiting_dailywin_input` / `_awaiting_dailyloss_input`) and operate on the latest active/pending signal (`state_mgr.get_latest_signal()`) under `_get_signal_lock`:
+    - **Adjust SL / TPs:** `/sl <price>`, `sl <price>`, `move sl <price>`, `/tp <...>`, `tp1..tp4 <price>`, `adjust <...>`
+    - **Trail / Step Milestones:** `/trail`, `trail`, `/trail <pips|price|tp1..tp4>`, `trail <pips|price|tp1..tp4>`, `lock tp1..tp4`, `tp1 hit`, `tp2 hit`, `tp3 hit`
+    - **Active Trade Shortcuts:** `/be`, `be`, `/partial`, `partial`
+    - **Manual Signal Execution:** `/trade <signal>`, `/exec <signal>` (runs full 6-gate `parse_message` -> preflight -> 4-layer execution pipeline).

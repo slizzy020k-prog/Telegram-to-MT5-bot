@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from config import (
     ALLOW_FORWARDS,
@@ -61,8 +61,9 @@ BREAKEVEN_PATTERNS = [
     r"\bsl\s+to\s+entry\b",
     r"\bsl\s+to\s+be\b",
     r"\brisk\s+free\b",
-    r"\bmove\s+sl\b",
-    r"\bset\s+sl\s+to\s+entry\b",
+    r"\bmove\s+sl\s+(?:to\s+)?(?:entry|be|break\s*even)\b",
+    r"^\s*move\s+sl\s*[!.]*\s*$",
+    r"\bset\s+sl\s+(?:to\s+)?(?:entry|be|break\s*even)\b",
 ]
 
 WORST_HOLD_PATTERNS = [
@@ -106,24 +107,34 @@ REACTIVATE_PATTERNS = [
 ]
 
 _TP1_TARGET_RE = r"(?:tp(?:\s*#?\s*1)?|target\s*#?\s*1|take\s*profit\s*#?\s*1|(?:first|1st)\s+(?:tp|target|take\s*profit))"
+_TP2_TARGET_RE = r"(?:tp\s*#?\s*2|target\s*#?\s*2|take\s*profit\s*#?\s*2|(?:second|2nd)\s+(?:tp|target|take\s*profit))"
+_TP3_TARGET_RE = r"(?:tp\s*#?\s*3|target\s*#?\s*3|take\s*profit\s*#?\s*3|(?:third|3rd)\s+(?:tp|target|take\s*profit))"
 _TP1_VERB_RE = r"(?:hit|hits|hitted|smashed|reached|done|cleared|achieved|completed|complete|taken|banked|secured|booked|touched|tagged|crushed)"
 _TP1_AUX_RE = r"(?:(?:was|is|got|just|has\s+been|have\s+been)\s+)?"
 _TP1_NOT_PRICE_AFTER = r"(?!\s*(?:[:=@\-]|[\u2600-\U0001FAFF])?\s*\d{3,6}(?:\.\d+)?\b(?!\s*pips?\b))"
 _TP1_EMOJI_RE = r"[✅✔️☑️💥🔥🚀🎯💰👏🎉🏆💵🤑]+"
 
-TP1_HIT_REPLY_PATTERNS = [
-    rf"(?i)\b{_TP1_TARGET_RE}\s*{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
-    rf"(?i)\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{_TP1_TARGET_RE}\b",
-    rf"(?i)\b{_TP1_TARGET_RE}{_TP1_NOT_PRICE_AFTER}\s*{_TP1_EMOJI_RE}\s*(?:\+?\s*\d{{1,4}}\s*pips?\b)?",
-    rf"(?i){_TP1_EMOJI_RE}\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
-    rf"(?i)\b{_TP1_TARGET_RE}\s*\+?\s*\d{{1,4}}\s*pips?\b",
-]
 
-_TP1_NEGATION_RE = re.compile(
+def _build_tp_hit_patterns(target_re: str) -> List[str]:
+    return [
+        rf"(?i)\b{target_re}\b\s*{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
+        rf"(?i)\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{target_re}\b",
+        rf"(?i)\b{target_re}\b{_TP1_NOT_PRICE_AFTER}\s*{_TP1_EMOJI_RE}\s*(?:\+?\s*\d{{1,4}}\s*pips?\b)?",
+        rf"(?i){_TP1_EMOJI_RE}\s*{target_re}\b{_TP1_NOT_PRICE_AFTER}",
+        rf"(?i)\b{target_re}\b\s*\+?\s*\d{{1,4}}\s*pips?\b",
+    ]
+
+
+TP1_HIT_REPLY_PATTERNS = _build_tp_hit_patterns(_TP1_TARGET_RE)
+TP2_HIT_PATTERNS = _build_tp_hit_patterns(_TP2_TARGET_RE)
+TP3_HIT_PATTERNS = _build_tp_hit_patterns(_TP3_TARGET_RE)
+
+_TP_NEGATION_RE = re.compile(
     r"\b(?:not|didn'?t|did\s+not|hasn'?t|has\s+not|haven'?t|have\s+not|wasn'?t|isn'?t|won'?t|never|almost|nearly|before)\s+"
-    r"(?:been\s+)?(?:hit|hits|smashed|reached|done|tp(?:\s*#?\s*1)?|target\s*#?\s*1|(?:first|1st)\s+(?:tp|target))\b",
+    r"(?:been\s+)?(?:hit|hits|smashed|reached|done|tp(?:\s*#?\s*[1-5])?|target\s*#?\s*[1-5]|(?:first|1st|second|2nd|third|3rd)\s+(?:tp|target))\b",
     re.IGNORECASE,
 )
+_TP1_NEGATION_RE = _TP_NEGATION_RE
 
 
 def is_tp1_hit_message(text: Optional[str]) -> bool:
@@ -131,9 +142,32 @@ def is_tp1_hit_message(text: Optional[str]) -> bool:
     if not text:
         return False
     lower = text.lower()
-    if _TP1_NEGATION_RE.search(lower):
+    if _TP_NEGATION_RE.search(lower):
         return False
     return any(re.search(p, lower) for p in TP1_HIT_REPLY_PATTERNS)
+
+
+def detect_tp_milestone_hit(text: Optional[str]) -> Optional[int]:
+    """Return 1, 2, or 3 if text indicates TP1/TP2/TP3 was hit/reached; None otherwise."""
+    if not text:
+        return None
+    lower = text.lower()
+    if _TP_NEGATION_RE.search(lower):
+        return None
+    if any(re.search(p, lower) for p in TP3_HIT_PATTERNS):
+        return 3
+    if any(re.search(p, lower) for p in TP2_HIT_PATTERNS):
+        return 2
+    if any(re.search(p, lower) for p in TP1_HIT_REPLY_PATTERNS):
+        return 1
+    return None
+
+
+_TRAIL_SL_INTENT_RE = re.compile(
+    r"\b(?:trail(?:\s+sl|\s+stop(?:\s*loss)?)?|lock(?:\s+in)?(?:\s+profits?|\s+tp\s*#?\s*[1-4]|\s+target\s*#?\s*[1-4]))\b"
+    r"|^\s*lock\s+(?:tp|target)\s*#?\s*[1-4]\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -170,21 +204,21 @@ SINGLE_PRICE_PATTERN = re.compile(
 
 # Take Profit pattern: TP1..TP9, TP 1, TP#1, Target 1, etc. (never matching 'TP1💥50 PIPs')
 TP_PATTERN = re.compile(
-    r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
+    r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:(?:to|at|is)\s+)?(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 
 # Stop Loss patterns (explicit SL/Stoploss + standalone Stop excluding "Buy stop <price>")
 _EXPLICIT_SL_PATTERN = re.compile(
-    r"\b(?:sl|stop\s*loss|stoploss)\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    r"\b(?:sl|stop\s*loss|stoploss)\s*(?:[:=@\-]|->|\b(?:to|at|is)\b)?\s*(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 _STANDALONE_STOP_SL_PATTERN = re.compile(
-    r"\bstop\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    r"\bstop\s*(?:[:=@\-]|->|\b(?:to|at|is)\b)?\s*(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 SL_PATTERN = re.compile(
-    r"\b(?:sl|stop\s*loss|stoploss|(?<!buy\s)(?<!sell\s)(?<!long\s)(?<!short\s)stop)\s*[:=@\-]?\s*(\d{2,6}(?:\.\d+)?)",
+    r"\b(?:sl|stop\s*loss|stoploss|(?<!buy\s)(?<!sell\s)(?<!long\s)(?<!short\s)stop)\s*(?:[:=@\-]|->|\b(?:to|at|is)\b)?\s*(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
 )
 
@@ -253,6 +287,116 @@ def derive_tp_levels(
         base.append(round(base[-1] + sign * step * pip_size, digits))
 
     return {f"TP{i + 1}": base[i] for i in range(5)}
+
+
+def merge_tp_levels_for_active_signal(
+    existing_tps: Optional[Dict[str, float]],
+    labeled_tps: Optional[Dict[str, float]] = None,
+    unlabeled_tps: Sequence[float] = (),
+    direction: str = "BUY",
+    pip_size: float = 0.10,
+    step_pips: Optional[Sequence[float]] = None,
+) -> Dict[str, float]:
+    """
+    Merge labeled_tps ('TP1'..'TP5') and unlabeled_tps into existing_tps for an active signal.
+    Preserves untouched stages (e.g. TP1 stays intact when 'TP2 3918 TP3 3930' arrives)
+    and re-derives missing or non-monotonic stages above updated stages up to TP5.
+    """
+    digits = _decimals_for_pip(pip_size)
+    merged: Dict[str, float] = {}
+    if isinstance(existing_tps, dict):
+        for i in range(1, 6):
+            k = f"TP{i}"
+            v = existing_tps.get(k)
+            if v is not None:
+                try:
+                    fv = float(v)
+                    if fv > 0:
+                        merged[k] = round(fv, digits)
+                except (TypeError, ValueError):
+                    pass
+
+    explicit_labeled: Dict[str, float] = {}
+    updated_stages: List[int] = []
+    if isinstance(labeled_tps, dict):
+        for raw_k, raw_v in labeled_tps.items():
+            if raw_v is None:
+                continue
+            k_str = str(raw_k).strip().upper()
+            if k_str.startswith("TP") and len(k_str) == 3 and k_str[2].isdigit():
+                idx = int(k_str[2])
+            elif k_str.isdigit():
+                idx = int(k_str)
+            else:
+                continue
+            if 1 <= idx <= 5:
+                try:
+                    fv = round(float(raw_v), digits)
+                    if fv > 0:
+                        key = f"TP{idx}"
+                        explicit_labeled[key] = fv
+                        merged[key] = fv
+                        updated_stages.append(idx)
+                except (TypeError, ValueError):
+                    pass
+
+    if unlabeled_tps:
+        stage_cursor = 1
+        for raw_v in unlabeled_tps:
+            if raw_v is None:
+                continue
+            try:
+                fv = round(float(raw_v), digits)
+            except (TypeError, ValueError):
+                continue
+            if fv <= 0:
+                continue
+            while stage_cursor <= 5 and f"TP{stage_cursor}" in explicit_labeled:
+                stage_cursor += 1
+            if stage_cursor > 5:
+                break
+            key = f"TP{stage_cursor}"
+            merged[key] = fv
+            updated_stages.append(stage_cursor)
+            stage_cursor += 1
+
+    if not merged:
+        return {}
+
+    steps = (
+        [float(s) for s in step_pips]
+        if step_pips is not None
+        else [float(TP2_STEP_PIPS), float(TP3_STEP_PIPS), float(TP4_STEP_PIPS), float(TP5_STEP_PIPS)]
+    )
+    while len(steps) < 4:
+        steps.append(float(DEFAULT_TP_STEP_PIPS))
+
+    is_buy = (direction or "BUY").upper() == "BUY"
+    sign = 1.0 if is_buy else -1.0
+
+    # If TP1 is missing (e.g. existing_tps was empty and only TP2+ was supplied), back-fill down to TP1
+    if "TP1" not in merged:
+        first_present = min(int(k[2]) for k in merged if k.startswith("TP") and k[2:].isdigit())
+        for idx in range(first_present - 1, 0, -1):
+            step = steps[idx - 1]
+            merged[f"TP{idx}"] = round(merged[f"TP{idx + 1}"] - sign * step * pip_size, digits)
+
+    for idx in range(2, 6):
+        key = f"TP{idx}"
+        prev_val = merged[f"TP{idx - 1}"]
+        step = steps[idx - 2]
+        if key in explicit_labeled or idx in updated_stages:
+            continue
+        cur_val = merged.get(key)
+        is_non_monotonic = (
+            cur_val is None
+            or (is_buy and cur_val <= prev_val)
+            or (not is_buy and cur_val >= prev_val)
+        )
+        if is_non_monotonic:
+            merged[key] = round(prev_val + sign * step * pip_size, digits)
+
+    return {f"TP{i}": merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged}
 
 
 def _extract_sl(text: str) -> Optional[float]:
@@ -349,6 +493,10 @@ class SignalAction(dict):
                 return self.get("tp_levels") or {}
             if name == "explicit_tps":
                 return self.get("explicit_tps") or []
+            if name == "labeled_tps":
+                return self.get("labeled_tps") or {}
+            if name == "unlabeled_tps":
+                return self.get("unlabeled_tps") or []
             if name == "broker_symbol":
                 return self.get("symbol")
             if name == "zone":
@@ -419,13 +567,13 @@ def gate_2_check_announcements_and_recaps(
 
     # 3. Past-Tense Victory Recap Blocker
     if not is_reply and not is_edit:
-        is_short_tp1_cmd = (
+        is_short_tp_milestone_cmd = (
             len(lower.split()) <= 8
             and not DIRECTION_PATTERN.search(lower)
             and not re.search(r"\b\d{4}(?:\.\d+)?\b", lower)
-            and is_tp1_hit_message(lower)
+            and detect_tp_milestone_hit(lower) in (1, 2, 3)
         )
-        if not is_short_tp1_cmd:
+        if not is_short_tp_milestone_cmd:
             for pattern in VICTORY_RECAP_BLOCKERS:
                 if re.search(pattern, lower):
                     logger.info(f"Gate 2 Reject (Victory Recap): Matched pattern '{pattern}'")
@@ -444,12 +592,14 @@ def gate_3_classify_trade_management(
     """
     Gate 3: Trade Management & Reply Classifier.
     Detects Breakeven, Close Worst/Hold Layers, Partial Close, Full Close,
-    'Active' Reactivation, and TP1-Hit alerts/replies.
+    'Active' Reactivation, TP1..TP3-Hit alerts/replies, Trail SL / Lock TP,
+    and active-trade SL / TP1..TP5 target adjustments.
     """
     lower = text.lower()
 
     action = None
     cancel_limits = False
+    tp_hit_stage: Optional[int] = None
 
     effective_is_reply = (
         (reply_to_msg_id is not None)
@@ -465,11 +615,21 @@ def gate_3_classify_trade_management(
         # 1) Anything that looks like a priced entry signal is NOT a management command.
         if has_direction and has_4digit_price:
             return None
-        # 2) Long messages are conversation, not commands (except explicit TP1-hit edits).
+        # 2) Long messages are conversation, not commands (except explicit TP-milestone-hit edits).
         if word_count > 10:
-            if is_edit and is_tp1_hit_message(lower):
+            edit_hit_stage = detect_tp_milestone_hit(lower) if is_edit else None
+            if edit_hit_stage == 1:
                 action = "ACTION_TP1_HIT_REPLY"
                 cancel_limits = True
+                tp_hit_stage = 1
+            elif edit_hit_stage == 2:
+                action = "ACTION_TP2_HIT"
+                cancel_limits = False
+                tp_hit_stage = 2
+            elif edit_hit_stage == 3:
+                action = "ACTION_TP3_HIT"
+                cancel_limits = False
+                tp_hit_stage = 3
             else:
                 return None
 
@@ -495,15 +655,26 @@ def gate_3_classify_trade_management(
         action = "ACTION_FULL_CLOSE"
         cancel_limits = True
 
-    # 3. Provider "TP1 hit" / "Tp1 was hit on this" (replies, edits, or standalone <= 8 words without dir/4-digit price)
+    # 3. Provider TP1..TP3 hit alerts (replies, edits, or standalone <= 8 words without dir/4-digit price)
     is_tp1_eligible = (
         effective_is_reply
         or is_edit
         or (word_count <= 8 and not has_direction and not has_4digit_price)
     )
-    if not action and is_tp1_eligible and is_tp1_hit_message(lower):
-        action = "ACTION_TP1_HIT_REPLY"
-        cancel_limits = True
+    if not action and is_tp1_eligible:
+        hit_stage = detect_tp_milestone_hit(lower)
+        if hit_stage == 1:
+            action = "ACTION_TP1_HIT_REPLY"
+            cancel_limits = True
+            tp_hit_stage = 1
+        elif hit_stage == 2:
+            action = "ACTION_TP2_HIT"
+            cancel_limits = False
+            tp_hit_stage = 2
+        elif hit_stage == 3:
+            action = "ACTION_TP3_HIT"
+            cancel_limits = False
+            tp_hit_stage = 3
 
     # 4. Breakeven
     if not action and _hit(BREAKEVEN_PATTERNS):
@@ -523,8 +694,97 @@ def gate_3_classify_trade_management(
     if not action and _hit(PARTIAL_CLOSE_PATTERNS):
         action = "ACTION_PARTIAL_CLOSE"
 
+    # 7. Active-Trade Trail SL / Lock TP1..TP4 & 8. Adjust SL / TP1..TP5 (no directional verb)
+    if not action and not has_direction and (effective_is_reply or is_edit or word_count <= 20):
+        # 7a. Trail SL / Lock TP1..TP4 ("Trail SL", "Trail 15", "Trail TP2", "Lock TP2", "Trail SL to 3895")
+        if _TRAIL_SL_INTENT_RE.search(lower):
+            ms_match = re.search(r"\b(?:tp|target|take\s*profit)\s*#?\s*([1-4])\b", lower)
+            trail_milestone = f"TP{ms_match.group(1)}" if ms_match else None
+
+            raw_labeled, raw_unlabeled = extract_labeled_tps(text)
+            labeled_tps = {k: v for k, v in raw_labeled.items() if v >= 500.0}
+            unlabeled_tps = [v for v in raw_unlabeled if v >= 500.0]
+            tp_prices_set = set(labeled_tps.values()) | set(unlabeled_tps)
+
+            trail_price: Optional[float] = None
+            for pm in re.finditer(
+                r"\b(?:to|@|=|:|sl|stop\s*loss|stoploss|trail)\s*(?:[:=@\-]|->|\b(?:to|at|is)\b)?\s*(\d{3,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
+                lower,
+            ):
+                cand_p = round(float(pm.group(1)), 2)
+                if 500.0 <= cand_p < 100000.0 and cand_p not in tp_prices_set:
+                    trail_price = cand_p
+                    break
+
+            trail_pips: Optional[float] = None
+            pips_m = re.search(r"\b(\d{1,3}(?:\.\d+)?)\s*pips?\b", lower)
+            if pips_m:
+                pv = float(pips_m.group(1))
+                if 1.0 <= pv <= 500.0:
+                    trail_pips = pv
+            elif trail_milestone is None and trail_price is None:
+                bare_m = re.search(
+                    r"\btrail(?:\s+sl|\s+stop(?:\s*loss)?)?(?:\s+by)?\s*[:=@\-]?\s*(\d{1,3}(?:\.\d+)?)\b",
+                    lower,
+                )
+                if bare_m:
+                    pv = float(bare_m.group(1))
+                    if 1.0 <= pv < 300.0:
+                        trail_pips = pv
+
+            mgmt_obj = SignalAction({
+                "event_type": "TRADE_MANAGEMENT",
+                "management_action": "ACTION_TRAIL_SL",
+                "message_id": message_id,
+                "reply_to_msg_id": reply_to_msg_id,
+                "cancel_pending_limits": False,
+                "symbol": DEFAULT_SYMBOL,
+                "trail_milestone": trail_milestone,
+                "trail_price": trail_price,
+                "trail_pips": trail_pips,
+                "sl": trail_price,
+                "sl_valid": bool(trail_price is not None and trail_price >= 500.0),
+                "labeled_tps": labeled_tps,
+                "unlabeled_tps": unlabeled_tps,
+                "raw_text": text,
+            })
+            logger.info(
+                f"Gate 3: Classified trade management command: ACTION_TRAIL_SL "
+                f"(milestone={trail_milestone}, price={trail_price}, pips={trail_pips}, ReplyTo={reply_to_msg_id})"
+            )
+            return mgmt_obj
+
+        # 7b. Adjust SL / TP1..TP5 ("SL 3885", "Move SL to 3885", "TP2 3918 TP3 3930", "Adjust TP2 3918 TP3 3928")
+        raw_adj_sl = _extract_sl(text)
+        adj_sl = round(raw_adj_sl, 2) if (raw_adj_sl is not None and raw_adj_sl >= 500.0) else None
+        raw_labeled, raw_unlabeled = extract_labeled_tps(text)
+        labeled_tps = {k: v for k, v in raw_labeled.items() if v >= 500.0}
+        unlabeled_tps = [v for v in raw_unlabeled if v >= 500.0]
+
+        if adj_sl is not None or labeled_tps or unlabeled_tps:
+            explicit_tps = [v for v in extract_tps(text) if v >= 500.0]
+            mgmt_obj = SignalAction({
+                "event_type": "TRADE_MANAGEMENT",
+                "management_action": "ACTION_ADJUST_TARGETS",
+                "message_id": message_id,
+                "reply_to_msg_id": reply_to_msg_id,
+                "cancel_pending_limits": False,
+                "symbol": DEFAULT_SYMBOL,
+                "sl": adj_sl,
+                "sl_valid": bool(adj_sl is not None and adj_sl >= 500.0),
+                "labeled_tps": labeled_tps,
+                "unlabeled_tps": unlabeled_tps,
+                "explicit_tps": explicit_tps,
+                "raw_text": text,
+            })
+            logger.info(
+                f"Gate 3: Classified trade management command: ACTION_ADJUST_TARGETS "
+                f"(SL={adj_sl}, labeled_tps={labeled_tps}, unlabeled_tps={unlabeled_tps}, ReplyTo={reply_to_msg_id})"
+            )
+            return mgmt_obj
+
     if action:
-        mgmt_obj = SignalAction({
+        payload: Dict[str, Any] = {
             "event_type": "TRADE_MANAGEMENT",
             "management_action": action,
             "message_id": message_id,
@@ -532,11 +792,40 @@ def gate_3_classify_trade_management(
             "cancel_pending_limits": cancel_limits,
             "symbol": DEFAULT_SYMBOL,
             "raw_text": text,
-        })
+        }
+        if tp_hit_stage is not None:
+            payload["tp_hit_stage"] = tp_hit_stage
+        mgmt_obj = SignalAction(payload)
         logger.info(f"Gate 3: Classified trade management command: {action} (ReplyTo: {reply_to_msg_id})")
         return mgmt_obj
 
     return None
+
+
+def extract_labeled_tps(text: str) -> Tuple[Dict[str, float], List[float]]:
+    """
+    Extract explicitly labeled TPs ({'TP1': 3905.0, 'TP2': 3915.0, ...}) and
+    unlabeled TPs ([3905.0, ...]) from text without shifting stage indices.
+    """
+    labeled: Dict[str, float] = {}
+    unlabeled: List[float] = []
+    if not text:
+        return labeled, unlabeled
+
+    for m in TP_PATTERN.finditer(text):
+        idx_str = m.group(1) or m.group(2)
+        price = round(float(m.group(3)), 2)
+        if idx_str:
+            idx = int(idx_str)
+            if 1 <= idx <= 5:
+                key = f"TP{idx}"
+                if key not in labeled:
+                    labeled[key] = price
+        else:
+            if price not in unlabeled:
+                unlabeled.append(price)
+
+    return labeled, unlabeled
 
 
 def extract_tps(text: str, direction: str = "BUY") -> List[float]:
@@ -698,6 +987,7 @@ def gate_4_extract_signal(
         order_intent = "AUTO"
 
     # 4. Take Profit (TP1..TP5) & Proximity Trigger (Gold: 1 pip = $0.10)
+    labeled_tps, unlabeled_tps = extract_labeled_tps(text)
     explicit_tps = extract_tps(text, direction=direction)
     tp_levels = derive_tp_levels(explicit_tps, direction=direction)
     raw_tp1 = tp_levels.get("TP1")
@@ -739,6 +1029,8 @@ def gate_4_extract_signal(
         "sl": raw_sl,
         "sl_valid": False,
         "explicit_tps": explicit_tps,
+        "labeled_tps": labeled_tps,
+        "unlabeled_tps": unlabeled_tps,
         "tp_levels": tp_levels,
         "raw_tp1": raw_tp1,
         "raw_tp2": raw_tp2,

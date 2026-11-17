@@ -44,6 +44,11 @@ class MockTelethonEvent:
         self.message.message = text
         self.message.reply_to_msg_id = reply_to_msg_id
         self.message.forward = None
+        self.message.out = False
+        self.replies = []
+
+    async def reply(self, text: str) -> None:
+        self.replies.append(text)
 
 
 def _make_tick(bid: float, ask: float) -> MagicMock:
@@ -313,8 +318,56 @@ async def run_simulation() -> None:
         f"while unrelated Signal #20008 remained {sig_keep_after['status']}!"
     )
 
+    # -----------------------------------------------------------------------
+    # STEP 8: Active-Trade Prompts — Adjust & Trail SL, TP1, TP2, TP3
+    # -----------------------------------------------------------------------
+    print("\n[STEP 8] Testing Active-Trade Prompts — Adjust & Trail SL, TP1, TP2, TP3 (Channel & Saved Messages)...")
+    # [8a] Execute 4-layer trade via /trade in Saved Messages with explicit SL & TP1..TP3
+    cmd_trade = MockTelethonEvent(
+        msg_id=20010,
+        text="/trade Buy 3895-3887 TP1 3900 TP2 3910 TP3 3920 SL 3875",
+        chat_id="me",
+    )
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3894.70, 3895.00)):
+        await main.handle_saved_messages_command(cmd_trade)
+    sig_p = main.state_mgr.get_signal(20010, chat_id="me")
+    assert sig_p is not None and sig_p["status"] == "ACTIVE"
+    assert sig_p["sl"] == 3875.0 and sig_p["raw_tp1"] == 3900.0 and sig_p["raw_tp2"] == 3910.0 and sig_p["raw_tp3"] == 3920.0
+    print("  [8a] Saved Messages `/trade` executed 4-layer trade with SL=3875.0, TP1=3900.0, TP2=3910.0, TP3=3920.0.")
+
+    # [8b] Adjust SL ("Move SL to 3882") and TP2/TP3 ("TP2 3914 TP3 3926") while ACTIVE (TP1 must stay 3900.0!)
+    cmd_sl = MockTelethonEvent(msg_id=20011, text="Move SL to 3882", chat_id="me")
+    cmd_tps = MockTelethonEvent(msg_id=20012, text="TP2 3914 TP3 3926", chat_id="me")
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3895.50, 3895.80)):
+        await main.handle_saved_messages_command(cmd_sl)
+        await main.handle_saved_messages_command(cmd_tps)
+    sig_p = main.state_mgr.get_signal(20010, chat_id="me")
+    assert sig_p["sl"] == 3882.0
+    assert sig_p["raw_tp1"] == 3900.0 and sig_p["raw_tp2"] == 3914.0 and sig_p["raw_tp3"] == 3926.0
+    print(f"  [8b] Adjusted SL -> {sig_p['sl']}, TP2 -> {sig_p['raw_tp2']}, TP3 -> {sig_p['raw_tp3']} (TP1 preserved at {sig_p['raw_tp1']}).")
+
+    # [8c] Trail & Step TP1 -> TP2 -> TP3 via prompts ("TP1 hit", "trail tp2", "/sl 3912", "/tp3 3928")
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.20, 3900.40)):
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20013, text="TP1 hit", chat_id="me"))
+    sig_p = main.state_mgr.get_signal(20010, chat_id="me")
+    assert sig_p["status"] == "RUNNER_ACTIVE" and sig_p["tp_stage"] == "TP2"
+
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3914.40, 3914.60)):
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20014, text="trail tp2", chat_id="me"))
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20015, text="/sl 3912", chat_id="me"))
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20016, text="/tp3 3928", chat_id="me"))
+    sig_p = main.state_mgr.get_signal(20010, chat_id="me")
+    assert sig_p["tp_stage"] == "TP3"
+    assert sig_p["sl"] == 3912.0
+    assert sig_p["raw_tp3"] == 3928.0
+    assert sig_p["layers"]["L1"]["tp"] == 3928.0
+    print(
+        f"  [8c] Stepped TP1 -> TP2 -> TP3: stage={sig_p['tp_stage']}, locked SL={sig_p['sl']}, "
+        f"runner broker TP={sig_p['layers']['L1']['tp']}!"
+    )
+
     print("\n" + "=" * 72)
-    print("  ALL 7 v3.1 + STEP 7 v3.2 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("  ALL 8 v3.3 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
     print("=" * 72)
 
 

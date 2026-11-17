@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import copy
 import time
@@ -92,6 +93,10 @@ from parser import (
     SignalAction,
     ZoneInfo,
     is_tp1_hit_message,
+    detect_tp_milestone_hit,
+    extract_labeled_tps,
+    merge_tp_levels_for_active_signal,
+    gate_3_classify_trade_management,
     derive_tp_levels,
     compute_zone_4tiers,
 )
@@ -3015,6 +3020,169 @@ def _extract_reply_to_id(msg: Any) -> Optional[int | str]:
     return None
 
 
+async def _apply_adjust_or_trail_unlocked(
+    target_msg_id: Any,
+    target_chat_id: Optional[int | str],
+    target_signal: Dict[str, Any],
+    mgmt_action_obj: Any,
+    source_label: str = "Channel Prompt",
+) -> str:
+    """
+    Shared handler for ACTION_ADJUST_TARGETS, ACTION_TRAIL_SL, ACTION_TP2_HIT, and ACTION_TP3_HIT.
+    Caller must hold `_get_signal_lock(target_chat_id, target_msg_id)`.
+    """
+    action = getattr(mgmt_action_obj, "management_action", None) or (
+        mgmt_action_obj.get("management_action") if isinstance(mgmt_action_obj, dict) else None
+    )
+    symbol = target_signal.get("symbol", DEFAULT_SYMBOL)
+    direction = target_signal.get("direction", "BUY")
+
+    if action in ("ACTION_ADJUST_TARGETS", "ADJUST_TARGETS"):
+        sl_valid = bool(
+            getattr(mgmt_action_obj, "sl_valid", False)
+            if not isinstance(mgmt_action_obj, dict)
+            else mgmt_action_obj.get("sl_valid", False)
+        )
+        raw_sl = (
+            getattr(mgmt_action_obj, "sl", None)
+            if not isinstance(mgmt_action_obj, dict)
+            else mgmt_action_obj.get("sl")
+        )
+        new_sl_val = raw_sl if (sl_valid and raw_sl is not None) else None
+        labeled_tps = (
+            getattr(mgmt_action_obj, "labeled_tps", None)
+            if not isinstance(mgmt_action_obj, dict)
+            else mgmt_action_obj.get("labeled_tps")
+        )
+        unlabeled_tps = (
+            getattr(mgmt_action_obj, "unlabeled_tps", None)
+            if not isinstance(mgmt_action_obj, dict)
+            else mgmt_action_obj.get("unlabeled_tps")
+        )
+
+        res = await _mt5_call(
+            executor.adjust_active_signal_sl_tp,
+            target_signal,
+            new_sl=new_sl_val,
+            labeled_tps=labeled_tps,
+            unlabeled_tps=unlabeled_tps,
+            ratchet_sl_only=False,
+        )
+        state_mgr.update_signal(target_msg_id, target_signal, chat_id=target_chat_id)
+        rej_note = (
+            f"\n• ⚠️ **SL Stop-Level Note:** `{res['rejected_sl_reason']}`"
+            if res.get("rejected_sl_reason")
+            else ""
+        )
+        return (
+            f"🎯 **Active Trade SL / TP Adjusted ({source_label}) [ID: {target_msg_id}]**\n"
+            f"• Symbol: `{symbol}` ({direction}) | Status: `{target_signal.get('status')}`\n"
+            f"• 🛡️ **SL:** `{res.get('sl')}` | **Active Stage:** `{res.get('tp_stage')}` | "
+            f"**Broker TP1:** `{res.get('final_tp')}`\n"
+            f"• 🎯 **Targets:** {_format_tp_summary(target_signal)}\n"
+            f"• Modified Positions: `{res.get('modified_positions', [])}` | "
+            f"Pending Orders: `{res.get('modified_orders', [])}`"
+            f"{rej_note}"
+        )
+
+    # Branch B: ACTION_TRAIL_SL, ACTION_TP2_HIT, ACTION_TP3_HIT
+    labeled_tps = (
+        getattr(mgmt_action_obj, "labeled_tps", None)
+        if not isinstance(mgmt_action_obj, dict)
+        else mgmt_action_obj.get("labeled_tps")
+    )
+    unlabeled_tps = (
+        getattr(mgmt_action_obj, "unlabeled_tps", None)
+        if not isinstance(mgmt_action_obj, dict)
+        else mgmt_action_obj.get("unlabeled_tps")
+    )
+    if labeled_tps or unlabeled_tps:
+        await _mt5_call(
+            executor.adjust_active_signal_sl_tp,
+            target_signal,
+            new_sl=None,
+            labeled_tps=labeled_tps,
+            unlabeled_tps=unlabeled_tps,
+            ratchet_sl_only=True,
+        )
+
+    if action in ("ACTION_TP2_HIT", "TP2_HIT"):
+        milestone = "TP2"
+    elif action in ("ACTION_TP3_HIT", "TP3_HIT"):
+        milestone = "TP3"
+    else:
+        milestone = (
+            getattr(mgmt_action_obj, "trail_milestone", None)
+            if not isinstance(mgmt_action_obj, dict)
+            else mgmt_action_obj.get("trail_milestone")
+        )
+
+    trail_pips = (
+        getattr(mgmt_action_obj, "trail_pips", None)
+        if not isinstance(mgmt_action_obj, dict)
+        else mgmt_action_obj.get("trail_pips")
+    )
+    trail_price = (
+        getattr(mgmt_action_obj, "trail_price", None)
+        if not isinstance(mgmt_action_obj, dict)
+        else mgmt_action_obj.get("trail_price")
+    )
+
+    was_tp1_reached = bool(target_signal.get("tp1_reached"))
+    prev_runners = [
+        t
+        for t in (
+            target_signal.get("runner_tickets")
+            or ([target_signal["runner_ticket"]] if target_signal.get("runner_ticket") else [])
+        )
+        if t is not None
+    ]
+
+    res = await _mt5_call(
+        executor.trail_active_signal,
+        target_signal,
+        milestone=milestone,
+        trail_pips=trail_pips,
+        explicit_sl_price=trail_price,
+    )
+
+    if not was_tp1_reached and target_signal.get("tp1_reached") and res.get("banked_tickets"):
+        await _account_closed_tickets(target_signal, list(res.get("banked_tickets") or []))
+
+    if target_signal.get("status") == "CLOSED":
+        closed_runners = [
+            t
+            for t in (target_signal.get("last_runner_tickets") or prev_runners)
+            if t is not None
+        ]
+        if closed_runners:
+            await _account_closed_tickets(target_signal, closed_runners)
+        state_mgr.update_signal(target_msg_id, target_signal, chat_id=target_chat_id)
+        fin = await _mt5_call(executor.get_account_financials)
+        curr = fin.get("currency", "GBP")
+        exit_rsn = target_signal.get("runner_close_reason") or f"Ceiling Reached ({source_label})"
+        await _record_signal_to_ledger(target_msg_id, target_signal, exit_reason=str(exit_rsn), currency=curr)
+        total_pnl_str = format_profit(float(target_signal.get("banked_profit") or 0.0), curr)
+        return (
+            f"🏆 **Active Trade Ceiling Reached & Banked ({source_label}) [ID: {target_msg_id}]**\n"
+            f"• Symbol: `{symbol}` ({direction}) | Status: `CLOSED`\n"
+            f"• Cleared Milestones: `{res.get('cleared_milestones', [])}`\n"
+            f"• 💰 **Total Realized Profit:** `{total_pnl_str}`\n\n"
+            f"{fin['formatted']}"
+        )
+
+    state_mgr.update_signal(target_msg_id, target_signal, chat_id=target_chat_id)
+    return (
+        f"🛡️ **Active Trade Trailed / Stepped ({source_label}) [ID: {target_msg_id}]**\n"
+        f"• Symbol: `{symbol}` ({direction}) | Status: `{target_signal.get('status')}`\n"
+        f"• 🔒 **Locked SL / Floor:** `{res.get('new_sl')}` | **Stage:** `{res.get('tp_stage')}` | "
+        f"**Next Target:** `{res.get('next_tp')}`\n"
+        f"• 🏁 **Cleared Milestones:** `{res.get('cleared_milestones', [])}` | "
+        f"Modified Tickets: `{res.get('modified_tickets', [])}`\n"
+        f"• 🎯 **Targets:** {_format_tp_summary(target_signal)}"
+    )
+
+
 async def _handle_trade_management_action(
     msg_id: Any,
     chat_id: Optional[int | str],
@@ -3031,6 +3199,8 @@ async def _handle_trade_management_action(
         "FULL_CLOSE",
         "ACTION_TP1_HIT_REPLY",
         "TP1_HIT_REPLY",
+        "ACTION_ADJUST_TARGETS",
+        "ADJUST_TARGETS",
     ):
         logger.info(f"Ignoring {action}: target signal {target_msg_id} is still in delay window (no open orders).")
         return
@@ -3333,6 +3503,26 @@ async def _handle_trade_management_action(
 
         _, _, alert = await _execute_tp1_scaling_handoff(
             target_msg_id, target_signal, chat_id=target_chat_id, source_label="Provider Reply"
+        )
+        await notify_saved_messages(alert)
+
+    elif action in (
+        "ACTION_ADJUST_TARGETS",
+        "ADJUST_TARGETS",
+        "ACTION_TRAIL_SL",
+        "TRAIL_SL",
+        "ACTION_TP2_HIT",
+        "TP2_HIT",
+        "ACTION_TP3_HIT",
+        "TP3_HIT",
+    ):
+        src_lbl = "Channel Reply" if is_reply_evt else "Channel Prompt"
+        alert = await _apply_adjust_or_trail_unlocked(
+            target_msg_id,
+            target_chat_id,
+            target_signal,
+            parsed,
+            source_label=src_lbl,
         )
         await notify_saved_messages(alert)
 
@@ -3759,7 +3949,8 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     symbol = existing_signal.get("symbol", DEFAULT_SYMBOL)
     direction = existing_signal.get("direction", "BUY")
 
-    if is_tp1_hit_message(raw_text):
+    edit_hit = detect_tp_milestone_hit(raw_text)
+    if edit_hit == 1 or is_tp1_hit_message(raw_text):
         _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
         mk_tkts_now = list(existing_signal.get("market_tickets", []))
         if curr_status in ("PENDING", "PENDING_DELAY") or not mk_tkts_now:
@@ -3773,6 +3964,20 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             )
             await notify_saved_messages(alert)
             return
+    elif edit_hit in (2, 3) and existing_signal.get("market_tickets"):
+        existing_signal["raw_text"] = raw_text
+        hit_action = SignalAction(
+            {
+                "event_type": "TRADE_MANAGEMENT",
+                "management_action": f"ACTION_TP{edit_hit}_HIT",
+                "tp_hit_stage": edit_hit,
+            }
+        )
+        alert = await _apply_adjust_or_trail_unlocked(
+            msg_id, chat_id, existing_signal, hit_action, source_label="Edited Signal"
+        )
+        await notify_saved_messages(alert)
+        return
 
     is_forward = getattr(msg, "forward", None) is not None
     tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
@@ -3787,20 +3992,51 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     if parsed is None:
         return
 
+    if parsed.event_type == "TRADE_MANAGEMENT":
+        existing_signal["raw_text"] = raw_text
+        state_mgr.update_signal(msg_id, {"raw_text": raw_text}, chat_id=chat_id)
+        await _handle_trade_management_action(
+            msg_id, chat_id, True, parsed, msg_id, chat_id, existing_signal
+        )
+        return
+
+    pip_size = await _mt5_call(executor.get_pip_size, symbol)
     new_sl = parsed.sl if (parsed.sl_valid and parsed.sl is not None) else existing_signal.get("sl")
-    new_tp = parsed.final_tp if parsed.final_tp is not None else existing_signal.get("final_tp")
 
-    merged_tp_levels: Dict[str, float] = {}
-    if isinstance(existing_signal.get("tp_levels"), dict):
-        merged_tp_levels.update(existing_signal["tp_levels"])
-    if isinstance(parsed.tp_levels, dict) and parsed.tp_levels:
-        merged_tp_levels.update(parsed.tp_levels)
+    existing_tps = (
+        dict(existing_signal["tp_levels"])
+        if isinstance(existing_signal.get("tp_levels"), dict) and existing_signal.get("tp_levels")
+        else _resolve_signal_tps_dict(existing_signal)
+    )
+    parsed_labeled = getattr(parsed, "labeled_tps", None) or {}
+    parsed_unlabeled = getattr(parsed, "unlabeled_tps", None) or []
+    if parsed_labeled:
+        merged_tp_levels = merge_tp_levels_for_active_signal(
+            existing_tps,
+            parsed_labeled,
+            parsed_unlabeled,
+            direction=direction,
+            pip_size=pip_size,
+        )
+    else:
+        merged_tp_levels = dict(existing_tps)
+        if isinstance(parsed.tp_levels, dict) and parsed.tp_levels:
+            merged_tp_levels.update(parsed.tp_levels)
 
-    raw_tp1 = parsed.raw_tp1 or existing_signal.get("raw_tp1") or merged_tp_levels.get("TP1")
-    raw_tp2 = parsed.raw_tp2 or existing_signal.get("raw_tp2") or merged_tp_levels.get("TP2")
-    raw_tp3 = parsed.raw_tp3 or existing_signal.get("raw_tp3") or merged_tp_levels.get("TP3")
-    raw_tp4 = parsed.raw_tp4 or existing_signal.get("raw_tp4") or merged_tp_levels.get("TP4")
-    raw_tp5 = parsed.raw_tp5 or existing_signal.get("raw_tp5") or merged_tp_levels.get("TP5")
+    raw_tp1 = merged_tp_levels.get("TP1") if "TP1" in merged_tp_levels else (parsed.raw_tp1 or existing_signal.get("raw_tp1"))
+    raw_tp2 = merged_tp_levels.get("TP2") if "TP2" in merged_tp_levels else (parsed.raw_tp2 or existing_signal.get("raw_tp2"))
+    raw_tp3 = merged_tp_levels.get("TP3") if "TP3" in merged_tp_levels else (parsed.raw_tp3 or existing_signal.get("raw_tp3"))
+    raw_tp4 = merged_tp_levels.get("TP4") if "TP4" in merged_tp_levels else (parsed.raw_tp4 or existing_signal.get("raw_tp4"))
+    raw_tp5 = merged_tp_levels.get("TP5") if "TP5" in merged_tp_levels else (parsed.raw_tp5 or existing_signal.get("raw_tp5"))
+
+    if raw_tp1 is not None:
+        new_tp = (
+            round(float(raw_tp1) - TP_FRONT_RUN_OFFSET, 2)
+            if str(direction).upper() == "BUY"
+            else round(float(raw_tp1) + TP_FRONT_RUN_OFFSET, 2)
+        )
+    else:
+        new_tp = parsed.final_tp if parsed.final_tp is not None else existing_signal.get("final_tp")
     is_stop_order = bool(getattr(parsed, "is_stop_order", False))
     is_limit_order = bool(getattr(parsed, "is_limit_order", False))
     order_intent = getattr(parsed, "order_intent", None) or ("STOP" if is_stop_order else "AUTO")
@@ -3988,50 +4224,34 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
     v3_runner_tp = raw_tp5 if raw_tp5 is not None else legacy_runner_tp
 
-    # Protect trailed SL when RUNNER_ACTIVE
+    # Protect trailed SL when RUNNER_ACTIVE (ratchet_sl_only=True)
     if curr_status == "RUNNER_ACTIVE":
-        runner_tkts = [
-            t for t in (existing_signal.get("runner_tickets") or ([existing_signal["runner_ticket"]] if existing_signal.get("runner_ticket") else []))
-            if t is not None
-        ]
-        if is_legacy:
-            target_runner_tp = legacy_runner_tp
-        else:
-            stage_key = str(existing_signal.get("tp_stage") or existing_signal.get("runner_milestone_name") or "TP2").upper()
-            if stage_key == "TP1":
-                stage_key = "TP2"
-            target_runner_tp = (
-                (merged_tp_levels or {}).get(stage_key)
-                or (merged_tp_levels or {}).get(f"TP{RUNNER_MAX_TP_STAGE}")
-                or v3_runner_tp
-            )
-        if runner_tkts and target_runner_tp:
-            for rt in runner_tkts:
-                await _mt5_call(executor.modify_position_sltp, ticket=rt, sl=None, tp=target_runner_tp)
-            for l_data in layers.values():
-                if isinstance(l_data, dict) and l_data.get("ticket") in runner_tkts:
-                    l_data["tp"] = target_runner_tp
-        state_mgr.update_signal(
-            msg_id,
-            {
-                "raw_tp1": raw_tp1,
-                "raw_tp2": raw_tp2,
-                "raw_tp3": raw_tp3,
-                "raw_tp4": raw_tp4,
-                "raw_tp5": raw_tp5,
-                "tp_levels": merged_tp_levels or None,
-                "layers": layers,
-                "raw_text": raw_text,
-            },
-            chat_id=chat_id,
+        res_adj = await _mt5_call(
+            executor.adjust_active_signal_sl_tp,
+            existing_signal,
+            new_sl=parsed.sl if parsed.sl_valid else None,
+            labeled_tps=parsed_labeled,
+            unlabeled_tps=parsed_unlabeled,
+            ratchet_sl_only=True,
+        )
+        existing_signal["raw_text"] = raw_text
+        state_mgr.update_signal(msg_id, existing_signal, chat_id=chat_id)
+        stage_key = str(existing_signal.get("tp_stage") or existing_signal.get("runner_milestone_name") or "TP2").upper()
+        if stage_key == "TP1":
+            stage_key = "TP2"
+        target_runner_tp = (
+            (existing_signal.get("tp_levels") or {}).get(stage_key)
+            or (existing_signal.get("tp_levels") or {}).get(f"TP{RUNNER_MAX_TP_STAGE}")
+            or v3_runner_tp
         )
         await notify_saved_messages(
             f"✏️ **Runner Target Updated via Edit [ID: {msg_id}]**\n"
-            f"• Runner TP Ceiling: `{target_runner_tp}`"
+            f"• Runner TP Ceiling: `{target_runner_tp}` | Floor / SL: `{res_adj.get('sl')}`\n"
+            f"• Targets: {_format_tp_summary(existing_signal)}"
         )
         return
 
-    # Update SL/TP per layer role (v3.1 All-at-TP1 Entry Policy for pre-TP1 4-layer signals)
+    # Update SL/TP per layer role (preserving TP2 stage on pre-lifted runner layers)
     if new_sl is not None or new_tp is not None:
         logger.info(f"Updating SL/TP on existing tickets for Msg ID {msg_id}: SL={new_sl}, Broker TP1={new_tp}")
         for l_name, l_data in layers.items():
@@ -4040,8 +4260,12 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             t = l_data.get("ticket")
             if not t:
                 continue
+            cur_l_stage = str(l_data.get("tp_stage") or "TP1").upper()
             if not is_legacy:
-                l_tp = new_tp
+                if cur_l_stage == "TP2" and merged_tp_levels.get("TP2") is not None:
+                    l_tp = merged_tp_levels["TP2"]
+                else:
+                    l_tp = new_tp
             elif l_name in ("L1", "TOP"):
                 l_tp = new_tp
             else:
@@ -4049,7 +4273,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
             if l_tp is not None:
                 l_data["tp"] = l_tp
-                if not is_legacy:
+                if not is_legacy and cur_l_stage != "TP2":
                     l_data["tp_stage"] = "TP1"
             if t in market_tickets:
                 await _mt5_call(executor.modify_position_sltp, ticket=t, sl=new_sl, tp=l_tp)
@@ -4309,6 +4533,9 @@ _KNOWN_SAVED_COMMANDS = {
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
     "/health", "health", "/status", "status", "/ping", "ping",
     "/trades", "trades", "/algo", "algo", "/check", "check", "/help", "help",
+    "/sl", "/tp", "/tp1", "/tp2", "/tp3", "/tp4", "/tp5",
+    "/trail", "trail", "/be", "be", "breakeven", "/partial", "partial",
+    "/trade", "/exec",
 }
 
 _KNOWN_SAVED_PREFIXES = (
@@ -4316,7 +4543,96 @@ _KNOWN_SAVED_PREFIXES = (
     "/dailywin ", "dailywin ", "/daily_win ", "daily_win ",
     "/dailyloss ", "dailyloss ", "/daily_loss ", "daily_loss ",
     "/set_daily_loss ", "set_daily_loss ",
+    "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
+    "/trail ", "/trade ", "/exec ",
 )
+
+
+def _resolve_saved_prompt_target_signal(
+    explicit_id: Optional[str] = None,
+    allow_pending: bool = False,
+) -> Optional[Tuple[str, Dict[str, Any], Optional[int | str]]]:
+    """
+    Resolve target `(msg_id, sig_dict, chat_id)` for a Saved Messages active-trade prompt.
+    If `explicit_id` (`#<msg_id>`) is given, finds that non-terminal signal; otherwise returns the latest open signal.
+    """
+    candidates = state_mgr.get_open_or_pending_signals() if allow_pending else state_mgr.get_active_signals()
+    if explicit_id is not None:
+        exp_clean = str(explicit_id).strip().lstrip("#")
+        for k, s in candidates:
+            raw_mid, _ = _normalize_task_msg_id(k, chat_id=s.get("chat_id"))
+            if str(raw_mid) == exp_clean or str(k) == exp_clean:
+                return str(k), s, s.get("chat_id")
+        return None
+
+    latest = state_mgr.get_latest_signal()
+    if latest:
+        k, s = latest
+        allowed_statuses = (
+            ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE", "PENDING", "PENDING_DELAY")
+            if allow_pending
+            else ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE")
+        )
+        if s.get("status") in allowed_statuses:
+            return str(k), s, s.get("chat_id")
+
+    if candidates:
+        candidates_sorted = sorted(candidates, key=state_mgr._sort_key, reverse=True)
+        k, s = candidates_sorted[0]
+        return str(k), s, s.get("chat_id")
+    return None
+
+
+def _normalize_saved_adjust_or_trail_prompt(raw_msg: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Normalize a Saved Messages user prompt (e.g. `/sl 3885`, `/tp 3905 3915 3925`, `/tp2 3918`,
+    `/trail tp2`, `Move SL to 3885`, `TP2 3914 TP3 3926`, `trail 15`, `tp1 hit`) into Gate 3 text
+    and extract any optional `#<msg_id>` target selector.
+    """
+    s = raw_msg.strip()
+    if not s:
+        return None, None
+
+    explicit_id: Optional[str] = None
+    id_match = re.search(r"(?:^|\s)#(\d{1,12})(?=\s|$)", s)
+    if id_match:
+        explicit_id = id_match.group(1)
+        s = (s[: id_match.start()] + " " + s[id_match.end() :]).strip()
+
+    low = s.lower()
+    if low.startswith("/"):
+        s_no_slash = s[1:].strip()
+        low_no_slash = s_no_slash.lower()
+        if re.match(r"^tp(?:\s+|$)", low_no_slash):
+            rest = s_no_slash[2:].strip()
+            # If multiple bare prices are given without TP1..TP5 labels, expand sequentially into TP1..TP5
+            if rest and not re.search(r"\btp\s*[1-5]\b", rest, re.IGNORECASE):
+                sl_part = ""
+                sl_m = re.search(r"\b(?:sl|s/l|stop\s*loss)\s*[:=@-]?\s*\d+(?:\.\d+)?", rest, re.IGNORECASE)
+                work_rest = rest
+                if sl_m:
+                    sl_part = " " + sl_m.group(0)
+                    work_rest = (rest[: sl_m.start()] + " " + rest[sl_m.end() :]).strip()
+                nums = re.findall(r"\d+(?:\.\d+)?", work_rest)
+                if nums:
+                    tp_tokens = [f"TP{i + 1} {n}" for i, n in enumerate(nums[:5])]
+                    return " ".join(tp_tokens) + sl_part, explicit_id
+        return s_no_slash, explicit_id
+
+    if re.match(r"^tp(?:\s+\d)", low) and not re.search(r"\btp\s*[1-5]\b", low):
+        rest = s[2:].strip()
+        sl_part = ""
+        sl_m = re.search(r"\b(?:sl|s/l|stop\s*loss)\s*[:=@-]?\s*\d+(?:\.\d+)?", rest, re.IGNORECASE)
+        work_rest = rest
+        if sl_m:
+            sl_part = " " + sl_m.group(0)
+            work_rest = (rest[: sl_m.start()] + " " + rest[sl_m.end() :]).strip()
+        nums = re.findall(r"\d+(?:\.\d+)?", work_rest)
+        if len(nums) >= 2:
+            tp_tokens = [f"TP{i + 1} {n}" for i, n in enumerate(nums[:5])]
+            return " ".join(tp_tokens) + sl_part, explicit_id
+
+    return s, explicit_id
 
 
 def _is_known_saved_command(text: str) -> bool:
@@ -4346,7 +4662,7 @@ async def handle_saved_messages_command(event: Any) -> None:
         for prefix in (
             "🏆", "🚀", "🛡️", "💰", "🚪", "🎯", "⚠️", "❌", "⏳", "✏️", "🏦", "🚨",
             "🧪", "🏃", "✅", "📋", "🤖", "⚪", "🚫", "🔄", "ℹ️", "💳", "🛑", "🔒",
-            "🟢", "🔴", "🩺", "🗑️",
+            "🟢", "🔴", "🩺", "🗑️", "🛠️",
         )
     ):
         return
@@ -4491,6 +4807,256 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"• Pending Orders Cancelled: `{len(cancelled_orders_list)}`\n"
             f"• 💰 **Total Amount Made / Realized:** `{profit_str}`\n"
             f"• All active signals & delayed entries marked `CLOSED`.\n\n"
+            f"{fin['formatted']}"
+        )
+        return
+
+    # LIVE CONTROL: Execute 4-Layer Trade Prompt from Saved Messages (/trade <signal> or /exec <signal>)
+    if text in ("/trade", "trade", "/exec", "exec") or text.startswith(("/trade ", "trade ", "/exec ", "exec ")):
+        sig_text = raw_msg.split(None, 1)[1].strip() if " " in raw_msg else ""
+        if not sig_text:
+            await event.reply(
+                "⚠️ **Usage:** `/trade Buy 3895-3887 TP1 3900 TP2 3910 TP3 3920 SL 3875`"
+            )
+            return
+        if session_trading_blocked():
+            await event.reply("🚫 **Trading is currently halted or locked for today.**")
+            return
+
+        tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
+        live_price = getattr(tick, "bid", None) if tick else None
+        parsed = parse_message(sig_text, message_id=msg.id or int(time.time() * 1000) % 1000000, live_price=live_price)
+        if not parsed or (parsed.event_type != "NEW_SIGNAL" and not parsed.is_entry):
+            await event.reply(f"❌ **Could not parse a valid 4-layer trade signal from:**\n`{sig_text}`")
+            return
+
+        symbol = parsed.symbol or DEFAULT_SYMBOL
+        direction = parsed.direction
+        sl = parsed.sl if parsed.sl_valid else None
+        final_tp = parsed.final_tp
+        zone = parsed.zone
+        tp_levels = dict(parsed.tp_levels or {})
+        raw_tp1 = parsed.raw_tp1
+        raw_tp2 = parsed.raw_tp2
+        raw_tp3 = parsed.raw_tp3
+        raw_tp4 = parsed.raw_tp4
+        raw_tp5 = parsed.raw_tp5
+        is_stop_order = bool(getattr(parsed, "is_stop_order", False))
+        is_limit_order = bool(getattr(parsed, "is_limit_order", False))
+        order_intent = getattr(parsed, "order_intent", None) or ("STOP" if is_stop_order else "AUTO")
+
+        passed, reason = await _mt5_call(
+            executor.check_preflight,
+            symbol=symbol,
+            direction=direction,
+            raw_tp1=raw_tp1,
+            sl=sl,
+            zone=zone,
+            single_price=parsed.single_price,
+            is_stop_order=is_stop_order,
+            order_intent=order_intent,
+        )
+        if not passed:
+            await event.reply(f"⚠️ **Order Blocked by Pre-Flight**: {reason}")
+            return
+
+        market_tickets: List[int] = []
+        pending_tickets: List[int] = []
+        layers_data: Dict[str, Dict[str, Any]] = {}
+        zone_completed = False
+        is_zone = False
+        initial_price = _get_live_entry_price(tick, direction)
+
+        if parsed.is_zone and zone:
+            market_tickets, pending_tickets, layers_data = await _mt5_call(
+                executor.execute_4layer_zone,
+                symbol=symbol,
+                direction=direction,
+                zone=zone,
+                sl=sl,
+                final_tp=final_tp,
+                raw_tp1=raw_tp1,
+                raw_tp2=raw_tp2,
+                raw_tp3=raw_tp3,
+                raw_tp4=raw_tp4,
+                raw_tp5=raw_tp5,
+                tp_levels=tp_levels or None,
+            )
+            zone_completed = True
+            is_zone = True
+        elif parsed.single_price is not None:
+            market_tickets, pending_tickets, layers_data = await _mt5_call(
+                executor.execute_4layer_single_price,
+                symbol=symbol,
+                direction=direction,
+                price=parsed.single_price,
+                sl=sl,
+                final_tp=final_tp,
+                raw_tp1=raw_tp1,
+                raw_tp2=raw_tp2,
+                raw_tp3=raw_tp3,
+                raw_tp4=raw_tp4,
+                raw_tp5=raw_tp5,
+                tp_levels=tp_levels or None,
+                order_intent=order_intent,
+                is_stop_order=is_stop_order,
+            )
+            zone_completed = True
+        else:
+            market_tickets, pending_tickets, layers_data = await _mt5_call(
+                executor.execute_4layer_market,
+                symbol=symbol,
+                direction=direction,
+                sl=sl,
+                final_tp=final_tp,
+                raw_tp1=raw_tp1,
+                raw_tp2=raw_tp2,
+                raw_tp3=raw_tp3,
+                raw_tp4=raw_tp4,
+                raw_tp5=raw_tp5,
+                tp_levels=tp_levels or None,
+            )
+
+        if not market_tickets and not pending_tickets:
+            err_reason = getattr(executor, "last_error", None) or "Broker rejected order(s)"
+            await event.reply(f"❌ **Order Rejected by MT5**: `{err_reason}`")
+            return
+
+        eff_mid = getattr(msg, "id", None) or int(time.time() * 1000) % 1000000
+        arm_tick = await _mt5_call(executor.get_tick, symbol)
+        tp1_guard_armed = _compute_initial_tp1_guard_armed(
+            arm_tick, direction, raw_tp1, bool(market_tickets)
+        )
+        created_sig = state_mgr.create_signal(
+            message_id=eff_mid,
+            chat_id="me",
+            symbol=symbol,
+            direction=direction,
+            layers=layers_data,
+            zone=zone.to_dict() if zone else None,
+            market_tickets=market_tickets,
+            pending_tickets=pending_tickets,
+            zone_completed=zone_completed,
+            max_orders=MAX_ORDERS_PER_SIGNAL,
+            is_zone=is_zone,
+            is_zone_order=is_zone,
+            is_stop_order=is_stop_order,
+            is_limit_order=is_limit_order,
+            order_intent=order_intent,
+            single_price=parsed.single_price,
+            sl=sl,
+            raw_tp1=raw_tp1,
+            tp1_price=raw_tp1,
+            raw_tp2=raw_tp2,
+            raw_tp3=raw_tp3,
+            raw_tp4=raw_tp4,
+            raw_tp5=raw_tp5,
+            tp_levels=tp_levels or None,
+            final_tp=final_tp,
+            proximity_close_price=parsed.proximity_close_price,
+            raw_text=sig_text,
+            initial_price=initial_price,
+            recorded_entry_price=initial_price,
+            tp1_guard_armed=tp1_guard_armed,
+        )
+        await event.reply(
+            f"🚀 **Saved Messages 4-Layer Trade Executed ({order_intent}) [ID: {eff_mid}]**\n"
+            f"• Direction: `{direction}` {symbol}\n"
+            f"• Orders: Market={market_tickets}, Pending={pending_tickets}\n"
+            f"• Layers: {_format_layers_summary(created_sig)}\n"
+            f"• SL: `{sl}` | Broker TP1: `{final_tp}` | Targets: {_format_tp_summary(created_sig)}"
+        )
+        return
+
+    # LIVE CONTROL: Breakeven shortcut (/be, be, breakeven, move sl to be, sl to entry)
+    if text in ("/be", "be", "breakeven", "move sl to be", "sl to entry") or text.startswith(("/be ", "be #")):
+        _, exp_id = _normalize_saved_adjust_or_trail_prompt(raw_msg)
+        resolved = _resolve_saved_prompt_target_signal(explicit_id=exp_id, allow_pending=False)
+        if not resolved:
+            await event.reply("⚠️ No active signal found to move to Breakeven.")
+            return
+        target_mid, target_sig, target_chat = resolved
+        async with _get_signal_lock(target_chat, target_mid):
+            fresh_sig = state_mgr.get_signal(target_mid, chat_id=target_chat) or target_sig
+            symbol = fresh_sig.get("symbol", DEFAULT_SYMBOL)
+            direction = fresh_sig.get("direction", "BUY")
+            layers = fresh_sig.get("layers", {})
+            await _mt5_call(
+                executor.apply_selective_breakeven,
+                layers=layers,
+                symbol=symbol,
+                direction=direction,
+                be_layers=BE_LAYERS,
+                be_offset_pips=BE_OFFSET_PIPS,
+            )
+            state_mgr.update_signal(target_mid, {"status": "BE_APPLIED", "layers": layers}, chat_id=target_chat)
+        await event.reply(
+            f"🛡️ **Selective Breakeven Applied (Saved Messages Prompt) [ID: {target_mid}]**\n"
+            f"• Symbol: `{symbol}` ({direction})\n"
+            f"• Layers Protected: `{BE_LAYERS}` (+{BE_OFFSET_PIPS} pips commission buffer)"
+        )
+        return
+
+    # LIVE CONTROL: Partial Close shortcut (/partial, partial, close half, take partials)
+    if text in ("/partial", "partial", "close half", "take partials") or text.startswith(("/partial ", "partial #")):
+        _, exp_id = _normalize_saved_adjust_or_trail_prompt(raw_msg)
+        resolved = _resolve_saved_prompt_target_signal(explicit_id=exp_id, allow_pending=False)
+        if not resolved:
+            await event.reply("⚠️ No active signal found for partial close.")
+            return
+        target_mid, target_sig, target_chat = resolved
+        async with _get_signal_lock(target_chat, target_mid):
+            fresh_sig = state_mgr.get_signal(target_mid, chat_id=target_chat) or target_sig
+            symbol = fresh_sig.get("symbol", DEFAULT_SYMBOL)
+            direction = fresh_sig.get("direction", "BUY")
+            layers = fresh_sig.get("layers", {})
+            market_tickets = list(fresh_sig.get("market_tickets", []))
+            pending_tickets = list(fresh_sig.get("pending_tickets", []))
+            closed = await _mt5_call(
+                executor.apply_partial_close,
+                market_tickets=market_tickets,
+                pending_tickets=pending_tickets,
+                symbol=symbol,
+                direction=direction,
+            )
+            fin = await _mt5_call(executor.get_account_financials)
+            curr = fin.get("currency", "GBP")
+            profit_info = ""
+            if closed and closed in market_tickets:
+                market_tickets.remove(closed)
+                added_p, _ = await _account_closed_tickets(fresh_sig, [closed])
+                profit_info = f"\n• 💰 **Amount Made:** `{format_profit(added_p, curr)}`"
+                for l_data in layers.values():
+                    if isinstance(l_data, dict) and l_data.get("ticket") == closed:
+                        l_data["status"] = "CLOSED"
+                if fresh_sig.get("runner_ticket") == closed:
+                    fresh_sig["last_runner_ticket"] = closed
+                    fresh_sig["runner_ticket"] = None
+            new_status = "CLOSED" if (not market_tickets and not pending_tickets) else "PARTIAL_CLOSED"
+            fresh_sig["market_tickets"] = market_tickets
+            fresh_sig["layers"] = layers
+            fresh_sig["status"] = new_status
+            state_mgr.update_signal(
+                target_mid,
+                {
+                    "market_tickets": market_tickets,
+                    "layers": layers,
+                    "status": new_status,
+                    "accounted_tickets": fresh_sig.get("accounted_tickets", []),
+                    "banked_profit": fresh_sig.get("banked_profit", 0.0),
+                    "runner_ticket": fresh_sig.get("runner_ticket"),
+                    "last_runner_ticket": fresh_sig.get("last_runner_ticket"),
+                },
+                chat_id=target_chat,
+            )
+            if new_status == "CLOSED":
+                await _record_signal_to_ledger(
+                    target_mid, fresh_sig, exit_reason="Partial Close (Saved Messages Prompt)", currency=curr
+                )
+        await event.reply(
+            f"💰 **Partial Close Executed on `{symbol}` [ID: {target_mid}]**\n"
+            f"• Order #{closed} closed at market."
+            f"{profit_info}\n\n"
             f"{fin['formatted']}"
         )
         return
@@ -4950,9 +5516,122 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/bank`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/bank`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
+        return
+
+    # LIVE CONTROL: Active-Trade SL / TP1..TP5 Adjust & Trail Prompts in Saved Messages
+    norm_prompt, exp_target_id = _normalize_saved_adjust_or_trail_prompt(raw_msg)
+    if norm_prompt:
+        mgmt_act = gate_3_classify_trade_management(norm_prompt, is_reply=True)
+        if mgmt_act and mgmt_act.management_action in (
+            "ACTION_ADJUST_TARGETS",
+            "ACTION_TRAIL_SL",
+            "ACTION_TP1_HIT_REPLY",
+            "ACTION_TP2_HIT",
+            "ACTION_TP3_HIT",
+            "ACTION_BREAKEVEN",
+            "ACTION_PARTIAL_CLOSE",
+        ):
+            allow_pend = mgmt_act.management_action in ("ACTION_ADJUST_TARGETS", "ACTION_TP1_HIT_REPLY")
+            resolved = _resolve_saved_prompt_target_signal(explicit_id=exp_target_id, allow_pending=allow_pend)
+            if not resolved:
+                await event.reply("⚠️ No active signal found to adjust or trail.")
+                return
+            target_mid, target_sig, target_chat = resolved
+            async with _get_signal_lock(target_chat, target_mid):
+                fresh_sig = state_mgr.get_signal(target_mid, chat_id=target_chat) or target_sig
+                if mgmt_act.management_action == "ACTION_TP1_HIT_REPLY":
+                    if fresh_sig.get("status") in ("PENDING", "PENDING_DELAY") or not fresh_sig.get("market_tickets"):
+                        await _invalidate_signal_tp1_unlocked(
+                            target_mid, reason="Saved Messages Prompt", chat_id=target_chat
+                        )
+                        await event.reply(
+                            f"🚫 **[TP1 INVALIDATED] [ID: {target_mid}]** Pending setup cancelled before fill."
+                        )
+                    else:
+                        _, _, alert = await _execute_tp1_scaling_handoff(
+                            target_mid, fresh_sig, chat_id=target_chat, source_label="Saved Messages Prompt"
+                        )
+                        await event.reply(alert)
+                elif mgmt_act.management_action == "ACTION_BREAKEVEN":
+                    layers = fresh_sig.get("layers", {})
+                    await _mt5_call(
+                        executor.apply_selective_breakeven,
+                        layers=layers,
+                        symbol=fresh_sig.get("symbol", DEFAULT_SYMBOL),
+                        direction=fresh_sig.get("direction", "BUY"),
+                        be_layers=BE_LAYERS,
+                        be_offset_pips=BE_OFFSET_PIPS,
+                    )
+                    state_mgr.update_signal(target_mid, {"status": "BE_APPLIED", "layers": layers}, chat_id=target_chat)
+                    await event.reply(
+                        f"🛡️ **Selective Breakeven Applied (Saved Messages Prompt) [ID: {target_mid}]**"
+                    )
+                elif mgmt_act.management_action == "ACTION_PARTIAL_CLOSE":
+                    symbol = fresh_sig.get("symbol", DEFAULT_SYMBOL)
+                    direction = fresh_sig.get("direction", "BUY")
+                    layers = fresh_sig.get("layers", {})
+                    market_tickets = list(fresh_sig.get("market_tickets", []))
+                    pending_tickets = list(fresh_sig.get("pending_tickets", []))
+                    closed = await _mt5_call(
+                        executor.apply_partial_close,
+                        market_tickets=market_tickets,
+                        pending_tickets=pending_tickets,
+                        symbol=symbol,
+                        direction=direction,
+                    )
+                    fin = await _mt5_call(executor.get_account_financials)
+                    curr = fin.get("currency", "GBP")
+                    profit_info = ""
+                    if closed and closed in market_tickets:
+                        market_tickets.remove(closed)
+                        added_p, _ = await _account_closed_tickets(fresh_sig, [closed])
+                        profit_info = f"\n• 💰 **Amount Made:** `{format_profit(added_p, curr)}`"
+                        for l_data in layers.values():
+                            if isinstance(l_data, dict) and l_data.get("ticket") == closed:
+                                l_data["status"] = "CLOSED"
+                        if fresh_sig.get("runner_ticket") == closed:
+                            fresh_sig["last_runner_ticket"] = closed
+                            fresh_sig["runner_ticket"] = None
+                    new_status = "CLOSED" if (not market_tickets and not pending_tickets) else "PARTIAL_CLOSED"
+                    fresh_sig["market_tickets"] = market_tickets
+                    fresh_sig["layers"] = layers
+                    fresh_sig["status"] = new_status
+                    state_mgr.update_signal(
+                        target_mid,
+                        {
+                            "market_tickets": market_tickets,
+                            "layers": layers,
+                            "status": new_status,
+                            "accounted_tickets": fresh_sig.get("accounted_tickets", []),
+                            "banked_profit": fresh_sig.get("banked_profit", 0.0),
+                            "runner_ticket": fresh_sig.get("runner_ticket"),
+                            "last_runner_ticket": fresh_sig.get("last_runner_ticket"),
+                        },
+                        chat_id=target_chat,
+                    )
+                    if new_status == "CLOSED":
+                        await _record_signal_to_ledger(
+                            target_mid, fresh_sig, exit_reason="Partial Close (Saved Messages Prompt)", currency=curr
+                        )
+                    await event.reply(
+                        f"💰 **Partial Close Executed on `{symbol}` [ID: {target_mid}]**\n"
+                        f"• Order #{closed} closed at market."
+                        f"{profit_info}\n\n"
+                        f"{fin['formatted']}"
+                    )
+                else:
+                    alert = await _apply_adjust_or_trail_unlocked(
+                        target_mid,
+                        target_chat,
+                        fresh_sig,
+                        mgmt_act,
+                        source_label="Saved Messages Prompt",
+                    )
+                    await event.reply(alert)
+            return
 
 
 # ---------------------------------------------------------------------------
