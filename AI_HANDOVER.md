@@ -49,22 +49,21 @@ This document provides a complete technical handover for any AI coding agent or 
      3. `ACTION_REACTIVATE` (`active`, `reactivate`, `valid again` — **only** when `reply_to_msg_id` is set or as a standalone command)
      4. `ACTION_PARTIAL_CLOSE` (`close half`, `partial`, `partials`, `secure profit`, `50%`, `bank profit`)
      5. `ACTION_FULL_CLOSE` (standalone `close`, `close all`, `close now`, `exit`, `cut`, `invalidate`, `cancel`, `delete limit`)
-     6. `ACTION_TP1_HIT_REPLY` (`tp1 hit`, `tp1 was hit`, `tp1 smashed` — **only** when `is_reply=True`)
+     6. `ACTION_TP1_HIT_REPLY` (`is_tp1_hit_message`: `"TP1 hit"`, `"TP1 ✅"`, `"Target 1 hit"`, etc. on replies, edits, or standalone `<= 8`-word alerts without direction or 4-digit prices; strictly ignores `"TP1 3900"` entry lines and negations).
 4. **Gate 4 (`gate_4_extract_signal`):** Extracts `BUY`/`SELL` direction, 3-tier zone (`top`, `mid`, `bottom`) or `single_price` or `is_instant_now`, `raw_tp1`, `raw_tp2`, `raw_tp3`, `final_tp`, `proximity_close_price`, and `sl`.
    - `extract_tps()` merges labeled (`TP1`, `TP2`) and unlabeled (`TP 3900`) targets sequentially so unlabeled `TP1` is never lost when `TP2` is labeled.
 5. **Gate 5 (`gate_5_validate_price_sanity`):** Rejects missing-digit typos (`SL < 1000` on Gold), SLs exceeding `MAX_SL_PIPS` (`350` pips / `$35.00`), or directionally inverted SLs/TPs (`sl_valid = False` -> falls back to `FALLBACK_SL_PIPS = 150` pips).
 
 ---
 
-### B. `"Buy now"` vs `"Sell now"` (20-Second Grace Window)
-- **`"Buy now"` (unpriced):** Executes Layer 1 (`0.01` lot) at market immediately with fallback SL (`150` pips), saving state as `ACTIVE` and awaiting message edits for Layers 2 & 3.
-- **`"Sell now"` (unpriced):**
-  - Saves signal with `status = "PENDING_DELAY"` (`market_tickets = []`, `pending_tickets = []`) and starts `_delayed_sell_now_task(msg_id)` for `SELL_NOW_DELAY_SECONDS` (`20s`).
-  - **If edited with a zone or limit price within 20s:** Cancels the timer via `_cancel_delayed_sell_now(msg_id)` and places the 3-layer zone or single limit order (`status = "ACTIVE"`).
-  - **If edited with SL/TP only within 20s:** Updates `sl` / `final_tp` in state while the 20s timer continues.
-  - **If `close` / `cancel` arrives within 20s:** Cancels the timer and marks `status = "CLOSED"` with zero orders placed. (`BE` commands during `PENDING_DELAY` are ignored).
-  - **If 20s expires with no limits:** Re-runs `executor.check_preflight()` and executes `0.01` market sell (`status = "ACTIVE"`).
-  - On startup in `main()`, any orphaned `PENDING_DELAY` records from a prior run are closed safely.
+### B. Recorded Market Point, 20-Second Delay, Bad-Position Guard & TP1 Cancellation (`"Sell now"` / `"Buy now"` / Zones)
+- Both unpriced **`"Sell now"`** and **`"Buy now"`** save `status = "PENDING_DELAY"`, record `recorded_entry_price` (`tick.bid` for SELL, `tick.ask` for BUY) via `_get_live_entry_price()`, and start `_delayed_sell_now_task(msg_id)` for `SELL_NOW_DELAY_SECONDS` (`20s`).
+- **If edited with a zone or limit price within the delay:** Cancels timer via `_cancel_delayed_sell_now(msg_id)`, runs `executor.check_preflight()`, and places the 3-layer zone or single limit order (`status = "ACTIVE"`).
+- **If `"TP1 hit"` arrives via reply, edit, short standalone alert, or live MT5 price:** Cancels the delayed entry / deletes all unfilled zone pending limits and marks `status = "CLOSED"`, `tp1_reached = True` without entering (or scales filled positions & deletes remaining limits via `handle_tp1_scaling_and_select_runner()`).
+- **If no zone edit arrives after `SELL_NOW_DELAY_SECONDS` (Bad-Position Entry Guard):**
+  - Compares live price against `recorded_entry_price` (`SELL`: requires `bid >= recorded_entry_price`; `BUY`: requires `ask <= recorded_entry_price`; a `None` tick never exits the guard early).
+  - Holds up to `NOW_ENTRY_MAX_WAIT_SECONDS` (`180s`) until price is favorable or TP1 hits, then runs `check_preflight()` and enters `0.01` market (`status = "ACTIVE"`).
+- On startup in `main()`, any orphaned `PENDING_DELAY` records from a prior run are closed safely.
 
 ---
 
@@ -148,11 +147,22 @@ Reproduces the benchmark table (`£50`→`0.01/0.02/0.05`, `£100`→`0.01/0.05/
   - When `net_profit_today >= target_amount`: closes all open bot positions at market, cancels all pending limit orders, marks active signals `CLOSED`, resets `_daily_win["enabled"] = False`, sends a Saved Messages summary with updated `Balance`/`Credit`/`Equity`, disconnects Telethon, and exits `main.py` with `DAILY_WIN_EXIT_CODE = 88`.
   - Both `start_copier.bat` and `Launch_XAUUSD_Copier.bat` check `if %ERRORLEVEL% EQU 88` and stop the auto-restart loop so no further trading occurs.
 
+### D. Realized-Only Daily Loss Limit & Session Termination (`dailyloss` in Saved Messages)
+- Persisted under `_daily_loss` in `StateManager` (`get_daily_loss_config()` / `set_daily_loss_config()`).
+- **Broker-Server Timezone & Realized-Only Query (`mt5_executor.py`):**
+  - `get_server_time_offset_seconds()` and `get_server_date_str()` align today's trading day window with the broker's server clock (e.g. PU Prime GMT+2 = `7200s`).
+  - `get_realized_today_pnl()` sums `profit + commission + swap` strictly for closed `DEAL_TYPE_BUY` / `DEAL_TYPE_SELL` exit deals (`DEAL_ENTRY_OUT` / `INOUT` / `OUT_BY`), ignoring open floating drawdown and broker balance/credit deals.
+- **Saved Messages Toggle (`handle_saved_messages_command`):**
+  - Supports 2-step prompt (`dailyloss` -> e.g. `£20`) and 1-step (`dailyloss 20`, `dailyloss off`), cross-cancelling `_awaiting_dailywin_input` cleanly.
+- **1-Second Enforcement (`check_and_enforce_daily_loss_limit`):**
+  - When `realized_today_pnl <= -limit_amount`, cancels all pending limits & delayed entries, closes open bot exposure (`DAILY_LOSS_CLOSE_OPEN_TRADES = true`), records `triggered_date` & `triggered_at`, notifies Saved Messages, disconnects Telethon, and exits with `DAILY_LOSS_EXIT_CODE = 89` (caught by `if %ERRORLEVEL% EQU 89` in both `.bat` launchers).
+  - Manual relaunch on the same broker day starts in `LOCKED` mode (`_daily_loss_locked = True`), blocking all new trades while keeping Saved Messages online so `dailyloss off` or raising the limit unlocks it.
+
 ---
 
 ## 5. Development, Testing & Git Rules
 
-1. **Run Test Suite (58 Tests):**
+1. **Run Test Suite (66 Tests):**
    ```powershell
    python -m pytest tests -o pythonpath=. -v
    ```

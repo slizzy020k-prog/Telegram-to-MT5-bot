@@ -29,10 +29,11 @@ from config import (
     ENFORCE_HIGH_RISK_LOT_CAP,
     DAILY_LOSS_PAUSE_PCT,
     EMERGENCY_CUTOFF_LOSS_PCT,
+    DEFAULT_SYMBOL,
 )
 from parser import ZoneInfo
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("copier.mt5")
 
@@ -46,7 +47,7 @@ def calculate_risk_guide_thresholds(capital: float) -> Dict[str, float]:
       £500  -> Low: 0.05 | Mid: 0.25 | High: 0.50
       £1000 -> Low: 0.10 | Mid: 0.50 | High: 1.00
     """
-    cap = max(0.0, float(capital))
+    cap = max(0.0, float(capital or 0.0))
     low_risk = max(0.01, round(math.floor((cap + 1e-9) / 100.0) * 0.01, 2))
     mid_risk = max(0.01, round(math.floor((cap + 1e-9) / 20.0) * 0.01, 2))
     high_risk = max(0.01, round(math.floor((cap + 1e-9) / 10.0) * 0.01, 2))
@@ -165,6 +166,7 @@ class MT5Executor:
         Auto-resolves broker symbol suffixes (e.g. XAUUSD -> XAUUSD.s).
         Result is cached per session.
         """
+        symbol = symbol or DEFAULT_SYMBOL
         if self.dry_run or not self._connected:
             return symbol
 
@@ -194,6 +196,8 @@ class MT5Executor:
         """Ensure symbol exists and is selected in Market Watch."""
         if self.dry_run:
             return True
+        if not symbol:
+            return False
 
         resolved = self.resolve_symbol(symbol)
         info = mt5.symbol_info(resolved)
@@ -216,6 +220,7 @@ class MT5Executor:
                 trade_mode = 4  # Full access
                 filling_mode = 2  # IOC
                 visible = True
+                trade_stops_level = 50
             return DummySymbolInfo()
         resolved = self.resolve_symbol(symbol)
         return mt5.symbol_info(resolved)
@@ -237,7 +242,7 @@ class MT5Executor:
         - Forex 3/5 digit: point * 10
         - Forex 2/4 digit: point
         """
-        upper = symbol.upper()
+        upper = (symbol or DEFAULT_SYMBOL).upper()
         if "GOLD" in upper or "XAU" in upper:
             return 0.10
 
@@ -245,9 +250,10 @@ class MT5Executor:
         if not info:
             return 0.0001
 
-        if info.digits in (3, 5):
-            return info.point * 10.0
-        return info.point
+        point = getattr(info, "point", None) or 0.0001
+        if getattr(info, "digits", 5) in (3, 5):
+            return point * 10.0
+        return point
 
     def check_preflight(
         self,
@@ -258,18 +264,26 @@ class MT5Executor:
     ) -> Tuple[bool, str]:
         """
         Pre-Flight Safety Checks:
-        1. MT5 connection live.
-        2. Trade mode full (market open).
-        3. Safe Price Window Check:
+        1. MT5 connection live (reconnects if dropped).
+        2. Algo Trading enabled & Daily Drawdown below 50% pause threshold.
+        3. Trade mode full (market open) & valid live tick quote.
+        4. Safe Price Window Check:
            - Upper bound: not within 20 pips of TP1 (move not already finished).
            - Lower bound: at least 20 pips away from SL.
         (Spread caps and signal concurrency limits disabled: all signals execute).
         """
+        direction_norm = (direction or "BUY").strip().upper()
+        if direction_norm not in ("BUY", "SELL"):
+            return False, f"Invalid trade direction: {direction}"
+
+        if not self.dry_run and not self._ensure_connected():
+            return False, "MT5 terminal not connected"
+
         if not self.is_trade_allowed():
             return False, "Algo Trading is OFF in MT5 (trade_allowed=False)"
 
         dd = self.get_daily_drawdown_status()
-        if dd["pause_new_signals"]:
+        if dd.get("pause_new_signals"):
             return (
                 False,
                 f"{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Limit Reached "
@@ -280,9 +294,6 @@ class MT5Executor:
 
         if self.dry_run:
             return True, "DRY_RUN: Pre-flight OK"
-
-        if not self._ensure_connected():
-            return False, "MT5 terminal not connected"
 
         resolved = self.resolve_symbol(symbol)
         if not self.ensure_symbol(resolved):
@@ -296,37 +307,39 @@ class MT5Executor:
         if hasattr(info, "trade_mode") and info.trade_mode != mt5.SYMBOL_TRADE_MODE_FULL:
             return False, f"Trade mode is not FULL (mode={info.trade_mode}) - market may be closed"
 
-        # 2. Check if Algo Trading button is ON in MT5
-        if not self.is_trade_allowed():
-            return False, "Algo Trading is OFF in MT5 (trade_allowed=False)"
-
-        # 2. Retrieve tick
+        # 2. Retrieve tick & validate non-zero quote
         tick = self.get_tick(resolved)
         if not tick:
             return False, f"No tick available for {resolved}"
 
-        spread_points = round((tick.ask - tick.bid) / info.point, 1)
+        ask = getattr(tick, "ask", None)
+        bid = getattr(tick, "bid", None)
+        if not isinstance(ask, (int, float)) or not isinstance(bid, (int, float)) or ask <= 0 or bid <= 0:
+            return False, f"Invalid/empty tick quote for {resolved} (ask={ask}, bid={bid})"
+
+        point = getattr(info, "point", None) or 0.01
+        spread_points = round((ask - bid) / point, 1)
         logger.info(f"Pre-flight check: Current spread on {resolved} is {spread_points} points.")
 
-        # 3. Safe Price Window Check
-        # Gold pip size is 0.10 => 20 pips = 2.00 points
-        pip_20 = TP1_CLOSE_PROXIMITY_PIPS * 0.10
-        sl_pip_20 = MIN_SL_BUFFER_PIPS * 0.10
+        # 3. Safe Price Window Check (Gold: 1 pip = 0.10 => 20 pips = 2.00 points)
+        pip_size = self.get_pip_size(resolved)
+        pip_20 = TP1_CLOSE_PROXIMITY_PIPS * pip_size
+        sl_pip_20 = MIN_SL_BUFFER_PIPS * pip_size
 
-        if direction == "BUY":
+        if direction_norm == "BUY":
             # TP1 guard: must NOT already be within 20 pips of TP1 (ask >= raw_tp1 - 2.00)
-            if raw_tp1 is not None and tick.ask >= (raw_tp1 - pip_20):
-                return False, f"Price {tick.ask} is within 20 pips of TP1 ({raw_tp1}) - R:R expired"
+            if raw_tp1 is not None and ask >= (raw_tp1 - pip_20):
+                return False, f"Price {ask} is within 20 pips of TP1 ({raw_tp1}) - R:R expired"
             # SL guard: must be at least 20 pips above SL
-            if sl is not None and tick.ask <= (sl + sl_pip_20):
-                return False, f"Price {tick.ask} is too close to SL ({sl}) (< 20 pips)"
+            if sl is not None and ask <= (sl + sl_pip_20):
+                return False, f"Price {ask} is too close to SL ({sl}) (< 20 pips)"
         else:  # SELL
             # TP1 guard: must NOT already be within 20 pips of TP1 (bid <= raw_tp1 + 2.00)
-            if raw_tp1 is not None and tick.bid <= (raw_tp1 + pip_20):
-                return False, f"Price {tick.bid} is within 20 pips of TP1 ({raw_tp1}) - R:R expired"
+            if raw_tp1 is not None and bid <= (raw_tp1 + pip_20):
+                return False, f"Price {bid} is within 20 pips of TP1 ({raw_tp1}) - R:R expired"
             # SL guard: must be at least 20 pips below SL
-            if sl is not None and tick.bid >= (sl - sl_pip_20):
-                return False, f"Price {tick.bid} is too close to SL ({sl}) (< 20 pips)"
+            if sl is not None and bid >= (sl - sl_pip_20):
+                return False, f"Price {bid} is too close to SL ({sl}) (< 20 pips)"
 
         return True, "Pre-flight checks passed"
 
@@ -339,10 +352,11 @@ class MT5Executor:
         if not info:
             return [mt5.ORDER_FILLING_RETURN]
 
+        filling_mask = getattr(info, "filling_mode", 0) or 0
         modes = []
-        if info.filling_mode & 2 != 0:
+        if filling_mask & 2 != 0:
             modes.append(mt5.ORDER_FILLING_IOC)
-        if info.filling_mode & 1 != 0:
+        if filling_mask & 1 != 0:
             modes.append(mt5.ORDER_FILLING_FOK)
         modes.append(mt5.ORDER_FILLING_RETURN)
         return modes
@@ -365,8 +379,12 @@ class MT5Executor:
             return False, None
 
         self.last_error = None
-        symbol = request.get("symbol", "")
+        symbol = request.get("symbol") or DEFAULT_SYMBOL
         filling_modes = self.get_filling_modes(symbol)
+        success_retcodes = (
+            mt5.TRADE_RETCODE_DONE,
+            getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
+        )
 
         for fill_mode in filling_modes:
             req_copy = request.copy()
@@ -379,11 +397,12 @@ class MT5Executor:
                 logger.warning(f"order_send returned None (fill={fill_mode}): {err}")
                 continue
 
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
+            if result.retcode in success_retcodes:
                 self.last_error = None
                 return True, result
 
             if result.retcode == mt5.TRADE_RETCODE_INVALID_FILL:
+                self.last_error = f"retcode={result.retcode} ({getattr(result, 'comment', '')})"
                 logger.debug(f"Invalid filling mode {fill_mode}, attempting next mode...")
                 continue
             else:
@@ -406,10 +425,26 @@ class MT5Executor:
     ) -> Optional[int]:
         """Execute an immediate Market Buy or Sell order."""
         self.last_error = None
-        allowed_lot, block_reason = self.check_and_cap_order_lot(lot)
+        direction_norm = (direction or "").strip().upper()
+        if direction_norm not in ("BUY", "SELL"):
+            self.last_error = f"Invalid direction: {direction}"
+            logger.error(f"execute_market_order rejected invalid direction: {direction!r}")
+            return None
+
+        if lot is None or float(lot) <= 0.0:
+            self.last_error = f"Invalid lot size: {lot}"
+            logger.error(f"execute_market_order rejected invalid lot size: {lot!r}")
+            return None
+
+        if not self._ensure_connected():
+            self.last_error = "MT5 terminal is not connected"
+            logger.error("Cannot execute market order: MT5 terminal is not connected.")
+            return None
+
+        allowed_lot, block_reason = self.check_and_cap_order_lot(float(lot))
         if allowed_lot <= 0.0:
             self.last_error = block_reason or "High Risk Lot Cap reached"
-            logger.warning(f"Market {direction} blocked by Risk Guide Cap: {self.last_error}")
+            logger.warning(f"Market {direction_norm} blocked by Risk Guide Cap: {self.last_error}")
             return None
         lot = allowed_lot
 
@@ -419,7 +454,7 @@ class MT5Executor:
             return None
 
         sym_info = self.get_symbol_info(resolved_sym)
-        digits = sym_info.digits if sym_info else 2
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
         pip_size = self.get_pip_size(resolved_sym)
         tick = self.get_tick(resolved_sym)
 
@@ -428,9 +463,14 @@ class MT5Executor:
             logger.error(f"Cannot get tick for {resolved_sym}")
             return None
 
-        is_buy = direction == "BUY"
+        is_buy = direction_norm == "BUY"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
-        entry_price = tick.ask if is_buy else tick.bid
+        raw_entry = getattr(tick, "ask", None) if is_buy else getattr(tick, "bid", None)
+        if not isinstance(raw_entry, (int, float)) or raw_entry <= 0:
+            self.last_error = f"Invalid tick price ({raw_entry}) for {resolved_sym}"
+            logger.error(f"Invalid tick price ({raw_entry}) for {resolved_sym}")
+            return None
+        entry_price = round(float(raw_entry), digits)
 
         final_sl = sl
         if final_sl is None or final_sl == 0.0:
@@ -438,9 +478,11 @@ class MT5Executor:
                 final_sl = round(entry_price - (FALLBACK_SL_PIPS * pip_size), digits)
             else:
                 final_sl = round(entry_price + (FALLBACK_SL_PIPS * pip_size), digits)
-            logger.info(f"Attached fallback SL ({FALLBACK_SL_PIPS} pips): {final_sl} on {direction} {resolved_sym}")
+            logger.info(f"Attached fallback SL ({FALLBACK_SL_PIPS} pips): {final_sl} on {direction_norm} {resolved_sym}")
+        else:
+            final_sl = round(float(final_sl), digits)
 
-        final_tp = round(tp, digits) if tp is not None else 0.0
+        final_tp = round(float(tp), digits) if tp is not None else 0.0
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -452,17 +494,25 @@ class MT5Executor:
             "tp": final_tp,
             "deviation": 20,
             "magic": MAGIC_NUMBER,
-            "comment": comment,
+            "comment": str(comment or "")[:31],
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
             ticket = getattr(result, "order", None)
-            if self.dry_run and ticket is not None:
+            if not ticket:
+                deal_id = getattr(result, "deal", None)
+                if isinstance(deal_id, int) and deal_id > 0:
+                    ticket = deal_id
+            if not ticket:
+                self.last_error = "Order succeeded but MT5 returned no ticket"
+                logger.error(f"Market {direction_norm} order returned invalid ticket: {ticket}")
+                return None
+            if self.dry_run:
                 self._dry_run_ticket_lots[ticket] = round(lot, 2)
             logger.info(
-                f"Opened Market {direction} Order #{ticket} | Symbol={resolved_sym}, "
+                f"Opened Market {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"Lot={lot}, Price={entry_price}, SL={final_sl}, TP={final_tp}"
             )
             return ticket
@@ -480,10 +530,31 @@ class MT5Executor:
     ) -> Optional[int]:
         """Place a BUY LIMIT or SELL LIMIT order at the specified zone price."""
         self.last_error = None
-        allowed_lot, block_reason = self.check_and_cap_order_lot(lot)
+        direction_norm = (direction or "").strip().upper()
+        if direction_norm not in ("BUY", "SELL"):
+            self.last_error = f"Invalid direction: {direction}"
+            logger.error(f"place_limit_order rejected invalid direction: {direction!r}")
+            return None
+
+        if price is None or float(price) <= 0.0:
+            self.last_error = f"Invalid limit price: {price}"
+            logger.error(f"place_limit_order rejected invalid price: {price!r}")
+            return None
+
+        if lot is None or float(lot) <= 0.0:
+            self.last_error = f"Invalid lot size: {lot}"
+            logger.error(f"place_limit_order rejected invalid lot size: {lot!r}")
+            return None
+
+        if not self._ensure_connected():
+            self.last_error = "MT5 terminal is not connected"
+            logger.error("Cannot place limit order: MT5 terminal is not connected.")
+            return None
+
+        allowed_lot, block_reason = self.check_and_cap_order_lot(float(lot))
         if allowed_lot <= 0.0:
             self.last_error = block_reason or "High Risk Lot Cap reached"
-            logger.warning(f"Limit {direction} @ {price} blocked by Risk Guide Cap: {self.last_error}")
+            logger.warning(f"Limit {direction_norm} @ {price} blocked by Risk Guide Cap: {self.last_error}")
             return None
         lot = allowed_lot
 
@@ -493,12 +564,12 @@ class MT5Executor:
             return None
 
         sym_info = self.get_symbol_info(resolved_sym)
-        digits = sym_info.digits if sym_info else 2
-        is_buy = direction == "BUY"
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
+        is_buy = direction_norm == "BUY"
         order_type = mt5.ORDER_TYPE_BUY_LIMIT if is_buy else mt5.ORDER_TYPE_SELL_LIMIT
 
         pip_size = self.get_pip_size(resolved_sym)
-        target_price = round(price, digits)
+        target_price = round(float(price), digits)
 
         final_sl = sl
         if final_sl is None or final_sl == 0.0:
@@ -506,11 +577,11 @@ class MT5Executor:
                 final_sl = round(target_price - (FALLBACK_SL_PIPS * pip_size), digits)
             else:
                 final_sl = round(target_price + (FALLBACK_SL_PIPS * pip_size), digits)
-            logger.info(f"Attached fallback SL ({FALLBACK_SL_PIPS} pips): {final_sl} on Limit {direction} {resolved_sym}")
+            logger.info(f"Attached fallback SL ({FALLBACK_SL_PIPS} pips): {final_sl} on Limit {direction_norm} {resolved_sym}")
         else:
-            final_sl = round(final_sl, digits)
+            final_sl = round(float(final_sl), digits)
 
-        final_tp = round(tp, digits) if tp is not None else 0.0
+        final_tp = round(float(tp), digits) if tp is not None else 0.0
 
         request = {
             "action": mt5.TRADE_ACTION_PENDING,
@@ -522,17 +593,21 @@ class MT5Executor:
             "tp": final_tp,
             "deviation": 20,
             "magic": MAGIC_NUMBER,
-            "comment": comment,
+            "comment": str(comment or "")[:31],
             "type_time": mt5.ORDER_TIME_GTC,
         }
 
         success, result = self.send_order_with_filling_fallback(request)
         if success and result:
             ticket = getattr(result, "order", None)
-            if self.dry_run and ticket is not None:
+            if not ticket:
+                self.last_error = "Pending order succeeded but MT5 returned no ticket"
+                logger.error(f"Limit {direction_norm} order returned invalid ticket: {ticket}")
+                return None
+            if self.dry_run:
                 self._dry_run_ticket_lots[ticket] = round(lot, 2)
             logger.info(
-                f"Placed Limit {direction} Order #{ticket} | Symbol={resolved_sym}, "
+                f"Placed Limit {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"TargetPrice={target_price}, Lot={lot}, SL={final_sl}, TP={final_tp}"
             )
             return ticket
@@ -558,13 +633,31 @@ class MT5Executor:
           if bid < price -> SELL LIMIT at price
         Returns (market_tickets, pending_tickets, layer_dict).
         """
+        direction_norm = (direction or "BUY").strip().upper()
+        if direction_norm not in ("BUY", "SELL") or price is None or float(price) <= 0.0:
+            self.last_error = f"Invalid single-price order parameters (direction={direction}, price={price})"
+            return [], [], {}
+
+        if not self._ensure_connected():
+            self.last_error = "MT5 terminal is not connected"
+            return [], [], {}
+
         resolved_sym = self.resolve_symbol(symbol)
         if not self.ensure_symbol(resolved_sym):
+            self.last_error = f"Symbol {resolved_sym} not accessible"
             return [], [], {}
 
         tick = self.get_tick(resolved_sym)
         if not tick:
+            self.last_error = f"No tick available for {resolved_sym}"
             logger.error(f"Cannot get tick for {resolved_sym}")
+            return [], [], {}
+
+        ask = getattr(tick, "ask", None)
+        bid = getattr(tick, "bid", None)
+        if not isinstance(ask, (int, float)) or not isinstance(bid, (int, float)) or ask <= 0 or bid <= 0:
+            self.last_error = f"Invalid tick quote for {resolved_sym} (ask={ask}, bid={bid})"
+            logger.error(self.last_error)
             return [], [], {}
 
         market_tickets: List[int] = []
@@ -572,11 +665,11 @@ class MT5Executor:
         layers_data: Dict[str, Dict[str, Any]] = {}
 
         logger.info(
-            f"Executing Single-Price Order for {direction} {resolved_sym}: Price={price}, Lot={lot}, TP={final_tp}, SL={sl}"
+            f"Executing Single-Price Order for {direction_norm} {resolved_sym}: Price={price}, Lot={lot}, TP={final_tp}, SL={sl}"
         )
 
-        if direction == "BUY":
-            if tick.ask <= price:
+        if direction_norm == "BUY":
+            if ask <= price:
                 t1 = self.execute_market_order(
                     symbol=resolved_sym, direction="BUY", lot=lot,
                     sl=sl, tp=final_tp, comment="TG Single (Market)",
@@ -593,7 +686,7 @@ class MT5Executor:
                     pending_tickets.append(t1)
                     layers_data["TOP"] = {"lot": lot, "target_price": price, "ticket": t1, "order_type": "LIMIT", "status": "PENDING"}
         else:  # SELL
-            if tick.bid >= price:
+            if bid >= price:
                 t1 = self.execute_market_order(
                     symbol=resolved_sym, direction="SELL", lot=lot,
                     sl=sl, tp=final_tp, comment="TG Single (Market)",
@@ -629,16 +722,35 @@ class MT5Executor:
         - Layer 3 (BOTTOM): 0.02 lot -> Target TP2 (or TP1 + 100 pips if no TP2)
         Returns (market_tickets, pending_tickets, layer_dict).
         """
+        direction = (direction or "BUY").strip().upper()
+        if direction not in ("BUY", "SELL") or zone is None:
+            self.last_error = f"Invalid 3-layer zone parameters (direction={direction}, zone={zone})"
+            return [], [], {}
+
+        if not self._ensure_connected():
+            self.last_error = "MT5 terminal is not connected"
+            return [], [], {}
+
+        symbol = self.resolve_symbol(symbol)
         if not self.ensure_symbol(symbol):
+            self.last_error = f"Symbol {symbol} not accessible"
             return [], [], {}
 
         tick = self.get_tick(symbol)
         if not tick:
+            self.last_error = f"No tick available for {symbol}"
             logger.error(f"Cannot get tick for {symbol}")
             return [], [], {}
 
+        ask = getattr(tick, "ask", None)
+        bid = getattr(tick, "bid", None)
+        if not isinstance(ask, (int, float)) or not isinstance(bid, (int, float)) or ask <= 0 or bid <= 0:
+            self.last_error = f"Invalid tick quote for {symbol} (ask={ask}, bid={bid})"
+            logger.error(self.last_error)
+            return [], [], {}
+
         sym_info = self.get_symbol_info(symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
 
         top_lot = LAYER_LOTS.get("TOP", 0.01)
         mid_lot = LAYER_LOTS.get("MID", 0.01)
@@ -789,6 +901,8 @@ class MT5Executor:
 
     def modify_position_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
         """Modify SL and TP of an open MT5 market position."""
+        if not ticket:
+            return False
         if self.dry_run:
             logger.info(f"[DRY-RUN] Modified Position #{ticket}: SL={sl}, TP={tp}")
             return True
@@ -804,10 +918,10 @@ class MT5Executor:
         p = pos[0]
 
         sym_info = self.get_symbol_info(p.symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
 
-        new_sl = round(sl, digits) if sl is not None else p.sl
-        new_tp = round(tp, digits) if tp is not None else p.tp
+        new_sl = round(float(sl), digits) if sl is not None else p.sl
+        new_tp = round(float(tp), digits) if tp is not None else p.tp
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -832,6 +946,8 @@ class MT5Executor:
 
     def modify_pending_order_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
         """Modify SL and TP of a pending MT5 limit order."""
+        if not ticket:
+            return False
         if self.dry_run:
             logger.info(f"[DRY-RUN] Modified Pending Order #{ticket}: SL={sl}, TP={tp}")
             return True
@@ -847,10 +963,10 @@ class MT5Executor:
         order = orders[0]
 
         sym_info = self.get_symbol_info(order.symbol)
-        digits = sym_info.digits if sym_info else 2
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
 
-        new_sl = round(sl, digits) if sl is not None else order.sl
-        new_tp = round(tp, digits) if tp is not None else order.tp
+        new_sl = round(float(sl), digits) if sl is not None else order.sl
+        new_tp = round(float(tp), digits) if tp is not None else order.tp
 
         request = {
             "action": mt5.TRADE_ACTION_MODIFY,
@@ -877,6 +993,8 @@ class MT5Executor:
 
     def cancel_pending_order(self, ticket: int) -> bool:
         """Cancel an unfilled pending limit order."""
+        if not ticket:
+            return False
         if self.dry_run:
             self._dry_run_ticket_lots.pop(ticket, None)
             logger.info(f"[DRY-RUN] Cancelled Pending Order #{ticket}")
@@ -902,6 +1020,8 @@ class MT5Executor:
 
     def close_market_position(self, ticket: int) -> bool:
         """Close an open MT5 position completely at current market price."""
+        if not ticket:
+            return False
         if not hasattr(self, "_cached_pos_profits"):
             self._cached_pos_profits = {}
 
@@ -920,14 +1040,20 @@ class MT5Executor:
             logger.warning(f"Position #{ticket} not found to close (already closed).")
             return False
         p = pos[0]
-        self._cached_pos_profits[ticket] = round(p.profit, 2)
+        self._cached_pos_profits[ticket] = round(
+            float(getattr(p, "profit", 0.0) or 0.0) + float(getattr(p, "swap", 0.0) or 0.0),
+            2,
+        )
 
         tick = self.get_tick(p.symbol)
         if not tick:
             return False
 
         close_type = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        close_price = tick.bid if p.type == mt5.ORDER_TYPE_BUY else tick.ask
+        close_price = getattr(tick, "bid", None) if p.type == mt5.ORDER_TYPE_BUY else getattr(tick, "ask", None)
+        if not isinstance(close_price, (int, float)) or close_price <= 0:
+            logger.warning(f"Invalid close tick price ({close_price}) for #{ticket} ({p.symbol})")
+            return False
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -960,11 +1086,12 @@ class MT5Executor:
             return getattr(self, "_cached_pos_profits", {}).get(ticket, 1.25)
 
         try:
-            import MetaTrader5 as mt5
             deals = mt5.history_deals_get(position=ticket)
             if deals:
                 net_profit = sum(
-                    getattr(d, "profit", 0.0) + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0)
+                    float(getattr(d, "profit", 0.0) or 0.0)
+                    + float(getattr(d, "commission", 0.0) or 0.0)
+                    + float(getattr(d, "swap", 0.0) or 0.0)
                     for d in deals
                 )
                 return round(net_profit, 2)
@@ -984,7 +1111,12 @@ class MT5Executor:
             return {"profit": profit, "reason": reason}
         try:
             deals = mt5.history_deals_get(position=ticket) or []
-            exit_deals = [d for d in deals if getattr(d, "entry", 0) == getattr(mt5, "DEAL_ENTRY_OUT", 1)]
+            out_entries = {
+                getattr(mt5, "DEAL_ENTRY_OUT", 1),
+                getattr(mt5, "DEAL_ENTRY_INOUT", 2),
+                getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+            }
+            exit_deals = [d for d in deals if getattr(d, "entry", -1) in out_entries]
             if exit_deals:
                 d = exit_deals[-1]
                 d_reason = getattr(d, "reason", None)
@@ -1019,16 +1151,15 @@ class MT5Executor:
                 ),
             }
         try:
-            import MetaTrader5 as mt5
             acc = mt5.account_info()
             if acc:
-                bal = round(acc.balance, 2)
-                cred = round(acc.credit, 2)
-                eq = round(acc.equity, 2)
-                pnl = round(getattr(acc, "profit", 0.0), 2)
-                mgn = round(getattr(acc, "margin", 0.0), 2)
-                free_mgn = round(getattr(acc, "margin_free", eq), 2)
-                curr = acc.currency
+                bal = round(float(getattr(acc, "balance", 0.0) or 0.0), 2)
+                cred = round(float(getattr(acc, "credit", 0.0) or 0.0), 2)
+                eq = round(float(getattr(acc, "equity", 0.0) or 0.0), 2)
+                pnl = round(float(getattr(acc, "profit", 0.0) or 0.0), 2)
+                mgn = round(float(getattr(acc, "margin", 0.0) or 0.0), 2)
+                free_mgn = round(float(getattr(acc, "margin_free", eq) or 0.0), 2)
+                curr = getattr(acc, "currency", None) or "GBP"
                 return {
                     "balance": bal,
                     "credit": cred,
@@ -1070,8 +1201,14 @@ class MT5Executor:
         try:
             positions = mt5.positions_get() or []
             orders = mt5.orders_get() or []
-            open_lots = round(sum(p.volume for p in positions if getattr(p, "magic", 0) == MAGIC_NUMBER), 2)
-            pending_lots = round(sum(o.volume_current for o in orders if getattr(o, "magic", 0) == MAGIC_NUMBER), 2)
+            open_lots = round(
+                sum(float(getattr(p, "volume", 0.0) or 0.0) for p in positions if getattr(p, "magic", 0) == MAGIC_NUMBER),
+                2,
+            )
+            pending_lots = round(
+                sum(float(getattr(o, "volume_current", 0.0) or 0.0) for o in orders if getattr(o, "magic", 0) == MAGIC_NUMBER),
+                2,
+            )
             return {
                 "open_lots": open_lots,
                 "pending_lots": pending_lots,
@@ -1123,12 +1260,15 @@ class MT5Executor:
         Enforces the Professional Risk Guide High-Risk Cap:
         Never allows total active + pending lots to exceed high_risk_lots.
         """
+        if requested_lot is None or float(requested_lot) <= 0.0:
+            return 0.0, f"Invalid lot size: {requested_lot}"
+
         if not ENFORCE_HIGH_RISK_LOT_CAP:
-            return round(requested_lot, 2), None
+            return round(float(requested_lot), 2), None
 
         # In default dry-run mode without an explicit test capital override, allow normal test execution
         if self.dry_run and self._dry_run_capital is None:
-            return round(requested_lot, 2), None
+            return round(float(requested_lot), 2), None
 
         status = self.get_risk_exposure_status()
         avail = status["available_lots"]
@@ -1188,6 +1328,125 @@ class MT5Executor:
             )
         return alerts
 
+    def get_server_time_offset_seconds(self) -> int:
+        """
+        Broker server clock offset vs UTC (e.g. PU Prime = GMT+2 -> 7200s), derived from the
+        latest tick timestamp (MT5 tick/deal times are server-time-as-epoch). Rounded to 30 min.
+        Stale ticks (weekend / market closed) fall back to the last good cached offset.
+        """
+        cached = getattr(self, "_server_offset_cache", None)
+        if self.dry_run or not self._connected:
+            return 0
+        try:
+            tick = mt5.symbol_info_tick(self.resolve_symbol(DEFAULT_SYMBOL))
+            if tick and getattr(tick, "time", 0):
+                diff = float(tick.time) - time.time()
+                rounded = int(round(diff / 1800.0) * 1800)
+                if -12 * 3600 <= rounded <= 14 * 3600 and abs(diff - rounded) <= 600:
+                    self._server_offset_cache = rounded
+                    return rounded
+        except Exception as e:
+            logger.debug(f"Could not derive server time offset: {e}")
+        return cached if cached is not None else 0
+
+    def get_server_date_str(self) -> str:
+        """Current broker-server trading day as YYYY-MM-DD (local date in dry-run)."""
+        if self.dry_run or not self._connected:
+            return datetime.now().strftime("%Y-%m-%d")
+        offset = self.get_server_time_offset_seconds()
+        return datetime.fromtimestamp(time.time() + offset, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    def get_realized_today_pnl(self) -> float:
+        """
+        Net REALIZED P&L for the current broker-server trading day (closed trading deals only:
+        profit + commission + swap on OUT / INOUT / OUT_BY deals with type DEAL_TYPE_BUY or
+        DEAL_TYPE_SELL). Open floating trades and broker balance/credit/correction deals are excluded.
+        """
+        if self.dry_run or not self._connected:
+            return round(float(self._dry_run_daily_realized_pnl), 2)
+        try:
+            offset = self.get_server_time_offset_seconds()
+            srv_now = datetime.fromtimestamp(time.time() + offset, tz=timezone.utc)
+            day_start = srv_now.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day_start + timedelta(days=1)
+            # Query to +1h past day_end so deals stamped in server time are never cut off at "now"
+            deals = mt5.history_deals_get(day_start, day_end + timedelta(hours=1))
+            if deals is None:
+                logger.debug(f"history_deals_get returned None: {mt5.last_error()}")
+                return 0.0
+            out_entries = {
+                getattr(mt5, "DEAL_ENTRY_OUT", 1),
+                getattr(mt5, "DEAL_ENTRY_INOUT", 2),
+                getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
+            }
+            trade_deal_types = {
+                getattr(mt5, "DEAL_TYPE_BUY", 0),
+                getattr(mt5, "DEAL_TYPE_SELL", 1),
+            }
+            day_start_ts = day_start.timestamp()
+            day_end_ts = day_end.timestamp()
+            realized = 0.0
+            for d in deals:
+                if getattr(d, "entry", -1) not in out_entries:
+                    continue
+                if getattr(d, "type", -1) not in trade_deal_types:
+                    continue
+                raw_time = getattr(d, "time", None)
+                if raw_time is not None:
+                    d_ts = float(raw_time)
+                    if d_ts < day_start_ts or d_ts >= day_end_ts:
+                        continue
+                realized += (
+                    float(getattr(d, "profit", 0.0) or 0.0)
+                    + float(getattr(d, "commission", 0.0) or 0.0)
+                    + float(getattr(d, "swap", 0.0) or 0.0)
+                )
+            return round(realized, 2)
+        except Exception as e:
+            logger.debug(f"Could not compute realized today P&L: {e}")
+            return 0.0
+
+    def close_all_bot_exposure(
+        self,
+        tracked_market_tickets: Optional[List[int]] = None,
+        tracked_pending_tickets: Optional[List[int]] = None,
+    ) -> Dict[str, List[int]]:
+        """Close every open bot position (MAGIC_NUMBER) and cancel every bot pending order."""
+        closed: List[int] = []
+        cancelled: List[int] = []
+        market_tickets: List[int] = []
+        pending_tickets: List[int] = []
+        for t in (tracked_market_tickets or []):
+            if t and t not in market_tickets:
+                market_tickets.append(t)
+        for t in (tracked_pending_tickets or []):
+            if t and t not in pending_tickets:
+                pending_tickets.append(t)
+
+        if not self.dry_run and self._connected:
+            try:
+                for p in (mt5.positions_get() or []):
+                    p_ticket = getattr(p, "ticket", None)
+                    if p_ticket and getattr(p, "magic", None) == MAGIC_NUMBER and p_ticket not in market_tickets:
+                        market_tickets.append(p_ticket)
+                for o in (mt5.orders_get() or []):
+                    o_ticket = getattr(o, "ticket", None)
+                    if o_ticket and getattr(o, "magic", None) == MAGIC_NUMBER and o_ticket not in pending_tickets:
+                        pending_tickets.append(o_ticket)
+            except Exception as e:
+                logger.warning(f"close_all_bot_exposure: could not list live bot exposure: {e}")
+
+        for t in market_tickets:
+            if self.close_market_position(t):
+                closed.append(t)
+        market_set = set(market_tickets)
+        for t in pending_tickets:
+            if t in market_set:
+                continue
+            if self.cancel_pending_order(t):
+                cancelled.append(t)
+        return {"closed_tickets": closed, "cancelled_orders": cancelled}
+
     def get_daily_drawdown_status(self) -> Dict[str, Any]:
         """
         Two-Stage Daily Loss & Account Drawdown Monitor:
@@ -1198,45 +1457,33 @@ class MT5Executor:
         curr = fin.get("currency", "GBP")
 
         if self.dry_run or not self._connected:
-            curr_bal = self._dry_run_capital if self._dry_run_capital is not None else 200.0
-            realized_today = self._dry_run_daily_realized_pnl
-            floating_pnl = self._dry_run_floating_pnl
+            curr_bal = float(self._dry_run_capital) if self._dry_run_capital is not None else 200.0
+            realized_today = float(self._dry_run_daily_realized_pnl or 0.0)
+            floating_pnl = float(self._dry_run_floating_pnl or 0.0)
         else:
-            curr_bal = fin.get("balance", 0.0)
-            realized_today = 0.0
+            curr_bal = float(fin.get("balance") or 0.0)
+            realized_today = self.get_realized_today_pnl()
             floating_pnl = 0.0
             try:
-                now_dt = datetime.now()
-                day_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-                deals = mt5.history_deals_get(day_start, now_dt) or []
-                out_entries = {
-                    getattr(mt5, "DEAL_ENTRY_OUT", 1),
-                    getattr(mt5, "DEAL_ENTRY_INOUT", 2),
-                    getattr(mt5, "DEAL_ENTRY_OUT_BY", 3),
-                }
-                for d in deals:
-                    if getattr(d, "entry", 0) in out_entries:
-                        realized_today += (
-                            getattr(d, "profit", 0.0)
-                            + getattr(d, "commission", 0.0)
-                            + getattr(d, "swap", 0.0)
-                        )
                 positions = mt5.positions_get() or []
                 for p in positions:
-                    floating_pnl += getattr(p, "profit", 0.0) + getattr(p, "swap", 0.0)
+                    floating_pnl += (
+                        float(getattr(p, "profit", 0.0) or 0.0)
+                        + float(getattr(p, "swap", 0.0) or 0.0)
+                    )
             except Exception as e:
-                logger.debug(f"Could not compute daily drawdown deals: {e}")
+                logger.debug(f"Could not compute floating P&L: {e}")
 
         realized_today = round(realized_today, 2)
         floating_pnl = round(floating_pnl, 2)
-        ref_bal = max(curr_bal, round(curr_bal - min(0.0, realized_today), 2))
+        ref_bal = max(0.0, curr_bal, round(curr_bal - min(0.0, realized_today), 2))
         floating_loss = max(0.0, round(-floating_pnl, 2))
         realized_loss = max(0.0, round(-realized_today, 2))
         total_daily_loss = round(realized_loss + floating_loss, 2)
 
         pause_limit = round(ref_bal * (DAILY_LOSS_PAUSE_PCT / 100.0), 2)
         cutoff_limit_ref = round(ref_bal * (EMERGENCY_CUTOFF_LOSS_PCT / 100.0), 2)
-        cutoff_limit_curr = round(curr_bal * (EMERGENCY_CUTOFF_LOSS_PCT / 100.0), 2)
+        cutoff_limit_curr = round(max(0.0, curr_bal) * (EMERGENCY_CUTOFF_LOSS_PCT / 100.0), 2)
 
         loss_pct = round((total_daily_loss / ref_bal) * 100.0, 1) if ref_bal > 0 else 0.0
         floating_loss_pct = round((floating_loss / curr_bal) * 100.0, 1) if curr_bal > 0 else 0.0
@@ -1283,7 +1530,7 @@ class MT5Executor:
             positions = mt5.positions_get() or []
             for p in positions:
                 if getattr(p, "magic", 0) == MAGIC_NUMBER or (tracked_market_tickets and p.ticket in tracked_market_tickets):
-                    if getattr(p, "profit", 0.0) < 0.0 or tracked_market_tickets:
+                    if float(getattr(p, "profit", 0.0) or 0.0) < 0.0 or tracked_market_tickets:
                         if self.close_market_position(p.ticket):
                             closed_tickets.append(p.ticket)
 
@@ -1556,14 +1803,36 @@ class MT5Executor:
         5. Attempts immediate broker SL lock to floor_price; if rejected, soft_tp1_floor protects in software!
         Returns runner_ticket or None.
         """
-        layers = signal_data.get("layers", {})
-        direction = signal_data.get("direction", "BUY").upper()
+        layers = signal_data.get("layers") or {}
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
         raw_tp1 = signal_data.get("raw_tp1")
-        symbol = signal_data.get("symbol", "XAUUSD.s")
-        floor_price = round(raw_tp1 - TP1_LOCK_BUFFER, 2) if direction == "BUY" else round(raw_tp1 + TP1_LOCK_BUFFER, 2)
+        symbol = signal_data.get("symbol") or DEFAULT_SYMBOL
+        sym_info = self.get_symbol_info(symbol)
+        digits = getattr(sym_info, "digits", 2) if sym_info else 2
 
-        market_tickets = list(signal_data.get("market_tickets", []))
-        pending_tickets = list(signal_data.get("pending_tickets", []))
+        if raw_tp1 is not None:
+            floor_price = (
+                round(float(raw_tp1) - TP1_LOCK_BUFFER, digits)
+                if direction == "BUY"
+                else round(float(raw_tp1) + TP1_LOCK_BUFFER, digits)
+            )
+        else:
+            tick = self.get_tick(symbol)
+            raw_px = None
+            if tick is not None:
+                raw_px = getattr(tick, "bid", None) if direction == "BUY" else getattr(tick, "ask", None)
+            if not isinstance(raw_px, (int, float)) or raw_px <= 0:
+                raw_px = signal_data.get("recorded_entry_price")
+            if not isinstance(raw_px, (int, float)) or raw_px <= 0:
+                raw_px = 3895.0
+            floor_price = (
+                round(float(raw_px) - TP1_LOCK_BUFFER, digits)
+                if direction == "BUY"
+                else round(float(raw_px) + TP1_LOCK_BUFFER, digits)
+            )
+
+        market_tickets = list(signal_data.get("market_tickets") or [])
+        pending_tickets = list(signal_data.get("pending_tickets") or [])
         active_set = set(market_tickets)
 
         # Cancel all unfilled pending limit orders
@@ -1571,21 +1840,21 @@ class MT5Executor:
             self.cancel_pending_order(pt)
         signal_data["pending_tickets"] = []
 
-        top_ticket = layers.get("TOP", {}).get("ticket") if layers else None
-        mid_ticket = layers.get("MID", {}).get("ticket") if layers else None
-        bot_ticket = layers.get("BOTTOM", {}).get("ticket") if layers else None
+        top_ticket = (layers.get("TOP") or {}).get("ticket") if layers else None
+        mid_ticket = (layers.get("MID") or {}).get("ticket") if layers else None
+        bot_ticket = (layers.get("BOTTOM") or {}).get("ticket") if layers else None
 
         top_open = top_ticket is not None and top_ticket in active_set
         mid_open = mid_ticket is not None and mid_ticket in active_set
         bot_open = bot_ticket is not None and bot_ticket in active_set
 
-        banked_tickets = []
+        banked_tickets: List[int] = []
 
         # Always close TOP if open
         if top_open and top_ticket:
             self.close_market_position(top_ticket)
             banked_tickets.append(top_ticket)
-            if "TOP" in layers:
+            if isinstance(layers.get("TOP"), dict):
                 layers["TOP"]["status"] = "CLOSED"
 
         runner_ticket = None
@@ -1596,22 +1865,29 @@ class MT5Executor:
             if mid_open and mid_ticket:
                 self.close_market_position(mid_ticket)
                 banked_tickets.append(mid_ticket)
-                if "MID" in layers:
+                if isinstance(layers.get("MID"), dict):
                     layers["MID"]["status"] = "CLOSED"
             runner_ticket = bot_ticket
             runner_layer = "BOTTOM"
-            if "BOTTOM" in layers:
+            if isinstance(layers.get("BOTTOM"), dict):
                 layers["BOTTOM"]["status"] = "RUNNER"
         elif mid_open and mid_ticket:
             # TOP + MID open:
             runner_ticket = mid_ticket
             runner_layer = "MID"
-            if "MID" in layers:
+            if isinstance(layers.get("MID"), dict):
                 layers["MID"]["status"] = "RUNNER"
         else:
             # Only TOP was open (or single order)
             runner_ticket = None
             runner_layer = None
+
+        # Safety: close any remaining active market tickets that are not the designated runner
+        # (e.g., if layers metadata was missing or incomplete).
+        for mt in market_tickets:
+            if mt and mt != runner_ticket and mt not in banked_tickets:
+                self.close_market_position(mt)
+                banked_tickets.append(mt)
 
         signal_data["last_banked_tickets"] = banked_tickets
         signal_data["runner_layer"] = runner_layer
@@ -1643,8 +1919,8 @@ class MT5Executor:
             return False
 
         signal_data["last_runner_ticket"] = ticket
-        direction = signal_data.get("direction", "BUY").upper()
-        symbol = signal_data.get("symbol", "XAUUSD.s")
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        symbol = signal_data.get("symbol") or DEFAULT_SYMBOL
         floor_price = signal_data.get("soft_tp1_floor")
         raw_tp1 = signal_data.get("raw_tp1")
         raw_tp2 = signal_data.get("raw_tp2")
@@ -1657,7 +1933,7 @@ class MT5Executor:
             tick = self.get_tick(symbol)
             if not tick:
                 return True
-            pos_sl = signal_data.get("soft_tp1_floor", 0.0)
+            pos_sl = float(signal_data.get("soft_tp1_floor") or 0.0)
             min_stop_dist = 0.50
         else:
             positions = mt5.positions_get(ticket=ticket)
@@ -1669,7 +1945,7 @@ class MT5Executor:
                 signal_data["market_tickets"] = []
                 return False
             pos = positions[0]
-            pos_sl = pos.sl
+            pos_sl = float(getattr(pos, "sl", 0.0) or 0.0)
             sym_info = self.get_symbol_info(pos.symbol)
             tick = self.get_tick(pos.symbol)
             if not sym_info or not tick:
@@ -1683,7 +1959,9 @@ class MT5Executor:
         no_tp2_arm_dist = NO_TP2_SURGE_ARM_PIPS * 0.10
 
         if direction == "BUY":
-            live_price = tick.bid
+            live_price = getattr(tick, "bid", None)
+            if not isinstance(live_price, (int, float)) or live_price <= 0:
+                return True
 
             # 1. VIRTUAL TP1 FLOOR CHECK
             if floor_price is not None and live_price <= floor_price:
@@ -1697,7 +1975,7 @@ class MT5Executor:
                 return False
 
             # 2. TP2 / TP3 REACHED TARGET CHECK
-            if runner_target and live_price >= runner_target:
+            if runner_target is not None and live_price >= runner_target:
                 logger.info(f"Runner #{ticket}: Reached Target {target_label} ({runner_target})! Closing at market to secure maximum profit.")
                 self.close_market_position(ticket)
                 signal_data["last_runner_ticket"] = ticket
@@ -1712,8 +1990,16 @@ class MT5Executor:
             signal_data["runner_peak_price"] = max(signal_data.get("runner_peak_price") or live_price, live_price)
             peak = signal_data["runner_peak_price"]
 
-            arm_level = round(runner_target - tp2_arm_dist, 2) if runner_target else round(raw_tp1 + no_tp2_arm_dist, 2)
-            if live_price >= arm_level:
+            if runner_target is not None:
+                arm_level = round(float(runner_target) - tp2_arm_dist, 2)
+            elif raw_tp1 is not None:
+                arm_level = round(float(raw_tp1) + no_tp2_arm_dist, 2)
+            elif floor_price is not None:
+                arm_level = round(float(floor_price) + TP1_LOCK_BUFFER + no_tp2_arm_dist, 2)
+            else:
+                arm_level = None
+
+            if arm_level is not None and live_price >= arm_level:
                 signal_data["tp2_shortfall_armed"] = True
 
             if signal_data.get("tp2_shortfall_armed") and live_price <= round(peak - tp2_pullback_dist, 2):
@@ -1727,13 +2013,16 @@ class MT5Executor:
                 return False
 
             # 4. ONE-WAY HARD BROKER SL TRAILING (Never below floor_price)
-            candidate_sl = max(floor_price or 0.0, round(live_price - trail_dist, 2))
+            floor_bound = float(floor_price) if floor_price is not None else 0.0
+            candidate_sl = max(floor_bound, round(live_price - trail_dist, 2))
             if candidate_sl >= round((pos_sl or 0.0) + trail_step, 2) and (live_price - candidate_sl) >= min_stop_dist:
                 logger.info(f"Runner #{ticket}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
                 self.modify_position_sltp(ticket, sl=candidate_sl, tp=None)
 
         elif direction == "SELL":
-            live_price = tick.ask
+            live_price = getattr(tick, "ask", None)
+            if not isinstance(live_price, (int, float)) or live_price <= 0:
+                return True
 
             # 1. VIRTUAL TP1 FLOOR CHECK
             if floor_price is not None and live_price >= floor_price:
@@ -1747,7 +2036,7 @@ class MT5Executor:
                 return False
 
             # 2. TP2 / TP3 REACHED TARGET CHECK
-            if runner_target and live_price <= runner_target:
+            if runner_target is not None and live_price <= runner_target:
                 logger.info(f"Runner #{ticket}: Reached Target {target_label} ({runner_target})! Closing at market to secure maximum profit.")
                 self.close_market_position(ticket)
                 signal_data["last_runner_ticket"] = ticket
@@ -1762,8 +2051,16 @@ class MT5Executor:
             signal_data["runner_peak_price"] = min(signal_data.get("runner_peak_price") or live_price, live_price)
             peak = signal_data["runner_peak_price"]
 
-            arm_level = round(runner_target + tp2_arm_dist, 2) if runner_target else round(raw_tp1 - no_tp2_arm_dist, 2)
-            if live_price <= arm_level:
+            if runner_target is not None:
+                arm_level = round(float(runner_target) + tp2_arm_dist, 2)
+            elif raw_tp1 is not None:
+                arm_level = round(float(raw_tp1) - no_tp2_arm_dist, 2)
+            elif floor_price is not None:
+                arm_level = round(float(floor_price) - TP1_LOCK_BUFFER - no_tp2_arm_dist, 2)
+            else:
+                arm_level = None
+
+            if arm_level is not None and live_price <= arm_level:
                 signal_data["tp2_shortfall_armed"] = True
 
             if signal_data.get("tp2_shortfall_armed") and live_price >= round(peak + tp2_pullback_dist, 2):
@@ -1777,7 +2074,8 @@ class MT5Executor:
                 return False
 
             # 4. ONE-WAY HARD BROKER SL TRAILING (Never above floor_price)
-            candidate_sl = min(floor_price or 999999.0, round(live_price + trail_dist, 2))
+            floor_bound = float(floor_price) if floor_price is not None else 999999.0
+            candidate_sl = min(floor_bound, round(live_price + trail_dist, 2))
             if (pos_sl == 0.0 or candidate_sl <= round(pos_sl - trail_step, 2)) and (candidate_sl - live_price) >= min_stop_dist:
                 logger.info(f"Runner #{ticket}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
                 self.modify_position_sltp(ticket, sl=candidate_sl, tp=None)

@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import logging
 import threading
@@ -35,7 +36,8 @@ class StateManager:
                 with open(self.file_path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                     if content:
-                        self._state = json.loads(content)
+                        loaded = json.loads(content)
+                        self._state = loaded if isinstance(loaded, dict) else {}
                     else:
                         self._state = {}
             except Exception as e:
@@ -65,11 +67,13 @@ class StateManager:
                     pass
 
     def get_signal(self, message_id: int | str) -> Optional[Dict[str, Any]]:
-        """Retrieve signal state by Telegram message ID."""
+        """Retrieve signal state by Telegram message ID (ignores internal _ metadata keys)."""
         key = str(message_id)
+        if key.startswith("_"):
+            return None
         with self._lock:
             signal = self._state.get(key)
-            return dict(signal) if signal else None
+            return copy.deepcopy(signal) if isinstance(signal, dict) else None
 
     def create_signal(
         self,
@@ -158,18 +162,21 @@ class StateManager:
             self._save_state_locked()
 
         logger.info(f"State saved for message_id={key} (Symbol={symbol}, Direction={direction})")
-        return signal_record
+        return copy.deepcopy(signal_record)
 
     def update_signal(self, message_id: int | str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Update fields on an existing signal record."""
         key = str(message_id)
+        if key.startswith("_"):
+            return None
         with self._lock:
-            if key not in self._state:
+            existing = self._state.get(key)
+            if not isinstance(existing, dict):
                 logger.warning(f"Attempted to update non-existent signal: {key}")
                 return None
-            self._state[key].update(updates)
+            existing.update(updates)
             self._save_state_locked()
-            return dict(self._state[key])
+            return copy.deepcopy(existing)
 
     def update_layer(
         self,
@@ -182,9 +189,12 @@ class StateManager:
     ) -> None:
         """Update a specific layer (TOP, MID, or BOTTOM) in the signal record."""
         key = str(message_id)
+        if key.startswith("_"):
+            return
         with self._lock:
-            if key in self._state:
-                layers = self._state[key].setdefault("layers", {})
+            rec = self._state.get(key)
+            if isinstance(rec, dict):
+                layers = rec.setdefault("layers", {})
                 layer = layers.setdefault(layer_name, {})
                 if ticket is not None:
                     layer["ticket"] = ticket
@@ -199,9 +209,12 @@ class StateManager:
     def add_market_ticket(self, message_id: int | str, ticket: int) -> None:
         """Add a market ticket to the signal record."""
         key = str(message_id)
+        if key.startswith("_"):
+            return
         with self._lock:
-            if key in self._state:
-                tickets = self._state[key].setdefault("market_tickets", [])
+            rec = self._state.get(key)
+            if isinstance(rec, dict):
+                tickets = rec.setdefault("market_tickets", [])
                 if ticket not in tickets:
                     tickets.append(ticket)
                 self._save_state_locked()
@@ -209,9 +222,12 @@ class StateManager:
     def add_pending_ticket(self, message_id: int | str, ticket: int) -> None:
         """Add a pending ticket to the signal record."""
         key = str(message_id)
+        if key.startswith("_"):
+            return
         with self._lock:
-            if key in self._state:
-                tickets = self._state[key].setdefault("pending_tickets", [])
+            rec = self._state.get(key)
+            if isinstance(rec, dict):
+                tickets = rec.setdefault("pending_tickets", [])
                 if ticket not in tickets:
                     tickets.append(ticket)
                 self._save_state_locked()
@@ -219,9 +235,12 @@ class StateManager:
     def remove_pending_ticket(self, message_id: int | str, ticket: int) -> None:
         """Remove a pending ticket from the signal record."""
         key = str(message_id)
+        if key.startswith("_"):
+            return
         with self._lock:
-            if key in self._state:
-                tickets = self._state[key].get("pending_tickets", [])
+            rec = self._state.get(key)
+            if isinstance(rec, dict):
+                tickets = rec.get("pending_tickets", [])
                 if ticket in tickets:
                     tickets.remove(ticket)
                     self._save_state_locked()
@@ -229,24 +248,27 @@ class StateManager:
     def set_tp1_reached(self, message_id: int | str, reached: bool = True) -> None:
         """Mark tp1_reached status for a signal."""
         key = str(message_id)
+        if key.startswith("_"):
+            return
         with self._lock:
-            if key in self._state:
-                self._state[key]["tp1_reached"] = reached
+            rec = self._state.get(key)
+            if isinstance(rec, dict):
+                rec["tp1_reached"] = reached
                 self._save_state_locked()
 
     def get_active_signals(self) -> List[Tuple[str, Dict[str, Any]]]:
-        """Return all signals that are currently active and not fully closed."""
+        """Return all signals that are currently active and not fully closed (skips _ metadata keys)."""
         with self._lock:
             active = []
             for msg_id, data in self._state.items():
                 if str(msg_id).startswith("_") or not isinstance(data, dict):
                     continue
                 if data.get("status") in ("ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE"):
-                    active.append((msg_id, dict(data)))
+                    active.append((msg_id, copy.deepcopy(data)))
             return active
 
     def count_open_signals(self) -> int:
-        """Count active open signals."""
+        """Count active open signals (skips _ metadata keys and non-dict entries)."""
         with self._lock:
             return sum(
                 1 for k, data in self._state.items()
@@ -256,18 +278,22 @@ class StateManager:
             )
 
     def _sort_key(self, item: Tuple[str, Dict[str, Any]]):
-        """Sort helper: parse ISO timestamp robustly with numeric msg_id tie-breaker."""
+        """Sort helper: parse ISO timestamp robustly (UTC-normalized) with numeric msg_id tie-breaker."""
         msg_id_str, val = item
         ts_str = val.get("timestamp", "") if isinstance(val, dict) else ""
         try:
             ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
             ts = datetime.min.replace(tzinfo=timezone.utc)
-        numeric_id = int(msg_id_str) if msg_id_str.isdigit() else 0
+        key_str = str(msg_id_str)
+        numeric_id = int(key_str) if key_str.isdigit() else 0
         return (ts, numeric_id)
 
     def get_latest_signal(self, symbol: Optional[str] = None) -> Optional[Tuple[str, Dict[str, Any]]]:
-        """Get the most recent active signal."""
+        """Get the most recent active signal (or latest signal if none active), skipping _ metadata keys."""
+        target_sym = symbol.upper() if symbol else None
         with self._lock:
             signal_items = [
                 (k, v) for k, v in self._state.items()
@@ -279,16 +305,28 @@ class StateManager:
                 reverse=True,
             )
             for msg_id, data in sorted_items:
-                if data.get("status") in ["ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE"]:
-                    if symbol is None or data.get("symbol", "").upper() == symbol.upper():
-                        return msg_id, dict(data)
+                if data.get("status") in ["ACTIVE", "PENDING_DELAY", "BE_APPLIED", "PARTIAL_CLOSED", "RUNNER_ACTIVE"]:
+                    if target_sym is None or (data.get("symbol") or "").upper() == target_sym:
+                        return msg_id, copy.deepcopy(data)
 
             # If no active found, return the latest of any status matching symbol
             for msg_id, data in sorted_items:
-                if symbol is None or data.get("symbol", "").upper() == symbol.upper():
-                    return msg_id, dict(data)
+                if target_sym is None or (data.get("symbol") or "").upper() == target_sym:
+                    return msg_id, copy.deepcopy(data)
 
             return None
+
+    def delete_signal(self, message_id: int | str) -> bool:
+        """Delete a signal record from state (e.g. if unentered delayed order was rejected by broker)."""
+        key = str(message_id)
+        if key.startswith("_"):
+            return False
+        with self._lock:
+            if key in self._state:
+                del self._state[key]
+                self._save_state_locked()
+                return True
+            return False
 
     def cleanup_old_signals(self, days: int = 7) -> int:
         """Remove terminal signals older than N days."""
@@ -322,25 +360,31 @@ class StateManager:
         return len(to_remove)
 
     def get_all_signals(self) -> Dict[str, Dict[str, Any]]:
-        """Return a copy of the full state (excluding internal _ metadata keys)."""
+        """Return a copy of the full state (excluding internal _ metadata keys and non-dict entries)."""
         with self._lock:
             return {
-                k: dict(v) for k, v in self._state.items()
+                k: copy.deepcopy(v) for k, v in self._state.items()
                 if not str(k).startswith("_") and isinstance(v, dict)
             }
 
     def get_daily_win_config(self) -> Dict[str, Any]:
         """Return the persistent Daily Win Target configuration."""
         with self._lock:
+            defaults = {
+                "enabled": False,
+                "target_amount": 0.0,
+                "baseline_pnl": 0.0,
+                "date": datetime.now().strftime("%Y-%m-%d"),
+            }
             cfg = self._state.get("_daily_win")
-            if not isinstance(cfg, dict):
-                return {
-                    "enabled": False,
-                    "target_amount": 0.0,
-                    "baseline_pnl": 0.0,
-                    "date": datetime.now().strftime("%Y-%m-%d"),
-                }
-            return dict(cfg)
+            if isinstance(cfg, dict):
+                defaults.update(cfg)
+                defaults["enabled"] = bool(defaults["enabled"])
+                defaults["target_amount"] = round(float(defaults["target_amount"] or 0.0), 2)
+                defaults["baseline_pnl"] = round(float(defaults["baseline_pnl"] or 0.0), 2)
+                if not defaults.get("date"):
+                    defaults["date"] = datetime.now().strftime("%Y-%m-%d")
+            return defaults
 
     def set_daily_win_config(
         self,
@@ -353,10 +397,46 @@ class StateManager:
         with self._lock:
             cfg = {
                 "enabled": bool(enabled),
-                "target_amount": round(float(target_amount), 2),
-                "baseline_pnl": round(float(baseline_pnl), 2),
+                "target_amount": round(float(target_amount or 0.0), 2),
+                "baseline_pnl": round(float(baseline_pnl or 0.0), 2),
                 "date": date_str or datetime.now().strftime("%Y-%m-%d"),
             }
             self._state["_daily_win"] = cfg
+            self._save_state_locked()
+            return dict(cfg)
+
+    def get_daily_loss_config(self) -> Dict[str, Any]:
+        """Return the persistent Daily Loss Limit configuration (realized closed losses only)."""
+        with self._lock:
+            defaults = {
+                "enabled": False,
+                "limit_amount": 0.0,
+                "triggered_date": None,
+                "triggered_at": 0.0,
+            }
+            cfg = self._state.get("_daily_loss")
+            if isinstance(cfg, dict):
+                defaults.update(cfg)
+                defaults["enabled"] = bool(defaults["enabled"])
+                defaults["limit_amount"] = round(abs(float(defaults["limit_amount"] or 0.0)), 2)
+                defaults["triggered_at"] = float(defaults["triggered_at"] or 0.0)
+            return defaults
+
+    def set_daily_loss_config(
+        self,
+        enabled: bool,
+        limit_amount: float = 0.0,
+        triggered_date: Optional[str] = None,
+        triggered_at: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Persist the Daily Loss Limit configuration. Pass triggered_date=None to clear any previous trigger."""
+        with self._lock:
+            cfg = {
+                "enabled": bool(enabled),
+                "limit_amount": round(abs(float(limit_amount or 0.0)), 2),
+                "triggered_date": triggered_date,
+                "triggered_at": float(triggered_at or 0.0),
+            }
+            self._state["_daily_loss"] = cfg
             self._save_state_locked()
             return dict(cfg)

@@ -1,3 +1,5 @@
+import time
+from datetime import datetime, timedelta
 import pytest
 from unittest.mock import MagicMock, patch
 from config import DEFAULT_SYMBOL, FALLBACK_SL_PIPS
@@ -397,6 +399,7 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
                 main.executor.last_error = "retcode=10019 (No money)"
                 evt_fail = MockTelethonEvent(msg_id=9802, text="Buy now")
                 await main.handle_new_message(evt_fail)
+                await asyncio.sleep(0.12)
         finally:
             main.notify_saved_messages = orig_notify
 
@@ -733,4 +736,691 @@ async def test_daily_win_command_and_auto_session_termination(tmp_path):
     finally:
         main._daily_win_terminate_requested = False
         main.notify_saved_messages = orig_notify
+
+
+@pytest.mark.asyncio
+async def test_recorded_market_point_bad_position_guard_and_tp1_hit_cancellation(tmp_path):
+    """
+    Verify:
+    1. When 'Sell now' / 'Buy now' is posted, the market point is recorded (`recorded_entry_price`).
+    2. If the channel posts/replies/edits 'TP1 hit' for that message before entry, it cancels the timer
+       and NEVER enters the trade.
+    3. For 'Sell now' with no zone edit: if price after the delay is LOWER than recorded point (bad position),
+       it holds off and only activates when price is HIGHER than (or equal to) the recorded point.
+    4. For 'Buy now' with no zone edit (opposite): if price after the delay is HIGHER than recorded point
+       (bad position), it holds off and only activates when price is LOWER than (or equal to) the recorded point.
+    """
+    import asyncio
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_recorded_px.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+
+    orig_delay = main.SELL_NOW_DELAY_SECONDS
+    main.SELL_NOW_DELAY_SECONDS = 0.05
+    try:
+        # 1. 'Sell now' where channel replies 'TP1 hit' during delay -> MUST NOT enter trade!
+        tick_initial = MagicMock(bid=3895.00, ask=3895.50)
+        with patch.object(main.executor, "get_tick", return_value=tick_initial):
+            await main.handle_new_message(MockTelethonEvent(msg_id=10101, text="Sell now"))
+            sig1 = main.state_mgr.get_signal(10101)
+            assert sig1["status"] == "PENDING_DELAY"
+            assert sig1["recorded_entry_price"] == 3895.00
+
+            # Channel replies "TP1 hit" before timer finishes
+            await main.handle_new_message(
+                MockTelethonEvent(msg_id=10102, text="TP1 hit", reply_to_msg_id=10101)
+            )
+            await asyncio.sleep(0.12)
+            sig1_after = main.state_mgr.get_signal(10101)
+            assert sig1_after["status"] == "CLOSED"
+            assert sig1_after["tp1_reached"] is True
+            assert sig1_after["market_tickets"] == []
+
+        # 2. 'Sell now' recorded at 3895.00: after delay, price dumped to 3891.00 (bad position for SELL)
+        #    -> must NOT enter at 3891.00! Once price rises to 3895.80 (higher than 3895.00), activates!
+        live_tick = MagicMock(bid=3895.00, ask=3895.50)
+        with patch.object(main.executor, "get_tick", side_effect=lambda sym: live_tick):
+            await main.handle_new_message(MockTelethonEvent(msg_id=10103, text="Sell now"))
+            assert main.state_mgr.get_signal(10103)["recorded_entry_price"] == 3895.00
+
+            # Price drops to 3891.00 (lower than 3895.00 -> bad position for SELL)
+            live_tick.bid = 3891.00
+            live_tick.ask = 3891.50
+            await asyncio.sleep(0.12)
+
+            sig_held = main.state_mgr.get_signal(10103)
+            assert sig_held["status"] == "PENDING_DELAY"
+            assert sig_held.get("awaiting_favorable_price") is True
+            assert sig_held["market_tickets"] == []
+
+            # Now price moves higher than recorded point (3895.80 > 3895.00) -> activates SELL!
+            live_tick.bid = 3895.80
+            live_tick.ask = 3896.30
+            await asyncio.sleep(0.12)
+
+            sig_entered = main.state_mgr.get_signal(10103)
+            assert sig_entered["status"] == "ACTIVE"
+            assert len(sig_entered["market_tickets"]) == 1
+
+        # 3. 'Buy now' recorded at 3895.00 (opposite rule): after delay, price spiked to 3899.00 (bad position)
+        #    -> must NOT enter at 3899.00! Once price pulls back to 3894.20 (lower than 3895.00), activates!
+        buy_tick = MagicMock(bid=3894.50, ask=3895.00)
+        with patch.object(main.executor, "get_tick", side_effect=lambda sym: buy_tick):
+            await main.handle_new_message(MockTelethonEvent(msg_id=10104, text="Buy now"))
+            assert main.state_mgr.get_signal(10104)["recorded_entry_price"] == 3895.00
+
+            # Price spikes to 3899.00 (higher than 3895.00 -> bad position for BUY)
+            buy_tick.bid = 3898.50
+            buy_tick.ask = 3899.00
+            await asyncio.sleep(0.12)
+
+            sig_buy_held = main.state_mgr.get_signal(10104)
+            assert sig_buy_held["status"] == "PENDING_DELAY"
+            assert sig_buy_held.get("awaiting_favorable_price") is True
+            assert sig_buy_held["market_tickets"] == []
+
+            # Now price moves lower than recorded point (3894.20 < 3895.00) -> activates BUY!
+            buy_tick.bid = 3893.70
+            buy_tick.ask = 3894.20
+            await asyncio.sleep(0.12)
+
+            sig_buy_entered = main.state_mgr.get_signal(10104)
+            assert sig_buy_entered["status"] == "ACTIVE"
+            assert len(sig_buy_entered["market_tickets"]) == 1
+    finally:
+        main.SELL_NOW_DELAY_SECONDS = orig_delay
+
+
+def _reset_main_session_flags():
+    """Reset module-level session control flags between isolated tests."""
+    for mid in list(main._pending_sell_now_tasks.keys()):
+        main._cancel_delayed_sell_now(mid)
+    main._recent_messages.clear()
+    main._awaiting_dailywin_input = False
+    main._awaiting_dailyloss_input = False
+    main._daily_win_terminate_requested = False
+    main._daily_loss_terminate_requested = False
+    main._daily_loss_locked = False
+    main._daily_loss_lock_notified_date = None
+    main._daily_50pct_alert_date = None
+
+
+@pytest.mark.asyncio
+async def test_dailyloss_commands_2step_1step_invalid_switch_and_status(tmp_path):
+    """
+    Verify Saved Messages `dailyloss` flows:
+    - Interactive 2-step (`dailyloss` -> `£20`)
+    - 1-step (`dailyloss 20`, `/dailyloss £25.50`, `dailyloss -30`, `dailyloss off`)
+    - Invalid input keeps prompt armed (`_awaiting_dailyloss_input is True`)
+    - Cross-switching between `dailywin` and `dailyloss` cleanly cancels the other prompt
+    - `/status` displays Daily Loss Limit (OFF, ACTIVE, LOCKED) and `dailyloss` command footer
+    """
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_dailyloss_cmds.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 120.0
+    _reset_main_session_flags()
+
+    try:
+        # 0. /status when OFF
+        st0 = MockTelethonEvent(msg_id=11000, text="/status", chat_id="me")
+        await main.handle_saved_messages_command(st0)
+        assert "Daily Loss Limit (`dailyloss`): ⚪ OFF" in st0.replies[-1]
+        assert "`dailyloss`" in st0.replies[-1]
+
+        # 1. Interactive 2-step: `dailyloss` -> invalid -> `£20`
+        c1 = MockTelethonEvent(msg_id=11001, text="dailyloss", chat_id="me")
+        await main.handle_saved_messages_command(c1)
+        assert main._awaiting_dailyloss_input is True
+        assert main._awaiting_dailywin_input is False
+        assert "Daily Loss Limit Toggle (`dailyloss`)" in c1.replies[-1]
+
+        c_bad = MockTelethonEvent(msg_id=11002, text="not-a-number", chat_id="me")
+        await main.handle_saved_messages_command(c_bad)
+        assert main._awaiting_dailyloss_input is True
+        assert "Invalid Daily Loss Amount" in c_bad.replies[-1]
+
+        c2 = MockTelethonEvent(msg_id=11003, text="£20", chat_id="me")
+        await main.handle_saved_messages_command(c2)
+        assert main._awaiting_dailyloss_input is False
+        cfg = main.state_mgr.get_daily_loss_config()
+        assert cfg["enabled"] is True
+        assert cfg["limit_amount"] == 20.0
+        assert "Daily Loss Limit Activated: `-£20.00 GBP`" in c2.replies[-1]
+        assert "ONLY realized closed / Stop-Loss trades" in c2.replies[-1]
+
+        # /status when ACTIVE
+        st1 = MockTelethonEvent(msg_id=11004, text="/status", chat_id="me")
+        await main.handle_saved_messages_command(st1)
+        assert "Daily Loss Limit (`dailyloss`): 🟢 ACTIVE — Limit: `-£20.00 GBP`" in st1.replies[-1]
+
+        # 2. 1-step variants
+        c3 = MockTelethonEvent(msg_id=11005, text="/dailyloss £25.50", chat_id="me")
+        await main.handle_saved_messages_command(c3)
+        assert main.state_mgr.get_daily_loss_config()["limit_amount"] == 25.50
+
+        c4 = MockTelethonEvent(msg_id=11006, text="dailyloss -30", chat_id="me")
+        await main.handle_saved_messages_command(c4)
+        assert main.state_mgr.get_daily_loss_config()["limit_amount"] == 30.0
+
+        c_off = MockTelethonEvent(msg_id=11007, text="dailyloss off", chat_id="me")
+        await main.handle_saved_messages_command(c_off)
+        assert main.state_mgr.get_daily_loss_config()["enabled"] is False
+        assert "Daily Loss Limit Disabled" in c_off.replies[-1]
+
+        # 3. Switching prompts: `dailywin` -> `dailyloss` -> `£15` sets dailyloss ONLY
+        sw1 = MockTelethonEvent(msg_id=11008, text="dailywin", chat_id="me")
+        await main.handle_saved_messages_command(sw1)
+        assert main._awaiting_dailywin_input is True
+        assert main._awaiting_dailyloss_input is False
+
+        sw2 = MockTelethonEvent(msg_id=11009, text="dailyloss", chat_id="me")
+        await main.handle_saved_messages_command(sw2)
+        assert main._awaiting_dailywin_input is False
+        assert main._awaiting_dailyloss_input is True
+
+        sw3 = MockTelethonEvent(msg_id=11010, text="£15", chat_id="me")
+        await main.handle_saved_messages_command(sw3)
+        assert main._awaiting_dailyloss_input is False
+        assert main.state_mgr.get_daily_loss_config()["limit_amount"] == 15.0
+        assert main.state_mgr.get_daily_win_config()["enabled"] is False
+
+        # 4. Reverse switch: `dailyloss` -> `dailywin` -> `£35` sets dailywin ONLY
+        sw4 = MockTelethonEvent(msg_id=11011, text="dailyloss", chat_id="me")
+        await main.handle_saved_messages_command(sw4)
+        assert main._awaiting_dailyloss_input is True
+
+        sw5 = MockTelethonEvent(msg_id=11012, text="dailywin", chat_id="me")
+        await main.handle_saved_messages_command(sw5)
+        assert main._awaiting_dailyloss_input is False
+        assert main._awaiting_dailywin_input is True
+
+        sw6 = MockTelethonEvent(msg_id=11013, text="£35", chat_id="me")
+        await main.handle_saved_messages_command(sw6)
+        assert main._awaiting_dailywin_input is False
+        assert main.state_mgr.get_daily_win_config()["enabled"] is True
+        assert main.state_mgr.get_daily_win_config()["target_amount"] == 35.0
+        assert main.state_mgr.get_daily_loss_config()["limit_amount"] == 15.0
+
+        # 5. Known command `/status` clears an open `dailyloss` prompt and runs `/status`
+        sw7 = MockTelethonEvent(msg_id=11014, text="dailyloss", chat_id="me")
+        await main.handle_saved_messages_command(sw7)
+        assert main._awaiting_dailyloss_input is True
+        main._daily_loss_locked = True
+        st2 = MockTelethonEvent(msg_id=11015, text="/status", chat_id="me")
+        await main.handle_saved_messages_command(st2)
+        assert main._awaiting_dailyloss_input is False
+        assert "🔒 LOCKED" in st2.replies[-1]
+    finally:
+        _reset_main_session_flags()
+
+
+@pytest.mark.asyncio
+async def test_dailyloss_realized_only_enforcement_and_exposure_cleanup(tmp_path):
+    """
+    Verify:
+    - Floating drawdown of -£35.00 does NOT trigger `dailyloss £20` (`limit_reached is False`).
+    - Realized Stop-Loss deals reaching -£20.00 DO trigger `DAILY_LOSS_REACHED`, cancel pending
+      limits & delayed timers, close open exposure, send Saved Messages alert, and set
+      `_daily_loss_terminate_requested = True`.
+    - Also verify `DAILY_LOSS_CLOSE_OPEN_TRADES=False` leaves open positions while cancelling limits/timers.
+    """
+    import asyncio
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_dailyloss_exec.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 120.0
+    _reset_main_session_flags()
+
+    alerts = []
+    orig_notify = main.notify_saved_messages
+    orig_delay = main.SELL_NOW_DELAY_SECONDS
+    orig_close_open = main.DAILY_LOSS_CLOSE_OPEN_TRADES
+    main.SELL_NOW_DELAY_SECONDS = 5.0
+
+    async def cap_notify(txt):
+        alerts.append(txt)
+
+    main.notify_saved_messages = cap_notify
+    try:
+        # Configure dailyloss £20
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=11101, text="dailyloss 20", chat_id="me"))
+
+        # Open a 3-layer zone (1 market + 2 pending limits) and a delayed Sell now timer
+        await main.handle_new_message(MockTelethonEvent(msg_id=11102, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        sig_zone = main.state_mgr.get_signal(11102)
+        assert sig_zone["status"] == "ACTIVE"
+        assert len(sig_zone["market_tickets"]) >= 1
+        assert len(sig_zone["pending_tickets"]) >= 1
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=11103, text="Sell now"))
+        assert main.state_mgr.get_signal(11103)["status"] == "PENDING_DELAY"
+        assert 11103 in main._pending_sell_now_tasks
+
+        # 1. Floating open drawdown -£35.00 MUST NOT trigger dailyloss £20
+        main.executor._dry_run_floating_pnl = -35.0
+        main.executor._dry_run_daily_realized_pnl = 0.0
+        prog_float = main.get_daily_loss_progress()
+        assert prog_float["limit_reached"] is False
+        assert await main.check_and_enforce_daily_loss_limit() == "OK"
+        assert main._daily_loss_terminate_requested is False
+        assert main.state_mgr.get_signal(11102)["status"] == "ACTIVE"
+        assert main.state_mgr.get_signal(11103)["status"] == "PENDING_DELAY"
+
+        # 2. Realized closed Stop-Loss deals reach -£20.00 -> triggers termination!
+        main.executor._dry_run_daily_realized_pnl = -20.0
+        prog_realized = main.get_daily_loss_progress()
+        assert prog_realized["limit_reached"] is True
+        res = await main.check_and_enforce_daily_loss_limit()
+        assert res == "DAILY_LOSS_REACHED"
+        assert main._daily_loss_terminate_requested is True
+        assert main.session_trading_blocked() is True
+
+        # Delayed timer cancelled, PENDING_DELAY closed, active signal closed with 0 tickets
+        await asyncio.sleep(0.02)
+        assert 11103 not in main._pending_sell_now_tasks
+        assert main.state_mgr.get_signal(11103)["status"] == "CLOSED"
+        sig_zone_after = main.state_mgr.get_signal(11102)
+        assert sig_zone_after["status"] == "CLOSED"
+        assert sig_zone_after["market_tickets"] == []
+        assert sig_zone_after["pending_tickets"] == []
+
+        # Trigger timestamp persisted for same-day relaunch lock
+        cfg = main.state_mgr.get_daily_loss_config()
+        assert cfg["triggered_date"] == main._trading_day_str()
+        assert cfg["triggered_at"] > 0.0
+
+        # Notification delivered to Saved Messages
+        assert any("DAILY LOSS LIMIT HIT (-£20.00 GBP) — SESSION TERMINATED!" in a for a in alerts)
+
+        # New incoming signal blocked once termination requested
+        await main.handle_new_message(MockTelethonEvent(msg_id=11104, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.state_mgr.get_signal(11104) is None
+
+        # 3. Verify DAILY_LOSS_CLOSE_OPEN_TRADES=False cancels pending limits & timers but preserves open positions
+        _reset_main_session_flags()
+        main.state_mgr = StateManager(tmp_path / "state_dailyloss_keep_open.json")
+        main.executor = MT5Executor(dry_run=True)
+        main.executor.connect()
+        main.DAILY_LOSS_CLOSE_OPEN_TRADES = False
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=11110, text="dailyloss 20", chat_id="me"))
+        await main.handle_new_message(MockTelethonEvent(msg_id=11111, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        mk_before = list(main.state_mgr.get_signal(11111)["market_tickets"])
+        assert len(mk_before) >= 1
+        main.executor._dry_run_daily_realized_pnl = -20.0
+        assert await main.check_and_enforce_daily_loss_limit() == "DAILY_LOSS_REACHED"
+        sig_keep = main.state_mgr.get_signal(11111)
+        assert sig_keep["market_tickets"] == mk_before
+        assert sig_keep["pending_tickets"] == []
+    finally:
+        main.DAILY_LOSS_CLOSE_OPEN_TRADES = orig_close_open
+        main.SELL_NOW_DELAY_SECONDS = orig_delay
+        main.notify_saved_messages = orig_notify
+        _reset_main_session_flags()
+
+
+def test_mt5_get_realized_today_pnl_excludes_balance_and_credit_deals():
+    """Verify non-dry-run get_realized_today_pnl() counts ONLY closed BUY/SELL deals (never balance/credit)."""
+    from types import SimpleNamespace
+    import mt5_executor as ex_mod
+
+    ex = MT5Executor(dry_run=False)
+    ex._connected = True
+    ex._server_offset_cache = 7200
+
+    now_srv_ts = time.time() + 7200
+    tick_mock = SimpleNamespace(time=now_srv_ts, bid=3860.0, ask=3860.5)
+    deals = [
+        # Deposit / Credit / Correction with OUT-like or IN entry -> MUST be excluded!
+        SimpleNamespace(entry=0, type=2, time=now_srv_ts - 100, profit=120.0, commission=0.0, swap=0.0),
+        SimpleNamespace(entry=1, type=2, time=now_srv_ts - 90, profit=-50.0, commission=0.0, swap=0.0),
+        SimpleNamespace(entry=1, type=3, time=now_srv_ts - 80, profit=-24.0, commission=0.0, swap=0.0),
+        # Open IN trading deal -> excluded
+        SimpleNamespace(entry=0, type=0, time=now_srv_ts - 70, profit=0.0, commission=-0.10, swap=0.0),
+        # Closed BUY/SELL deals (SL/TP/manual) -> included with profit + commission + swap!
+        SimpleNamespace(entry=1, type=0, time=now_srv_ts - 60, profit=-15.0, commission=-0.15, swap=-0.05),
+        SimpleNamespace(entry=1, type=1, time=now_srv_ts - 50, profit=-4.80, commission=0.0, swap=0.0),
+        # Yesterday's closed deal -> excluded
+        SimpleNamespace(entry=1, type=0, time=now_srv_ts - 90000, profit=-99.0, commission=0.0, swap=0.0),
+    ]
+
+    with patch.object(ex_mod.mt5, "symbol_info_tick", return_value=tick_mock), \
+         patch.object(ex_mod.mt5, "history_deals_get", return_value=deals):
+        pnl = ex.get_realized_today_pnl()
+    assert pnl == -20.0
+
+
+@pytest.mark.asyncio
+async def test_dailyloss_same_day_relaunch_lock_and_unlock(tmp_path):
+    """
+    When relaunched on the same broker day after `dailyloss` already fired:
+    - `check_and_enforce_daily_loss_limit()` returns `"LOCKED"` (does NOT exit 89).
+    - `session_trading_blocked()` blocks new channel signals.
+    - Typing `dailyloss off` OR raising the limit (`dailyloss 50`) unlocks trading.
+    """
+    from datetime import timedelta
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_dailyloss_lock.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    main.executor._dry_run_capital = 120.0
+    _reset_main_session_flags()
+
+    alerts = []
+    orig_notify = main.notify_saved_messages
+
+    async def cap_notify(txt):
+        alerts.append(txt)
+
+    main.notify_saved_messages = cap_notify
+    try:
+        today = main._trading_day_str()
+        main.executor._dry_run_daily_realized_pnl = -20.0
+        main.state_mgr.set_daily_loss_config(
+            enabled=True,
+            limit_amount=20.0,
+            triggered_date=today,
+            triggered_at=main.BOT_START_TIME - 30.0,
+        )
+
+        # 1. Enters LOCKED mode on same-day relaunch
+        status = await main.check_and_enforce_daily_loss_limit()
+        assert status == "LOCKED"
+        assert main._daily_loss_locked is True
+        assert main._daily_loss_terminate_requested is False
+        assert main.session_trading_blocked() is True
+        assert any("DAILY LOSS LOCK ACTIVE" in a for a in alerts)
+
+        # New signals blocked while locked
+        await main.handle_new_message(MockTelethonEvent(msg_id=11201, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.state_mgr.get_signal(11201) is None
+
+        # 2. Raising limit above today's realized loss (`dailyloss 50`) unlocks trading
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=11202, text="dailyloss 50", chat_id="me"))
+        assert main._daily_loss_locked is False
+        assert main.session_trading_blocked() is False
+        assert await main.check_and_enforce_daily_loss_limit() == "OK"
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=11203, text="Buy 3895-3887\nTP 3905\nSL 3875"))
+        assert main.state_mgr.get_signal(11203)["status"] == "ACTIVE"
+
+        # 3. Lock again, then unlock via `dailyloss off`
+        main.state_mgr.set_daily_loss_config(
+            enabled=True,
+            limit_amount=20.0,
+            triggered_date=today,
+            triggered_at=main.BOT_START_TIME - 10.0,
+        )
+        main._daily_loss_lock_notified_date = None
+        assert await main.check_and_enforce_daily_loss_limit() == "LOCKED"
+        assert main.session_trading_blocked() is True
+
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=11204, text="dailyloss off", chat_id="me"))
+        assert main._daily_loss_locked is False
+        assert main.session_trading_blocked() is False
+
+        # 4. Next broker day rollover (yesterday's trigger + today's realized 0.0) -> OK
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        main.state_mgr.set_daily_loss_config(
+            enabled=True,
+            limit_amount=20.0,
+            triggered_date=yesterday,
+            triggered_at=main.BOT_START_TIME - 86400.0,
+        )
+        main.executor._dry_run_daily_realized_pnl = 0.0
+        assert await main.check_and_enforce_daily_loss_limit() == "OK"
+        assert main._daily_loss_locked is False
+    finally:
+        main.notify_saved_messages = orig_notify
+        _reset_main_session_flags()
+
+
+def test_is_tp1_hit_message_and_parser_true_false_positives():
+    """Verify parser.is_tp1_hit_message and parse_message on realistic TP1 alerts vs signal lines."""
+    from parser import is_tp1_hit_message
+
+    tp1_true = [
+        "TP1 hit",
+        "Tp1 hit ✅",
+        "✅ TP1 ✅",
+        "TP1 done",
+        "TP1 smashed 🔥",
+        "Target 1 hit",
+        "Hit TP1 +30 pips",
+        "TP 1 reached",
+        "TP1 ✅",
+        "First TP hit",
+    ]
+    for msg in tp1_true:
+        assert is_tp1_hit_message(msg) is True, f"Expected True for {msg!r}"
+        parsed_standalone = parse_message(msg, message_id=12001)
+        assert parsed_standalone is not None, f"Standalone TP1 rejected: {msg!r}"
+        assert parsed_standalone.management_action == "ACTION_TP1_HIT_REPLY", f"Wrong action for {msg!r}: {parsed_standalone}"
+
+        parsed_reply = parse_message(msg, message_id=12002, is_reply=True, reply_to_msg_id=12000)
+        assert parsed_reply is not None and parsed_reply.management_action == "ACTION_TP1_HIT_REPLY"
+
+    tp1_false = [
+        "Buy 3895-3887 TP1 3900",
+        "TP1 3900",
+        "Target 1: 3900",
+        "Take profit 1 3900",
+        "✅ TP1 3900",
+        "TP1 not hit yet",
+        "TP2 hit",
+    ]
+    for msg in tp1_false:
+        assert is_tp1_hit_message(msg) is False, f"Expected False for {msg!r}"
+
+    # Full signal line with TP1 3900 must parse as NEW_SIGNAL, never TP1 hit
+    sig = parse_message("Buy 3895-3887 TP1 3900 SL 3875")
+    assert sig is not None and sig.event_type == "NEW_SIGNAL"
+    assert sig.raw_tp1 == 3900.0
+
+
+@pytest.mark.asyncio
+async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_standalone_and_watcher(tmp_path):
+    """
+    Verify:
+    - 'Sell now' / 'Buy now' cancelled with 0 orders if TP1 hit arrives via edit OR short standalone alert.
+    - Bad-position guard holds on null tick and expires cleanly after NOW_ENTRY_MAX_WAIT_SECONDS.
+    - Zone with unfilled pending limits (and mixed market + pending limits) cancels pending limits /
+      scales cleanly on TP1 hit via reply, edit, standalone alert, and live watcher price.
+    """
+    import asyncio
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    main.state_mgr = StateManager(tmp_path / "state_tp1_cancel_all.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    _reset_main_session_flags()
+
+    orig_delay = main.SELL_NOW_DELAY_SECONDS
+    orig_max_wait = main.NOW_ENTRY_MAX_WAIT_SECONDS
+    main.SELL_NOW_DELAY_SECONDS = 0.08
+    main.NOW_ENTRY_MAX_WAIT_SECONDS = 0.15
+    try:
+        # 1. Sell now cancelled by EDIT ("TP1 hit ✅")
+        tick_sell = MagicMock(bid=3895.0, ask=3895.5)
+        with patch.object(main.executor, "get_tick", return_value=tick_sell):
+            await main.handle_new_message(MockTelethonEvent(msg_id=12101, text="Sell now"))
+            assert main.state_mgr.get_signal(12101)["status"] == "PENDING_DELAY"
+            await main.handle_message_edited(MockTelethonEvent(msg_id=12101, text="TP1 hit ✅"))
+            await asyncio.sleep(0.10)
+        s1 = main.state_mgr.get_signal(12101)
+        assert s1["status"] == "CLOSED" and s1["tp1_reached"] is True and s1["market_tickets"] == []
+
+        # 2. Buy now cancelled by short STANDALONE alert ("TP1 smashed 🔥")
+        tick_buy = MagicMock(bid=3894.5, ask=3895.0)
+        with patch.object(main.executor, "get_tick", return_value=tick_buy):
+            await main.handle_new_message(MockTelethonEvent(msg_id=12102, text="Buy now"))
+            assert main.state_mgr.get_signal(12102)["status"] == "PENDING_DELAY"
+            await main.handle_new_message(MockTelethonEvent(msg_id=12103, text="TP1 smashed 🔥"))
+            await asyncio.sleep(0.10)
+        s2 = main.state_mgr.get_signal(12102)
+        assert s2["status"] == "CLOSED" and s2["tp1_reached"] is True and s2["market_tickets"] == []
+
+        # 3. Bad-position guard: null tick never bypasses recorded_entry_price & expires after max wait
+        tick_seq = [MagicMock(bid=3895.0, ask=3895.5), MagicMock(bid=3895.0, ask=3895.5)]
+        with patch.object(main.executor, "get_tick", side_effect=lambda sym: tick_seq.pop(0) if tick_seq else None):
+            await main.handle_new_message(MockTelethonEvent(msg_id=12104, text="Sell now"))
+            assert main.state_mgr.get_signal(12104)["recorded_entry_price"] == 3895.0
+            await asyncio.sleep(0.32)
+        s3 = main.state_mgr.get_signal(12104)
+        assert s3["status"] == "CLOSED" and s3["market_tickets"] == []
+
+        # 4a. Unfilled zone pending limits cancelled via REPLY "TP1 ✅"
+        buy_above_zone = MagicMock(bid=3896.8, ask=3897.0)  # Above top 3895 -> all 3 limits PENDING
+        with patch.object(main.executor, "get_tick", return_value=buy_above_zone), \
+             patch.object(main.executor, "cancel_pending_order", wraps=main.executor.cancel_pending_order) as cancel_spy:
+            await main.handle_new_message(MockTelethonEvent(msg_id=12105, text="Buy 3895-3887\nTP 3900\nSL 3875"))
+            sz = main.state_mgr.get_signal(12105)
+            assert sz["market_tickets"] == []
+            assert len(sz["pending_tickets"]) == 3
+            await main.handle_new_message(MockTelethonEvent(msg_id=12106, text="TP1 ✅", reply_to_msg_id=12105))
+            assert cancel_spy.call_count == 3
+        sz_after = main.state_mgr.get_signal(12105)
+        assert sz_after["status"] == "CLOSED" and sz_after["tp1_reached"] is True and sz_after["pending_tickets"] == []
+
+        # 4b. Unfilled zone pending limits cancelled via EDIT "Target 1 hit"
+        with patch.object(main.executor, "get_tick", return_value=buy_above_zone), \
+             patch.object(main.executor, "cancel_pending_order", wraps=main.executor.cancel_pending_order) as cancel_spy2:
+            await main.handle_new_message(MockTelethonEvent(msg_id=12107, text="Buy 3895-3887\nTP 3900\nSL 3875"))
+            assert len(main.state_mgr.get_signal(12107)["pending_tickets"]) == 3
+            await main.handle_message_edited(MockTelethonEvent(msg_id=12107, text="Target 1 hit"))
+            assert cancel_spy2.call_count == 3
+        assert main.state_mgr.get_signal(12107)["status"] == "CLOSED"
+        assert main.state_mgr.get_signal(12107)["tp1_reached"] is True
+
+        # 4c. Unfilled zone pending limits cancelled via LIVE PRICE in tp1_proximity_watcher_task
+        with patch.object(main.executor, "get_tick", return_value=buy_above_zone):
+            await main.handle_new_message(MockTelethonEvent(msg_id=12108, text="Buy 3895-3887\nTP 3900\nSL 3875"))
+        tick_tp1_hit = MagicMock(bid=3900.2, ask=3900.5)
+        with patch.object(main.executor, "get_tick", return_value=tick_tp1_hit):
+            watcher = asyncio.create_task(main.tp1_proximity_watcher_task())
+            await asyncio.sleep(0.05)
+            watcher.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
+        s_watch = main.state_mgr.get_signal(12108)
+        assert s_watch["status"] == "CLOSED"
+        assert s_watch["tp1_reached"] is True
+        assert s_watch["pending_tickets"] == []
+
+        # 4d. Mixed market + pending limits: reply "TP1 hit" closes market TOP, cancels pending MID+BOTTOM
+        tick_mixed = MagicMock(bid=3894.5, ask=3894.8)  # Below TOP 3895, above MID 3891 -> 1 market, 2 pending
+        with patch.object(main.executor, "get_tick", return_value=tick_mixed):
+            await main.handle_new_message(MockTelethonEvent(msg_id=12109, text="Buy 3895-3887\nTP 3900\nSL 3875"))
+        s_mix = main.state_mgr.get_signal(12109)
+        assert len(s_mix["market_tickets"]) == 1 and len(s_mix["pending_tickets"]) == 2
+        await main.handle_new_message(MockTelethonEvent(msg_id=12110, text="TP1 hit", reply_to_msg_id=12109))
+        s_mix_after = main.state_mgr.get_signal(12109)
+        assert s_mix_after["tp1_reached"] is True
+        assert s_mix_after["pending_tickets"] == []
+        assert s_mix_after["market_tickets"] == []
+        assert s_mix_after["status"] == "CLOSED"
+    finally:
+        main.SELL_NOW_DELAY_SECONDS = orig_delay
+        main.NOW_ENTRY_MAX_WAIT_SECONDS = orig_max_wait
+        _reset_main_session_flags()
+
+
+@pytest.mark.asyncio
+async def test_phase1_bug_regressions_and_bat_launchers(tmp_path):
+    """
+    Regression checks for Phase 1 audit fixes:
+    1. `manage_designated_runner` with `raw_tp1=None, raw_tp2=None` does not raise TypeError.
+    2. `/closeall` cancels active `_pending_sell_now_tasks` and closes `PENDING_DELAY` signals.
+    3. `handle_message_edited` during `PENDING_DELAY` enforces `check_preflight` before zone/limit entry.
+    4. `StateManager` safely skips `_daily_win`, `_daily_loss`, and non-dict entries.
+    5. Both `.bat` launchers preserve CRLF line endings, handle `ERRORLEVEL` 88 and 89, and contain no `|`.
+    """
+    from pathlib import Path
+    from tests.test_copier_scenarios import MockTelethonEvent
+
+    # 1. Runner with raw_tp1=None & raw_tp2=None (BUY and SELL)
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    for direction, px, floor in [("BUY", 3896.0, 3894.5), ("SELL", 3894.0, 3895.5)]:
+        sig_runner = {
+            "runner_ticket": 4242,
+            "runner_layer": "MID",
+            "symbol": DEFAULT_SYMBOL,
+            "direction": direction,
+            "soft_tp1_floor": floor,
+            "raw_tp1": None,
+            "raw_tp2": None,
+            "market_tickets": [4242],
+            "status": "RUNNER_ACTIVE",
+        }
+        with patch.object(ex, "get_tick", return_value=MagicMock(bid=px, ask=px + 0.3)):
+            assert ex.manage_designated_runner(sig_runner) is True
+
+    # 2 & 3. `/closeall` & edited-delay preflight guard
+    main.state_mgr = StateManager(tmp_path / "state_regressions.json")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+    _reset_main_session_flags()
+    orig_delay = main.SELL_NOW_DELAY_SECONDS
+    main.SELL_NOW_DELAY_SECONDS = 5.0
+    try:
+        await main.handle_new_message(MockTelethonEvent(msg_id=13001, text="Sell now"))
+        assert 13001 in main._pending_sell_now_tasks
+        close_cmd = MockTelethonEvent(msg_id=13002, text="/closeall", chat_id="me")
+        await main.handle_saved_messages_command(close_cmd)
+        assert 13001 not in main._pending_sell_now_tasks
+        assert main.state_mgr.get_signal(13001)["status"] == "CLOSED"
+
+        await main.handle_new_message(MockTelethonEvent(msg_id=13003, text="Sell now"))
+        with patch.object(main.executor, "check_preflight", return_value=(False, "Within 20 pips of TP1")):
+            await main.handle_message_edited(
+                MockTelethonEvent(msg_id=13003, text="Sell 3895-3900\nTP 3894\nSL 3910")
+            )
+        s_edit = main.state_mgr.get_signal(13003)
+        assert s_edit["status"] == "CLOSED"
+        assert s_edit["market_tickets"] == [] and s_edit["pending_tickets"] == []
+    finally:
+        main.SELL_NOW_DELAY_SECONDS = orig_delay
+        _reset_main_session_flags()
+
+    # 4. StateManager skips `_` metadata & non-dict records cleanly
+    sm = StateManager(tmp_path / "state_meta_skip.json")
+    sm.set_daily_win_config(True, 25.0, 0.0, "2026-11-17")
+    sm.set_daily_loss_config(True, 20.0, "2026-11-17", 1234.0)
+    with sm._lock:
+        sm._state["_corrupt"] = "not-a-dict"
+        sm._state["corrupt_non_meta"] = ["bad"]
+        sm._save_state_locked()
+    sm.create_signal(message_id=13010, symbol=DEFAULT_SYMBOL, direction="BUY")
+    assert list(sm.get_all_signals().keys()) == ["13010"]
+    assert sm.count_open_signals() == 1
+    assert len(sm.get_active_signals()) == 1
+    assert sm.get_latest_signal()[0] == "13010"
+    assert sm.cleanup_old_signals(days=7) == 0
+
+    # 5. Launcher .bat files retain CRLF, handle 88 & 89, and contain no unescaped '|'
+    bat_paths = [
+        Path(__file__).resolve().parent.parent / "start_copier.bat",
+        Path(r"C:\Users\kambo\OneDrive\Desktop\Launch_XAUUSD_Copier.bat"),
+    ]
+    for bp in bat_paths:
+        if bp.exists():
+            raw = bp.read_bytes()
+            assert b"\r\n" in raw
+            assert b"\n" not in raw.replace(b"\r\n", b"")
+            assert b"|" not in raw
+            txt = raw.decode("utf-8", errors="replace")
+            assert "ERRORLEVEL% EQU 88" in txt
+            assert "ERRORLEVEL% EQU 89" in txt
+
+
 

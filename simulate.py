@@ -98,22 +98,25 @@ async def run_simulation():
     print("     • Layer 3 (0.02 BOTTOM): UNTOUCHED at original SL 3875.0 (protected from pullbacks).")
 
     # -----------------------------------------------------------------------
-    # TEST 5: Scenario B - "Buy now" posted first -> Zone edited later
+    # TEST 5: Scenario B - "Buy now" held with recorded point -> Zone edited later
     # -----------------------------------------------------------------------
-    print("\n[STEP 5] Testing Scenario B: 'Buy now' posted first -> Edited later with Zone...")
+    print("\n[STEP 5] Testing Scenario B: 'Buy now' held (recorded point) -> Edited later with Zone...")
     buy_now_text = "Buy now"
     print(f"  [5a] Initial Post: \"{buy_now_text}\"")
     evt5a = MockTelethonEvent(msg_id=20005, text=buy_now_text)
     await handle_new_message(evt5a)
     sig5a = main.state_mgr.get_signal(20005)
-    print(f"     • Layer 1 (0.01 Market) opened immediately with fallback emergency SL: Ticket #{sig5a['market_tickets'][0]}")
+    assert sig5a is not None and sig5a["status"] == "PENDING_DELAY"
+    print(f"     • Recorded Entry Point: {sig5a['recorded_entry_price']} | Status: {sig5a['status']} (awaiting zone/delay)")
 
-    print("  [5b] Provider edits message 5 seconds later with Zone & SL/TP:")
+    print("  [5b] Provider edits message within delay window with Zone & SL/TP:")
     edit_text = "Buy 3895-3887 \n TP 3900 \n SL 3875"
     print(f"  Edited Message: \"{edit_text}\"")
     evt5b = MockTelethonEvent(msg_id=20005, text=edit_text)
     await handle_message_edited(evt5b)
     sig5b = main.state_mgr.get_signal(20005)
+    assert sig5b["status"] == "ACTIVE"
+    assert len(sig5b["market_tickets"]) + len(sig5b["pending_tickets"]) == 3
     print(f"  ✅ Edit State Machine Handled:")
     print(f"     • Layer 1: SL updated to 3875.0, TP updated to 3899.50")
     print(f"     • Layer 2 (0.01 Mid Limit): Placed at 3891.00")

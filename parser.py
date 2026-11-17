@@ -99,9 +99,33 @@ REACTIVATE_PATTERNS = [
     r"\bvalid\s+again\b",
 ]
 
+_TP1_TARGET_RE = r"(?:tp(?:\s*#?\s*1)?|target\s*#?\s*1|take\s*profit\s*#?\s*1|(?:first|1st)\s+(?:tp|target|take\s*profit))"
+_TP1_VERB_RE = r"(?:hit|hits|hitted|smashed|reached|done|cleared|achieved|completed|complete|taken|banked|secured|booked|touched|tagged|crushed)"
+_TP1_AUX_RE = r"(?:(?:was|is|got|just|has\s+been|have\s+been)\s+)?"
+_TP1_NOT_PRICE_AFTER = r"(?!\s*[:=@\-]?\s*\d{3,6}(?:\.\d+)?\b(?!\s*pips?\b))"
+
 TP1_HIT_REPLY_PATTERNS = [
-    r"\btp\s*1?\s+(?:was\s+)?(?:hit|smashed|reached|done)\b",
+    rf"\b{_TP1_TARGET_RE}\s+{_TP1_AUX_RE}{_TP1_VERB_RE}\b",
+    rf"\b(?:hit|hits|smashed|reached|cleared|achieved|touched|tagged|crushed|booked|banked|secured|took)\s+{_TP1_TARGET_RE}\b",
+    rf"\b{_TP1_TARGET_RE}\s*[✅✔️☑️]+{_TP1_NOT_PRICE_AFTER}",
+    rf"[✅✔️☑️]+\s*{_TP1_TARGET_RE}\b{_TP1_NOT_PRICE_AFTER}",
 ]
+
+_TP1_NEGATION_RE = re.compile(
+    r"\b(?:not|didn'?t|did\s+not|hasn'?t|has\s+not|haven'?t|have\s+not|wasn'?t|isn'?t|won'?t|never|almost|nearly|before)\s+"
+    r"(?:been\s+)?(?:hit|hits|smashed|reached|done|tp(?:\s*#?\s*1)?|target\s*#?\s*1|(?:first|1st)\s+(?:tp|target))\b",
+    re.IGNORECASE,
+)
+
+
+def is_tp1_hit_message(text: Optional[str]) -> bool:
+    """Return True if text indicates TP1 was hit/reached (never matching normal 'TP1 3900' entry lines)."""
+    if not text:
+        return False
+    lower = text.lower()
+    if _TP1_NEGATION_RE.search(lower):
+        return False
+    return any(re.search(p, lower) for p in TP1_HIT_REPLY_PATTERNS)
 
 # ---------------------------------------------------------------------------
 # GATE 4 SIGNAL EXTRACTION PATTERNS
@@ -248,10 +272,17 @@ def gate_2_check_announcements_and_recaps(
 
     # 3. Past-Tense Victory Recap Blocker
     if not is_reply and not is_edit:
-        for pattern in VICTORY_RECAP_BLOCKERS:
-            if re.search(pattern, lower):
-                logger.info(f"Gate 2 Reject (Victory Recap): Matched pattern '{pattern}'")
-                return False
+        is_short_tp1_cmd = (
+            len(lower.split()) <= 8
+            and not DIRECTION_PATTERN.search(lower)
+            and not re.search(r"\b\d{4}(?:\.\d+)?\b", lower)
+            and is_tp1_hit_message(lower)
+        )
+        if not is_short_tp1_cmd:
+            for pattern in VICTORY_RECAP_BLOCKERS:
+                if re.search(pattern, lower):
+                    logger.info(f"Gate 2 Reject (Victory Recap): Matched pattern '{pattern}'")
+                    return False
 
     return True
 
@@ -260,27 +291,40 @@ def gate_3_classify_trade_management(
     text: str,
     message_id: int = 0,
     reply_to_msg_id: Optional[int] = None,
+    is_reply: Optional[bool] = None,
+    is_edit: bool = False,
 ) -> Optional[SignalAction]:
     """
     Gate 3: Trade Management & Reply Classifier.
-    Detects Breakeven, Partial Close, Full Close, and 'Active' Reactivation.
+    Detects Breakeven, Close Worst/Hold Layers, Partial Close, Full Close,
+    'Active' Reactivation, and TP1-Hit alerts/replies.
     """
     lower = text.lower()
 
     action = None
     cancel_limits = False
 
-    is_reply = reply_to_msg_id is not None
+    effective_is_reply = (
+        (reply_to_msg_id is not None)
+        if is_reply is None
+        else (bool(is_reply) or reply_to_msg_id is not None)
+    )
     word_count = len(lower.split())
+    has_direction = bool(DIRECTION_PATTERN.search(lower))
+    has_4digit_price = bool(re.search(r"\b\d{4}(?:\.\d+)?\b", lower))
 
-    if not is_reply:
+    if not effective_is_reply:
         # Non-reply chatter must never act on a live trade by accident:
         # 1) Anything that looks like a priced entry signal is NOT a management command.
-        if DIRECTION_PATTERN.search(lower) and re.search(r"\b\d{4}(?:\.\d+)?\b", lower):
+        if has_direction and has_4digit_price:
             return None
-        # 2) Long messages are conversation, not commands.
+        # 2) Long messages are conversation, not commands (except explicit TP1-hit edits).
         if word_count > 10:
-            return None
+            if is_edit and is_tp1_hit_message(lower):
+                action = "ACTION_TP1_HIT_REPLY"
+                cancel_limits = True
+            else:
+                return None
 
     # Ambiguous single words (e.g. "be careful", "cut your losses", "exit early") are only
     # accepted as commands on replies or when the whole message is a 1-2 word command.
@@ -289,43 +333,48 @@ def gate_3_classify_trade_management(
     def _hit(patterns: List[str]) -> bool:
         for p in patterns:
             if re.search(p, lower):
-                if not is_reply and p in ambiguous and word_count > 2:
+                if not effective_is_reply and p in ambiguous and word_count > 2:
                     continue
                 return True
         return False
 
-    # 1. Breakeven
-    if _hit(BREAKEVEN_PATTERNS):
-        action = "ACTION_BREAKEVEN"
-        cancel_limits = True
-
-    # 2. Close Worst Entries & Hold Layers (must check before generic Partial/Full Close)
+    # 1. Close Worst Entries & Hold Layers (must check before generic Partial/Full Close)
     if not action and _hit(WORST_HOLD_PATTERNS):
         action = "ACTION_CLOSE_WORST_HOLD_LAYERS"
         cancel_limits = False
 
-    # 3. Reactivate ("Active") - only on replies or standalone command to avoid chat noise
-    if not action:
-        is_standalone_reactivate = bool(
-            re.fullmatch(r"(?:re-?activate|active(?:\s+now)?|valid\s+again)[!.\s]*", lower.strip())
-        )
-        if is_reply or is_standalone_reactivate:
-            if _hit(REACTIVATE_PATTERNS):
-                action = "ACTION_REACTIVATE"
-
-    # 4. Partial Close
-    if not action and _hit(PARTIAL_CLOSE_PATTERNS):
-        action = "ACTION_PARTIAL_CLOSE"
-
-    # 5. Full Close / Invalidate / Cancel
+    # 2. Full Close / Invalidate / Cancel
     if not action and _hit(FULL_CLOSE_PATTERNS):
         action = "ACTION_FULL_CLOSE"
         cancel_limits = True
 
-    # 6. Provider Reply "TP1 hit" / "Tp1 was hit on this" (only when replying to a signal)
-    if not action and is_reply and _hit(TP1_HIT_REPLY_PATTERNS):
+    # 3. Provider "TP1 hit" / "Tp1 was hit on this" (replies, edits, or standalone <= 8 words without dir/4-digit price)
+    is_tp1_eligible = (
+        effective_is_reply
+        or is_edit
+        or (word_count <= 8 and not has_direction and not has_4digit_price)
+    )
+    if not action and is_tp1_eligible and is_tp1_hit_message(lower):
         action = "ACTION_TP1_HIT_REPLY"
         cancel_limits = True
+
+    # 4. Breakeven
+    if not action and _hit(BREAKEVEN_PATTERNS):
+        action = "ACTION_BREAKEVEN"
+        cancel_limits = True
+
+    # 5. Reactivate ("Active") - only on replies or standalone command to avoid chat noise
+    if not action:
+        is_standalone_reactivate = bool(
+            re.fullmatch(r"(?:re-?activate|active(?:\s+now)?|valid\s+again)[!.\s]*", lower.strip())
+        )
+        if effective_is_reply or is_standalone_reactivate:
+            if _hit(REACTIVATE_PATTERNS):
+                action = "ACTION_REACTIVATE"
+
+    # 6. Partial Close
+    if not action and _hit(PARTIAL_CLOSE_PATTERNS):
+        action = "ACTION_PARTIAL_CLOSE"
 
     if action:
         mgmt_obj = SignalAction({
@@ -629,16 +678,19 @@ def parse_message(
         return None
 
     clean_text = text.strip()
+    effective_is_reply = bool(is_reply) or (reply_to_msg_id is not None)
 
     # Gate 2: Announcement & Ignored Symbol Filter
-    if not gate_2_check_announcements_and_recaps(clean_text, is_reply=is_reply, is_edit=is_edit):
+    if not gate_2_check_announcements_and_recaps(clean_text, is_reply=effective_is_reply, is_edit=is_edit):
         return None
 
-    # Gate 3: Trade Management (BE, Close, Reactivate)
+    # Gate 3: Trade Management (BE, Close, Reactivate, TP1 Hit)
     mgmt_action = gate_3_classify_trade_management(
         clean_text,
         message_id=message_id,
         reply_to_msg_id=reply_to_msg_id,
+        is_reply=effective_is_reply,
+        is_edit=is_edit,
     )
     if mgmt_action:
         return mgmt_action

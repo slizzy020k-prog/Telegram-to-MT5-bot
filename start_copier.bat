@@ -37,6 +37,16 @@ if %ERRORLEVEL% EQU 88 (
     pause
     exit /b 0
 )
+if %ERRORLEVEL% EQU 89 (
+    echo.
+    echo  ==============================================================================
+    echo    DAILY LOSS LIMIT WAS HIT - SESSION TERMINATED FOR TODAY!
+    echo    Capital protected: no more trading until relaunch on next day or override.
+    echo    A summary has been sent to Saved Messages.
+    echo  ==============================================================================
+    pause
+    exit /b 0
+)
 
 echo.
 echo  ==============================================================================
