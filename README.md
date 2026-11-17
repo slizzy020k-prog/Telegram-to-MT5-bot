@@ -1,4 +1,4 @@
-# Telegram-to-MT5 Gold (`XAUUSD`) Signal Copier (v3.4)
+# Telegram-to-MT5 Gold (`XAUUSD`) Signal Copier (v3.4.2)
 
 A fast, automated Python bot on Windows that reads **Gold (`XAUUSD`)** trading signals from your Telegram channels and executes + manages them on **MetaTrader 5** in real time.
 
@@ -7,10 +7,10 @@ A fast, automated Python bot on Windows that reads **Gold (`XAUUSD`)** trading s
 ## How It Works (In Plain English)
 
 ### 1. Reading Signals Automatically
-- **Gold-Only by Default:** Works even when the provider just writes `"Buy now"` or `"Sell limit 3895-3887"` without typing `"XAUUSD"`. Any non-Gold pair (`EURUSD`, `NAS100`, `BTCUSD`, etc.) or chat noise/recap is automatically ignored.
-- **4-Layer Entries (`0.05` Lots Base):** Every valid trade splits into **4 layers** (`[0.01, 0.01, 0.01, 0.02]` lots):
-  - **Price Zone (`Buy 3895-3887`):** Spreads `L1`, `L2`, `L3`, `L4` evenly across the zone (`0%`, `33%`, `67%`, `100%`), placing Market orders for any price already reached and Limit orders for deeper levels.
-  - **Single Price or `"Buy/Sell now"`:** Opens up to 4 layers (and if `"Buy now"` is edited minutes later with a full zone, SL, and TPs, the bot automatically adds the missing layers and updates SL/TP).
+- **Strict Signal Intent Whitelist (Gold-Only by Default):** Works even when the provider writes `"Buy now"`, `"Sell with limit 3890"`, or `"Sell limit 3895-3887"` without typing `"XAUUSD"`. Only explicit `Buy/Sell now` (or market commands), `Buy/Sell limit/stop/with limit` + price/zone, or `Buy/Sell` + a real Gold price (`>= 500`) are accepted. Casual chat (`"sell straight"`), victory recaps, conflicting directions, and non-Gold pairs (`EURUSD`, `NAS100`, `BTCUSD`, etc.) are rejected with a `[PARSER IGNORED]` log entry.
+- **4-Layer Entries (`0.05` Lots Base):** Complete signals split into **4 layers** (`[0.01, 0.01, 0.01, 0.02]` lots):
+  - **Price Zone (`Buy 3895-3887`):** Spreads `L1`, `L2`, `L3`, `L4` evenly across the zone (`0%`, `33%`, `67%`, `100%`), placing Market orders for any price already reached and Limit orders for deeper levels. Pending limits are **never** cancelled for hitting `TP1` before price actually enters the zone.
+  - **Stub `L1`-Only & Zone Edit Distribution:** An unpriced `"Buy/Sell now"` or single-price stub posted without `SL` or `TP` opens **only `L1` (`0.01` lot)**. When edited later to add a zone, the bot keeps `L1` and distributes `L2–L4` as pending limits across the zone (strictly capped at 4 live orders total). An edit adding only `SL`/`TP` updates targets without stacking duplicate orders.
 
 ### 2. Taking Profit & Scaling Winners (`TP1 -> TP2 -> TP3 -> TP4`)
 - **Start Safe at TP1:** All layers start with their broker Take-Profit set at `TP1 - $0.50` (BUY) or `TP1 + $0.50` (SELL) so spreads don't cause missed fills.
@@ -20,13 +20,15 @@ A fast, automated Python bot on Windows that reads **Gold (`XAUUSD`)** trading s
   - **Only 1 layer filled:** **`L1` automatically becomes the runner** (nothing closes early at `TP1`) so single-fill trades still catch big moves to `TP2–TP4`.
 - **Early Broker TP Lift (`70%`):** Once price reaches `70%` of the way to `TP1`, the runner's broker TP lifts early to `TP2` so MT5 never cuts off a fast breakout at `TP1`.
 
-### 3. Gold-Calibrated Reversal Guard ("Bank It" Without Choking Trades)
-Normal Gold wicks (`$0.80–$1.40`) won't kick you out of winning trades early:
-- **Stays Off Mid-Range:** Only arms on the runner once profit reaches **`85%` of `TP1`** (`ARM_THRESHOLD_PCT = 0.85`).
-- **30% Giveback + Gold Noise Floor:** Once armed, it banks the runner at market **only** if open profit drops **`30%` from its peak** (`capped at $4.50` max giveback after `TP1`) **AND** price pulls back at least **`$1.50` (`15 pips`)** (or `0.35 x M1 ATR(14)` when volatility is high).
-- **Milestone Hard-SL Locks:** As milestones clear, hard MT5 Stop-Loss steps cleanly (`BE -> TP1 -> TP2 -> TP3`) without dragging a tight trailing stop right behind price.
-- **Spread Spike Filter:** Temporarily pauses reversal exits during sudden news/rollover spread spikes (automatically adapts to brokers like PU Prime where normal Gold spread is `~$0.52`).
-- **Base-Layer `TP1 Shortfall` (`L1–L3` Only):** If price gets within `$0.80` (`8 pips`) of `TP1` and reverses by `$2.00` (`20 pips` for 3 ticks), **only** `L1–L3` bank early—your deepest runner stays open at Breakeven.
+### 3. Pre-TP1 Near-Miss Bank & Post-TP1 Dynamic ATR Trailing Stop
+- **Before `TP1` Is Reached (Near-Miss Bank Guard):**
+  - **Stays Off Mid-Range:** Only arms on the runner once profit reaches **`85%` of `TP1`** (`ARM_THRESHOLD_PCT = 0.85`).
+  - **30% Giveback + Gold Noise Floor:** Once armed, it banks the runner at market if open profit drops **`30%` from its peak** **AND** price pulls back at least **`$1.50` (`15 pips`)** (or `0.35 x M1 ATR(14)` in high volatility, scaled down for tight scalps `<= $4.00`), **OR** if giveback hits the **`$3.50` hard ceiling** (`HARD_GIVEBACK_CEILING_DOLLARS = 3.50`).
+  - **Base-Layer `TP1 Shortfall` (`L1–L3` Only):** If price gets within `$0.80` (`8 pips`) of `TP1` and reverses by `$2.00` (`20 pips` for 3 ticks), **only** `L1–L3` bank early—your deepest runner stays open at Breakeven.
+- **At & After `TP1` Touch (Dynamic M1-ATR Trailing Stop):**
+  - The moment price touches `TP1` (even by a single tick), the bot activates a **real M1-ATR Trailing Stop** (`clamp(1.5 x M1_ATR_14, $2.00, $3.00)`, floored at breakeven + offset) synced as a hard MT5 `SL` across the runner and any surviving `L2`/`L3` layers whenever it improves by **`$0.20`**.
+  - As price climbs `TP1 -> TP2 -> TP3 -> TP4`, the stop ratchets forward behind peak price (`$3.50` hard giveback ceiling backstop still applies), while `L2`/`L3` keep their `TP2`/`TP3` targets.
+- **Spread Spike Filter:** Temporarily pauses 30% reversal exits during sudden news/rollover spread spikes (adapts automatically to brokers like PU Prime where normal Gold spread is `~$0.52`), while never delaying the `$3.50` hard giveback ceiling.
 
 ### 4. Instant Channel Commands, Edits & Deleted Messages
 - **Fast Breakeven (No Reply Needed, Per-Channel Only):** If a provider posts `"BE"`, `"Go breakeven!"`, or `"break even your entries"` in a channel (even without replying to the signal), the bot moves **all 4 layers (`L1–L4`)** of **that channel's trade only** to Breakeven (`+2 pips`, with instant `0.0p` fallback and `0.5s` auto-retry if a layer is slightly underwater). It never touches trades from other channels.
@@ -94,8 +96,12 @@ Send any of these messages to your own **Saved Messages** chat in Telegram from 
 | `RUNNER_EARLY_TP_LIFT_PCT` | `0.70` | Lifts runner's broker TP to `TP2` at `70%` of `TP1` |
 | `GIVEBACK_PCT` | `0.30` | Banks runner on a `30%` drop from peak open profit |
 | `MIN_GOLD_PULLBACK_DOLLARS` | `1.50` | Minimum `$1.50` (`15 pips`) drop required so Gold wicks are ignored |
-| `MAX_GIVEBACK_DOLLARS` | `4.50` | Max dollar pullback allowed after `TP1` (`TP2–TP4` stages) |
-| `ADAPTIVE_SPREAD_CEILING_DOLLARS` | `0.80` | Adaptive spread ceiling before pausing reversal exits on spikes |
+| `HARD_GIVEBACK_CEILING_DOLLARS` | `3.50` | Hard maximum dollar giveback from peak before forced exit |
+| `TP1_TRAIL_ENABLED` | `true` | Enables dynamic M1-ATR trailing stop once `TP1` is touched |
+| `TP1_TRAIL_ATR_MULT` | `1.5` | Multiplier applied to `M1_ATR_14` for trailing stop distance |
+| `TP1_TRAIL_MIN_DOLLARS` / `TP1_TRAIL_MAX_DOLLARS` | `2.00` / `3.00` | Clamped range for dynamic `TP1` trailing stop distance (`$2.50` if ATR unavailable) |
+| `TP1_TRAIL_STEP_DOLLARS` | `0.20` | Minimum stop improvement required before sending an MT5 `SL` update |
+| `ADAPTIVE_SPREAD_CEILING_DOLLARS` | `0.80` | Adaptive spread ceiling before pausing 30% reversal exits on spikes |
 | `SHORTFALL_ARM_PIPS` / `SHORTFALL_PULLBACK_PIPS` | `8.0` / `20.0` | Base-layer (`L1–L3`) pre-TP1 protection (`$0.80` arm, `$2.00` pullback, `3` ticks) |
 | `ENFORCE_HIGH_RISK_LOT_CAP` | `true` | Caps total active lots safely based on live account balance (`£10` per `0.01` lot) |
 | `CLOSE_ON_SIGNAL_DELETED` | `true` | Auto-closes/cancels a trade if its Telegram signal is deleted |
@@ -113,6 +119,6 @@ python simulate.py
 python test_examples.py
 ```
 
-- **`pytest`:** `139` unit & scenario tests covering parsing, 4-layer execution, breakeven, edits, deletes, reconnect catch-up, and the Gold Reversal Guard.
+- **`pytest`:** `147` unit & scenario tests covering parsing, 4-layer execution, breakeven, edits, deletes, reconnect catch-up, TP1 trailing stop, and the Gold Reversal Guard.
 - **`simulate.py`:** `10`-step end-to-end simulation in an isolated temp folder.
 - **Deep Technical Specs:** See `ARCHITECTURE_v3.md` for internal state-machine and engineering contracts.
