@@ -367,7 +367,11 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
         assert sig_pending["status"] == "PENDING"
         assert sig_pending["market_tickets"] == []
 
-        await asyncio.sleep(0.12)
+        for _ in range(15):
+            await asyncio.sleep(0.03)
+            sig_active = main.state_mgr.get_signal(9801)
+            if sig_active and sig_active["status"] == "ACTIVE":
+                break
         sig_active = main.state_mgr.get_signal(9801)
         assert sig_active["status"] == "ACTIVE"
         assert len(sig_active["market_tickets"]) == 4

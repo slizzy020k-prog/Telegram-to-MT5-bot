@@ -228,7 +228,28 @@ TP5_STEP_PIPS: float = _env_float(
     "TP5_STEP_PIPS", DEFAULT_TP_STEP_PIPS, min_val=1.0, max_val=2000.0, positive_only=True
 )
 
-# Dynamic Multi-Layer Active Runner Scaling & Anti-Choke Reversal Guard ("Bank It" Rule)
+# Dynamic Multi-Layer Active Runner Scaling & Gold Calibrated Peak-Profit Giveback Guard ("Bank It")
+GOLD_REVERSAL_GUARD_ENABLED: bool = _env_bool("GOLD_REVERSAL_GUARD_ENABLED", True)
+ARM_THRESHOLD_PCT: float = _env_float("ARM_THRESHOLD_PCT", 0.85, min_val=0.10, max_val=0.99)
+GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.95)
+MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
+    "MIN_GOLD_PULLBACK_DOLLARS", 1.50, min_val=0.10, max_val=50.0, positive_only=True
+)
+ATR_NOISE_FLOOR_MULT: float = _env_float("ATR_NOISE_FLOOR_MULT", 0.35, min_val=0.0, max_val=5.0)
+M1_ATR_PERIOD: int = _env_int("M1_ATR_PERIOD", 14, min_val=2, max_val=200)
+MAX_GIVEBACK_DOLLARS: float = _env_float("MAX_GIVEBACK_DOLLARS", 4.50, min_val=0.0, max_val=200.0)
+MAX_ALLOWED_SPREAD_DOLLARS: float = _env_float(
+    "MAX_ALLOWED_SPREAD_DOLLARS", 0.40, min_val=0.05, max_val=20.0, positive_only=True
+)
+ADAPTIVE_SPREAD_CEILING_DOLLARS: float = _env_float(
+    "ADAPTIVE_SPREAD_CEILING_DOLLARS", 0.80, min_val=0.05, max_val=20.0, positive_only=True
+)
+ADAPTIVE_SPREAD_MULTIPLIER: float = _env_float(
+    "ADAPTIVE_SPREAD_MULTIPLIER", 1.50, min_val=1.0, max_val=5.0, positive_only=True
+)
+RUNNER_EARLY_TP_LIFT_PCT: float = _env_float("RUNNER_EARLY_TP_LIFT_PCT", 0.70, min_val=0.10, max_val=0.99)
+RUNNER_CONTINUOUS_TRAIL_ENABLED: bool = _env_bool("RUNNER_CONTINUOUS_TRAIL_ENABLED", False)
+
 RUNNER_DEEPEST_COUNT_FULL: int = _env_int("RUNNER_DEEPEST_COUNT_FULL", 1, min_val=1, max_val=2)
 RUNNER_MAX_TP_STAGE: int = _env_int("RUNNER_MAX_TP_STAGE", 4, min_val=1, max_val=5)
 RUNNER_PROACTIVE_TP_LIFT: bool = _env_bool("RUNNER_PROACTIVE_TP_LIFT", True)
@@ -274,8 +295,9 @@ TRAIL_STEP_PIPS: float = _env_float("TRAIL_STEP_PIPS", 5.0, min_val=0.0, max_val
 TP2_SHORTFALL_ARM_PIPS: float = _env_float("TP2_SHORTFALL_ARM_PIPS", 20.0, min_val=0.0, max_val=500.0)
 TP2_SHORTFALL_PULLBACK_PIPS: float = _env_float("TP2_SHORTFALL_PULLBACK_PIPS", 8.0, min_val=0.0, max_val=200.0)
 NO_TP2_SURGE_ARM_PIPS: float = _env_float("NO_TP2_SURGE_ARM_PIPS", 40.0, min_val=0.0, max_val=500.0)
-SHORTFALL_ARM_PIPS: float = _env_float("SHORTFALL_ARM_PIPS", 10.0, min_val=0.0, max_val=500.0)
-SHORTFALL_PULLBACK_PIPS: float = _env_float("SHORTFALL_PULLBACK_PIPS", 12.0, min_val=0.0, max_val=200.0)
+SHORTFALL_ARM_PIPS: float = _env_float("SHORTFALL_ARM_PIPS", 8.0, min_val=0.0, max_val=500.0)
+SHORTFALL_PULLBACK_PIPS: float = _env_float("SHORTFALL_PULLBACK_PIPS", 20.0, min_val=0.0, max_val=200.0)
+SHORTFALL_CONFIRM_TICKS: int = _env_int("SHORTFALL_CONFIRM_TICKS", 3, min_val=1, max_val=10)
 TP1_CLOSE_PROXIMITY_PIPS: int = _env_int("TP1_CLOSE_PROXIMITY_PIPS", 20, min_val=0, max_val=500)
 
 # Stop-Loss, Entry Protection & Risk Caps

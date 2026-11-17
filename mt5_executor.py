@@ -5,14 +5,19 @@ import numbers
 import random
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import MetaTrader5 as mt5
 
 import config as _config
 from config import (
+    ADAPTIVE_SPREAD_CEILING_DOLLARS,
+    ADAPTIVE_SPREAD_MULTIPLIER,
     ALLOW_BELOW_ZONE_WICK,
+    ARM_THRESHOLD_PCT,
+    ATR_NOISE_FLOOR_MULT,
     BASE_LAYER_LOTS,
     BE_AFTER_TP1,
     BE_LAYERS,
@@ -25,11 +30,17 @@ from config import (
     EMERGENCY_CUTOFF_LOSS_PCT,
     ENFORCE_HIGH_RISK_LOT_CAP,
     FALLBACK_SL_PIPS,
+    GIVEBACK_PCT,
+    GOLD_REVERSAL_GUARD_ENABLED,
     LAYER_LOTS,
     LAYER_NAMES,
     LEGACY_LAYER_MAP,
+    M1_ATR_PERIOD,
     MAGIC_NUMBER,
+    MAX_ALLOWED_SPREAD_DOLLARS,
+    MAX_GIVEBACK_DOLLARS,
     MAX_ORDERS_PER_SIGNAL,
+    MIN_GOLD_PULLBACK_DOLLARS,
     MIN_SL_BUFFER_PIPS,
     MT5_LOGIN,
     MT5_PASSWORD,
@@ -38,7 +49,9 @@ from config import (
     NO_TP2_SURGE_ARM_PIPS,
     RISK_LOT_MULTIPLIER,
     RUNNER_CLEAN_BREAK_PIPS,
+    RUNNER_CONTINUOUS_TRAIL_ENABLED,
     RUNNER_DEEPEST_COUNT_FULL,
+    RUNNER_EARLY_TP_LIFT_PCT,
     RUNNER_MAX_MIDRANGE_RATIO,
     RUNNER_MAX_TP_STAGE,
     RUNNER_PROACTIVE_TP_LIFT,
@@ -50,6 +63,7 @@ from config import (
     RUNNER_REVERSAL_PULLBACK_PCT,
     RUNNER_REVERSAL_PULLBACK_PIPS,
     SHORTFALL_ARM_PIPS,
+    SHORTFALL_CONFIRM_TICKS,
     SHORTFALL_PULLBACK_PIPS,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
@@ -100,6 +114,19 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "NO_TP2_SURGE_ARM_PIPS",
         "SHORTFALL_ARM_PIPS",
         "SHORTFALL_PULLBACK_PIPS",
+        "SHORTFALL_CONFIRM_TICKS",
+        "GOLD_REVERSAL_GUARD_ENABLED",
+        "ARM_THRESHOLD_PCT",
+        "GIVEBACK_PCT",
+        "MIN_GOLD_PULLBACK_DOLLARS",
+        "ATR_NOISE_FLOOR_MULT",
+        "M1_ATR_PERIOD",
+        "MAX_GIVEBACK_DOLLARS",
+        "MAX_ALLOWED_SPREAD_DOLLARS",
+        "ADAPTIVE_SPREAD_CEILING_DOLLARS",
+        "ADAPTIVE_SPREAD_MULTIPLIER",
+        "RUNNER_EARLY_TP_LIFT_PCT",
+        "RUNNER_CONTINUOUS_TRAIL_ENABLED",
         "RUNNER_DEEPEST_COUNT_FULL",
         "RUNNER_MAX_TP_STAGE",
         "RUNNER_PROACTIVE_TP_LIFT",
@@ -357,8 +384,12 @@ class MT5Executor:
         self._dry_run_daily_realized_pnl: float = 0.0
         self._dry_run_floating_pnl: float = 0.0
         self._dry_run_last_m1_candle: Optional[Dict[str, float]] = None
+        self._dry_run_m1_atr: Optional[float] = None
         self._cached_pos_profits: Dict[int, float] = {}
         self._realized_pnl_cache: Optional[Tuple[float, float, str]] = None
+        self._closing_lock = threading.Lock()
+        self._closing_tickets: Set[int] = set()
+        self._spread_history: Dict[str, Deque[float]] = {}
 
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal."""
@@ -604,6 +635,121 @@ class MT5Executor:
         except Exception as e:
             logger.debug(f"Could not fetch closed M1 candle for {symbol}: {e}")
             return None
+
+    def get_m1_atr(self, symbol: str, period: Optional[int] = None) -> float:
+        """
+        Compute the closed-bar M1 ATR(period) in price dollars/points (default period=14).
+        Returns `self._dry_run_m1_atr` in dry-run when set, or 0.0 safely when bars are unavailable.
+        """
+        eff_period = max(2, _int_num(period if period is not None else _cfg("M1_ATR_PERIOD", M1_ATR_PERIOD), 14))
+        if self.dry_run:
+            return float(self._dry_run_m1_atr) if self._dry_run_m1_atr is not None and self._dry_run_m1_atr > 0 else 0.0
+        if not self._connected:
+            return 0.0
+
+        try:
+            timeframe_m1 = _mt5_const("TIMEFRAME_M1", 1)
+            with self._mt5_lock:
+                resolved = self.resolve_symbol(symbol)
+                rates = mt5.copy_rates_from_pos(resolved, timeframe_m1, 1, eff_period + 1)
+            if rates is None or len(rates) < 2:
+                return 0.0
+
+            def _field(bar_obj: Any, key: str) -> Optional[float]:
+                if isinstance(bar_obj, dict):
+                    val = bar_obj.get(key)
+                else:
+                    try:
+                        val = bar_obj[key]
+                    except Exception:
+                        val = getattr(bar_obj, key, None)
+                if isinstance(val, numbers.Real) and not isinstance(val, bool):
+                    fv = float(val)
+                    return fv if math.isfinite(fv) else None
+                return None
+
+            trs: List[float] = []
+            prev_close = _field(rates[0], "close")
+            for idx in range(1, len(rates)):
+                bar = rates[idx]
+                h = _field(bar, "high")
+                l = _field(bar, "low")
+                c = _field(bar, "close")
+                if h is None or l is None or c is None:
+                    continue
+                if prev_close is not None:
+                    tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
+                else:
+                    tr = h - l
+                if tr >= 0.0:
+                    trs.append(tr)
+                prev_close = c
+
+            if not trs:
+                return 0.0
+            return round(sum(trs) / len(trs), 4)
+        except Exception as e:
+            logger.debug(f"Could not compute M1 ATR({eff_period}) for {symbol}: {e}")
+            return 0.0
+
+    def check_spread_spike(self, symbol: str, tick: Any) -> Tuple[bool, float, float]:
+        """
+        Adaptive Spread Spike Filter:
+        - Returns `(is_spike, spread_dollars, max_allowed_spread_dollars)`.
+        - On low-spread ECN feeds (baseline <= MAX_ALLOWED_SPREAD_DOLLARS = $0.40), enforces
+          `max($0.40, 1.5 * rolling_median_spread)` so momentary spread spikes > $0.40 pause exits.
+        - On standard broker feeds like PU Prime (`XAUUSD.s` normal spread $0.50-$0.52 > $0.40),
+          adapts cleanly to `max(ADAPTIVE_SPREAD_CEILING_DOLLARS = $0.80, 1.5 * rolling_median_spread)`
+          so normal trading is never blocked while true news/rollover spikes (> $0.80) pause exits.
+        """
+        cfg_max = float(_cfg("MAX_ALLOWED_SPREAD_DOLLARS", MAX_ALLOWED_SPREAD_DOLLARS))
+        adapt_ceil = float(_cfg("ADAPTIVE_SPREAD_CEILING_DOLLARS", ADAPTIVE_SPREAD_CEILING_DOLLARS))
+        mult = float(_cfg("ADAPTIVE_SPREAD_MULTIPLIER", ADAPTIVE_SPREAD_MULTIPLIER))
+        if tick is None:
+            return False, 0.0, cfg_max
+
+        bid = _num(getattr(tick, "bid", 0.0), 0.0)
+        ask = _num(getattr(tick, "ask", 0.0), 0.0)
+        if bid <= 0.0 or ask <= 0.0 or ask < bid:
+            return False, 0.0, cfg_max
+
+        spread_dollars = round(ask - bid, 4)
+        sym_key = (symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)).upper()
+
+        with self._closing_lock:
+            hist = self._spread_history.setdefault(sym_key, deque(maxlen=30))
+            if hist:
+                sorted_h = sorted(hist)
+                med = sorted_h[len(sorted_h) // 2]
+                if med > cfg_max + 1e-6:
+                    eff_max = max(adapt_ceil, round(mult * med, 4))
+                else:
+                    eff_max = max(cfg_max, round(mult * med, 4))
+            else:
+                if not self.dry_run and spread_dollars <= adapt_ceil + 1e-6:
+                    hist.append(spread_dollars)
+                    eff_max = max(adapt_ceil, round(mult * spread_dollars, 4)) if spread_dollars > cfg_max + 1e-6 else cfg_max
+                else:
+                    eff_max = cfg_max
+
+            is_spike = spread_dollars > eff_max + 1e-6
+            if not is_spike:
+                hist.append(spread_dollars)
+
+        return is_spike, spread_dollars, eff_max
+
+    def try_begin_signal_close(self, signal_data: Dict[str, Any]) -> bool:
+        """Atomically acquire `signal_data['is_closing'] = True` to prevent overlapping close triggers."""
+        with self._closing_lock:
+            if signal_data.get("is_closing"):
+                return False
+            signal_data["is_closing"] = True
+            return True
+
+    def end_signal_close(self, signal_data: Dict[str, Any]) -> None:
+        """Release `signal_data['is_closing'] = False` after atomic close sequence completes."""
+        with self._closing_lock:
+            signal_data["is_closing"] = False
 
     def check_preflight(
         self,
@@ -2075,67 +2221,84 @@ class MT5Executor:
             return False
 
     def close_market_position(self, ticket: int) -> bool:
-        """Close an open MT5 position completely at current market price (thread-safe)."""
-        if not ticket:
+        """
+        Close an open MT5 position completely at current market price (thread-safe).
+        Guarded by an atomic in-flight `_closing_tickets` lock (`is_closing = True`) so overlapping
+        rules or rapid ticks never send duplicate market-close orders for the same ticket.
+        """
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0:
             return False
 
-        if self.dry_run:
-            self._dry_run_ticket_lots.pop(ticket, None)
-            logger.info(f"[DRY-RUN] Closed Market Position #{ticket}")
-            self._cached_pos_profits[ticket] = 1.25
-            self.invalidate_realized_pnl_cache()
-            return True
-
-        with self._mt5_lock:
-            if not self._ensure_connected():
-                logger.error(f"Cannot close position #{ticket}: MT5 is not connected.")
+        with self._closing_lock:
+            if t_int in self._closing_tickets:
+                logger.warning(
+                    f"Atomic exit lock: duplicate concurrent close skipped for Ticket #{t_int} (is_closing=True)."
+                )
                 return False
+            self._closing_tickets.add(t_int)
 
-            pos = mt5.positions_get(ticket=ticket)
-            if not pos:
-                logger.warning(f"Position #{ticket} not found to close (already closed).")
-                return False
-            p = pos[0]
-            self._cached_pos_profits[ticket] = round(
-                _num(getattr(p, "profit", 0.0)) + _num(getattr(p, "swap", 0.0)),
-                2,
-            )
-
-            raw_sym = getattr(p, "symbol", None)
-            p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
-            tick = self.get_tick(p_symbol)
-            if not tick:
-                return False
-
-            buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
-            sell_order_type = _mt5_const("ORDER_TYPE_SELL", 1)
-            is_buy_pos = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
-            close_type = sell_order_type if is_buy_pos else buy_order_type
-            close_price = getattr(tick, "bid", None) if is_buy_pos else getattr(tick, "ask", None)
-            if not isinstance(close_price, (int, float)) or isinstance(close_price, bool) or close_price <= 0:
-                logger.warning(f"Invalid close tick price ({close_price}) for #{ticket} ({p_symbol})")
-                return False
-
-            vol = _num(getattr(p, "volume", 0.01), 0.01) or 0.01
-            request = {
-                "action": _mt5_const("TRADE_ACTION_DEAL", 1),
-                "position": ticket,
-                "symbol": p_symbol,
-                "volume": vol,
-                "type": close_type,
-                "price": close_price,
-                "deviation": 20,
-                "magic": _cfg("MAGIC_NUMBER", MAGIC_NUMBER),
-                "comment": "TG Copier Close",
-                "type_time": _mt5_const("ORDER_TIME_GTC", 0),
-            }
-
-            success, _ = self.send_order_with_filling_fallback(request)
-            if success:
+        try:
+            if self.dry_run:
+                self._dry_run_ticket_lots.pop(ticket, None)
+                logger.info(f"[DRY-RUN] Closed Market Position #{ticket}")
+                self._cached_pos_profits[ticket] = 1.25
                 self.invalidate_realized_pnl_cache()
-                logger.info(f"Closed Position #{ticket} ({p_symbol} {vol} lots at {close_price})")
                 return True
-            return False
+
+            with self._mt5_lock:
+                if not self._ensure_connected():
+                    logger.error(f"Cannot close position #{ticket}: MT5 is not connected.")
+                    return False
+
+                pos = mt5.positions_get(ticket=ticket)
+                if not pos:
+                    logger.warning(f"Position #{ticket} not found to close (already closed).")
+                    return False
+                p = pos[0]
+                self._cached_pos_profits[ticket] = round(
+                    _num(getattr(p, "profit", 0.0)) + _num(getattr(p, "swap", 0.0)),
+                    2,
+                )
+
+                raw_sym = getattr(p, "symbol", None)
+                p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+                tick = self.get_tick(p_symbol)
+                if not tick:
+                    return False
+
+                buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
+                sell_order_type = _mt5_const("ORDER_TYPE_SELL", 1)
+                is_buy_pos = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
+                close_type = sell_order_type if is_buy_pos else buy_order_type
+                close_price = getattr(tick, "bid", None) if is_buy_pos else getattr(tick, "ask", None)
+                if not isinstance(close_price, (int, float)) or isinstance(close_price, bool) or close_price <= 0:
+                    logger.warning(f"Invalid close tick price ({close_price}) for #{ticket} ({p_symbol})")
+                    return False
+
+                vol = _num(getattr(p, "volume", 0.01), 0.01) or 0.01
+                request = {
+                    "action": _mt5_const("TRADE_ACTION_DEAL", 1),
+                    "position": ticket,
+                    "symbol": p_symbol,
+                    "volume": vol,
+                    "type": close_type,
+                    "price": close_price,
+                    "deviation": 20,
+                    "magic": _cfg("MAGIC_NUMBER", MAGIC_NUMBER),
+                    "comment": "TG Copier Close",
+                    "type_time": _mt5_const("ORDER_TIME_GTC", 0),
+                }
+
+                success, _ = self.send_order_with_filling_fallback(request)
+                if success:
+                    self.invalidate_realized_pnl_cache()
+                    logger.info(f"Closed Position #{ticket} ({p_symbol} {vol} lots at {close_price})")
+                    return True
+                return False
+        finally:
+            with self._closing_lock:
+                self._closing_tickets.discard(t_int)
 
     def _compute_close_info_from_deals(self, ticket: int, deals: Any) -> Dict[str, Any]:
         """Compute {"profit": float, "reason": str} from a single history_deals_get result."""
@@ -3628,7 +3791,22 @@ class MT5Executor:
                 float(raw_tp1), float(live_price), pip_size, anchor=anchor
             )
             dist_to_tp1 = (float(raw_tp1) - float(live_price)) if is_buy else (float(live_price) - float(raw_tp1))
-            if dist_to_tp1 <= eff_buf + 1e-9:
+            should_lift_early = dist_to_tp1 <= eff_buf + 1e-9
+
+            # In Gold Calibrated Reversal Guard mode, lift ONLY the deepest runner's broker TP to TP2
+            # early at RUNNER_EARLY_TP_LIFT_PCT (default 70% of TP1) so broker front-run TP (TP1 - $0.50)
+            # never closes a tight scalp before 85% arming is reached (L1-L3 stay at TP1 - $0.50).
+            if bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)):
+                sig_entry = self._resolve_signal_primary_entry(signal_data)
+                if sig_entry is not None and sig_entry > 0:
+                    leg_span = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
+                    if leg_span > 1e-9:
+                        prog_pct = ((float(live_price) - sig_entry) / leg_span) if is_buy else ((sig_entry - float(live_price)) / leg_span)
+                        lift_pct = float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT))
+                        if prog_pct + 1e-9 >= lift_pct:
+                            should_lift_early = True
+
+            if should_lift_early:
                 target_tp2 = round(float(tp2), digits)
                 for lk in runner_layers:
                     l_info = layers.get(lk)
@@ -3653,6 +3831,237 @@ class MT5Executor:
             "runner_tickets": runner_tickets,
             "lifted_tickets": lifted_tickets,
             "reset_tickets": reset_tickets,
+        }
+
+    def _resolve_signal_primary_entry(self, signal_data: Dict[str, Any]) -> Optional[float]:
+        """Resolve primary L1 / recorded signal entry price for measuring % progress toward TP1."""
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        layers = signal_data.get("layers") or {}
+        for lk in ("L1", "TOP"):
+            l_obj = layers.get(lk)
+            if isinstance(l_obj, dict):
+                tp_px = l_obj.get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
+                    return float(tp_px)
+        for key in ("recorded_entry_price", "initial_price"):
+            val = signal_data.get(key)
+            if isinstance(val, numbers.Real) and not isinstance(val, bool) and float(val) > 0:
+                return float(val)
+        z = signal_data.get("zone")
+        if isinstance(z, dict):
+            zv = z.get("top") if direction == "BUY" else z.get("bottom")
+            if isinstance(zv, numbers.Real) and not isinstance(zv, bool) and float(zv) > 0:
+                return float(zv)
+        for lk in ("L2", "L3", "L4", "MID", "BOTTOM"):
+            l_obj = layers.get(lk)
+            if isinstance(l_obj, dict):
+                tp_px = l_obj.get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
+                    return float(tp_px)
+        return None
+
+    def evaluate_gold_reversal_guard(
+        self,
+        signal_data: Dict[str, Any],
+        tick: Any = None,
+        runner_entry_override: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gold (XAUUSD) Calibrated Peak-Profit Giveback Guard ("Bank It" Without Choking Winners):
+        1. Strict Arming Zone (`ARM_THRESHOLD_PCT = 0.85`): stays completely OFF in mid-range;
+           only sets `reversal_guard_armed = True` once progress reaches >= 85% of distance to TP1
+           (or once `tp1_reached == True`).
+        2. Healthy Reversal Trigger (`GIVEBACK_PCT = 0.30`): tracks `drawdown_from_peak =
+           (peak_profit - current_profit) / peak_profit` (with post-TP1 cap `MAX_GIVEBACK_DOLLARS`).
+           Triggers market exit ONLY when giveback threshold is breached AND pullback >= Gold noise floor.
+        3. Gold Noise Floor (`MIN_GOLD_PULLBACK_DOLLARS = 1.50`): requires at least
+           `max(1.50, 0.35 * M1_ATR_14)` dollars of actual price reversal.
+        4. Adaptive Spread Spike Filter: pauses exit triggers during temporary spread spikes.
+        5. Scaling Continuity: keeps `reversal_guard_armed = True` and updates `peak_profit`
+           dynamically across TP1 -> TP2 -> TP3 -> TP4.
+        """
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+
+        if tick is None:
+            tick = self.get_tick(symbol)
+        if tick is None:
+            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": False}
+
+        raw_exec = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+        if not isinstance(raw_exec, numbers.Real) or isinstance(raw_exec, bool) or float(raw_exec) <= 0:
+            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": False}
+        exec_price = float(raw_exec)
+
+        is_spike, spread_dollars, eff_max_spread = self.check_spread_spike(symbol, tick)
+        signal_data["spread_spike_paused"] = is_spike
+
+        layers = signal_data.get("layers") or {}
+        market_tickets = list(signal_data.get("market_tickets") or [])
+        raw_rls = signal_data.get("runner_layers")
+        if isinstance(raw_rls, list) and raw_rls:
+            runner_layers = [str(x) for x in raw_rls if x]
+        else:
+            full_cnt = _int_num(_cfg("RUNNER_DEEPEST_COUNT_FULL", RUNNER_DEEPEST_COUNT_FULL), 1)
+            runner_layers, _ = select_dynamic_runners(layers, market_tickets, full_runner_count=full_cnt)
+
+        primary_rl = runner_layers[-1] if runner_layers else signal_data.get("runner_layer")
+        sig_entry = self._resolve_signal_primary_entry(signal_data)
+
+        runner_entry: Optional[float] = None
+        if runner_entry_override is not None and float(runner_entry_override) > 0:
+            runner_entry = float(runner_entry_override)
+        elif primary_rl and isinstance(layers.get(primary_rl), dict):
+            tp_px = layers[primary_rl].get("target_price")
+            if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
+                runner_entry = float(tp_px)
+        if runner_entry is None:
+            runner_entry = sig_entry
+        if sig_entry is None:
+            sig_entry = runner_entry
+
+        if runner_entry is None or runner_entry <= 0:
+            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": is_spike}
+
+        pip_size = self.get_pip_size(symbol)
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
+        raw_tp1 = signal_data.get("raw_tp1") or tp_levels.get("TP1")
+
+        current_profit = round((exec_price - runner_entry) if is_buy else (runner_entry - exec_price), 6)
+
+        # Re-anchor stored peak_profit cleanly if deepest runner layer changed (e.g. deeper limit filled)
+        prev_r_entry = signal_data.get("reversal_guard_runner_entry")
+        prev_peak_px = signal_data.get("runner_peak_price")
+        prev_peak_profit = _num(
+            signal_data.get("peak_profit", signal_data.get("reversal_guard_peak_profit", 0.0)),
+            0.0,
+        )
+        if prev_r_entry is not None and abs(float(prev_r_entry) - runner_entry) > 1e-6 and prev_peak_px is not None:
+            prev_peak_profit = round((float(prev_peak_px) - runner_entry) if is_buy else (runner_entry - float(prev_peak_px)), 6)
+        signal_data["reversal_guard_runner_entry"] = runner_entry
+
+        arm_pct = float(_cfg("ARM_THRESHOLD_PCT", ARM_THRESHOLD_PCT))
+        armed = bool(signal_data.get("reversal_guard_armed", False))
+
+        if not armed:
+            if signal_data.get("tp1_reached"):
+                armed = True
+            elif raw_tp1 is not None and sig_entry is not None:
+                tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
+                if tp1_leg > 1e-9:
+                    # Only arm on genuine market move (do not arm on an artificial negative-bid spread spike)
+                    sig_progress = ((exec_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - exec_price) / tp1_leg)
+                    if sig_progress + 1e-9 >= arm_pct and current_profit > 0:
+                        armed = True
+
+            if armed:
+                signal_data["reversal_guard_armed"] = True
+                peak_profit = max(prev_peak_profit, current_profit)
+                peak_px = exec_price
+                if prev_peak_px is not None:
+                    peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
+                signal_data["peak_profit"] = round(peak_profit, 6)
+                signal_data["reversal_guard_peak_profit"] = round(peak_profit, 6)
+                signal_data["runner_peak_price"] = round(peak_px, digits)
+                signal_data["runner_reversal_ticks"] = 0
+                logger.info(
+                    f"Gold Reversal Guard ARMED (exec={exec_price}, peak_profit=${peak_profit:.2f}, "
+                    f"runner_entry={runner_entry}, arm_pct={arm_pct*100:.0f}%)"
+                )
+            else:
+                signal_data["reversal_guard_armed"] = False
+                return {
+                    "armed": False,
+                    "triggered": False,
+                    "paused_by_spread": is_spike,
+                    "spread_dollars": spread_dollars,
+                    "max_allowed_spread": eff_max_spread,
+                    "peak_profit": prev_peak_profit,
+                    "current_profit": current_profit,
+                    "pullback_dollars": 0.0,
+                    "drawdown_from_peak": 0.0,
+                    "noise_floor_dollars": float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS)),
+                    "m1_atr_14": 0.0,
+                    "peak_price": prev_peak_px,
+                    "live_price": exec_price,
+                }
+
+        # Armed: continuously update peak_profit & runner_peak_price as runner climbs TP1 -> TP2 -> TP3 -> TP4
+        peak_profit = max(prev_peak_profit, current_profit)
+        if prev_peak_px is None:
+            peak_px = exec_price
+        else:
+            peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
+
+        if current_profit > prev_peak_profit + 1e-9:
+            signal_data["runner_reversal_ticks"] = 0
+
+        signal_data["peak_profit"] = round(peak_profit, 6)
+        signal_data["reversal_guard_peak_profit"] = round(peak_profit, 6)
+        signal_data["runner_peak_price"] = round(peak_px, digits)
+
+        pullback_dollars = max(0.0, round(peak_profit - current_profit, 6))
+        drawdown_from_peak = (pullback_dollars / peak_profit) if peak_profit > 1e-9 else 0.0
+        signal_data["drawdown_from_peak"] = round(drawdown_from_peak, 6)
+
+        m1_atr_14 = self.get_m1_atr(symbol)
+        min_pb_dollars = float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS))
+        atr_mult = float(_cfg("ATR_NOISE_FLOOR_MULT", ATR_NOISE_FLOOR_MULT))
+        noise_floor_dollars = round(max(min_pb_dollars, atr_mult * m1_atr_14), 4)
+
+        if is_spike:
+            logger.info(
+                f"Gold Reversal Guard PAUSED due to spread spike (${spread_dollars:.2f} > ${eff_max_spread:.2f} max)"
+            )
+            return {
+                "armed": True,
+                "triggered": False,
+                "paused_by_spread": True,
+                "spread_dollars": spread_dollars,
+                "max_allowed_spread": eff_max_spread,
+                "peak_profit": peak_profit,
+                "current_profit": current_profit,
+                "pullback_dollars": pullback_dollars,
+                "drawdown_from_peak": drawdown_from_peak,
+                "noise_floor_dollars": noise_floor_dollars,
+                "m1_atr_14": m1_atr_14,
+                "peak_price": peak_px,
+                "live_price": exec_price,
+            }
+
+        giveback_pct = float(_cfg("GIVEBACK_PCT", GIVEBACK_PCT))
+        max_gb_dollars = float(_cfg("MAX_GIVEBACK_DOLLARS", MAX_GIVEBACK_DOLLARS))
+
+        if signal_data.get("tp1_reached") and max_gb_dollars > 0.0:
+            # Post-TP1 (TP2-TP4): 30% giveback capped at MAX_GIVEBACK_DOLLARS ($4.50) and floored at noise_floor_dollars
+            pct_req = giveback_pct * peak_profit
+            eff_req_dollars = max(noise_floor_dollars, min(max_gb_dollars, pct_req))
+            triggered = (pullback_dollars + 1e-9 >= eff_req_dollars) and (peak_profit > 0.0)
+        else:
+            # Pre-TP1: exact 30% peak-profit giveback AND >= Gold noise floor ($1.50 or 0.35 * M1_ATR_14)
+            triggered = (
+                peak_profit > 0.0
+                and drawdown_from_peak + 1e-9 >= giveback_pct
+                and pullback_dollars + 1e-9 >= noise_floor_dollars
+            )
+
+        return {
+            "armed": True,
+            "triggered": triggered,
+            "paused_by_spread": False,
+            "spread_dollars": spread_dollars,
+            "max_allowed_spread": eff_max_spread,
+            "peak_profit": peak_profit,
+            "current_profit": current_profit,
+            "pullback_dollars": pullback_dollars,
+            "drawdown_from_peak": drawdown_from_peak,
+            "noise_floor_dollars": noise_floor_dollars,
+            "m1_atr_14": m1_atr_14,
+            "peak_price": peak_px,
+            "live_price": exec_price,
         }
 
     def handle_tp1_scaling_and_select_runner(self, signal_data: Dict[str, Any]) -> Optional[int]:
@@ -3795,11 +4204,16 @@ class MT5Executor:
             if r_open is not None and r_open > 0:
                 runner_be_sl = round(r_open + offset_value, digits) if is_buy else round(r_open - offset_value, digits)
 
+            gold_guard_on = bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED))
             past_tp1_floor = True
             if live_price is not None:
                 past_tp1_floor = (live_price >= tp1_floor_price) if is_buy else (live_price <= tp1_floor_price)
 
-            if past_tp1_floor:
+            # In Gold Reversal Guard mode, lock at BE when price first touches TP1 so a $1.00 TP1 retest
+            # wick never stops out the runner prematurely; once TP1 is broken cleanly (+5p), lock TP1 floor.
+            use_tp1_lock = past_tp1_floor and (already_clean_tp1 or not gold_guard_on)
+
+            if use_tp1_lock:
                 if be_after_tp1 and runner_be_sl is not None:
                     floor_price = round(max(tp1_floor_price, runner_be_sl), digits) if is_buy else round(min(tp1_floor_price, runner_be_sl), digits)
                 else:
@@ -3816,7 +4230,7 @@ class MT5Executor:
                     t_open = float(l_info["target_price"])
                     t_be_sl = round(t_open + offset_value, digits) if is_buy else round(t_open - offset_value, digits)
 
-                t_sl = floor_price if past_tp1_floor else (t_be_sl if be_after_tp1 else None)
+                t_sl = floor_price if use_tp1_lock else (t_be_sl if be_after_tp1 else None)
                 if t_sl is not None:
                     if not self.modify_position_sltp(rt, sl=t_sl, tp=target_tp_val):
                         if be_after_tp1 and t_be_sl is not None and t_be_sl != t_sl:
@@ -3833,7 +4247,28 @@ class MT5Executor:
                         l_info["tp"] = target_tp_val
                         l_info["tp_stage"] = next_stage_key
         else:
+            r_open = None
             floor_price = None
+
+        # Scaling Continuity: carry forward peak_price & peak_profit and keep reversal_guard_armed = True
+        prev_peak_px = signal_data.get("runner_peak_price")
+        cand_peak = live_price if live_price is not None else raw_tp1
+        if prev_peak_px is not None and cand_peak is not None:
+            new_peak_px = max(float(prev_peak_px), float(cand_peak)) if is_buy else min(float(prev_peak_px), float(cand_peak))
+        else:
+            new_peak_px = cand_peak if cand_peak is not None else prev_peak_px
+
+        if runner_tickets and bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)):
+            signal_data["reversal_guard_armed"] = True
+            if r_open is not None and r_open > 0 and new_peak_px is not None:
+                pk_prof = round((float(new_peak_px) - r_open) if is_buy else (r_open - float(new_peak_px)), 6)
+                prev_pk_prof = _num(signal_data.get("peak_profit", 0.0), 0.0)
+                if signal_data.get("reversal_guard_runner_entry") not in (None, r_open):
+                    prev_pk_prof = pk_prof
+                best_prof = max(0.0, pk_prof, prev_pk_prof)
+                signal_data["peak_profit"] = round(best_prof, 6)
+                signal_data["reversal_guard_peak_profit"] = round(best_prof, 6)
+                signal_data["reversal_guard_runner_entry"] = r_open
 
         signal_data["last_banked_tickets"] = banked_tickets
         signal_data["runner_layers"] = list(runner_layers)
@@ -3851,7 +4286,7 @@ class MT5Executor:
         signal_data["runner_reversal_ticks"] = 0
         signal_data["shortfall_reversal_ticks"] = 0
         signal_data["tp2_shortfall_armed"] = False
-        signal_data["runner_peak_price"] = live_price if live_price is not None else raw_tp1
+        signal_data["runner_peak_price"] = new_peak_px
         signal_data["tp1_reached"] = True
         signal_data["market_tickets"] = surviving_tickets
 
@@ -3985,47 +4420,62 @@ class MT5Executor:
         close_position: bool = True,
         ceiling_stage: Optional[int] = None,
     ) -> bool:
-        """Close all active runner_tickets (preserving any other surviving market_tickets) and update signal status."""
-        r_tickets = [_int_num(t, 0) for t in runner_tickets if _int_num(t, 0) > 0]
-        if close_position:
-            for rt in r_tickets:
-                self.close_market_position(rt)
-        else:
-            self.invalidate_realized_pnl_cache()
+        """
+        Atomically close all active runner_tickets under `is_closing = True` lock
+        (preserving any other surviving market_tickets) and update signal status.
+        """
+        if not self.try_begin_signal_close(signal_data):
+            logger.warning(f"Atomic exit lock: duplicate _finalize_runner_exit skipped ({reason}).")
+            return False
 
-        layers = signal_data.get("layers") or {}
-        for lk in runner_layers:
-            if lk and isinstance(layers.get(lk), dict):
-                layers[lk]["status"] = "CLOSED"
+        try:
+            r_tickets = [_int_num(t, 0) for t in runner_tickets if _int_num(t, 0) > 0]
+            already_closed_once = set(signal_data.get("_closed_tickets_once") or [])
+            if close_position:
+                for rt in r_tickets:
+                    if rt in already_closed_once:
+                        continue
+                    self.close_market_position(rt)
+                    already_closed_once.add(rt)
+                signal_data["_closed_tickets_once"] = sorted(already_closed_once)
+            else:
+                self.invalidate_realized_pnl_cache()
 
-        r_set = set(r_tickets)
-        remaining_mkt = [t for t in (signal_data.get("market_tickets") or []) if t not in r_set]
-        signal_data["market_tickets"] = remaining_mkt
-        signal_data["last_runner_tickets"] = list(r_tickets)
-        signal_data["last_runner_ticket"] = r_tickets[-1] if r_tickets else None
-        signal_data["runner_close_reason"] = reason
-        signal_data["runner_tickets"] = []
-        signal_data["runner_ticket"] = None
-        signal_data["runner_layers"] = []
-        signal_data["runner_layer"] = None
-        signal_data["runner_proximity_armed"] = False
-        signal_data["runner_reversal_ticks"] = 0
-        signal_data["tp2_shortfall_armed"] = False
+            layers = signal_data.get("layers") or {}
+            for lk in runner_layers:
+                if lk and isinstance(layers.get(lk), dict):
+                    layers[lk]["status"] = "CLOSED"
 
-        if ceiling_stage is not None:
-            c_key = f"TP{ceiling_stage}"
-            signal_data[f"tp{ceiling_stage}_reached"] = True
-            if ceiling_stage >= 2:
-                signal_data["tp2_reached"] = True
-            signal_data["tp_stage"] = c_key
-            cleared = list(signal_data.get("runner_cleared_milestones") or [])
-            if c_key not in cleared:
-                cleared.append(c_key)
-            signal_data["runner_cleared_milestones"] = cleared
+            r_set = set(r_tickets)
+            remaining_mkt = [t for t in (signal_data.get("market_tickets") or []) if t not in r_set]
+            signal_data["market_tickets"] = remaining_mkt
+            signal_data["last_runner_tickets"] = list(r_tickets)
+            signal_data["last_runner_ticket"] = r_tickets[-1] if r_tickets else None
+            signal_data["runner_close_reason"] = reason
+            signal_data["runner_tickets"] = []
+            signal_data["runner_ticket"] = None
+            signal_data["runner_layers"] = []
+            signal_data["runner_layer"] = None
+            signal_data["runner_proximity_armed"] = False
+            signal_data["runner_reversal_ticks"] = 0
+            signal_data["tp2_shortfall_armed"] = False
 
-        has_open_or_pending = bool(remaining_mkt or signal_data.get("pending_tickets"))
-        signal_data["status"] = "BE_APPLIED" if has_open_or_pending else "CLOSED"
-        return False
+            if ceiling_stage is not None:
+                c_key = f"TP{ceiling_stage}"
+                signal_data[f"tp{ceiling_stage}_reached"] = True
+                if ceiling_stage >= 2:
+                    signal_data["tp2_reached"] = True
+                signal_data["tp_stage"] = c_key
+                cleared = list(signal_data.get("runner_cleared_milestones") or [])
+                if c_key not in cleared:
+                    cleared.append(c_key)
+                signal_data["runner_cleared_milestones"] = cleared
+
+            has_open_or_pending = bool(remaining_mkt or signal_data.get("pending_tickets"))
+            signal_data["status"] = "BE_APPLIED" if has_open_or_pending else "CLOSED"
+            return False
+        finally:
+            self.end_signal_close(signal_data)
 
     def _manage_4layer_runner(self, signal_data: Dict[str, Any]) -> bool:
         """
@@ -4214,6 +4664,7 @@ class MT5Executor:
         if runner_entry is not None and float(runner_entry) > 0:
             be_floor = round(float(runner_entry) + be_offset, digits) if is_buy else round(float(runner_entry) - be_offset, digits)
 
+        gold_guard_on = bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED))
         while k < max_stage:
             target = tp_levels.get(f"TP{k}")
             if target is None:
@@ -4233,7 +4684,13 @@ class MT5Executor:
             signal_data["runner_proximity_armed"] = False
             signal_data["runner_reversal_ticks"] = 0
             signal_data["tp2_shortfall_armed"] = False
-            signal_data["runner_peak_price"] = live_price
+            prev_pk_px = signal_data.get("runner_peak_price")
+            if prev_pk_px is not None:
+                signal_data["runner_peak_price"] = max(float(prev_pk_px), live_price) if is_buy else min(float(prev_pk_px), live_price)
+            else:
+                signal_data["runner_peak_price"] = live_price
+            if gold_guard_on:
+                signal_data["reversal_guard_armed"] = True
 
             if k == 1:
                 tp1_lock = target_f - lock_buf if is_buy else target_f + lock_buf
@@ -4245,13 +4702,16 @@ class MT5Executor:
                 floor_price = round(max(cands) if is_buy else min(cands), digits)
             else:
                 prev_tp = tp_levels.get(f"TP{k - 1}")
-                trail_cand = target_f - trail_dist if is_buy else target_f + trail_dist
-                cands = [trail_cand]
+                cands = []
+                if not gold_guard_on:
+                    trail_cand = target_f - trail_dist if is_buy else target_f + trail_dist
+                    cands.append(trail_cand)
                 if prev_tp is not None:
                     cands.append(float(prev_tp))
                 if floor_price is not None:
                     cands.append(float(floor_price))
-                floor_price = round(max(cands) if is_buy else min(cands), digits)
+                if cands:
+                    floor_price = round(max(cands) if is_buy else min(cands), digits)
 
             k += 1
             step_stage = f"TP{k}"
@@ -4277,9 +4737,69 @@ class MT5Executor:
             signal_data["runner_sl_floor"] = floor_price
             signal_data["soft_tp1_floor"] = floor_price
 
-        # 5. Strict Proximity Reversal Guard ("Bank It") + Proactive Broker TP Lift at Current TPk
+        # 5. Reversal Guard ("Bank It") + Proactive Broker TP Lift at Current TPk
         cur_target = tp_levels.get(f"TP{k}")
-        if cur_target is not None:
+        if gold_guard_on:
+            # Proactive broker TP lift to TP{k+1} at 70% of current leg so hard broker TP never caps momentum
+            if cur_target is not None and bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT)) and k < max_stage:
+                cur_target_f = float(cur_target)
+                anchor = self._resolve_milestone_anchor(signal_data, tp_levels, k, fallback_entry=runner_entry)
+                lift_now = False
+                if anchor is not None and float(anchor) > 0:
+                    leg_span = (cur_target_f - float(anchor)) if is_buy else (float(anchor) - cur_target_f)
+                    if leg_span > 1e-9:
+                        prog = ((live_price - float(anchor)) / leg_span) if is_buy else ((float(anchor) - live_price) / leg_span)
+                        if prog + 1e-9 >= float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT)):
+                            lift_now = True
+                if not lift_now:
+                    eff_buf, _ = self._compute_proximity_and_pullback(cur_target_f, live_price, pip_size, anchor=anchor)
+                    dist_t = (cur_target_f - live_price) if is_buy else (live_price - cur_target_f)
+                    if dist_t <= eff_buf + 1e-9:
+                        lift_now = True
+                if lift_now:
+                    lift_stage = f"TP{k + 1}"
+                    lift_tp = tp_levels.get(lift_stage)
+                    if lift_tp is not None:
+                        self._step_runner_broker_tp_and_sl(
+                            signal_data,
+                            runner_tickets,
+                            runner_layers,
+                            new_sl=None,
+                            new_tp=float(lift_tp),
+                            new_stage=lift_stage,
+                            digits=digits,
+                        )
+
+            guard_res = self.evaluate_gold_reversal_guard(
+                signal_data,
+                tick=tick,
+                runner_entry_override=runner_entry,
+            )
+            if guard_res.get("triggered"):
+                candle_ok = True
+                if _cfg("RUNNER_REVERSAL_CANDLE_CONFIRM", RUNNER_REVERSAL_CANDLE_CONFIRM):
+                    candle = self.get_last_closed_m1_candle(p_symbol)
+                    if not candle:
+                        candle_ok = False
+                    elif is_buy:
+                        candle_ok = candle["close"] < candle["open"]
+                    else:
+                        candle_ok = candle["close"] > candle["open"]
+                if candle_ok:
+                    pk_px = guard_res.get("peak_price", live_price)
+                    dd_pct = guard_res.get("drawdown_from_peak", 0.0) * 100.0
+                    pb_dlr = guard_res.get("pullback_dollars", 0.0)
+                    logger.info(
+                        f"Runner {runner_tickets}: Gold Reversal Guard BANK IT at TP{k} "
+                        f"(peak={pk_px}, live={live_price}, giveback={dd_pct:.1f}% / ${pb_dlr:.2f}). Closing at market."
+                    )
+                    return self._finalize_runner_exit(
+                        signal_data,
+                        runner_tickets,
+                        runner_layers,
+                        reason=f"Gold Reversal Guard (TP{k}, Peak: {pk_px}, Giveback: {dd_pct:.1f}% / ${pb_dlr:.2f})",
+                    )
+        elif cur_target is not None:
             cur_target_f = float(cur_target)
             anchor = self._resolve_milestone_anchor(signal_data, tp_levels, k, fallback_entry=runner_entry)
             cur_peak = signal_data.get("runner_peak_price")
@@ -4361,30 +4881,32 @@ class MT5Executor:
                 else:
                     signal_data["runner_reversal_ticks"] = 0
 
-        # 6. Continuous One-Way Hard Broker SL Trailing across all runner_tickets
-        trail_step = float(_cfg("TRAIL_STEP_PIPS", TRAIL_STEP_PIPS)) * pip_size
-        if is_buy:
-            floor_bound = float(floor_price) if floor_price is not None else 0.0
-            candidate_sl = max(floor_bound, round(live_price - trail_dist, digits))
-            if candidate_sl >= round((pos_sl or 0.0) + trail_step, digits) - 1e-9 and (live_price - candidate_sl) >= min_stop_dist - 1e-9:
-                logger.info(f"Runner {runner_tickets}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
-                any_mod = False
-                for rt in runner_tickets:
-                    if self.modify_position_sltp(rt, sl=candidate_sl, tp=None):
-                        any_mod = True
-                if any_mod and self.dry_run:
-                    signal_data["broker_sl"] = candidate_sl
-        else:
-            floor_bound = float(floor_price) if floor_price is not None else 999999.0
-            candidate_sl = min(floor_bound, round(live_price + trail_dist, digits))
-            if (pos_sl == 0.0 or candidate_sl <= round(pos_sl - trail_step, digits) + 1e-9) and (candidate_sl - live_price) >= min_stop_dist - 1e-9:
-                logger.info(f"Runner {runner_tickets}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
-                any_mod = False
-                for rt in runner_tickets:
-                    if self.modify_position_sltp(rt, sl=candidate_sl, tp=None):
-                        any_mod = True
-                if any_mod and self.dry_run:
-                    signal_data["broker_sl"] = candidate_sl
+        # 6. Optional Continuous One-Way Hard Broker SL Trailing (disabled by default when Gold Reversal Guard is active)
+        cont_trail_on = bool(_cfg("RUNNER_CONTINUOUS_TRAIL_ENABLED", RUNNER_CONTINUOUS_TRAIL_ENABLED)) or not gold_guard_on
+        if cont_trail_on:
+            trail_step = float(_cfg("TRAIL_STEP_PIPS", TRAIL_STEP_PIPS)) * pip_size
+            if is_buy:
+                floor_bound = float(floor_price) if floor_price is not None else 0.0
+                candidate_sl = max(floor_bound, round(live_price - trail_dist, digits))
+                if candidate_sl >= round((pos_sl or 0.0) + trail_step, digits) - 1e-9 and (live_price - candidate_sl) >= min_stop_dist - 1e-9:
+                    logger.info(f"Runner {runner_tickets}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
+                    any_mod = False
+                    for rt in runner_tickets:
+                        if self.modify_position_sltp(rt, sl=candidate_sl, tp=None):
+                            any_mod = True
+                    if any_mod and self.dry_run:
+                        signal_data["broker_sl"] = candidate_sl
+            else:
+                floor_bound = float(floor_price) if floor_price is not None else 999999.0
+                candidate_sl = min(floor_bound, round(live_price + trail_dist, digits))
+                if (pos_sl == 0.0 or candidate_sl <= round(pos_sl - trail_step, digits) + 1e-9) and (candidate_sl - live_price) >= min_stop_dist - 1e-9:
+                    logger.info(f"Runner {runner_tickets}: Trailing SL ratchet -> {candidate_sl} (live={live_price})")
+                    any_mod = False
+                    for rt in runner_tickets:
+                        if self.modify_position_sltp(rt, sl=candidate_sl, tp=None):
+                            any_mod = True
+                    if any_mod and self.dry_run:
+                        signal_data["broker_sl"] = candidate_sl
 
         return True
 

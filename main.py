@@ -52,6 +52,17 @@ from config import (
     RUNNER_REVERSAL_CONFIRM_TICKS,
     RUNNER_REVERSAL_CANDLE_CONFIRM,
     RUNNER_CLEAN_BREAK_PIPS,
+    GOLD_REVERSAL_GUARD_ENABLED,
+    ARM_THRESHOLD_PCT,
+    GIVEBACK_PCT,
+    MIN_GOLD_PULLBACK_DOLLARS,
+    ATR_NOISE_FLOOR_MULT,
+    MAX_GIVEBACK_DOLLARS,
+    MAX_ALLOWED_SPREAD_DOLLARS,
+    ADAPTIVE_SPREAD_CEILING_DOLLARS,
+    RUNNER_EARLY_TP_LIFT_PCT,
+    RUNNER_CONTINUOUS_TRAIL_ENABLED,
+    SHORTFALL_CONFIRM_TICKS,
     NOTIFY_SAVED_MESSAGES,
     DRY_RUN,
     LOG_FILE_PATH,
@@ -2709,12 +2720,17 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
         "runner_ticket", "runner_tickets", "runner_layer", "runner_layers",
         "runner_milestone_idx", "runner_milestone_name", "tp_stage",
         "runner_cleared_milestones", "runner_proximity_armed", "runner_reversal_ticks", "tp2_shortfall_armed",
+        "reversal_guard_armed", "peak_profit", "reversal_guard_peak_profit",
         "runner_sl_floor", "soft_tp1_floor", "broker_sl",
         "tp2_reached", "tp3_reached", "tp4_reached", "tp5_reached",
         "accounted_tickets", "banked_profit", "tp_levels",
     )
     important_changed = any(sig.get(k) != sig_before.get(k) for k in important_keys)
-    armed_now = bool(sig.get("runner_proximity_armed") or sig.get("tp2_shortfall_armed"))
+    armed_now = bool(
+        sig.get("runner_proximity_armed")
+        or sig.get("tp2_shortfall_armed")
+        or sig.get("reversal_guard_armed")
+    )
     now_mono = time.monotonic()
     t_key = f"{sig_chat}:{msg_id}"
 
@@ -2887,23 +2903,140 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
         await notify_saved_messages(alert)
         return
 
-    # Branch C: Calibrated TP1 Near-Miss Shortfall Protection (SHORTFALL_GUARD + Anti-Choke Confirm Ticks)
+    # Branch C: Layer-Separated Pre-TP1 Protection
+    # 1) Deepest Runner(s): Governed EXCLUSIVELY by Gold Calibrated Peak-Profit Giveback Guard
+    #    (arms at >=85% of TP1, triggers on >=30% peak-profit giveback AND >= max($1.50, 0.35*M1_ATR_14),
+    #     pauses on spread spikes).
+    # 2) Base Non-Runner Layers (L1-L3 when 4 layers active): Governed by calibrated TP1 Shortfall Guard
+    #    (arms within $0.80 / 8p of TP1 and >=85% of leg, triggers on >=$2.00 / 20p pullback + 3 ticks),
+    #    closing ONLY base layers while sparing the deepest runner!
+    _cfg_mod = sys.modules.get("config")
+    gold_guard_on = bool(
+        GOLD_REVERSAL_GUARD_ENABLED
+        if GOLD_REVERSAL_GUARD_ENABLED != getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True)
+        else getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)
+    )
+    layers_map = sig.get("layers") if isinstance(sig.get("layers"), dict) else {}
+    mkt_tkts = [int(t) for t in (sig.get("market_tickets") or []) if t is not None]
+    runner_layers, early_layers = executor.select_dynamic_runners(
+        layers_map, mkt_tkts, full_runner_count=RUNNER_DEEPEST_COUNT_FULL
+    )
+    if not runner_layers and not early_layers and mkt_tkts:
+        if len(mkt_tkts) == 1:
+            runner_tickets_pre = [mkt_tkts[0]]
+            early_tickets_pre: List[int] = []
+        else:
+            runner_tickets_pre = [mkt_tkts[-1]]
+            early_tickets_pre = list(mkt_tkts[:-1])
+    else:
+        early_tickets_pre = [
+            int(layers_map[lk]["ticket"])
+            for lk in early_layers
+            if isinstance(layers_map.get(lk), dict)
+            and layers_map[lk].get("ticket") is not None
+            and int(layers_map[lk]["ticket"]) in mkt_tkts
+        ]
+        runner_tickets_pre = [
+            int(layers_map[lk]["ticket"])
+            for lk in runner_layers
+            if isinstance(layers_map.get(lk), dict)
+            and layers_map[lk].get("ticket") is not None
+            and int(layers_map[lk]["ticket"]) in mkt_tkts
+        ]
+
+    # C1. Gold Calibrated Peak-Profit Giveback Guard on Active Deepest Runner(s)
+    is_spike = False
+    if gold_guard_on and runner_tickets_pre:
+        sig_before_rg = copy.deepcopy(sig)
+        rg_res = await _mt5_call(executor.evaluate_gold_reversal_guard, sig, tick)
+        is_spike = bool(rg_res.get("paused_by_spread"))
+        if rg_res.get("triggered"):
+            if not await _mt5_call(executor.try_begin_signal_close, sig):
+                return
+            try:
+                pk_px = rg_res.get("peak_price", curr_price)
+                dd_pct = float(rg_res.get("drawdown_from_peak") or 0.0) * 100.0
+                pb_dlr = float(rg_res.get("pullback_dollars") or 0.0)
+                nf_dlr = float(rg_res.get("noise_floor_dollars") or MIN_GOLD_PULLBACK_DOLLARS)
+                logger.warning(
+                    f"⚠️ GOLD REVERSAL GUARD TRIGGERED near TP1 on Msg ID {msg_id}! "
+                    f"Peak={pk_px}, Live={curr_price}, Giveback={dd_pct:.1f}% (${pb_dlr:.2f} >= ${nf_dlr:.2f}), TP1={raw_tp1}"
+                )
+                closed_tickets = list(sig.get("market_tickets", []))
+                for t in closed_tickets:
+                    await _mt5_call(executor.close_market_position, t)
+                for pt in sig.get("pending_tickets", []):
+                    await _mt5_call(executor.cancel_pending_order, pt)
+
+                for lk in layers_map:
+                    if isinstance(layers_map[lk], dict):
+                        layers_map[lk]["status"] = "CLOSED"
+
+                added_profit, _ = await _account_closed_tickets(sig, closed_tickets)
+                sig["status"] = "CLOSED"
+                sig["market_tickets"] = []
+                sig["pending_tickets"] = []
+                sig["runner_tickets"] = []
+                sig["runner_ticket"] = None
+                sig["layers"] = layers_map
+                sig["runner_close_reason"] = (
+                    f"Gold Reversal Guard (TP1, Peak: {pk_px}, Giveback: {dd_pct:.1f}% / ${pb_dlr:.2f})"
+                )
+            finally:
+                await _mt5_call(executor.end_signal_close, sig)
+
+            state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+            fin = await _mt5_call(executor.get_account_financials)
+            curr = fin.get("currency", "GBP")
+            await _record_signal_to_ledger(
+                msg_id, sig, exit_reason="Gold Reversal Guard (TP1 Near-Miss)", currency=curr
+            )
+            profit_str = format_profit(added_profit, curr)
+            await notify_saved_messages(
+                f"🛡️ **Gold Calibrated Reversal Guard Banked! [ID: {msg_id}]**\n"
+                f"• Symbol: `{symbol}` ({direction})\n"
+                f"• Peak Price: `{pk_px}` (TP1 `{raw_tp1}`)\n"
+                f"• Reversal Price: `{curr_price}` (`{dd_pct:.1f}%` giveback / `${pb_dlr:.2f}` >= `${nf_dlr:.2f}` floor)\n"
+                f"• 💰 **Amount Made:** `{profit_str}`\n"
+                f"• Remaining open profit banked at market & pending orders cancelled!\n\n"
+                f"{fin['formatted']}"
+            )
+            return
+
+        if sig != sig_before_rg:
+            state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+
+    # C2. Runner Override: Disable tight TP1 Shortfall Guard when no non-runner base layers exist
+    #     (e.g. N=1 single-layer trade where L1 dynamically acts as the deepest runner).
+    if gold_guard_on and not early_tickets_pre:
+        if sig.get("shortfall_armed"):
+            sig["shortfall_armed"] = False
+            sig["shortfall_reversal_ticks"] = 0
+            state_mgr.update_signal(
+                msg_id,
+                {"shortfall_armed": False, "shortfall_reversal_ticks": 0},
+                chat_id=sig_chat,
+            )
+        return
+
+    # C3. Calibrated Base-Layer TP1 Shortfall Guard (acts ONLY on non-runner base layers L1-L3)
     raw_arm_dist = float(SHORTFALL_ARM_PIPS) * pip_size
     entry_ref = sig.get("recorded_entry_price") if sig.get("recorded_entry_price") is not None else sig.get("initial_price")
     if entry_ref is None and isinstance(sig.get("zone"), dict):
         z_dict = sig["zone"]
         entry_ref = z_dict.get("top") if direction == "BUY" else z_dict.get("bottom")
-    if entry_ref is None and isinstance(sig.get("layers"), dict):
-        l1_obj = sig["layers"].get("L1") or sig["layers"].get("TOP") or {}
+    if entry_ref is None and isinstance(layers_map, dict):
+        l1_obj = layers_map.get("L1") or layers_map.get("TOP") or {}
         entry_ref = l1_obj.get("target_price")
     if isinstance(entry_ref, (int, float)) and not isinstance(entry_ref, bool):
         leg_dist = abs(float(raw_tp1) - float(entry_ref))
-        arm_dist = min(raw_arm_dist, leg_dist * float(RUNNER_MAX_MIDRANGE_RATIO)) if leg_dist > 0 else raw_arm_dist
+        max_leg_ratio = (1.0 - float(ARM_THRESHOLD_PCT)) if gold_guard_on else float(RUNNER_MAX_MIDRANGE_RATIO)
+        arm_dist = min(raw_arm_dist, leg_dist * max_leg_ratio) if leg_dist > 0 else raw_arm_dist
     else:
         arm_dist = raw_arm_dist
 
     pullback_dist = float(SHORTFALL_PULLBACK_PIPS) * pip_size
-    confirm_ticks_req = max(1, int(RUNNER_REVERSAL_CONFIRM_TICKS))
+    confirm_ticks_req = max(1, int(SHORTFALL_CONFIRM_TICKS if gold_guard_on else RUNNER_REVERSAL_CONFIRM_TICKS))
     shortfall_triggered = False
     peak_val = sig.get("peak_price")
 
@@ -2912,7 +3045,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
         if direction == "BUY"
         else curr_price <= round(float(raw_tp1) + arm_dist, 4)
     )
-    if not sig.get("shortfall_armed") and in_arm_zone:
+    if not sig.get("shortfall_armed") and in_arm_zone and not is_spike:
         sig["shortfall_armed"] = True
         sig["peak_price"] = curr_price
         sig["shortfall_reversal_ticks"] = 0
@@ -2923,7 +3056,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
         )
         peak_val = curr_price
 
-    if sig.get("shortfall_armed"):
+    if sig.get("shortfall_armed") and not is_spike:
         if direction == "BUY":
             if peak_val is None or curr_price > float(peak_val):
                 sig["peak_price"] = curr_price
@@ -2968,44 +3101,77 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 state_mgr.update_signal(msg_id, {"shortfall_reversal_ticks": 0}, chat_id=sig_chat)
 
     if shortfall_triggered:
-        logger.warning(
-            f"⚠️ TP1 SHORTFALL TRIGGERED on Msg ID {msg_id}! "
-            f"Peak={peak_val}, Reversal Price={curr_price}, TP1={raw_tp1}"
-        )
-        closed_tickets = list(sig.get("market_tickets", []))
-        for t in closed_tickets:
-            await _mt5_call(executor.close_market_position, t)
-        for pt in sig.get("pending_tickets", []):
-            await _mt5_call(executor.cancel_pending_order, pt)
+        if not await _mt5_call(executor.try_begin_signal_close, sig):
+            return
+        try:
+            target_close_tkts = list(early_tickets_pre) if (gold_guard_on and runner_tickets_pre) else list(sig.get("market_tickets", []))
+            logger.warning(
+                f"⚠️ TP1 SHORTFALL TRIGGERED on Msg ID {msg_id} (Base Tickets={target_close_tkts}, Runner Spared={runner_tickets_pre if gold_guard_on else []})! "
+                f"Peak={peak_val}, Reversal Price={curr_price}, TP1={raw_tp1}"
+            )
+            for t in target_close_tkts:
+                await _mt5_call(executor.close_market_position, t)
 
-        layers = sig.get("layers", {})
-        for lk in layers:
-            if isinstance(layers[lk], dict):
-                layers[lk]["status"] = "CLOSED"
+            if CANCEL_PENDING_ON_TP1 or not (gold_guard_on and runner_tickets_pre):
+                for pt in list(sig.get("pending_tickets", [])):
+                    await _mt5_call(executor.cancel_pending_order, pt)
+                sig["pending_tickets"] = []
+                for lv in layers_map.values():
+                    if isinstance(lv, dict) and lv.get("status") == "PENDING":
+                        lv["status"] = "CANCELLED"
 
-        added_profit, _ = await _account_closed_tickets(sig, closed_tickets)
-        sig["status"] = "CLOSED"
-        sig["market_tickets"] = []
-        sig["pending_tickets"] = []
-        sig["runner_tickets"] = []
-        sig["runner_ticket"] = None
-        sig["layers"] = layers
+            closed_set_sf = set(target_close_tkts)
+            for lk, lv in layers_map.items():
+                if isinstance(lv, dict) and lv.get("ticket") in closed_set_sf:
+                    lv["status"] = "CLOSED"
+
+            added_profit, _ = await _account_closed_tickets(sig, target_close_tkts)
+            surviving_mkt = [t for t in mkt_tkts if t not in closed_set_sf]
+            sig["market_tickets"] = surviving_mkt
+            sig["layers"] = layers_map
+            sig["shortfall_armed"] = False
+            sig["shortfall_reversal_ticks"] = 0
+
+            if gold_guard_on and surviving_mkt:
+                if BE_AFTER_TP1 and runner_layers:
+                    await _mt5_call(
+                        executor.apply_signal_breakeven,
+                        sig,
+                        list(runner_layers),
+                        BE_OFFSET_PIPS,
+                    )
+                sig["status"] = "BE_APPLIED" if BE_AFTER_TP1 else "ACTIVE"
+            else:
+                sig["status"] = "CLOSED"
+                sig["runner_tickets"] = []
+                sig["runner_ticket"] = None
+        finally:
+            await _mt5_call(executor.end_signal_close, sig)
+
         state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
-
         fin = await _mt5_call(executor.get_account_financials)
         curr = fin.get("currency", "GBP")
-        await _record_signal_to_ledger(msg_id, sig, exit_reason="TP1 Shortfall Guard", currency=curr)
         profit_str = format_profit(added_profit, curr)
 
-        await notify_saved_messages(
-            f"⚠️ **TP1 Shortfall Guard Triggered & Banked! [ID: {msg_id}]**\n"
-            f"• Symbol: `{symbol}` ({direction})\n"
-            f"• Peak Price: `{peak_val}` (within {SHORTFALL_ARM_PIPS} pips of TP1 `{raw_tp1}`)\n"
-            f"• Reversal Price: `{curr_price}` (pulled back {SHORTFALL_PULLBACK_PIPS} pips from peak)\n"
-            f"• 💰 **Amount Made:** `{profit_str}`\n"
-            f"• All positions banked at market & pending orders cancelled!\n\n"
-            f"{fin['formatted']}"
-        )
+        if sig["status"] == "CLOSED":
+            await _record_signal_to_ledger(msg_id, sig, exit_reason="TP1 Shortfall Guard", currency=curr)
+            await notify_saved_messages(
+                f"⚠️ **TP1 Shortfall Guard Triggered & Banked! [ID: {msg_id}]**\n"
+                f"• Symbol: `{symbol}` ({direction})\n"
+                f"• Peak Price: `{peak_val}` (within {SHORTFALL_ARM_PIPS} pips of TP1 `{raw_tp1}`)\n"
+                f"• Reversal Price: `{curr_price}` (pulled back {SHORTFALL_PULLBACK_PIPS} pips from peak)\n"
+                f"• 💰 **Amount Made:** `{profit_str}`\n"
+                f"• All base positions banked at market & pending orders cancelled!\n\n"
+                f"{fin['formatted']}"
+            )
+        else:
+            await notify_saved_messages(
+                f"⚠️ **Base Layers Banked via TP1 Shortfall — Runner Holding! [ID: {msg_id}]**\n"
+                f"• Symbol: `{symbol}` ({direction})\n"
+                f"• Banked Base Tickets: `{target_close_tkts}` (`{profit_str}`)\n"
+                f"• 🏃 **Active Runner `{runner_layers}` (`{sig['market_tickets']}`):** Protected at BE & riding under Gold Reversal Guard!\n\n"
+                f"{fin['formatted']}"
+            )
 
 
 async def tp1_proximity_watcher_task() -> None:

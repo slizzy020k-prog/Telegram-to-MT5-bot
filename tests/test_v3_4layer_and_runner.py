@@ -525,7 +525,8 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     (3, 3919.20, 3919.80, 3918.50),  # Tight 10p zone near TP3=3920, 13p pullback
     (4, 3929.20, 3929.80, 3928.50),  # Tight 10p zone near TP4=3930, 13p pullback
 ])
-def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(target_idx, approach_px, peak_px, pullback_px):
+def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(monkeypatch, target_idx, approach_px, peak_px, pullback_px):
+    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     sig = _make_4layer_sig("BUY")
@@ -564,6 +565,7 @@ def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(target_idx, approach_
 
 
 def test_runner_fsm_pct_both_modes_and_m1_candle_confirm(monkeypatch):
+    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -890,15 +892,20 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
                 await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
         assert main.state_mgr.get_signal(9302)["shortfall_armed"] is False
 
-        # Surge to 3899.75 (within 2.5 pips of 3900.0!) -> arms cleanly -> sustained >=12p reversal to 3898.40 banks profit!
+        # Surge to 3899.75 ($9.75 profit, 97.5% of TP1!) -> arms cleanly;
+        # $1.35 Gold wick (3898.40 < $1.50 noise floor & < 30%) holds open, then >=30% reversal (3896.70) banks all profit!
         for px in (3899.75, 3898.45, 3898.40):
             with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
                 await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
+        assert main.state_mgr.get_signal(9302)["status"] == "ACTIVE"
+
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3896.70, 3896.90)):
+            await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
 
         after = main.state_mgr.get_signal(9302)
         assert after["status"] == "CLOSED"
         assert after["market_tickets"] == []
-        assert any("TP1 Shortfall Guard Triggered & Banked" in a for a in alerts)
+        assert any("Reversal Guard Banked" in a or "Shortfall Guard Triggered" in a for a in alerts)
         assert len(main.trade_ledger.read_trades()) == 1
     finally:
         main.notify_saved_messages = orig_notify

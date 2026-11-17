@@ -398,6 +398,23 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"RUNNER_MAX_MIDRANGE_RATIO must be in (0, 1], got {midrange_ratio!r}."
         )
 
+    if hasattr(cfg, "GOLD_REVERSAL_GUARD_ENABLED"):
+        gold_rg = getattr(cfg, "GOLD_REVERSAL_GUARD_ENABLED")
+        if not isinstance(gold_rg, bool):
+            errors.append(f"GOLD_REVERSAL_GUARD_ENABLED must be a bool, got {gold_rg!r}.")
+
+    for ratio_name in ("ARM_THRESHOLD_PCT", "GIVEBACK_PCT", "RUNNER_EARLY_TP_LIFT_PCT"):
+        if hasattr(cfg, ratio_name):
+            r_val = getattr(cfg, ratio_name)
+            if not _is_finite_number(r_val) or not (0.0 < float(r_val) < 1.0):
+                errors.append(f"{ratio_name} must be in (0, 1), got {r_val!r}.")
+
+    for pos_guard_field in ("MIN_GOLD_PULLBACK_DOLLARS", "MAX_ALLOWED_SPREAD_DOLLARS", "ADAPTIVE_SPREAD_CEILING_DOLLARS"):
+        if hasattr(cfg, pos_guard_field):
+            p_val = getattr(cfg, pos_guard_field)
+            if not _is_finite_number(p_val) or float(p_val) <= 0.0:
+                errors.append(f"{pos_guard_field} must be > 0, got {p_val!r}.")
+
     if hasattr(cfg, "CLOSE_ON_SIGNAL_DELETED"):
         close_on_del = getattr(cfg, "CLOSE_ON_SIGNAL_DELETED")
         if not isinstance(close_on_del, bool):

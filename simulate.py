@@ -252,18 +252,17 @@ async def run_simulation() -> None:
     assert sig3["layers"]["L4"]["tp"] == 3920.0
     print(f"  [6c] Ignored 6p micro-noise & cleared TP2 -> stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
 
-    # Approach TP3 (3920.0) within strict 10p buffer ($1.00 -> >= 3919.0) -> arm -> peak 3919.80 -> 2-tick 13p reversal -> Bank It!
+    # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD, then >=$4.50 giveback (3915.20) Banks It!
     for px in (3919.20, 3919.80, 3918.50):
         with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
             assert main.executor.manage_designated_runner(sig3) is True
-    assert sig3["runner_reversal_ticks"] == 1
-    with patch.object(main.executor, "get_tick", return_value=_make_tick(3918.50, 3918.70)):
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3915.20, 3915.40)):
         still_running = main.executor.manage_designated_runner(sig3)
     assert still_running is False
     assert sig3["layers"]["L4"]["status"] == "CLOSED"
     assert sig3["market_tickets"] == [] and sig3["status"] == "CLOSED"
-    assert "Bank It" in (sig3.get("runner_close_reason") or "")
-    print(f"  [6d] Confirmed 2-tick Reversal Guard near TP3: {sig3['runner_close_reason']}.")
+    assert "Gold Reversal Guard" in (sig3.get("runner_close_reason") or "")
+    print(f"  [6d] Confirmed Gold Reversal Guard near TP3 (held $1.30 wick, banked on reversal): {sig3['runner_close_reason']}.")
 
     main.state_mgr.update_signal(20003, sig3, chat_id=evt3.chat_id)
     ledger_rec = main.trade_ledger.record_closed_signal(

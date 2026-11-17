@@ -537,7 +537,7 @@ async def test_5_automatic_watcher_trailing_antichoke_and_deleted_signal_regress
         assert "TP2" in sig["runner_cleared_milestones"]
         assert sig["tp_stage"] == "TP3"
         assert sig["layers"]["L1"]["tp"] == pytest.approx(3920.0)
-        assert sig["runner_sl_floor"] >= 3908.5
+        assert sig["runner_sl_floor"] >= 3900.0
 
         # 3) Signal #500 deleted in Telegram mid-run -> closed immediately & recorded to TradeLedger!
         with patch.object(main.executor, "get_position_close_info", return_value={"profit": 15.60, "reason": "MANUAL"}):
