@@ -171,7 +171,7 @@ async def test_spec_1_sell_now_price_guard_mocked_mt5_and_telethon(tmp_path, cap
 
         sig_exec = main.state_mgr.get_signal(101)
         assert sig_exec["status"] == "ACTIVE"
-        assert len(sig_exec["market_tickets"]) == 4
+        assert len(sig_exec["market_tickets"]) == 1
         assert any(r.get("action") == mt5.TRADE_ACTION_DEAL and r.get("type") == mt5.ORDER_TYPE_SELL for r in env["sent_requests"])
         assert any("[PRICE GUARD]" in rec.message and "SELL" in rec.message and "2650.0" in rec.message and "2651.2" in rec.message and "Action: EXECUTED" in rec.message for rec in caplog.records)
 
@@ -241,7 +241,7 @@ async def test_spec_2_buy_now_price_guard_mocked_mt5_and_telethon(tmp_path, capl
 
         sig_exec = main.state_mgr.get_signal(201)
         assert sig_exec["status"] == "ACTIVE"
-        assert len(sig_exec["market_tickets"]) == 4
+        assert len(sig_exec["market_tickets"]) == 1
         assert any(r.get("action") == mt5.TRADE_ACTION_DEAL and r.get("type") == mt5.ORDER_TYPE_BUY for r in env["sent_requests"])
         assert any("[PRICE GUARD]" in rec.message and "BUY" in rec.message and "2650.0" in rec.message and "2649.1" in rec.message and "Action: EXECUTED" in rec.message for rec in caplog.records)
 
@@ -421,6 +421,8 @@ async def test_spec_4_tp1_invalidation_via_live_market_price_mid_delay_and_zone(
             env["pending_orders"].append(SimpleNamespace(ticket=pt, symbol=DEFAULT_SYMBOL, volume_current=0.01, magic=MAGIC_NUMBER))
 
         env["sent_requests"].clear()
+        tick_ref["tick"] = SimpleNamespace(bid=2644.50, ask=2644.90, time=now_srv)
+        await main._process_pre_tp1_or_backstop_tick(402, main.state_mgr.get_signal(402))
         tick_ref["tick"] = SimpleNamespace(bid=2655.20, ask=2655.50, time=now_srv)
         watcher = asyncio.create_task(main.tp1_proximity_watcher_task())
         await asyncio.sleep(0.05)
@@ -588,13 +590,13 @@ async def test_spec_7_zero_delay_immediate_now_execution(tmp_path):
         assert len(s_buy["market_tickets"]) == 4
         assert s_buy["pending_tickets"] == []
 
-        # 2. Immediate Sell now -> enters 4-layer Market SELL immediately
+        # 2. Immediate Sell now stub -> enters L1 Market SELL immediately
         await main.handle_new_message(_make_event(702, "Sell now"))
         assert main._pending_sell_now_tasks == {}
         s_sell = main.state_mgr.get_signal(702)
         assert s_sell is not None
         assert s_sell["status"] == "ACTIVE"
-        assert len(s_sell["market_tickets"]) == 4
+        assert len(s_sell["market_tickets"]) == 1
 
         # 3. Follow-up zone edit updates SL/TP on all 4 layers without exceeding 4 orders
         await main.handle_message_edited(_make_event(702, "Sell 3850-3855\nSL 3865\nTP 3840"))
@@ -725,10 +727,11 @@ async def test_spec_9_buy_limit_and_sell_limit_live_activation_and_stops_fallbac
             assert main.state_mgr.get_signal(9102, chat_id=-1004369388188)["status"] == "ACTIVE"
             assert main.state_mgr.get_signal(9103, chat_id=-1004369388188)["status"] == "ACTIVE"
 
-            # Now dip to 3841.0 (below 3843 TP1, near 3840 entry) -> arms BUY LIMIT guard, then bounce to 3843.2 -> invalidates 9101!
-            tick_ref["tick"] = SimpleNamespace(bid=3840.6, ask=3841.1, time=1794886035)
+            # Now dip into entry zone (ask=3839.9 <= 3840.0 top) -> arms BUY LIMIT guard, then bounce to 3843.1 -> invalidates 9101!
+            tick_ref["tick"] = SimpleNamespace(bid=3839.4, ask=3839.9, time=1794886035)
             await asyncio.sleep(1.1)
             assert main.state_mgr.get_signal(9101, chat_id=-1003712081715)["tp1_guard_armed"] is True
+            assert main.state_mgr.get_signal(9101, chat_id=-1003712081715)["has_entered_zone"] is True
 
             tick_ref["tick"] = SimpleNamespace(bid=3843.1, ask=3843.6, time=1794886036)
             await asyncio.sleep(1.1)

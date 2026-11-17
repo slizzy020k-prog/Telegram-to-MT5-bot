@@ -424,3 +424,15 @@ STATE_FILE_PATH: Path = Path(os.getenv("STATE_FILE_PATH") or str(BASE_DIR / "sig
 LOG_FILE_PATH: Path = Path(os.getenv("LOG_FILE_PATH") or str(BASE_DIR / "copier.log"))
 TRADES_LEDGER_PATH: Path = Path(os.getenv("TRADES_LEDGER_PATH") or str(BASE_DIR / "trades_ledger.jsonl"))
 LOCK_FILE_PATH: Path = Path(os.getenv("LOCK_FILE_PATH") or str(BASE_DIR / "copier.lock"))
+
+
+# ===========================================================================
+# v3.4.1 TP1-TOUCH BANK SYSTEM & HARD GIVEBACK CEILING
+# ===========================================================================
+TP1_TOUCH_BANK_ENABLED: bool = _env_bool("TP1_TOUCH_BANK_ENABLED", True)
+TP1_TOUCH_BANK_BUFFER_PIPS: float = _env_float(
+    "TP1_TOUCH_BANK_BUFFER_PIPS", 12.0, min_val=1.0, max_val=100.0
+)
+HARD_GIVEBACK_CEILING_DOLLARS: float = _env_float(
+    "HARD_GIVEBACK_CEILING_DOLLARS", 3.50, min_val=0.50, max_val=50.0
+)

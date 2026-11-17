@@ -374,7 +374,7 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
                 break
         sig_active = main.state_mgr.get_signal(9801)
         assert sig_active["status"] == "ACTIVE"
-        assert len(sig_active["market_tickets"]) == 4
+        assert len(sig_active["market_tickets"]) == 1
         assert sig_active["direction"] == "SELL"
 
         # 2. Sell now WITH zone edit within timer -> cancels timer & executes 4-layer zone limits
@@ -828,7 +828,7 @@ async def test_recorded_market_point_bad_position_guard_and_tp1_hit_cancellation
 
             sig_entered = main.state_mgr.get_signal(10103)
             assert sig_entered["status"] == "ACTIVE"
-            assert len(sig_entered["market_tickets"]) == 4
+            assert len(sig_entered["market_tickets"]) == 1
 
         # 3. 'Buy now' recorded at 3895.00 (opposite rule): in legacy recovery-wait mode,
         #    if price spiked to 3899.00, holds off until price pulls back <= 3895.00, then activates!
@@ -854,7 +854,7 @@ async def test_recorded_market_point_bad_position_guard_and_tp1_hit_cancellation
 
             sig_buy_entered = main.state_mgr.get_signal(10104)
             assert sig_buy_entered["status"] == "ACTIVE"
-            assert len(sig_buy_entered["market_tickets"]) == 4
+            assert len(sig_buy_entered["market_tickets"]) == 1
     finally:
         main.NOW_PRICE_GUARD_ABORT_ON_MISMATCH = orig_abort
         main.SELL_NOW_DELAY_SECONDS = orig_delay
@@ -1335,9 +1335,12 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
         assert main.state_mgr.get_signal(12107)["status"] == "INVALIDATED_TP1"
         assert main.state_mgr.get_signal(12107)["tp1_reached"] is True
 
-        # 4c. Unfilled zone pending limits cancelled via LIVE PRICE in tp1_proximity_watcher_task
+        # 4c. Unfilled zone pending limits cancelled via LIVE PRICE in tp1_proximity_watcher_task after entering zone
         with patch.object(main.executor, "get_tick", return_value=buy_above_zone):
             await main.handle_new_message(MockTelethonEvent(msg_id=12108, text="Buy 3895-3887\nTP 3900\nSL 3875"))
+        tick_enter_zone = MagicMock(bid=3894.5, ask=3894.9)
+        with patch.object(main.executor, "get_tick", return_value=tick_enter_zone):
+            await main._process_pre_tp1_or_backstop_tick(12108, main.state_mgr.get_signal(12108))
         tick_tp1_hit = MagicMock(bid=3900.2, ask=3900.5)
         with patch.object(main.executor, "get_tick", return_value=tick_tp1_hit):
             watcher = asyncio.create_task(main.tp1_proximity_watcher_task())

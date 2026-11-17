@@ -190,17 +190,43 @@ _TRAIL_SL_INTENT_RE = re.compile(
 
 # Expanded direction verbs supporting singular/plural limits and stops
 DIRECTION_PATTERN = re.compile(
-    r"\b(buy\s+limits?|sell\s+limits?|buy\s+stops?|sell\s+stops?|buy|sell|long|short)\b",
+    r"\b(buy\s+(?:with\s+)?limits?|sell\s+(?:with\s+)?limits?|buy\s+(?:with\s+)?stops?|sell\s+(?:with\s+)?stops?|buy|sell|long|short)\b",
     re.IGNORECASE,
 )
 
 # Order-type detection patterns (distinguishing STOP orders from LIMIT orders)
 _STOP_ORDER_PATTERN = re.compile(
-    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?\s+stops?|stop\s+(?:order|entry))\b",
+    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd(?:\.[a-z0-9]+)?|xau|gold|usd))?(?:\s+with)?\s+stops?|stop\s+(?:order|entry))\b",
     re.IGNORECASE,
 )
 _LIMIT_ORDER_PATTERN = re.compile(
-    r"\b(?:limits?|(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?\s+limits?)\b",
+    r"\b(?:limits?|(?:buy|sell|long|short)(?:\s+(?:xauusd(?:\.[a-z0-9]+)?|xau|gold|usd))?(?:\s+with)?\s+limits?)\b",
+    re.IGNORECASE,
+)
+
+# Explicit immediate market execution intent ("Buy now", "Sell xauusd now", "Buy at market", "Market buy")
+_MARKET_NOW_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:buy|sell|long|short)(?:\s+(?:xauusd(?:\.[a-z0-9]+)?|xau|gold|usd))?"
+    r"(?:\s+(?:right|at|@))?\s+(?:now|market(?:\s+(?:price|order|execution))?|instant(?:ly)?|cmp|current\s+market(?:\s+price)?)"
+    r"|(?:market|instant)\s+(?:buy|sell|long|short)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Conversational / past-tense chatter phrases that must never trigger un-targeted trade entries
+_PROSE_CHATTER_PATTERN = re.compile(
+    r"\b(?:"
+    r"when\s+(?:u|you)\s+sent"
+    r"|i\s+(?:went|bought|brought|sold|took|held|entered|closed)"
+    r"|(?:sold|bought|brought)\s+it\b"
+    r"|from\s+(?:last\s+night|earlier|yesterday)"
+    r"|was\s+able\s+to\s+(?:buy|sell)"
+    r"|buy\s+my\b"
+    r"|sell\s+straight(?:\s+into)?"
+    r"|holding\s+(?:sells|buys)"
+    r"|(?:sells|buys)\s+running"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -210,9 +236,9 @@ ZONE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Single price entry (e.g. "Buy limit 3920", "Buy xauusd stop 3900", "Sell limits @ 3860")
+# Single price entry (e.g. "Buy limit 3920", "Buy xauusd stop 3900", "Sell limits @ 3860", "sell with limit 3890")
 SINGLE_PRICE_PATTERN = re.compile(
-    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd|xau|gold|usd))?(?:\s+(?:limits?|stops?))?|(?:limits?|stops?|entry|entries|zone|price))\s*(?:(?:at|around|near|zone|area|@|:|=|-)\s*)*(\d{2,6}(?:\.\d+)?)\b(?!\s*(?:pips?|%|lots?)\b)",
+    r"\b(?:(?:buy|sell|long|short)(?:\s+(?:xauusd(?:\.[a-z0-9]+)?|xau|gold|usd))?(?:\s+with)?(?:\s+(?:limits?|stops?))?|(?:limits?|stops?|entry|entries|zone|price))\s*(?:(?:at|around|near|zone|area|@|:|=|-)\s*)*(\d{2,6}(?:\.\d+)?)\b(?!\s*(?:pips?|%|lots?)\b)",
     re.IGNORECASE,
 )
 
@@ -942,14 +968,25 @@ def extract_tps(text: str, direction: str = "BUY") -> List[float]:
 def _strip_entry_text(text: str) -> str:
     """Extract only entry-relevant segments before TP/SL clauses for zone/price parsing."""
     clean_lines = []
+    seen_targets = False
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or re.match(
+        if not stripped:
+            continue
+        if re.match(
             r"^(?:tp\d*|sl|stop\s*loss|stoploss|stop|take\s*profit|target\d*)\b",
             stripped,
             re.IGNORECASE,
         ):
+            seen_targets = True
             continue
+        has_inline_target = bool(
+            re.search(
+                r"\b(?:tp\d*|take\s*profit\d*|target\d*|sl|stop\s*loss|stoploss)\b",
+                stripped,
+                re.IGNORECASE,
+            )
+        )
         entry_part = re.split(
             r"\b(?:tp\d*|take\s*profit\d*|target\d*|sl|stop\s*loss|stoploss)\b",
             stripped,
@@ -957,7 +994,11 @@ def _strip_entry_text(text: str) -> str:
             flags=re.IGNORECASE,
         )[0].strip()
         if entry_part:
+            if seen_targets and not DIRECTION_PATTERN.search(entry_part):
+                continue
             clean_lines.append(entry_part)
+        if has_inline_target:
+            seen_targets = True
     return " \n ".join(clean_lines)
 
 
@@ -965,6 +1006,7 @@ def gate_4_extract_signal(
     text: str,
     message_id: int = 0,
     is_edit: bool = False,
+    is_reply: bool = False,
 ) -> Optional[SignalAction]:
     """
     Gate 4: New Signal Extraction (v3.0 4-Layer + TP1-TP5 + STOP/LIMIT).
@@ -975,7 +1017,7 @@ def gate_4_extract_signal(
     # 1. Direction Verb Detection
     dir_match = DIRECTION_PATTERN.search(text)
     if not dir_match:
-        logger.debug("Gate 4 Reject: No valid directional verb detected.")
+        logger.info(f"[PARSER IGNORED] No valid directional verb detected | text={text!r}")
         return None
 
     matched_verb = dir_match.group(1).upper()
@@ -986,6 +1028,27 @@ def gate_4_extract_signal(
 
     # 3. Entry Zone, Price & Order Intent Detection
     zone_search_text = _strip_entry_text(text)
+
+    # Guard: Reject conflicting directions (e.g. "lmao + 410 pips sell straight into a TP1 buy")
+    has_buy_full = bool(re.search(r"\bbuy\b", text, re.IGNORECASE))
+    has_sell_full = bool(re.search(r"\bsell\b", text, re.IGNORECASE))
+    has_buy_entry = bool(re.search(r"\b(?:buy|long)\b", zone_search_text, re.IGNORECASE))
+    has_sell_entry = bool(re.search(r"\b(?:sell|short)\b", zone_search_text, re.IGNORECASE))
+    if (has_buy_full and has_sell_full) or (has_buy_entry and has_sell_entry):
+        logger.info(f"[PARSER IGNORED] Conflicting buy/sell directions detected | text={text!r}")
+        return None
+
+    # 4. Pre-extract TP & SL so stub vs complete-signal validation knows whether targets exist
+    labeled_tps, unlabeled_tps = extract_labeled_tps(text)
+    explicit_tps = [v for v in extract_tps(text, direction=direction) if 500.0 <= v < 100000.0]
+    raw_sl = _extract_sl(text)
+    has_valid_targets = bool(explicit_tps) or (raw_sl is not None and 500.0 <= raw_sl < 100000.0)
+
+    # Guard: Reject conversational / past-tense chatter when no complete SL+TP target set is present
+    if not (bool(explicit_tps) and raw_sl is not None and 500.0 <= raw_sl < 100000.0):
+        if _PROSE_CHATTER_PATTERN.search(text):
+            logger.info(f"[PARSER IGNORED] Conversational chatter phrase detected | text={text!r}")
+            return None
 
     is_stop_order = bool(_STOP_ORDER_PATTERN.search(zone_search_text))
     is_limit_order = False if is_stop_order else bool(_LIMIT_ORDER_PATTERN.search(zone_search_text))
@@ -1001,8 +1064,8 @@ def gate_4_extract_signal(
     if zone_match:
         p1 = float(zone_match.group(1))
         p2 = float(zone_match.group(2))
-        # Guard: Reject lot-range noise like 0.01-0.02
-        if max(p1, p2) >= 10.0:
+        # Guard: Require valid Gold prices (500 <= p < 100000) and reasonable zone span (<= 250 points)
+        if 500.0 <= p1 < 100000.0 and 500.0 <= p2 < 100000.0 and abs(p1 - p2) <= 250.0:
             top_price = round(max(p1, p2), 2)
             bottom_price = round(min(p1, p2), 2)
             mid_price = round((top_price + bottom_price) / 2.0, 2)
@@ -1025,7 +1088,7 @@ def gate_4_extract_signal(
             re.IGNORECASE,
         ):
             val = round(float(num_m.group(1)), 2)
-            if val >= 100.0 and val not in distinct_levels:
+            if 500.0 <= val < 100000.0 and val not in distinct_levels:
                 distinct_levels.append(val)
         if len(distinct_levels) >= 2 and (max(distinct_levels) - min(distinct_levels)) <= 100.0:
             top_price = max(distinct_levels)
@@ -1040,23 +1103,45 @@ def gate_4_extract_signal(
             is_zone = True
 
     if not is_zone:
-        # Check for single-price entry limit or stop (e.g. "Sell limit 3920", "Buy stop 3900")
+        # Check for single-price entry limit, stop, or stub (e.g. "Sell limit 3920", "Buy stop 3900", "BUY XAUUSD 3853")
         single_match = SINGLE_PRICE_PATTERN.search(zone_search_text)
         if single_match:
             price = float(single_match.group(1))
-            if price >= 10.0:
+            if 500.0 <= price < 100000.0:
                 single_price = round(price, 2)
                 is_zone = False
-        elif len(distinct_levels) == 1:
+        if single_price is None and len(distinct_levels) == 1 and has_valid_targets:
             single_price = distinct_levels[0]
             is_zone = False
-        elif is_limit_order or is_stop_order:
-            # Explicit "buy limit" / "sell stop" etc. WITHOUT any price is incomplete/chatter -> never execute as Market Now!
-            logger.info("Gate 4 Reject: LIMIT/STOP keyword detected without an entry price or zone.")
+
+        if single_price is None:
+            if is_limit_order or is_stop_order:
+                # Explicit "buy limit" / "sell stop" etc. WITHOUT any valid Gold price is incomplete/chatter -> never execute as Market Now!
+                logger.info(
+                    f"[PARSER IGNORED] LIMIT/STOP keyword detected without an entry price or zone (>=500) | text={text!r}"
+                )
+                return None
+            if _MARKET_NOW_PATTERN.search(zone_search_text):
+                # Explicit market entry ("Buy now", "Sell xauusd now", "Buy at market")
+                is_instant_now = True
+            else:
+                logger.info(
+                    f"[PARSER IGNORED] Bare directional word without valid Gold price/zone (>=500) or explicit 'now' keyword | text={text!r}"
+                )
+                return None
+
+    # Guard: Unstructured prose / question without SL and without TP
+    if not has_valid_targets:
+        if "?" in zone_search_text or (not is_zone and len(zone_search_text.split()) > 8):
+            logger.info(
+                f"[PARSER IGNORED] Unstructured message without SL/TP exceeds stub length or is a question | text={text!r}"
+            )
             return None
-        else:
-            # No zone or single price found -> instant market entry ("Buy now")
-            is_instant_now = True
+        if is_reply and not is_zone and single_price is None and not _MARKET_NOW_PATTERN.search(zone_search_text):
+            logger.info(
+                f"[PARSER IGNORED] Unstructured reply without valid Gold price/zone or explicit 'now' | text={text!r}"
+            )
+            return None
 
     if is_stop_order:
         order_intent = "STOP"
@@ -1067,9 +1152,7 @@ def gate_4_extract_signal(
     else:
         order_intent = "AUTO"
 
-    # 4. Take Profit (TP1..TP5) & Proximity Trigger (Gold: 1 pip = $0.10)
-    labeled_tps, unlabeled_tps = extract_labeled_tps(text)
-    explicit_tps = extract_tps(text, direction=direction)
+    # 5. Take Profit (TP1..TP5) & Proximity Trigger (Gold: 1 pip = $0.10)
     tp_levels = derive_tp_levels(explicit_tps, direction=direction)
     raw_tp1 = tp_levels.get("TP1")
     raw_tp2 = tp_levels.get("TP2")
@@ -1087,9 +1170,6 @@ def gate_4_extract_signal(
         else:
             final_tp = round(raw_tp1 + TP_FRONT_RUN_OFFSET, 2)
             proximity_close_price = round(raw_tp1 + pip_distance_20, 2)
-
-    # 5. Stop Loss
-    raw_sl = _extract_sl(text)
 
     return SignalAction({
         "event_type": "NEW_SIGNAL",
@@ -1271,11 +1351,23 @@ def parse_message(
     if mgmt_action:
         return mgmt_action
 
+    # Reply Hygiene before Gate 4: a reply that did not match any Gate 3 trade-management command
+    # must still be blocked by VICTORY_RECAP_BLOCKERS unless it contains real Gold trade structure.
+    if effective_is_reply and not is_edit and not _has_real_trade_structure(clean_text):
+        lower_clean = clean_text.lower()
+        for pattern in VICTORY_RECAP_BLOCKERS:
+            if re.search(pattern, lower_clean):
+                logger.info(
+                    f"[PARSER IGNORED] Reply matched victory recap blocker '{pattern}' without trade structure | text={clean_text!r}"
+                )
+                return None
+
     # Gate 4: Signal Extraction
     signal_action = gate_4_extract_signal(
         clean_text,
         message_id=message_id,
         is_edit=is_edit,
+        is_reply=effective_is_reply,
     )
     if not signal_action:
         return None

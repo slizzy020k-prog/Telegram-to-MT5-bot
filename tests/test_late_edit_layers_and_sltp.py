@@ -290,12 +290,12 @@ async def test_single_price_pending_retiered_into_4layer_zone_after_4_minutes_an
     main.executor.connect()
 
     with patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
-        # Step 1: Provider posts "SELL XAUUSD 3860" while live bid is 3858.0 -> 4 pending SELL LIMITs at 3860.0
+        # Step 1: Provider posts priced single-price signal "SELL XAUUSD 3860\nTP 3855\nSL 3870" while live bid is 3858.0 -> 4 pending SELL LIMITs at 3860.0
         t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
         tick_init = SimpleNamespace(bid=3858.00, ask=3858.20, time=1700000000)
         with patch.object(main.executor, "get_tick", return_value=tick_init):
             await main.handle_new_message(
-                FakeEvent(9742, "SELL XAUUSD 3860", chat_id=-1004369388188, date=t0)
+                FakeEvent(9742, "SELL XAUUSD 3860\nTP 3855\nSL 3870", chat_id=-1004369388188, date=t0)
             )
 
         sig0 = main.state_mgr.get_signal(9742, chat_id=-1004369388188)

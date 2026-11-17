@@ -32,6 +32,7 @@ from config import (
     FALLBACK_SL_PIPS,
     GIVEBACK_PCT,
     GOLD_REVERSAL_GUARD_ENABLED,
+    HARD_GIVEBACK_CEILING_DOLLARS,
     LAYER_LOTS,
     LAYER_NAMES,
     LEGACY_LAYER_MAP,
@@ -67,6 +68,8 @@ from config import (
     SHORTFALL_PULLBACK_PIPS,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
+    TP1_TOUCH_BANK_BUFFER_PIPS,
+    TP1_TOUCH_BANK_ENABLED,
     TP2_SHORTFALL_ARM_PIPS,
     TP2_SHORTFALL_PULLBACK_PIPS,
     TP2_STEP_PIPS,
@@ -102,6 +105,8 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "TP_FRONT_RUN_OFFSET",
         "TP1_CLOSE_PROXIMITY_PIPS",
         "TP1_LOCK_BUFFER",
+        "TP1_TOUCH_BANK_ENABLED",
+        "TP1_TOUCH_BANK_BUFFER_PIPS",
         "DEFAULT_TP_STEP_PIPS",
         "TP2_STEP_PIPS",
         "TP3_STEP_PIPS",
@@ -122,6 +127,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "ATR_NOISE_FLOOR_MULT",
         "M1_ATR_PERIOD",
         "MAX_GIVEBACK_DOLLARS",
+        "HARD_GIVEBACK_CEILING_DOLLARS",
         "MAX_ALLOWED_SPREAD_DOLLARS",
         "ADAPTIVE_SPREAD_CEILING_DOLLARS",
         "ADAPTIVE_SPREAD_MULTIPLIER",
@@ -1378,7 +1384,24 @@ class MT5Executor:
         sym_info = self.get_symbol_info(symbol)
         eff_base = base_lots if base_lots is not None else _cfg("BASE_LAYER_LOTS", BASE_LAYER_LOTS)
         eff_mult = multiplier if multiplier is not None else _cfg("RISK_LOT_MULTIPLIER", RISK_LOT_MULTIPLIER)
-        scaled = scale_layer_lots(eff_base, eff_mult, sym_info)
+        if (
+            isinstance(base_lots, (list, tuple))
+            and len(base_lots) == 4
+            and all(_num(v, -1.0) >= 0.0 for v in base_lots)
+            and any(_num(v, 0.0) > 0.0 for v in base_lots)
+            and any(_num(v, 0.0) == 0.0 for v in base_lots)
+        ):
+            cfg_fallback = list(_cfg("BASE_LAYER_LOTS", BASE_LAYER_LOTS))
+            while len(cfg_fallback) < 4:
+                cfg_fallback.append(0.01)
+            filled_base = [
+                _num(base_lots[i], 0.0) if _num(base_lots[i], 0.0) > 0.0 else float(cfg_fallback[i])
+                for i in range(4)
+            ]
+            full_scaled = scale_layer_lots(filled_base, eff_mult, sym_info)
+            scaled = [full_scaled[i] if _num(base_lots[i], 0.0) > 0.0 else 0.0 for i in range(4)]
+        else:
+            scaled = scale_layer_lots(eff_base, eff_mult, sym_info)
 
         enforce_cap = _cfg("ENFORCE_HIGH_RISK_LOT_CAP", ENFORCE_HIGH_RISK_LOT_CAP)
         if not enforce_cap or (self.dry_run and self._dry_run_capital is None):
@@ -1678,6 +1701,34 @@ class MT5Executor:
             entry_label="Zone",
         )
 
+    def _resolve_active_layer_subset(
+        self,
+        base_lots: Optional[Sequence[float]] = None,
+        max_layers: Optional[int] = None,
+        layers_subset: Optional[Sequence[str]] = None,
+    ) -> Tuple[List[str], Optional[List[float]]]:
+        """Resolve active layer names (e.g. ['L1'] for stubs) and masked base_lots vector."""
+        if layers_subset is not None:
+            wanted = {str(k).strip().upper() for k in layers_subset if k}
+            active_names = [l_name for l_name in LAYER_NAMES if l_name in wanted]
+        elif max_layers is not None:
+            k = max(1, min(len(LAYER_NAMES), int(max_layers)))
+            active_names = list(LAYER_NAMES[:k])
+        else:
+            active_names = list(LAYER_NAMES)
+
+        if len(active_names) >= len(LAYER_NAMES):
+            return active_names, (list(base_lots) if base_lots is not None else None)
+
+        cfg_base = list(base_lots) if base_lots is not None else list(_cfg("BASE_LAYER_LOTS", BASE_LAYER_LOTS))
+        while len(cfg_base) < len(LAYER_NAMES):
+            cfg_base.append(0.01)
+        masked_lots = [
+            float(cfg_base[idx]) if l_name in active_names else 0.0
+            for idx, l_name in enumerate(LAYER_NAMES)
+        ]
+        return active_names, masked_lots
+
     def execute_4layer_single_price(
         self,
         symbol: str,
@@ -1695,9 +1746,12 @@ class MT5Executor:
         is_stop_order: bool = False,
         base_lots: Optional[Sequence[float]] = None,
         multiplier: Optional[float] = None,
+        max_layers: Optional[int] = None,
+        layers_subset: Optional[Sequence[str]] = None,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """
-        Split a Single-Price entry (LIMIT, STOP, or smart AUTO) into 4 layers (L1..L4 -> TP1/TP2/TP3/TP5).
+        Split a Single-Price entry (LIMIT, STOP, or smart AUTO) into 4 layers (L1..L4 -> TP1/TP2/TP3/TP5),
+        or a restricted layer subset (e.g. max_layers=1 -> L1 only for un-SL/no-TP stubs).
         Returns (market_tickets, pending_tickets, layers_data).
         """
         if price is None or float(price) <= 0.0:
@@ -1709,7 +1763,12 @@ class MT5Executor:
             return [], [], {}
         direction_norm, resolved_sym, tick, _, digits, pip_size = prereq
 
-        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=base_lots, multiplier=multiplier)
+        active_names, eff_base_lots = self._resolve_active_layer_subset(
+            base_lots=base_lots,
+            max_layers=max_layers,
+            layers_subset=layers_subset,
+        )
+        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=eff_base_lots, multiplier=multiplier)
         if sum(alloc_lots) <= 0.0:
             self.last_error = warn or "High Risk Lot Cap reached"
             return [], [], {}
@@ -1734,12 +1793,13 @@ class MT5Executor:
 
         logger.info(
             f"Executing 4-Layer Single-Price ({eff_intent}) for {direction_norm} {resolved_sym}: "
-            f"Price={target_px}, Lots={alloc_lots}, TPs={layer_tps} | SL={sl}"
+            f"Price={target_px}, ActiveLayers={active_names}, Lots={alloc_lots}, TPs={layer_tps} | SL={sl}"
         )
 
         layer_specs = [
             (l_name, target_px, alloc_lots[idx], layer_tps[l_name])
             for idx, l_name in enumerate(LAYER_NAMES)
+            if l_name in active_names
         ]
         return self._execute_4layer_specs(
             symbol=resolved_sym,
@@ -1765,9 +1825,12 @@ class MT5Executor:
         tp_levels: Optional[Dict[str, float]] = None,
         base_lots: Optional[Sequence[float]] = None,
         multiplier: Optional[float] = None,
+        max_layers: Optional[int] = None,
+        layers_subset: Optional[Sequence[str]] = None,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """
-        Split an immediate Market Now entry into 4 market orders (L1..L4 -> TP1/TP2/TP3/TP5).
+        Split an immediate Market Now entry into 4 market orders (L1..L4 -> TP1/TP2/TP3/TP5),
+        or a restricted layer subset (e.g. max_layers=1 -> L1 only for unpriced stubs).
         Returns (market_tickets, pending_tickets, layers_data).
         """
         prereq = self._validate_entry_prerequisites(symbol, direction, "4-layer market")
@@ -1775,7 +1838,12 @@ class MT5Executor:
             return [], [], {}
         direction_norm, resolved_sym, tick, _, digits, pip_size = prereq
 
-        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=base_lots, multiplier=multiplier)
+        active_names, eff_base_lots = self._resolve_active_layer_subset(
+            base_lots=base_lots,
+            max_layers=max_layers,
+            layers_subset=layers_subset,
+        )
+        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=eff_base_lots, multiplier=multiplier)
         if sum(alloc_lots) <= 0.0:
             self.last_error = warn or "High Risk Lot Cap reached"
             return [], [], {}
@@ -1798,12 +1866,13 @@ class MT5Executor:
 
         logger.info(
             f"Executing 4-Layer Market for {direction_norm} {resolved_sym}: "
-            f"Entry={entry_px}, Lots={alloc_lots}, TPs={layer_tps} | SL={sl}"
+            f"Entry={entry_px}, ActiveLayers={active_names}, Lots={alloc_lots}, TPs={layer_tps} | SL={sl}"
         )
 
         layer_specs = [
             (l_name, entry_px, alloc_lots[idx], layer_tps[l_name])
             for idx, l_name in enumerate(LAYER_NAMES)
+            if l_name in active_names
         ]
         return self._execute_4layer_specs(
             symbol=resolved_sym,
@@ -2206,6 +2275,14 @@ class MT5Executor:
                 logger.error(f"Cannot cancel pending order #{ticket}: MT5 is not connected.")
                 return False
 
+            try:
+                filled_pos = mt5.positions_get(ticket=ticket)
+            except Exception:
+                filled_pos = None
+            if isinstance(filled_pos, (list, tuple)) and len(filled_pos) > 0:
+                logger.info(f"Pending order #{ticket} already filled into an open position; skipping cancel.")
+                return False
+
             request = {
                 "action": _mt5_const("TRADE_ACTION_REMOVE", 8),
                 "order": ticket,
@@ -2217,7 +2294,7 @@ class MT5Executor:
                 logger.info(f"Successfully cancelled Pending Order #{ticket}")
                 return True
             comment = getattr(result, "comment", "") if result else mt5.last_error()
-            logger.warning(f"Failed or already filled/cancelled for Order #{ticket}: {comment}")
+            logger.info(f"Order #{ticket} not cancelled (already filled or removed): {comment}")
             return False
 
     def close_market_position(self, ticket: int) -> bool:
@@ -3554,6 +3631,137 @@ class MT5Executor:
             raw_px = 3895.0
         return round(float(raw_px) - lock_buf, digits) if is_buy else round(float(raw_px) + lock_buf, digits)
 
+    def _compute_tp1_touch_floor(
+        self,
+        raw_tp1: float,
+        direction: str,
+        pip_size: float,
+        digits: int,
+    ) -> float:
+        """Compute TP1-touch bank protection floor (TP1 - $1.20 BUY / TP1 + $1.20 SELL by default)."""
+        raw_buf_pips = float(_cfg("TP1_TOUCH_BANK_BUFFER_PIPS", TP1_TOUCH_BANK_BUFFER_PIPS))
+        touch_buf = raw_buf_pips * (pip_size if pip_size > 0 else 0.10)
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        return round(float(raw_tp1) - touch_buf, digits) if is_buy else round(float(raw_tp1) + touch_buf, digits)
+
+    def _clamp_sl_for_broker_stops(
+        self,
+        desired_sl: float,
+        direction: str,
+        tick: Any,
+        sym_info: Any,
+        digits: int,
+    ) -> float:
+        """Clamp SL distance to at least broker trade_stops_level from live bid (BUY) / ask (SELL)."""
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+        min_stop_dist = max(0.0, stops_lvl * (pt or 0.01))
+        target_sl = round(float(desired_sl), digits)
+        if tick is None or min_stop_dist <= 0.0:
+            return target_sl
+        ref_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+        if not isinstance(ref_px, numbers.Real) or isinstance(ref_px, bool) or float(ref_px) <= 0.0:
+            return target_sl
+        ref_f = float(ref_px)
+        if is_buy:
+            return min(target_sl, round(ref_f - min_stop_dist, digits))
+        return max(target_sl, round(ref_f + min_stop_dist, digits))
+
+    def _apply_tp1_touch_protection(
+        self,
+        signal_data: Dict[str, Any],
+        symbol: str,
+        direction: str,
+        raw_tp1: float,
+        pip_size: float,
+        digits: int,
+        tick: Any = None,
+        sym_info: Any = None,
+        skip_tickets: Sequence[int] = (),
+        preferred_floor: Optional[float] = None,
+    ) -> Optional[float]:
+        """
+        Persist tp1_touched=True, ratchet runner virtual floor to at least TP1 - buffer (BUY)
+        or TP1 + buffer (SELL), and apply hard broker SL (clamped to stops level) across
+        ALL remaining open layers (runner + any remaining L2/L3 positions).
+        """
+        if not bool(_cfg("TP1_TOUCH_BANK_ENABLED", TP1_TOUCH_BANK_ENABLED)):
+            return None
+
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        touch_floor = self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
+        signal_data["tp1_touched"] = True
+        signal_data["tp1_touch_floor"] = touch_floor
+
+        cands = [touch_floor]
+        for prev_key in ("runner_sl_floor", "soft_tp1_floor"):
+            pv = signal_data.get(prev_key)
+            if isinstance(pv, numbers.Real) and not isinstance(pv, bool) and float(pv) > 0.0:
+                cands.append(float(pv))
+        if isinstance(preferred_floor, numbers.Real) and not isinstance(preferred_floor, bool) and float(preferred_floor) > 0.0:
+            cands.append(float(preferred_floor))
+        eff_floor = round(max(cands) if is_buy else min(cands), digits)
+
+        signal_data["runner_sl_floor"] = eff_floor
+        signal_data["soft_tp1_floor"] = eff_floor
+
+        if sym_info is None:
+            sym_info = self.get_symbol_info(symbol)
+        if tick is None:
+            tick = self.get_tick(symbol)
+        desired_broker_sl = self._clamp_sl_for_broker_stops(eff_floor, direction, tick, sym_info, digits)
+
+        layers = signal_data.get("layers") or {}
+        ticket_to_layer: Dict[int, Dict[str, Any]] = {}
+        for l_val in layers.values():
+            if isinstance(l_val, dict):
+                lt = _int_num(l_val.get("ticket"), 0)
+                if lt > 0:
+                    ticket_to_layer[lt] = l_val
+
+        skip_set = {_int_num(t, 0) for t in skip_tickets if _int_num(t, 0) > 0}
+        raw_rts = signal_data.get("runner_tickets") or (
+            [signal_data.get("runner_ticket")] if signal_data.get("runner_ticket") else []
+        )
+        runner_tkts = [_int_num(t, 0) for t in raw_rts if _int_num(t, 0) > 0]
+        runner_set = set(runner_tkts)
+        all_open = list(
+            dict.fromkeys(
+                t
+                for t in (runner_tkts + [_int_num(x, 0) for x in (signal_data.get("market_tickets") or [])])
+                if t > 0 and t not in skip_set
+            )
+        )
+
+        for tkt in all_open:
+            l_info = ticket_to_layer.get(tkt)
+            cur_sl = 0.0
+            if not self.dry_run:
+                with self._mt5_lock:
+                    pos_res = mt5.positions_get(ticket=tkt)
+                if pos_res:
+                    cur_sl = _num(getattr(pos_res[0], "sl", 0.0), 0.0)
+            if cur_sl <= 0.0 and l_info is not None:
+                for sl_k in ("sl", "be_sl"):
+                    sv = _num(l_info.get(sl_k), 0.0)
+                    if sv > 0.0:
+                        cur_sl = sv
+                        break
+
+            # Forward-only ratchet: never loosen an already tighter broker SL
+            if cur_sl > 0.0:
+                if (is_buy and desired_broker_sl <= cur_sl + 1e-6) or (not is_buy and desired_broker_sl >= cur_sl - 1e-6):
+                    continue
+
+            if self.modify_position_sltp(tkt, sl=desired_broker_sl, tp=None):
+                if l_info is not None:
+                    l_info["sl"] = desired_broker_sl
+                if tkt in runner_set:
+                    signal_data["broker_sl"] = desired_broker_sl
+
+        return eff_floor
+
     def _handle_tp1_scaling_legacy(
         self,
         signal_data: Dict[str, Any],
@@ -3946,8 +4154,15 @@ class MT5Executor:
         arm_pct = float(_cfg("ARM_THRESHOLD_PCT", ARM_THRESHOLD_PCT))
         armed = bool(signal_data.get("reversal_guard_armed", False))
 
+        # Track live & peak profit every tick in dollars
+        tick_peak_profit = max(0.0, prev_peak_profit, current_profit)
+        if prev_peak_px is None:
+            tick_peak_px = exec_price if current_profit > 0 else prev_peak_px
+        else:
+            tick_peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
+
         if not armed:
-            if signal_data.get("tp1_reached"):
+            if signal_data.get("tp1_reached") or signal_data.get("tp1_touched"):
                 armed = True
             elif raw_tp1 is not None and sig_entry is not None:
                 tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
@@ -3959,10 +4174,8 @@ class MT5Executor:
 
             if armed:
                 signal_data["reversal_guard_armed"] = True
-                peak_profit = max(prev_peak_profit, current_profit)
-                peak_px = exec_price
-                if prev_peak_px is not None:
-                    peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
+                peak_profit = tick_peak_profit
+                peak_px = tick_peak_px if tick_peak_px is not None else exec_price
                 signal_data["peak_profit"] = round(peak_profit, 6)
                 signal_data["reversal_guard_peak_profit"] = round(peak_profit, 6)
                 signal_data["runner_peak_price"] = round(peak_px, digits)
@@ -3973,28 +4186,30 @@ class MT5Executor:
                 )
             else:
                 signal_data["reversal_guard_armed"] = False
+                signal_data["peak_profit"] = round(tick_peak_profit, 6)
+                signal_data["reversal_guard_peak_profit"] = round(tick_peak_profit, 6)
+                if tick_peak_px is not None:
+                    signal_data["runner_peak_price"] = round(tick_peak_px, digits)
                 return {
                     "armed": False,
                     "triggered": False,
+                    "hard_ceiling_triggered": False,
                     "paused_by_spread": is_spike,
                     "spread_dollars": spread_dollars,
                     "max_allowed_spread": eff_max_spread,
-                    "peak_profit": prev_peak_profit,
+                    "peak_profit": tick_peak_profit,
                     "current_profit": current_profit,
                     "pullback_dollars": 0.0,
                     "drawdown_from_peak": 0.0,
                     "noise_floor_dollars": float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS)),
                     "m1_atr_14": 0.0,
-                    "peak_price": prev_peak_px,
+                    "peak_price": tick_peak_px,
                     "live_price": exec_price,
                 }
 
         # Armed: continuously update peak_profit & runner_peak_price as runner climbs TP1 -> TP2 -> TP3 -> TP4
-        peak_profit = max(prev_peak_profit, current_profit)
-        if prev_peak_px is None:
-            peak_px = exec_price
-        else:
-            peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
+        peak_profit = tick_peak_profit
+        peak_px = tick_peak_px if tick_peak_px is not None else exec_price
 
         if current_profit > prev_peak_profit + 1e-9:
             signal_data["runner_reversal_ticks"] = 0
@@ -4011,6 +4226,52 @@ class MT5Executor:
         min_pb_dollars = float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS))
         atr_mult = float(_cfg("ATR_NOISE_FLOOR_MULT", ATR_NOISE_FLOOR_MULT))
         noise_floor_dollars = round(max(min_pb_dollars, atr_mult * m1_atr_14), 4)
+        tp1_leg_dollars = (
+            ((float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1)))
+            if (raw_tp1 is not None and sig_entry is not None)
+            else None
+        )
+        if (
+            tp1_leg_dollars is not None
+            and 0.0 < tp1_leg_dollars <= 4.0
+            and not signal_data.get("tp2_reached")
+        ):
+            noise_floor_dollars = min(noise_floor_dollars, round(0.45 * tp1_leg_dollars, 4))
+
+        giveback_pct = float(_cfg("GIVEBACK_PCT", GIVEBACK_PCT))
+        max_gb_dollars = float(_cfg("MAX_GIVEBACK_DOLLARS", MAX_GIVEBACK_DOLLARS))
+        hard_ceil_cfg = float(_cfg("HARD_GIVEBACK_CEILING_DOLLARS", HARD_GIVEBACK_CEILING_DOLLARS))
+        positive_caps = [v for v in (max_gb_dollars, hard_ceil_cfg) if v > 0.0]
+        hard_ceiling_dollars = min(positive_caps) if positive_caps else 0.0
+        hard_ceiling_breached = (
+            peak_profit > 0.0
+            and hard_ceiling_dollars > 0.0
+            and pullback_dollars + 1e-9 >= hard_ceiling_dollars
+        )
+
+        # Hard giveback ceiling overrides 30% rule, noise floor, and spread-spike pause
+        if hard_ceiling_breached:
+            logger.info(
+                f"Gold Reversal Guard HARD CEILING TRIGGERED "
+                f"(peak=${peak_profit:.2f}, live=${current_profit:.2f}, "
+                f"giveback=${pullback_dollars:.2f} >= ceiling=${hard_ceiling_dollars:.2f}, spread=${spread_dollars:.2f})"
+            )
+            return {
+                "armed": True,
+                "triggered": True,
+                "hard_ceiling_triggered": True,
+                "paused_by_spread": False,
+                "spread_dollars": spread_dollars,
+                "max_allowed_spread": eff_max_spread,
+                "peak_profit": peak_profit,
+                "current_profit": current_profit,
+                "pullback_dollars": pullback_dollars,
+                "drawdown_from_peak": drawdown_from_peak,
+                "noise_floor_dollars": noise_floor_dollars,
+                "m1_atr_14": m1_atr_14,
+                "peak_price": peak_px,
+                "live_price": exec_price,
+            }
 
         if is_spike:
             logger.info(
@@ -4019,6 +4280,7 @@ class MT5Executor:
             return {
                 "armed": True,
                 "triggered": False,
+                "hard_ceiling_triggered": False,
                 "paused_by_spread": True,
                 "spread_dollars": spread_dollars,
                 "max_allowed_spread": eff_max_spread,
@@ -4032,16 +4294,13 @@ class MT5Executor:
                 "live_price": exec_price,
             }
 
-        giveback_pct = float(_cfg("GIVEBACK_PCT", GIVEBACK_PCT))
-        max_gb_dollars = float(_cfg("MAX_GIVEBACK_DOLLARS", MAX_GIVEBACK_DOLLARS))
-
-        if signal_data.get("tp1_reached") and max_gb_dollars > 0.0:
-            # Post-TP1 (TP2-TP4): 30% giveback capped at MAX_GIVEBACK_DOLLARS ($4.50) and floored at noise_floor_dollars
+        if signal_data.get("tp1_reached") and (hard_ceiling_dollars > 0.0 or max_gb_dollars > 0.0):
+            eff_cap = hard_ceiling_dollars if hard_ceiling_dollars > 0.0 else max_gb_dollars
             pct_req = giveback_pct * peak_profit
-            eff_req_dollars = max(noise_floor_dollars, min(max_gb_dollars, pct_req))
+            eff_req_dollars = max(noise_floor_dollars, min(eff_cap, pct_req))
             triggered = (pullback_dollars + 1e-9 >= eff_req_dollars) and (peak_profit > 0.0)
         else:
-            # Pre-TP1: exact 30% peak-profit giveback AND >= Gold noise floor ($1.50 or 0.35 * M1_ATR_14)
+            # Pre-TP1: exact 30% peak-profit giveback AND >= Gold noise floor
             triggered = (
                 peak_profit > 0.0
                 and drawdown_from_peak + 1e-9 >= giveback_pct
@@ -4051,6 +4310,7 @@ class MT5Executor:
         return {
             "armed": True,
             "triggered": triggered,
+            "hard_ceiling_triggered": False,
             "paused_by_spread": False,
             "spread_dollars": spread_dollars,
             "max_allowed_spread": eff_max_spread,
@@ -4205,23 +4465,48 @@ class MT5Executor:
                 runner_be_sl = round(r_open + offset_value, digits) if is_buy else round(r_open - offset_value, digits)
 
             gold_guard_on = bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED))
+            tp1_touch_enabled = bool(_cfg("TP1_TOUCH_BANK_ENABLED", TP1_TOUCH_BANK_ENABLED))
             past_tp1_floor = True
             if live_price is not None:
                 past_tp1_floor = (live_price >= tp1_floor_price) if is_buy else (live_price <= tp1_floor_price)
 
-            # In Gold Reversal Guard mode, lock at BE when price first touches TP1 so a $1.00 TP1 retest
-            # wick never stops out the runner prematurely; once TP1 is broken cleanly (+5p), lock TP1 floor.
+            touched_now = bool(
+                raw_tp1 is not None
+                and live_price is not None
+                and ((live_price >= float(raw_tp1)) if is_buy else (live_price <= float(raw_tp1)))
+            )
+            tp1_touched = bool(
+                tp1_touch_enabled
+                and raw_tp1 is not None
+                and (signal_data.get("tp1_touched") or touched_now)
+            )
+            eff_touch_floor: Optional[float] = None
+            if tp1_touched:
+                eff_touch_floor = self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
+                signal_data["tp1_touched"] = True
+                signal_data["tp1_touch_floor"] = eff_touch_floor
+
+            # In Gold Reversal Guard mode: on clean break (+5p) lock TP1-0.50 floor; on first
+            # single-tick TP1 touch (tp1_touched=True) lock at least TP1 - TP1_TOUCH_BANK_BUFFER_PIPS ($1.20).
             use_tp1_lock = past_tp1_floor and (already_clean_tp1 or not gold_guard_on)
 
             if use_tp1_lock:
+                cands = [tp1_floor_price]
+                if eff_touch_floor is not None:
+                    cands.append(eff_touch_floor)
                 if be_after_tp1 and runner_be_sl is not None:
-                    floor_price = round(max(tp1_floor_price, runner_be_sl), digits) if is_buy else round(min(tp1_floor_price, runner_be_sl), digits)
-                else:
-                    floor_price = tp1_floor_price
+                    cands.append(runner_be_sl)
+                floor_price = round(max(cands) if is_buy else min(cands), digits)
+            elif eff_touch_floor is not None:
+                cands = [eff_touch_floor]
+                if be_after_tp1 and runner_be_sl is not None:
+                    cands.append(runner_be_sl)
+                floor_price = round(max(cands) if is_buy else min(cands), digits)
             else:
                 floor_price = runner_be_sl if (be_after_tp1 and runner_be_sl is not None) else None
 
             target_tp_val = round(float(next_stage_tp), digits) if next_stage_tp is not None else None
+            sl_applied_tickets: Set[int] = set()
             for idx_r, rt in enumerate(runner_tickets):
                 lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
                 l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
@@ -4230,14 +4515,34 @@ class MT5Executor:
                     t_open = float(l_info["target_price"])
                     t_be_sl = round(t_open + offset_value, digits) if is_buy else round(t_open - offset_value, digits)
 
-                t_sl = floor_price if use_tp1_lock else (t_be_sl if be_after_tp1 else None)
+                if use_tp1_lock or eff_touch_floor is not None:
+                    sl_cands = [floor_price] if floor_price is not None else []
+                    if be_after_tp1 and t_be_sl is not None:
+                        sl_cands.append(t_be_sl)
+                    desired_sl = round(max(sl_cands) if is_buy else min(sl_cands), digits) if sl_cands else None
+                else:
+                    desired_sl = t_be_sl if be_after_tp1 else None
+
+                t_sl = (
+                    self._clamp_sl_for_broker_stops(desired_sl, direction, tick, sym_info, digits)
+                    if desired_sl is not None
+                    else None
+                )
                 if t_sl is not None:
-                    if not self.modify_position_sltp(rt, sl=t_sl, tp=target_tp_val):
-                        if be_after_tp1 and t_be_sl is not None and t_be_sl != t_sl:
-                            if not self.modify_position_sltp(rt, sl=t_be_sl, tp=target_tp_val) and target_tp_val is not None:
-                                self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
+                    if self.modify_position_sltp(rt, sl=t_sl, tp=target_tp_val):
+                        sl_applied_tickets.add(rt)
+                        signal_data["broker_sl"] = t_sl
+                        if l_info is not None:
+                            l_info["sl"] = t_sl
+                    elif be_after_tp1 and t_be_sl is not None and t_be_sl != t_sl:
+                        if self.modify_position_sltp(rt, sl=t_be_sl, tp=target_tp_val):
+                            sl_applied_tickets.add(rt)
+                            if l_info is not None:
+                                l_info["sl"] = t_be_sl
                         elif target_tp_val is not None:
                             self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
+                    elif target_tp_val is not None:
+                        self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
                 elif target_tp_val is not None:
                     self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
 
@@ -4248,7 +4553,24 @@ class MT5Executor:
                         l_info["tp_stage"] = next_stage_key
         else:
             r_open = None
-            floor_price = None
+            sl_applied_tickets = set()
+            tp1_touch_enabled = bool(_cfg("TP1_TOUCH_BANK_ENABLED", TP1_TOUCH_BANK_ENABLED))
+            touched_now = bool(
+                raw_tp1 is not None
+                and live_price is not None
+                and ((live_price >= float(raw_tp1)) if is_buy else (live_price <= float(raw_tp1)))
+            )
+            tp1_touched = bool(
+                tp1_touch_enabled
+                and raw_tp1 is not None
+                and (signal_data.get("tp1_touched") or touched_now)
+            )
+            eff_touch_floor = (
+                self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
+                if tp1_touched
+                else None
+            )
+            floor_price = eff_touch_floor if surviving_tickets else None
 
         # Scaling Continuity: carry forward peak_price & peak_profit and keep reversal_guard_armed = True
         prev_peak_px = signal_data.get("runner_peak_price")
@@ -4289,6 +4611,20 @@ class MT5Executor:
         signal_data["runner_peak_price"] = new_peak_px
         signal_data["tp1_reached"] = True
         signal_data["market_tickets"] = surviving_tickets
+
+        if tp1_touched and raw_tp1 is not None:
+            self._apply_tp1_touch_protection(
+                signal_data,
+                symbol,
+                direction,
+                float(raw_tp1),
+                pip_size,
+                digits,
+                tick=tick,
+                sym_info=sym_info,
+                skip_tickets=sorted(sl_applied_tickets),
+                preferred_floor=floor_price,
+            )
 
         if runner_tickets:
             signal_data["status"] = "RUNNER_ACTIVE"
@@ -4419,10 +4755,11 @@ class MT5Executor:
         reason: str,
         close_position: bool = True,
         ceiling_stage: Optional[int] = None,
+        close_all_market_tickets: bool = False,
     ) -> bool:
         """
-        Atomically close all active runner_tickets under `is_closing = True` lock
-        (preserving any other surviving market_tickets) and update signal status.
+        Atomically close active runner_tickets (and optionally any remaining non-runner open
+        market_tickets when banking on TP1-Touch Fallback Bank) under `is_closing = True` lock.
         """
         if not self.try_begin_signal_close(signal_data):
             logger.warning(f"Atomic exit lock: duplicate _finalize_runner_exit skipped ({reason}).")
@@ -4430,9 +4767,15 @@ class MT5Executor:
 
         try:
             r_tickets = [_int_num(t, 0) for t in runner_tickets if _int_num(t, 0) > 0]
+            all_mkt = [_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0]
+            if close_all_market_tickets:
+                to_close = list(dict.fromkeys(r_tickets + all_mkt))
+            else:
+                to_close = list(r_tickets)
+
             already_closed_once = set(signal_data.get("_closed_tickets_once") or [])
             if close_position:
-                for rt in r_tickets:
+                for rt in to_close:
                     if rt in already_closed_once:
                         continue
                     self.close_market_position(rt)
@@ -4441,16 +4784,22 @@ class MT5Executor:
             else:
                 self.invalidate_realized_pnl_cache()
 
+            close_set = set(to_close)
             layers = signal_data.get("layers") or {}
             for lk in runner_layers:
                 if lk and isinstance(layers.get(lk), dict):
                     layers[lk]["status"] = "CLOSED"
+            if close_all_market_tickets:
+                for l_val in layers.values():
+                    if isinstance(l_val, dict):
+                        lt = _int_num(l_val.get("ticket"), 0)
+                        if (lt > 0 and lt in close_set) or str(l_val.get("status") or "").upper() in ("OPEN", "FILLED", "RUNNER"):
+                            l_val["status"] = "CLOSED"
 
-            r_set = set(r_tickets)
-            remaining_mkt = [t for t in (signal_data.get("market_tickets") or []) if t not in r_set]
+            remaining_mkt = [t for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) not in close_set]
             signal_data["market_tickets"] = remaining_mkt
-            signal_data["last_runner_tickets"] = list(r_tickets)
-            signal_data["last_runner_ticket"] = r_tickets[-1] if r_tickets else None
+            signal_data["last_runner_tickets"] = list(to_close)
+            signal_data["last_runner_ticket"] = to_close[-1] if to_close else None
             signal_data["runner_close_reason"] = reason
             signal_data["runner_tickets"] = []
             signal_data["runner_ticket"] = None
@@ -4615,6 +4964,47 @@ class MT5Executor:
         )
         signal_data["runner_max_tp_stage"] = max_stage
 
+        # 0. TP1-Touch Bank System:
+        #    On first TP1 touch (bid>=TP1 BUY / ask<=TP1 SELL) persist tp1_touched=True, set floor &
+        #    hard broker SL (clamped to stops level) on ALL open layers; if already tp1_touched and
+        #    price falls back to TP1 - TP1_TOUCH_BANK_BUFFER_PIPS ($1.20), close runner + all open layers.
+        raw_tp1_val = signal_data.get("raw_tp1") or tp_levels.get("TP1")
+        tp1_touch_enabled = bool(_cfg("TP1_TOUCH_BANK_ENABLED", TP1_TOUCH_BANK_ENABLED))
+        if tp1_touch_enabled and raw_tp1_val is not None:
+            touched_now = (live_price >= float(raw_tp1_val)) if is_buy else (live_price <= float(raw_tp1_val))
+            if touched_now and not signal_data.get("tp1_touched"):
+                self._apply_tp1_touch_protection(
+                    signal_data,
+                    p_symbol,
+                    direction,
+                    float(raw_tp1_val),
+                    pip_size,
+                    digits,
+                    tick=tick,
+                    sym_info=sym_info,
+                )
+
+        if tp1_touch_enabled and signal_data.get("tp1_touched"):
+            tf_raw = signal_data.get("tp1_touch_floor")
+            if tf_raw is None and raw_tp1_val is not None:
+                tf_raw = self._compute_tp1_touch_floor(float(raw_tp1_val), direction, pip_size, digits)
+                signal_data["tp1_touch_floor"] = tf_raw
+            if tf_raw is not None:
+                tf_val = float(tf_raw)
+                touch_bank_hit = (live_price <= tf_val + 1e-9) if is_buy else (live_price >= tf_val - 1e-9)
+                if touch_bank_hit:
+                    logger.info(
+                        f"Runner {runner_tickets}: TP1-Touch Fallback Bank triggered "
+                        f"(live={live_price}, tp1_touch_floor={tf_val}). Closing runner + all open layers."
+                    )
+                    return self._finalize_runner_exit(
+                        signal_data,
+                        runner_tickets,
+                        runner_layers,
+                        reason="TP1-Touch Fallback Bank",
+                        close_all_market_tickets=True,
+                    )
+
         floor_price = signal_data.get("runner_sl_floor")
         if floor_price is None:
             floor_price = signal_data.get("soft_tp1_floor")
@@ -4777,7 +5167,7 @@ class MT5Executor:
             )
             if guard_res.get("triggered"):
                 candle_ok = True
-                if _cfg("RUNNER_REVERSAL_CANDLE_CONFIRM", RUNNER_REVERSAL_CANDLE_CONFIRM):
+                if not guard_res.get("hard_ceiling_triggered") and _cfg("RUNNER_REVERSAL_CANDLE_CONFIRM", RUNNER_REVERSAL_CANDLE_CONFIRM):
                     candle = self.get_last_closed_m1_candle(p_symbol)
                     if not candle:
                         candle_ok = False

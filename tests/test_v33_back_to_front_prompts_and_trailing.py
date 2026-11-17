@@ -189,10 +189,10 @@ async def test_1_end_to_end_trade_reading_execution_and_exact_broker_sl_tp_place
         assert all(r["type"] == ex_mod.mt5.ORDER_TYPE_BUY for r in sent_requests)
         assert all(r["sl"] == pytest.approx(3880.0) and r["tp"] == pytest.approx(3904.5) for r in sent_requests)
 
-        # 1H: Unpriced "Sell now" -> Fallback SL applied on execution + Fallback TP1 applied on watcher tick!
+        # 1H: Unpriced "Sell now" stub -> opens L1 (0.01) with Fallback SL + Fallback TP1 applied on watcher tick!
         sent_requests.clear()
         await main.handle_new_message(FakeEvent(108, "Sell XAUUSD now"))
-        assert len(sent_requests) == 4
+        assert len(sent_requests) == 1
         assert all(r["type"] == ex_mod.mt5.ORDER_TYPE_SELL for r in sent_requests)
         # Fallback SL for SELL @ bid=3895.00 with FALLBACK_SL_PIPS=150 -> 3910.0
         assert all(r["sl"] == pytest.approx(3910.0) for r in sent_requests)
@@ -202,7 +202,7 @@ async def test_1_end_to_end_trade_reading_execution_and_exact_broker_sl_tp_place
         monkeypatch.setattr(main, "UNPRICED_TP_GRACE_SECONDS", 0.0)
         with patch.object(ex, "modify_position_sltp", return_value=True) as mock_mod_pos:
             await main._process_pre_tp1_or_backstop_tick(108, sig_108)
-            assert mock_mod_pos.call_count == 4
+            assert mock_mod_pos.call_count == 1
         sig_108_after = main.state_mgr.get_signal(108, chat_id=-1001234567890)
         assert sig_108_after["raw_tp1"] == pytest.approx(round(3895.20 - config.FALLBACK_TP1_PIPS * 0.10, 2))
         assert sig_108_after["final_tp"] == pytest.approx(round(sig_108_after["raw_tp1"] + config.TP_FRONT_RUN_OFFSET, 2))

@@ -279,8 +279,8 @@ async def test_bounded_reconnect_catchup_dedup_edits_and_stale_guards(tmp_path, 
         SimpleNamespace(id=102, message="Buy now\nTP 3905\nSL 3880", date=now_utc - timedelta(seconds=120), reply_to_msg_id=None, reply_to=None, forward=None),
         # 5. Slipped BUY LIMIT (price=3899 vs live ask=3895 -> 40 pips > 15 pips max slippage) -> rejected stale
         SimpleNamespace(id=103, message="Buy limit 3899\nTP 3910\nSL 3880", date=now_utc - timedelta(seconds=5), reply_to_msg_id=None, reply_to=None, forward=None),
-        # 6. TP1 already reached on market (BUY TP1=3892 <= live 3895) -> rejected stale
-        SimpleNamespace(id=104, message="Buy limit 3885\nTP 3892\nSL 3870", date=now_utc - timedelta(seconds=5), reply_to_msg_id=None, reply_to=None, forward=None),
+        # 6. TP1 already reached on market (crossed BUY LIMIT 3896 with TP1=3892 <= live 3895) -> rejected stale
+        SimpleNamespace(id=104, message="Buy limit 3896\nTP 3892\nSL 3870", date=now_utc - timedelta(seconds=5), reply_to_msg_id=None, reply_to=None, forward=None),
         # 7. Fresh valid pending BUY LIMIT -> replayed & placed (4 orders)!
         SimpleNamespace(id=105, message="Buy limit 3880\nTP 3900\nSL 3865", date=now_utc - timedelta(seconds=5), reply_to_msg_id=None, reply_to=None, forward=None),
     ]

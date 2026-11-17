@@ -345,8 +345,8 @@ async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and
             await main._process_pre_tp1_or_backstop_tick("7401", main.state_mgr.get_signal(7401))
         assert main.state_mgr.get_signal(7401)["status"] == "ACTIVE"
 
-        # 3) Momentary spread spike ($0.65 > $0.40) even with deep artificial bid drop to 3895.50 -> PAUSED, MUST HOLD!
-        with patch.object(main.executor, "get_tick", return_value=_tick(3895.50, spread=0.65)):
+        # 3) Momentary spread spike ($0.65 > $0.40) with -$2.90 bid drop (< $3.50 hard ceiling) -> PAUSED, MUST HOLD!
+        with patch.object(main.executor, "get_tick", return_value=_tick(3896.10, spread=0.65)):
             await main._process_pre_tp1_or_backstop_tick("7401", main.state_mgr.get_signal(7401))
         s_spike = main.state_mgr.get_signal(7401)
         assert s_spike["status"] == "ACTIVE"
@@ -357,11 +357,11 @@ async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and
             await main._process_pre_tp1_or_backstop_tick("7401", main.state_mgr.get_signal(7401))
         assert main.state_mgr.get_signal(7401)["status"] == "RUNNER_ACTIVE"
 
-        # Also test a momentary spread spike at TP3 (3919.50 -> artificial bid 3913.00 with $0.70 spread) -> holds!
+        # Also test a momentary spread spike at TP3 (3919.50 -> artificial bid 3916.50 (-$3.00 < $3.50) with $0.70 spread) -> holds!
         for tk in (
             _tick(3910.60, spread=0.20),
             _tick(3919.50, spread=0.20),
-            _tick(3913.00, spread=0.70),  # spread spike paused!
+            _tick(3916.50, spread=0.70),  # spread spike paused (< $3.50 hard ceiling)!
             _tick(3920.60, spread=0.20),
             _tick(3930.10, spread=0.20),
         ):

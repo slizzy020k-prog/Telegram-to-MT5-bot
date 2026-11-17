@@ -557,6 +557,15 @@ async def _execute_tp1_scaling_handoff(
     4. Appends to TradeLedger if all layers closed at TP1; otherwise builds Runner FSM alert.
     """
     eff_chat = chat_id if chat_id is not None else sig.get("chat_id")
+    raw_tp1_val = sig.get("raw_tp1")
+    if curr_price is not None and raw_tp1_val is not None:
+        _cfg_mod = sys.modules.get("config")
+        if bool(getattr(_cfg_mod, "TP1_TOUCH_BANK_ENABLED", True)):
+            dir_u = (sig.get("direction") or "BUY").strip().upper()
+            if (dir_u == "BUY" and float(curr_price) >= float(raw_tp1_val)) or (
+                dir_u == "SELL" and float(curr_price) <= float(raw_tp1_val)
+            ):
+                sig["tp1_touched"] = True
     runner_t = await _mt5_call(executor.handle_tp1_scaling_and_select_runner, sig)
     state_mgr.set_tp1_reached(msg_id, True, chat_id=eff_chat)
 
@@ -1368,28 +1377,46 @@ def _compute_initial_tp1_guard_armed(
     direction: str,
     raw_tp1: Optional[float],
     has_market: bool,
+    zone: Any = None,
+    single_price: Optional[float] = None,
+    is_stop_order: bool = False,
 ) -> bool:
     """
-    Arm live-price TP1 invalidation immediately when market positions exist or live price starts
-    on the pre-TP1 side. When a deep BUY/SELL LIMIT starts with live price already beyond TP1,
-    wait until price moves back across TP1 toward the limit zone before arming invalidation.
+    Entry-First Gate for TP1 invalidation:
+    - When market positions already exist (`has_market=True`), arm immediately (`True`).
+    - When a setup is pending-only (`has_market=False`, 0 filled layers), NEVER arm solely because
+      live price is below/above TP1; arm ONLY if live price has already entered the entry zone/price.
     """
-    if has_market or raw_tp1 is None or not tick:
+    if has_market:
         return True
-    try:
-        tp_val = float(raw_tp1)
-    except (TypeError, ValueError):
-        return True
+    if not tick:
+        return False
+
     dir_up = str(direction or "").upper()
+    ref_px: Optional[float] = None
+    if isinstance(zone, dict):
+        raw_ref = zone.get("top") if dir_up == "BUY" else zone.get("bottom")
+        if isinstance(raw_ref, (int, float)) and not isinstance(raw_ref, bool):
+            ref_px = float(raw_ref)
+    elif zone is not None:
+        raw_ref = getattr(zone, "top", None) if dir_up == "BUY" else getattr(zone, "bottom", None)
+        if isinstance(raw_ref, (int, float)) and not isinstance(raw_ref, bool):
+            ref_px = float(raw_ref)
+    elif isinstance(single_price, (int, float)) and not isinstance(single_price, bool):
+        ref_px = float(single_price)
+
+    if ref_px is None:
+        return False
+
     if dir_up == "BUY":
         ask = getattr(tick, "ask", None)
         if isinstance(ask, (int, float)) and not isinstance(ask, bool):
-            return float(ask) < tp_val
+            return (float(ask) >= ref_px - 1e-9) if is_stop_order else (float(ask) <= ref_px + 1e-9)
     elif dir_up == "SELL":
         bid = getattr(tick, "bid", None)
         if isinstance(bid, (int, float)) and not isinstance(bid, bool):
-            return float(bid) > tp_val
-    return True
+            return (float(bid) <= ref_px + 1e-9) if is_stop_order else (float(bid) >= ref_px - 1e-9)
+    return False
 
 
 def _reserve_task_key(msg_id: Any, chat_id: Optional[int | str] = None) -> Any:
@@ -1718,6 +1745,7 @@ async def _delayed_sell_now_task(
                 return
 
             prev_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
+            is_delayed_stub = bool(sl is None and not sig.get("tp_levels") and tp1_price is None)
             mk_tkts, pd_tkts, layers_data = await _mt5_call(
                 executor.execute_4layer_market,
                 symbol=symbol,
@@ -1730,6 +1758,7 @@ async def _delayed_sell_now_task(
                 raw_tp4=sig.get("raw_tp4"),
                 raw_tp5=sig.get("raw_tp5"),
                 tp_levels=sig.get("tp_levels"),
+                max_layers=1 if is_delayed_stub else None,
             )
             if not mk_tkts and not pd_tkts:
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order"
@@ -1887,7 +1916,34 @@ def _evaluate_catchup_staleness(
     Returns a human-readable rejection reason if stale/slipped, or None when safe.
     """
     direction = (parsed.direction or "BUY").upper()
-    if parsed.raw_tp1 is not None and tick and _tick_hit_tp1(tick, direction, parsed.raw_tp1):
+    is_stop = bool(getattr(parsed, "is_stop_order", False))
+    live_px = _get_live_entry_price(tick, direction)
+
+    ref_px: Optional[float] = None
+    would_fill_market = False
+    if live_px is not None:
+        if parsed.single_price is not None:
+            ref_px = float(parsed.single_price)
+            if is_stop:
+                would_fill_market = (direction == "BUY" and live_px >= ref_px) or (direction == "SELL" and live_px <= ref_px)
+            else:
+                would_fill_market = (direction == "BUY" and live_px <= ref_px) or (direction == "SELL" and live_px >= ref_px)
+        elif parsed.is_zone and parsed.zone is not None:
+            ref_px = float(parsed.zone.top if direction == "BUY" else parsed.zone.bottom)
+            would_fill_market = (direction == "BUY" and live_px <= ref_px) or (direction == "SELL" and live_px >= ref_px)
+
+    is_strictly_pending_limit = (
+        not parsed.is_instant_now
+        and not is_stop
+        and ref_px is not None
+        and not would_fill_market
+    )
+    if (
+        not is_strictly_pending_limit
+        and parsed.raw_tp1 is not None
+        and tick
+        and _tick_hit_tp1(tick, direction, parsed.raw_tp1)
+    ):
         return f"TP1 ({parsed.raw_tp1}) already reached on live market"
 
     if parsed.is_instant_now:
@@ -1898,23 +1954,8 @@ def _evaluate_catchup_staleness(
             )
         return None
 
-    live_px = _get_live_entry_price(tick, direction)
     if live_px is None or pip_size <= 0:
         return None
-
-    ref_px: Optional[float] = None
-    would_fill_market = False
-    is_stop = bool(getattr(parsed, "is_stop_order", False))
-
-    if parsed.single_price is not None:
-        ref_px = float(parsed.single_price)
-        if is_stop:
-            would_fill_market = (direction == "BUY" and live_px >= ref_px) or (direction == "SELL" and live_px <= ref_px)
-        else:
-            would_fill_market = (direction == "BUY" and live_px <= ref_px) or (direction == "SELL" and live_px >= ref_px)
-    elif parsed.is_zone and parsed.zone is not None:
-        ref_px = float(parsed.zone.top if direction == "BUY" else parsed.zone.bottom)
-        would_fill_market = (direction == "BUY" and live_px <= ref_px) or (direction == "SELL" and live_px >= ref_px)
 
     if would_fill_market and ref_px is not None:
         slip_pips = round(abs(live_px - ref_px) / pip_size, 2)
@@ -2850,35 +2891,72 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
 
     tp1_hit = (curr_price >= raw_tp1) if direction == "BUY" else (curr_price <= raw_tp1)
 
-    # Trigger 2: If 0 market positions filled and pending limits/stops remain, invalidate once live price hits raw_tp1
+    # Trigger 2: If 0 market positions filled and pending limits/stops remain, invalidate ONLY after
+    # price has actually entered the entry zone/price (`has_entered_zone=True`) and then reaches raw_tp1
+    # (or if a stop order hits SL before entry).
     if not sig.get("market_tickets"):
         pd_tkts = list(sig.get("pending_tickets", []))
         if pd_tkts:
-            if not sig.get("tp1_guard_armed", True):
-                entry_ref = None
-                z = sig.get("zone")
-                if isinstance(z, dict):
-                    entry_ref = z.get("top") if direction == "BUY" else z.get("bottom")
-                elif isinstance(sig.get("layers"), dict):
-                    l1_obj = sig["layers"].get("L1") or sig["layers"].get("TOP") or {}
-                    entry_ref = l1_obj.get("target_price")
-                margin = (
-                    min(1.5, abs(float(raw_tp1) - float(entry_ref)) * 0.5)
-                    if isinstance(entry_ref, (int, float))
-                    else 0.5
-                )
-                if direction == "BUY":
-                    ask_val = getattr(tick, "ask", None)
-                    if isinstance(ask_val, (int, float)) and not isinstance(ask_val, bool) and float(ask_val) <= round(float(raw_tp1) - margin, 2):
-                        sig["tp1_guard_armed"] = True
-                        state_mgr.update_signal(msg_id, {"tp1_guard_armed": True}, chat_id=sig_chat)
-                elif direction == "SELL":
-                    bid_val = getattr(tick, "bid", None)
-                    if isinstance(bid_val, (int, float)) and not isinstance(bid_val, bool) and float(bid_val) >= round(float(raw_tp1) + margin, 2):
-                        sig["tp1_guard_armed"] = True
-                        state_mgr.update_signal(msg_id, {"tp1_guard_armed": True}, chat_id=sig_chat)
+            entry_ref = None
+            z = sig.get("zone")
+            if isinstance(z, dict):
+                entry_ref = z.get("top") if direction == "BUY" else z.get("bottom")
+            if entry_ref is None:
+                entry_ref = sig.get("single_price")
+            if entry_ref is None and isinstance(sig.get("layers"), dict):
+                l1_obj = sig["layers"].get("L1") or sig["layers"].get("TOP") or {}
+                entry_ref = l1_obj.get("target_price")
 
-            if sig.get("tp1_guard_armed", True) and _tick_hit_tp1(tick, direction, raw_tp1):
+            is_stop_pending = bool(sig.get("is_stop_order", False))
+            sl_pending = sig.get("sl")
+            if is_stop_pending and isinstance(sl_pending, (int, float)) and not isinstance(sl_pending, bool):
+                sl_f = float(sl_pending)
+                bid_v = getattr(tick, "bid", None)
+                ask_v = getattr(tick, "ask", None)
+                sl_hit_pre_entry = (
+                    (direction == "BUY" and isinstance(bid_v, (int, float)) and float(bid_v) <= sl_f)
+                    or (direction == "SELL" and isinstance(ask_v, (int, float)) and float(ask_v) >= sl_f)
+                )
+                if sl_hit_pre_entry:
+                    await _invalidate_signal_tp1_unlocked(
+                        msg_id,
+                        reason="Stop Loss Reached Before Stop Entry",
+                        chat_id=sig_chat,
+                    )
+                    return
+
+            if not sig.get("has_entered_zone") or not sig.get("tp1_guard_armed", False):
+                entered_now = False
+                if isinstance(entry_ref, (int, float)) and not isinstance(entry_ref, bool):
+                    ref_f = float(entry_ref)
+                    if direction == "BUY":
+                        ask_val = getattr(tick, "ask", None)
+                        if isinstance(ask_val, (int, float)) and not isinstance(ask_val, bool):
+                            entered_now = (
+                                (float(ask_val) >= ref_f - 1e-9)
+                                if is_stop_pending
+                                else (float(ask_val) <= ref_f + 1e-9)
+                            )
+                    elif direction == "SELL":
+                        bid_val = getattr(tick, "bid", None)
+                        if isinstance(bid_val, (int, float)) and not isinstance(bid_val, bool):
+                            entered_now = (
+                                (float(bid_val) <= ref_f + 1e-9)
+                                if is_stop_pending
+                                else (float(bid_val) >= ref_f - 1e-9)
+                            )
+                if entered_now:
+                    sig["has_entered_zone"] = True
+                    sig["tp1_guard_armed"] = True
+                    state_mgr.update_signal(
+                        msg_id,
+                        {"has_entered_zone": True, "tp1_guard_armed": True},
+                        chat_id=sig_chat,
+                    )
+
+            if (sig.get("has_entered_zone") or sig.get("tp1_guard_armed") is True) and _tick_hit_tp1(
+                tick, direction, raw_tp1
+            ):
                 await _invalidate_signal_tp1_unlocked(
                     msg_id,
                     reason="Market Price Reached TP1",
@@ -3595,8 +3673,23 @@ async def _handle_trade_management_action(
         )
 
     elif action in ("ACTION_REACTIVATE", "REACTIVATE"):
-        if target_signal.get("status") == "ACTIVE":
-            logger.info("Signal is already active; ignoring redundant 'Active' command.")
+        curr_st = str(target_signal.get("status") or "").upper()
+        has_live_tkts = bool(
+            target_signal.get("market_tickets")
+            or target_signal.get("pending_tickets")
+            or target_signal.get("runner_tickets")
+            or target_signal.get("runner_ticket")
+        )
+        is_closed_state = curr_st in ("CLOSED", "FULL_CLOSED", "CANCELLED")
+        if (
+            curr_st in ("ACTIVE", "RUNNER_ACTIVE", "BE_APPLIED", "PARTIAL_CLOSED", "OPEN", "PARTIAL_FILLED")
+            or (not is_closed_state and has_live_tkts)
+            or (target_signal.get("tp1_reached") and bool(target_signal.get("runner_tickets") or target_signal.get("runner_ticket")))
+        ):
+            logger.info(
+                f"Signal {target_msg_id} is already active/running (status={curr_st}, live_tickets={has_live_tkts}); "
+                f"ignoring redundant 'Active' command."
+            )
             return
 
         raw_tp1 = target_signal.get("raw_tp1")
@@ -4076,6 +4169,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
             zone_completed = True
             is_zone = True
         elif parsed.single_price is not None:
+            is_single_stub = bool(sl is None and not tp_levels and not is_limit_order and not is_stop_order)
             market_tickets, pending_tickets, layers_data = await _mt5_call(
                 executor.execute_4layer_single_price,
                 symbol=symbol,
@@ -4091,10 +4185,13 @@ async def _handle_new_message_unlocked(event: Any) -> None:
                 tp_levels=tp_levels or None,
                 order_intent=order_intent,
                 is_stop_order=is_stop_order,
+                max_layers=1 if is_single_stub else None,
             )
+            zone_completed = not is_single_stub
         elif float(SELL_NOW_DELAY_SECONDS) <= 0.0:
             now_tick = await _mt5_call(executor.get_tick, symbol)
             initial_price = _get_live_entry_price(now_tick, direction)
+            is_market_stub = bool(sl is None and not tp_levels)
             market_tickets, pending_tickets, layers_data = await _mt5_call(
                 executor.execute_4layer_market,
                 symbol=symbol,
@@ -4107,6 +4204,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
                 raw_tp4=raw_tp4,
                 raw_tp5=raw_tp5,
                 tp_levels=tp_levels or None,
+                max_layers=1 if is_market_stub else None,
             )
         else:
             now_tick = await _mt5_call(executor.get_tick, symbol)
@@ -4311,12 +4409,24 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         now = time.time()
         dedup_key = _get_dedup_key(chat_id, msg_id)
         clean_raw_text = raw_text.strip()
+        norm_text = " ".join(clean_raw_text.lower().split())
+        if _recent_message_texts.get("_active_state_mgr_id") != id(state_mgr):
+            _recent_message_texts["_active_state_mgr_id"] = id(state_mgr)
+        prev_raw = _recent_message_texts.get(dedup_key)
+        prev_norm = " ".join(prev_raw.strip().lower().split()) if isinstance(prev_raw, str) else None
+        state_scope_key = (id(state_mgr), dedup_key)
         if (
-            dedup_key in _recent_messages
-            and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS
-            and clean_raw_text == _recent_message_texts.get(dedup_key, "")
+            (
+                dedup_key in _recent_messages
+                and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS
+                and clean_raw_text == prev_raw
+            )
+            or _recent_message_texts.get(state_scope_key) == norm_text
+            or (prev_norm is not None and norm_text == prev_norm)
         ):
-            logger.debug(f"Edited message {msg_id} not in state & unchanged within {DEDUPLICATION_WINDOW_SECONDS}s dedup; skipping.")
+            logger.info(
+                f"Edited untracked message {msg_id} has unchanged normalized text; skipping re-execution."
+            )
             return
 
         now_utc = datetime.now(timezone.utc)
@@ -4353,6 +4463,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
         logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] (not in state; treating as new) ---")
         await _handle_new_message_unlocked(event)
+        _recent_message_texts[state_scope_key] = norm_text
         return
 
     logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] ---\nNew Text: {raw_text}")
@@ -4678,6 +4789,29 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     pending_tickets = list(existing_signal.get("pending_tickets", []))
     layers = dict(existing_signal.get("layers") or {})
 
+    # Pre-reconcile pending_tickets against live MT5 positions before cancel/modify/add-layers
+    live_pos_ids: set = set()
+    live_ord_ids: set = set()
+    if (market_tickets or pending_tickets) and not executor.dry_run:
+        live_positions = await _mt5_call(executor.get_live_positions, symbol)
+        live_orders = await _mt5_call(executor.get_live_orders, symbol)
+        live_pos_ids = {int(getattr(p, "ticket", 0)) for p in (live_positions or []) if getattr(p, "ticket", None)}
+        live_ord_ids = {int(getattr(o, "ticket", 0)) for o in (live_orders or []) if getattr(o, "ticket", None)}
+        if live_pos_ids and pending_tickets:
+            for pt in list(pending_tickets):
+                if int(pt) in live_pos_ids:
+                    pending_tickets.remove(pt)
+                    if pt not in market_tickets:
+                        market_tickets.append(pt)
+                    for l_data in layers.values():
+                        if isinstance(l_data, dict) and l_data.get("ticket") == pt:
+                            l_data["status"] = "OPEN"
+                            l_data["order_type"] = "MARKET"
+                    logger.info(
+                        f"Pre-edit reconciliation: Pending order #{pt} already filled on MT5; "
+                        f"promoted to market_tickets for Msg ID {msg_id}."
+                    )
+
     # Upgrade single-order legacy "TOP" entry into canonical "L1" so late zone edits scale to full 4-layer sizing
     if set(layers.keys()) == {"TOP"} and "MID" not in layers and "BOTTOM" not in layers:
         top_rec = dict(layers.pop("TOP"))
@@ -4868,9 +5002,22 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             if pt not in handled_tickets:
                 await _mt5_call(executor.modify_pending_order_sltp, ticket=pt, sl=new_sl, tp=new_tp)
 
-    # 3. Place additional layers across zone or single-price whenever open+pending < MAX_ORDERS_PER_SIGNAL
-    current_count = len(market_tickets) + len(pending_tickets)
-    slots_left = MAX_ORDERS_PER_SIGNAL - current_count
+    # 3. Place missing layers across zone ONLY (never stacking L2..L4 on a single-price SL/TP edit),
+    #    strictly capped so total open+pending orders for this signal never exceed MAX_ORDERS_PER_SIGNAL (4).
+    live_signal_tickets: set = {
+        int(t) for t in (list(market_tickets) + list(pending_tickets)) if t is not None
+    }
+    for ld in layers.values():
+        if isinstance(ld, dict) and ld.get("ticket") is not None and ld.get("status") in ("OPEN", "PENDING", "RUNNER"):
+            live_signal_tickets.add(int(ld["ticket"]))
+    if not executor.dry_run and (live_pos_ids or live_ord_ids):
+        active_mt5_ids = live_pos_ids | live_ord_ids
+        for raw_t in (existing_signal.get("mt5_order_tickets") or []):
+            if raw_t is not None and int(raw_t) in active_mt5_ids:
+                live_signal_tickets.add(int(raw_t))
+
+    current_count = len(live_signal_tickets)
+    slots_left = max(0, MAX_ORDERS_PER_SIGNAL - current_count)
     zone_completed = bool(existing_signal.get("zone_completed", False))
     old_zone = existing_signal.get("zone") if isinstance(existing_signal.get("zone"), dict) else None
     zone_changed = bool(
@@ -4904,16 +5051,41 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                     for i in range(4)
                 ]
                 alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol, rem_base_lots)
+                l1_is_open_market = bool(
+                    isinstance(layers.get("L1"), dict)
+                    and layers["L1"].get("status") == "OPEN"
+                    and layers["L1"].get("order_type") == "MARKET"
+                )
                 layer_specs = [
-                    (f"L{i + 1}", tiers[f"L{i + 1}"], alloc_lots[i], new_tp, f"TG L{i + 1} (Edit", "AUTO")
+                    (
+                        f"L{i + 1}",
+                        tiers[f"L{i + 1}"],
+                        alloc_lots[i],
+                        new_tp,
+                        f"TG L{i + 1} (Edit",
+                        "LIMIT" if (i > 0 and l1_is_open_market and not is_stop_order) else "AUTO",
+                    )
                     for i in range(4)
                 ]
 
+            occupied_prices: List[float] = [
+                round(float(ld["target_price"]), 2)
+                for ld in layers.values()
+                if isinstance(ld, dict)
+                and ld.get("ticket") is not None
+                and ld.get("status") in ("OPEN", "PENDING", "RUNNER")
+                and ld.get("target_price") is not None
+                and ld.get("order_type") != "MARKET"
+            ]
+
             for l_name, target_px, l_lot, l_tp, c_prefix, l_intent in layer_specs:
-                if slots_left <= 0:
+                if slots_left <= 0 or (len(market_tickets) + len(pending_tickets)) >= MAX_ORDERS_PER_SIGNAL:
                     break
                 existing_layer = layers.get(l_name)
                 if (isinstance(existing_layer, dict) and existing_layer.get("status") in ("OPEN", "PENDING", "CLOSED", "RUNNER")) or l_lot <= 0.0:
+                    continue
+                target_px_rounded = round(float(target_px), 2)
+                if any(abs(target_px_rounded - op) < 0.01 for op in occupied_prices):
                     continue
                 t, o_type = await _mt5_call(
                     _place_edit_layer_order,
@@ -4934,6 +5106,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                     else:
                         pending_tickets.append(t)
                         l_status = "PENDING"
+                        occupied_prices.append(target_px_rounded)
                     layers[l_name] = {
                         "lot": l_lot,
                         "target_price": target_px,
@@ -4946,50 +5119,6 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                     slots_left -= 1
 
             zone_completed = True
-        elif parsed.single_price is not None and not parsed.zone and not zone_completed and not is_legacy:
-            sp_px = round(float(parsed.single_price), 2)
-            rem_base_lots = [
-                0.0 if (f"L{i + 1}" in layers and layers[f"L{i + 1}"].get("ticket") is not None) else float(BASE_LAYER_LOTS[i])
-                for i in range(4)
-            ]
-            alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol, rem_base_lots)
-            for i in range(4):
-                if slots_left <= 0:
-                    break
-                l_name = f"L{i + 1}"
-                existing_layer = layers.get(l_name)
-                l_lot = alloc_lots[i]
-                if (isinstance(existing_layer, dict) and existing_layer.get("status") in ("OPEN", "PENDING", "CLOSED", "RUNNER")) or l_lot <= 0.0:
-                    continue
-                t, o_type = await _mt5_call(
-                    _place_edit_layer_order,
-                    symbol=symbol,
-                    direction=direction,
-                    target_price=sp_px,
-                    lot=l_lot,
-                    sl=new_sl,
-                    tp=new_tp,
-                    comment_prefix=f"TG {l_name} (Edit)",
-                    tick=tick,
-                    order_intent=order_intent,
-                )
-                if t:
-                    if o_type == "MARKET":
-                        market_tickets.append(t)
-                        l_status = "OPEN"
-                    else:
-                        pending_tickets.append(t)
-                        l_status = "PENDING"
-                    layers[l_name] = {
-                        "lot": l_lot,
-                        "target_price": sp_px,
-                        "tp": new_tp,
-                        "tp_stage": "TP1",
-                        "ticket": t,
-                        "order_type": o_type,
-                        "status": l_status,
-                    }
-                    slots_left -= 1
 
     signal_updates: Dict[str, Any] = {
         "sl": new_sl,
