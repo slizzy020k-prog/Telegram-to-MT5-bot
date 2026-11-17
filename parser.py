@@ -32,8 +32,10 @@ ACCOUNT_RISK_BLOCKERS = [
     r"mid\s+risk",
     r"low\s+risk",
     r"[£$€]?\s*\d+\s*account",
+    r"[£$€]\s*\d+\s*(?:to|-|–|—|->)\s*[£$€]?\s*\d+",
     r"account\s+size",
     r"lot\s+size",
+    r"\bhow\s+to\b",
 ]
 
 VICTORY_RECAP_BLOCKERS = [
@@ -48,6 +50,9 @@ VICTORY_RECAP_BLOCKERS = [
     r"\bentry\s+was\b",                              # "Buy entry was 3895"
     r"\bwas\s+(?:a\s+)?(?:great|good|perfect|beautiful)\b",
     r"\+\s*\d+\s*pips?\b",                           # "+50 pips"
+    r"\blast\s+night\b",                             # "1 sell from last night"
+    r"\byesterday\b",                                # past-tense recap
+    r"\bhis\s+money\b",                              # promo / testimonial chatter
 ]
 
 # ---------------------------------------------------------------------------
@@ -973,6 +978,10 @@ def gate_4_extract_signal(
         elif len(distinct_levels) == 1:
             single_price = distinct_levels[0]
             is_zone = False
+        elif is_limit_order or is_stop_order:
+            # Explicit "buy limit" / "sell stop" etc. WITHOUT any price is incomplete/chatter -> never execute as Market Now!
+            logger.info("Gate 4 Reject: LIMIT/STOP keyword detected without an entry price or zone.")
+            return None
         else:
             # No zone or single price found -> instant market entry ("Buy now")
             is_instant_now = True

@@ -1648,6 +1648,22 @@ async def _delayed_sell_now_task(
             if session_trading_blocked():
                 state_mgr.update_signal(msg_id, {"status": "CLOSED"}, chat_id=chat_id)
                 return
+            if CLOSE_ON_SIGNAL_DELETED and (
+                _is_message_tombstoned(chat_id, msg_id)
+                or (
+                    chat_id is not None
+                    and telethon_client is not None
+                    and isinstance(msg_id, int)
+                    and await _verify_message_deleted_on_telegram(chat_id, msg_id)
+                )
+            ):
+                await _close_deleted_signal_unlocked(
+                    msg_id,
+                    sig,
+                    chat_id=chat_id,
+                    source_label="Pre-Execution Delete Check",
+                )
+                return
 
             symbol = sig.get("symbol", DEFAULT_SYMBOL)
             direction = sig.get("direction", "SELL").upper()
@@ -2022,7 +2038,7 @@ async def _verify_message_deleted_on_telegram(sig_chat: Any, msg_id: int) -> boo
         return True
     if getattr(fetched, "id", None) == int(msg_id):
         return False
-    return True
+    return False
 
 
 async def handle_message_deleted(event: Any) -> None:
@@ -2941,6 +2957,16 @@ async def tp1_proximity_watcher_task() -> None:
     while True:
         try:
             now = time.time()
+            # Priority 0: Pull out deleted signals ASAP at the very top of every loop iteration
+            if (
+                CLOSE_ON_SIGNAL_DELETED
+                and float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS) > 0.0
+                and (now - last_deleted_poll >= float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS))
+            ):
+                last_deleted_poll = now
+                if state_mgr.get_open_or_pending_signals():
+                    await poll_deleted_active_signals(source_label="Fast Sweep")
+
             active_signals = state_mgr.get_active_signals()
             mt5_connected = True
             algo_allowed = True
@@ -2964,15 +2990,6 @@ async def tp1_proximity_watcher_task() -> None:
             if now - last_tg_keepalive >= TELEGRAM_KEEPALIVE_SECONDS:
                 last_tg_keepalive = now
                 await _run_telegram_keepalive_check(now)
-
-            if (
-                CLOSE_ON_SIGNAL_DELETED
-                and float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS) > 0.0
-                and (now - last_deleted_poll >= float(DELETED_SIGNAL_POLL_INTERVAL_SECONDS))
-            ):
-                last_deleted_poll = now
-                if state_mgr.get_open_or_pending_signals():
-                    await poll_deleted_active_signals(source_label="Periodic Sweep")
 
             if now - last_algo_check >= CHECK_ALGO_TRADING_INTERVAL:
                 last_algo_check = now

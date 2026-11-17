@@ -574,3 +574,14 @@ async def test_9_close_on_signal_deleted_config_toggle_and_startup_validation(tm
     assert res_bad["ok"] is False
     assert any("CLOSE_ON_SIGNAL_DELETED" in e for e in res_bad["errors"])
     assert any("DELETED_SIGNAL_POLL_INTERVAL_SECONDS" in e for e in res_bad["errors"])
+    assert config.DELETED_SIGNAL_POLL_INTERVAL_SECONDS == pytest.approx(1.5)
+
+
+def test_10_real_channel_chatter_false_positives_blocked():
+    """Verify real channel educational/testimonial chatter ('How to place a buy limit', '£150 to £600...') never opens trades."""
+    from parser import parse_message
+
+    assert parse_message("How to place a buy limit .") is None
+    assert parse_message("How to place a buy limit") is None
+    assert parse_message("Sell stop") is None
+    assert parse_message("£150 to £600 , bro x4 his money with 1 sell from last night lol 😆😮‍💨") is None
