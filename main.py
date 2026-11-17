@@ -65,6 +65,7 @@ from config import (
     NOW_ENTRY_MAX_WAIT_SECONDS,
     DAILY_LOSS_CLOSE_OPEN_TRADES,
     MAX_NEW_EDIT_AGE_SECONDS,
+    MAX_EDIT_EVENT_FRESHNESS_SECONDS,
     FALLBACK_TP1_PIPS,
     UNPRICED_TP_GRACE_SECONDS,
     DAILY_LOSS_PAUSE_PCT,
@@ -224,8 +225,9 @@ telethon_client: Optional[TelegramClient] = None
 _instance_lock: Optional[SingleInstanceLock] = None
 BOT_START_TIME = time.time()
 
-# In-memory deduplication tracking ((chat_id, msg_id) or msg_id -> process_timestamp)
+# In-memory deduplication tracking ((chat_id, msg_id) or msg_id -> process_timestamp / last_raw_text)
 _recent_messages: Dict[Any, float] = {}
+_recent_message_texts: Dict[Any, str] = {}
 
 # Out-of-order tombstone map for deleted Telegram signal messages ((chat_id, msg_id) -> deleted_timestamp)
 _deleted_messages: Dict[Any, float] = {}
@@ -305,12 +307,26 @@ def _normalize_task_msg_id(msg_id: Any, chat_id: Optional[int | str] = None) -> 
         return msg_id, chat_id
 
 
+def _canonical_chat_key(chat_id: Any) -> Any:
+    """Normalize Telegram supergroup/channel ID variants (-100<id>, -<id>, <id>) to one canonical key."""
+    if chat_id is None or isinstance(chat_id, bool):
+        return None
+    raw = str(chat_id).strip()
+    if not raw:
+        return None
+    digits = raw.lstrip("-")
+    if digits.isdigit():
+        bare = digits[3:] if (digits.startswith("100") and len(digits) > 3) else digits
+        return f"-100{bare}"
+    return raw
+
+
 def _get_signal_lock(chat_id: Optional[int | str], msg_id: Any) -> asyncio.Lock:
-    """Return a per-(event_loop, chat_id, msg_id) asyncio.Lock serializing edits, replies, and timers."""
+    """Return a per-(event_loop, canonical_chat_id, msg_id) asyncio.Lock serializing edits, replies, and timers."""
     loop = asyncio.get_running_loop()
     loop_id = id(loop)
     mid_norm, eff_chat = _normalize_task_msg_id(msg_id, chat_id=chat_id)
-    key = (loop_id, eff_chat, str(mid_norm))
+    key = (loop_id, _canonical_chat_key(eff_chat), str(mid_norm))
     lock = _signal_locks.get(key)
     if lock is None:
         if len(_signal_locks) > 1024:
@@ -1217,8 +1233,8 @@ def _safe_chat_id(event: Any) -> Optional[int | str]:
 
 
 def _get_dedup_key(chat_id: Optional[int | str], msg_id: Any) -> Any:
-    """Build per-channel deduplication key."""
-    return (chat_id, msg_id) if chat_id is not None else msg_id
+    """Build canonical per-channel deduplication key (normalizing -100<id> and -<id> variants)."""
+    return (_canonical_chat_key(chat_id), msg_id) if chat_id is not None else msg_id
 
 
 def _record_deleted_tombstone(chat_id: Optional[int | str], msg_id: Any) -> None:
@@ -2200,7 +2216,57 @@ async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
         tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
         pip_size = await _mt5_call(executor.get_pip_size, DEFAULT_SYMBOL)
 
-        for chat_id in CHANNEL_IDS:
+        # Deduplicate equivalent channel ID variants (e.g. -4369388188 & -1004369388188), preferring -100... form
+        dedup_channels: List[Any] = []
+        seen_canon: Dict[Any, int] = {}
+        for ch in CHANNEL_IDS:
+            canon = _canonical_chat_key(ch)
+            if canon not in seen_canon:
+                seen_canon[canon] = len(dedup_channels)
+                dedup_channels.append(ch)
+            elif str(ch).strip().startswith("-100") and not str(dedup_channels[seen_canon[canon]]).strip().startswith("-100"):
+                dedup_channels[seen_canon[canon]] = ch
+
+        # Pre-pass: check all currently active/pending signals (even if msg_id <= last_seen_id) for missed text edits
+        open_by_chat: Dict[Any, List[Tuple[int, Dict[str, Any]]]] = {}
+        for sig_key, sig_data in state_mgr.get_open_or_pending_signals():
+            raw_mid, sig_chat = _normalize_task_msg_id(sig_key, chat_id=sig_data.get("chat_id"))
+            if sig_chat is not None and isinstance(raw_mid, int) and not isinstance(raw_mid, bool) and raw_mid > 0:
+                open_by_chat.setdefault(sig_chat, []).append((int(raw_mid), sig_data))
+
+        for sig_chat, active_items in open_by_chat.items():
+            active_ids = [item[0] for item in active_items]
+            try:
+                raw_active = get_msgs_fn(sig_chat, ids=active_ids)
+                fetched_active = (
+                    await asyncio.wait_for(raw_active, timeout=8.0)
+                    if inspect.isawaitable(raw_active)
+                    else raw_active
+                )
+            except Exception as act_err:
+                logger.debug(f"Catch-up active edit check skipped for chat {sig_chat}: {act_err}")
+                continue
+            if not isinstance(fetched_active, (list, tuple)) or len(fetched_active) != len(active_ids):
+                continue
+            auth_ok = True
+            for idx, item in enumerate(fetched_active):
+                if item is None or type(item).__name__ == "MessageEmpty":
+                    continue
+                if getattr(item, "id", None) != active_ids[idx] or not isinstance(getattr(item, "message", None), str):
+                    auth_ok = False
+                    break
+            if not auth_ok:
+                continue
+            for idx, item in enumerate(fetched_active):
+                if item is None or type(item).__name__ == "MessageEmpty":
+                    continue
+                new_txt = (getattr(item, "message", None) or "").strip()
+                old_txt = (active_items[idx][1].get("raw_text") or "").strip()
+                if new_txt and new_txt != old_txt:
+                    await handle_message_edited(_CatchupEvent(item, sig_chat))
+                    summary["edits"] += 1
+
+        for chat_id in dedup_channels:
             summary["channels"] += 1
             last_seen_id = state_mgr.get_last_seen_msg_id(chat_id)
             try:
@@ -2240,7 +2306,10 @@ async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
                 existing = state_mgr.get_signal(msg_id, chat_id=chat_id)
                 if existing is not None:
                     if raw_text.strip() and raw_text.strip() != (existing.get("raw_text") or "").strip():
-                        if age_sec <= float(CATCHUP_WINDOW_SECONDS):
+                        is_non_terminal = existing.get("status") not in (
+                            "CLOSED", "FULL_CLOSED", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD"
+                        )
+                        if is_non_terminal or age_sec <= float(CATCHUP_WINDOW_SECONDS):
                             await handle_message_edited(_CatchupEvent(msg, chat_id))
                             summary["edits"] += 1
                     state_mgr.set_catchup_watermark(chat_id, msg_id, msg_ts=msg_ts_iso)
@@ -3567,16 +3636,24 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         stale_keys = [k for k, v in _recent_messages.items() if v < cutoff]
         for k in stale_keys:
             del _recent_messages[k]
+            _recent_message_texts.pop(k, None)
 
     dedup_key = _get_dedup_key(chat_id, msg_id)
-    if dedup_key in _recent_messages and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS:
+    clean_raw_text = raw_text.strip()
+    if (
+        dedup_key in _recent_messages
+        and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS
+        and clean_raw_text == _recent_message_texts.get(dedup_key, "")
+    ):
         logger.info(f"Message ID {msg_id} duplicate event within {DEDUPLICATION_WINDOW_SECONDS}s; skipping.")
         return
     if state_mgr.get_signal(msg_id, chat_id=chat_id) is not None:
         logger.info(f"Message ID {msg_id} already exists in state; skipping duplicate creation.")
         _recent_messages[dedup_key] = now
+        _recent_message_texts[dedup_key] = clean_raw_text
         return
     _recent_messages[dedup_key] = now
+    _recent_message_texts[dedup_key] = clean_raw_text
 
     if chat_id is not None and isinstance(msg_id, int) and not isinstance(msg_id, bool):
         msg_date = getattr(msg, "date", None)
@@ -3892,25 +3969,34 @@ def _place_edit_layer_order(
     tp: Optional[float],
     comment_prefix: str,
     tick: Any,
+    order_intent: str = "AUTO",
 ) -> Tuple[Optional[int], str]:
-    """Place a limit order if price has not reached target_price yet; otherwise execute at market."""
-    is_market = False
-    if tick:
-        if direction == "BUY" and getattr(tick, "ask", 999999.0) <= target_price:
-            is_market = True
-        elif direction == "SELL" and getattr(tick, "bid", 0.0) >= target_price:
-            is_market = True
-
-    if is_market:
-        t = executor.execute_market_order(
-            symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=f"{comment_prefix} Market",
+    """Route an edit/retier layer to MARKET, LIMIT, or STOP with broker trade_stops_level fallback."""
+    eff_tick = tick or executor.get_tick(executor.resolve_symbol(symbol))
+    if eff_tick is None:
+        t = executor.place_limit_order(
+            symbol=symbol,
+            direction=direction,
+            price=target_price,
+            lot=lot,
+            sl=sl,
+            tp=tp,
+            comment=f"{comment_prefix} Limit",
         )
-        return t, "MARKET"
-
-    t = executor.place_limit_order(
-        symbol=symbol, direction=direction, price=target_price, lot=lot, sl=sl, tp=tp, comment=f"{comment_prefix} Limit",
+        return (t, "LIMIT") if t else (None, "FAILED")
+    return executor._execute_layer_price(
+        symbol=symbol,
+        direction=direction,
+        target_price=target_price,
+        lot=lot,
+        sl=sl,
+        tp=tp,
+        tick=eff_tick,
+        market_comment=f"{comment_prefix} Market",
+        limit_comment=f"{comment_prefix} Limit",
+        order_intent=order_intent,
+        stop_comment=f"{comment_prefix} Stop",
     )
-    return t, "LIMIT"
 
 
 async def _handle_message_edited_unlocked(event: Any) -> None:
@@ -3937,20 +4023,46 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     if not existing_signal:
         now = time.time()
         dedup_key = _get_dedup_key(chat_id, msg_id)
-        if dedup_key in _recent_messages and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS:
-            logger.debug(f"Edited message {msg_id} not in state & within {DEDUPLICATION_WINDOW_SECONDS}s dedup; skipping.")
+        clean_raw_text = raw_text.strip()
+        if (
+            dedup_key in _recent_messages
+            and (now - _recent_messages[dedup_key]) < DEDUPLICATION_WINDOW_SECONDS
+            and clean_raw_text == _recent_message_texts.get(dedup_key, "")
+        ):
+            logger.debug(f"Edited message {msg_id} not in state & unchanged within {DEDUPLICATION_WINDOW_SECONDS}s dedup; skipping.")
             return
 
+        now_utc = datetime.now(timezone.utc)
         msg_date = getattr(msg, "date", None)
+        age_sec: Optional[float] = None
         if isinstance(msg_date, datetime):
             dt_utc = msg_date if msg_date.tzinfo is not None else msg_date.replace(tzinfo=timezone.utc)
-            age_sec = (datetime.now(timezone.utc) - dt_utc).total_seconds()
-            if age_sec > MAX_NEW_EDIT_AGE_SECONDS:
+            age_sec = max(0.0, (now_utc - dt_utc).total_seconds())
+
+        edit_date = getattr(msg, "edit_date", None)
+        is_telethon_msg = type(msg).__module__.startswith("telethon")
+        if isinstance(edit_date, datetime):
+            edit_dt_utc = edit_date if edit_date.tzinfo is not None else edit_date.replace(tzinfo=timezone.utc)
+            edit_age_sec = max(0.0, (now_utc - edit_dt_utc).total_seconds())
+            if edit_age_sec > MAX_EDIT_EVENT_FRESHNESS_SECONDS and (
+                age_sec is None or age_sec > MAX_EDIT_EVENT_FRESHNESS_SECONDS
+            ):
                 logger.info(
-                    f"Ignoring edit/reaction on old untracked message {msg_id} "
-                    f"(age={age_sec:.0f}s > {MAX_NEW_EDIT_AGE_SECONDS}s limit)."
+                    f"Ignoring stale reaction/update on untracked message {msg_id} "
+                    f"(edit_age={edit_age_sec:.0f}s > {MAX_EDIT_EVENT_FRESHNESS_SECONDS}s)."
                 )
                 return
+        elif is_telethon_msg and edit_date is None and age_sec is not None and age_sec > 15.0:
+            logger.info(
+                f"Ignoring non-text reaction/view update on unedited message {msg_id} (age={age_sec:.0f}s)."
+            )
+            return
+        elif age_sec is not None and age_sec > MAX_NEW_EDIT_AGE_SECONDS:
+            logger.info(
+                f"Ignoring edit/reaction on old untracked message {msg_id} "
+                f"(age={age_sec:.0f}s > {MAX_NEW_EDIT_AGE_SECONDS}s limit)."
+            )
+            return
 
         logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] (not in state; treating as new) ---")
         await _handle_new_message_unlocked(event)
@@ -3997,17 +4109,49 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         return
 
     is_forward = getattr(msg, "forward", None) is not None
-    tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
-    live_price = getattr(tick, "bid", None) if tick else None
+    tick = await _mt5_call(executor.get_tick, symbol)
+    live_price = (
+        getattr(tick, "bid", None) if str(direction).upper() == "BUY" else getattr(tick, "ask", None)
+    ) if tick else None
+    entry_ref_price = (
+        existing_signal.get("recorded_entry_price")
+        if existing_signal.get("recorded_entry_price") is not None
+        else (
+            existing_signal.get("initial_price")
+            if existing_signal.get("initial_price") is not None
+            else live_price
+        )
+    )
     parsed = parse_message(
         raw_text,
         message_id=msg_id,
         is_edit=True,
         is_forward=is_forward,
-        live_price=live_price,
+        live_price=live_price if live_price is not None else entry_ref_price,
     )
     if parsed is None:
         return
+    if (
+        parsed.event_type != "TRADE_MANAGEMENT"
+        and not parsed.sl_valid
+        and entry_ref_price is not None
+        and entry_ref_price != live_price
+        and curr_status != "RUNNER_ACTIVE"
+    ):
+        alt_parsed = parse_message(
+            raw_text,
+            message_id=msg_id,
+            is_edit=True,
+            is_forward=is_forward,
+            live_price=entry_ref_price,
+        )
+        if alt_parsed is not None and alt_parsed.sl_valid and alt_parsed.sl is not None:
+            if live_price is None or (
+                (str(direction).upper() == "BUY" and float(alt_parsed.sl) < float(live_price))
+                or (str(direction).upper() == "SELL" and float(alt_parsed.sl) > float(live_price))
+            ):
+                parsed["sl"] = alt_parsed.sl
+                parsed["sl_valid"] = True
 
     if parsed.event_type == "TRADE_MANAGEMENT":
         existing_signal["raw_text"] = raw_text
@@ -4020,6 +4164,8 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     pip_size = await _mt5_call(executor.get_pip_size, symbol)
     new_sl = parsed.sl if (parsed.sl_valid and parsed.sl is not None) else existing_signal.get("sl")
 
+    was_fallback_tp = bool(existing_signal.get("fallback_tp_applied"))
+    old_raw_tp1 = existing_signal.get("raw_tp1")
     existing_tps = (
         dict(existing_signal["tp_levels"])
         if isinstance(existing_signal.get("tp_levels"), dict) and existing_signal.get("tp_levels")
@@ -4027,18 +4173,33 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     )
     parsed_labeled = getattr(parsed, "labeled_tps", None) or {}
     parsed_unlabeled = getattr(parsed, "unlabeled_tps", None) or []
-    if parsed_labeled:
+    has_new_explicit_tps = bool(
+        parsed_labeled or parsed_unlabeled or (isinstance(parsed.tp_levels, dict) and parsed.tp_levels)
+    )
+
+    if was_fallback_tp and has_new_explicit_tps:
+        base_existing_tps: Dict[str, float] = {}
+        fallback_tp_flag = False
+    else:
+        base_existing_tps = existing_tps
+        fallback_tp_flag = was_fallback_tp
+
+    if parsed_labeled or (was_fallback_tp and has_new_explicit_tps and parsed_unlabeled):
         merged_tp_levels = merge_tp_levels_for_active_signal(
-            existing_tps,
+            base_existing_tps,
             parsed_labeled,
             parsed_unlabeled,
             direction=direction,
             pip_size=pip_size,
         )
-    else:
-        merged_tp_levels = dict(existing_tps)
-        if isinstance(parsed.tp_levels, dict) and parsed.tp_levels:
+    elif has_new_explicit_tps and isinstance(parsed.tp_levels, dict) and parsed.tp_levels:
+        if was_fallback_tp:
+            merged_tp_levels = dict(parsed.tp_levels)
+        else:
+            merged_tp_levels = dict(base_existing_tps)
             merged_tp_levels.update(parsed.tp_levels)
+    else:
+        merged_tp_levels = dict(base_existing_tps)
 
     raw_tp1 = merged_tp_levels.get("TP1") if "TP1" in merged_tp_levels else (parsed.raw_tp1 or existing_signal.get("raw_tp1"))
     raw_tp2 = merged_tp_levels.get("TP2") if "TP2" in merged_tp_levels else (parsed.raw_tp2 or existing_signal.get("raw_tp2"))
@@ -4229,9 +4390,14 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     market_tickets = list(existing_signal.get("market_tickets", []))
     pending_tickets = list(existing_signal.get("pending_tickets", []))
     layers = dict(existing_signal.get("layers") or {})
-    is_legacy = StateManager.is_legacy_3layer(existing_signal)
 
-    pip_size = await _mt5_call(executor.get_pip_size, symbol)
+    # Upgrade single-order legacy "TOP" entry into canonical "L1" so late zone edits scale to full 4-layer sizing
+    if set(layers.keys()) == {"TOP"} and "MID" not in layers and "BOTTOM" not in layers:
+        top_rec = dict(layers.pop("TOP"))
+        top_rec.setdefault("tp_stage", "TP1")
+        layers["L1"] = top_rec
+    is_legacy = StateManager.is_legacy_3layer({"layers": layers})
+
     if raw_tp2:
         legacy_runner_tp = round(raw_tp2, 2)
     elif raw_tp1:
@@ -4243,6 +4409,14 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
     # Protect trailed SL when RUNNER_ACTIVE (ratchet_sl_only=True)
     if curr_status == "RUNNER_ACTIVE":
+        if was_fallback_tp and has_new_explicit_tps:
+            existing_signal["fallback_tp_applied"] = False
+            existing_signal["tp_levels"] = dict(merged_tp_levels)
+            existing_signal["raw_tp1"] = raw_tp1
+            existing_signal["raw_tp2"] = raw_tp2
+            existing_signal["raw_tp3"] = raw_tp3
+            existing_signal["raw_tp4"] = raw_tp4
+            existing_signal["raw_tp5"] = raw_tp5
         res_adj = await _mt5_call(
             executor.adjust_active_signal_sl_tp,
             existing_signal,
@@ -4268,9 +4442,97 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         )
         return
 
-    # Update SL/TP per layer role (preserving TP2 stage on pre-lifted runner layers)
+    tp1_changed_pre_tp1 = (
+        not existing_signal.get("tp1_reached")
+        and ((was_fallback_tp and has_new_explicit_tps) or (raw_tp1 is not None and raw_tp1 != old_raw_tp1))
+    )
+
+    # 1. Re-tier unfilled pending orders when a late edit adds or modifies the entry zone / single-price
+    desired_pending_targets: Dict[str, float] = {}
+    if parsed.zone:
+        if is_legacy:
+            desired_pending_targets = {
+                "TOP": parsed.zone.top if direction == "BUY" else parsed.zone.bottom,
+                "MID": parsed.zone.mid,
+                "BOTTOM": parsed.zone.bottom if direction == "BUY" else parsed.zone.top,
+            }
+        else:
+            desired_pending_targets = dict(parsed.zone.get_tiers(direction))
+    elif parsed.single_price is not None:
+        sp_rounded = round(float(parsed.single_price), 2)
+        desired_pending_targets = {lk: sp_rounded for lk in layers.keys()}
+
+    retiered_tickets: set = set()
+    if desired_pending_targets and pending_tickets and not existing_signal.get("tp1_reached"):
+        for l_name, l_data in list(layers.items()):
+            if not isinstance(l_data, dict):
+                continue
+            t = l_data.get("ticket")
+            if not t or t not in pending_tickets or l_name not in desired_pending_targets:
+                continue
+            desired_px = round(float(desired_pending_targets[l_name]), 2)
+            old_px = l_data.get("target_price")
+            if old_px is not None and abs(float(old_px) - desired_px) < 0.01:
+                continue
+
+            l_lot = float(l_data.get("lot") or LAYER_LOTS.get(l_name, 0.01))
+            l_tp_target = (
+                new_tp if not is_legacy else (new_tp if l_name in ("L1", "TOP") else legacy_runner_tp)
+            )
+            cancelled_ok = await _mt5_call(executor.cancel_pending_order, t)
+            if cancelled_ok:
+                if t in pending_tickets:
+                    pending_tickets.remove(t)
+                new_t, new_otype = await _mt5_call(
+                    _place_edit_layer_order,
+                    symbol=symbol,
+                    direction=direction,
+                    target_price=desired_px,
+                    lot=l_lot,
+                    sl=new_sl,
+                    tp=l_tp_target,
+                    comment_prefix=f"TG {l_name} (Edit)",
+                    tick=tick,
+                    order_intent="AUTO" if parsed.zone else order_intent,
+                )
+                if new_t:
+                    retiered_tickets.add(new_t)
+                    if new_otype == "MARKET":
+                        market_tickets.append(new_t)
+                        l_status = "OPEN"
+                    else:
+                        pending_tickets.append(new_t)
+                        l_status = "PENDING"
+                    layers[l_name] = {
+                        "lot": l_lot,
+                        "target_price": desired_px,
+                        "tp": l_tp_target,
+                        "tp_stage": "TP1",
+                        "ticket": new_t,
+                        "order_type": new_otype,
+                        "status": l_status,
+                    }
+                else:
+                    l_data["status"] = "CANCELLED"
+                    l_data["ticket"] = None
+            else:
+                mod_filled = await _mt5_call(executor.modify_position_sltp, ticket=t, sl=new_sl, tp=l_tp_target)
+                if mod_filled:
+                    if t in pending_tickets:
+                        pending_tickets.remove(t)
+                    if t not in market_tickets:
+                        market_tickets.append(t)
+                    l_data["order_type"] = "MARKET"
+                    l_data["status"] = "OPEN"
+                    if l_tp_target is not None:
+                        l_data["tp"] = l_tp_target
+                        l_data["tp_stage"] = "TP1"
+                    retiered_tickets.add(t)
+
+    # 2. Update SL/TP across all existing market & pending tickets
     if new_sl is not None or new_tp is not None:
         logger.info(f"Updating SL/TP on existing tickets for Msg ID {msg_id}: SL={new_sl}, Broker TP1={new_tp}")
+        handled_tickets: set = set(retiered_tickets)
         for l_name, l_data in layers.items():
             if not isinstance(l_data, dict):
                 continue
@@ -4278,6 +4540,9 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             if not t:
                 continue
             cur_l_stage = str(l_data.get("tp_stage") or "TP1").upper()
+            if tp1_changed_pre_tp1 and cur_l_stage == "TP2":
+                cur_l_stage = "TP1"
+
             if not is_legacy:
                 if cur_l_stage == "TP2" and merged_tp_levels.get("TP2") is not None:
                     l_tp = merged_tp_levels["TP2"]
@@ -4292,105 +4557,187 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                 l_data["tp"] = l_tp
                 if not is_legacy and cur_l_stage != "TP2":
                     l_data["tp_stage"] = "TP1"
+            if t in retiered_tickets:
+                continue
             if t in market_tickets:
                 await _mt5_call(executor.modify_position_sltp, ticket=t, sl=new_sl, tp=l_tp)
+                handled_tickets.add(t)
             elif t in pending_tickets:
-                await _mt5_call(executor.modify_pending_order_sltp, ticket=t, sl=new_sl, tp=l_tp)
+                ok_pend = await _mt5_call(executor.modify_pending_order_sltp, ticket=t, sl=new_sl, tp=l_tp)
+                if not ok_pend:
+                    ok_pos = await _mt5_call(executor.modify_position_sltp, ticket=t, sl=new_sl, tp=l_tp)
+                    if ok_pos:
+                        pending_tickets.remove(t)
+                        if t not in market_tickets:
+                            market_tickets.append(t)
+                        l_data["order_type"] = "MARKET"
+                        l_data["status"] = "OPEN"
+                handled_tickets.add(t)
 
+        for mt in market_tickets:
+            if mt not in handled_tickets:
+                await _mt5_call(executor.modify_position_sltp, ticket=mt, sl=new_sl, tp=new_tp)
+        for pt in pending_tickets:
+            if pt not in handled_tickets:
+                await _mt5_call(executor.modify_pending_order_sltp, ticket=pt, sl=new_sl, tp=new_tp)
+
+    # 3. Place additional layers across zone or single-price whenever open+pending < MAX_ORDERS_PER_SIGNAL
     current_count = len(market_tickets) + len(pending_tickets)
     slots_left = MAX_ORDERS_PER_SIGNAL - current_count
-    zone_completed = existing_signal.get("zone_completed", False)
-
-    if parsed.zone and slots_left > 0 and not zone_completed:
-        zone = parsed.zone
-        if is_legacy:
-            layer_specs = [
-                ("MID", zone.mid, LAYER_LOTS.get("L2", 0.01), legacy_runner_tp, "TG Layer 2 (Edit Mid"),
-                (
-                    "BOTTOM",
-                    zone.bottom if direction == "BUY" else zone.top,
-                    LAYER_LOTS.get("L4", 0.02),
-                    legacy_runner_tp,
-                    "TG Layer 3 (Edit Bottom" if direction == "BUY" else "TG Layer 3 (Edit Top",
-                ),
-            ]
-        else:
-            tiers = zone.get_tiers(direction)
-            alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol)
-            layer_specs = [
-                ("L2", tiers["L2"], alloc_lots[1], new_tp, "TG L2 (Edit"),
-                ("L3", tiers["L3"], alloc_lots[2], new_tp, "TG L3 (Edit"),
-                ("L4", tiers["L4"], alloc_lots[3], new_tp, "TG L4 (Edit"),
-            ]
-
-        for l_name, target_px, l_lot, l_tp, c_prefix in layer_specs:
-            if slots_left <= 0:
-                break
-            if l_name in layers or l_lot <= 0.0:
-                continue
-            t, o_type = await _mt5_call(
-                _place_edit_layer_order,
-                symbol=symbol,
-                direction=direction,
-                target_price=target_px,
-                lot=l_lot,
-                sl=new_sl,
-                tp=l_tp,
-                comment_prefix=f"{c_prefix})",
-                tick=tick,
-            )
-            if t:
-                if o_type == "MARKET":
-                    market_tickets.append(t)
-                    layers[l_name] = {
-                        "lot": l_lot,
-                        "target_price": target_px,
-                        "tp": l_tp,
-                        "tp_stage": "TP1",
-                        "ticket": t,
-                        "order_type": "MARKET",
-                        "status": "OPEN",
-                    }
-                else:
-                    pending_tickets.append(t)
-                    layers[l_name] = {
-                        "lot": l_lot,
-                        "target_price": target_px,
-                        "tp": l_tp,
-                        "tp_stage": "TP1",
-                        "ticket": t,
-                        "order_type": "LIMIT",
-                        "status": "PENDING",
-                    }
-                slots_left -= 1
-
-        zone_completed = True
-
-    state_mgr.update_signal(
-        msg_id,
-        {
-            "sl": new_sl,
-            "raw_tp1": raw_tp1,
-            "raw_tp2": raw_tp2,
-            "raw_tp3": raw_tp3,
-            "raw_tp4": raw_tp4,
-            "raw_tp5": raw_tp5,
-            "tp_levels": merged_tp_levels or None,
-            "final_tp": new_tp,
-            "hard_broker_tp": new_tp,
-            "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
-            "zone": parsed.zone.to_dict() if parsed.zone else existing_signal.get("zone"),
-            "is_zone": True if parsed.zone else existing_signal.get("is_zone", False),
-            "is_zone_order": True if parsed.zone else existing_signal.get("is_zone_order", existing_signal.get("is_zone", False)),
-            "max_orders": MAX_ORDERS_PER_SIGNAL if parsed.zone else existing_signal.get("max_orders", MAX_ORDERS_PER_SIGNAL),
-            "layers": layers,
-            "market_tickets": market_tickets,
-            "pending_tickets": pending_tickets,
-            "zone_completed": zone_completed,
-            "raw_text": raw_text,
-        },
-        chat_id=chat_id,
+    zone_completed = bool(existing_signal.get("zone_completed", False))
+    old_zone = existing_signal.get("zone") if isinstance(existing_signal.get("zone"), dict) else None
+    zone_changed = bool(
+        parsed.zone
+        and (
+            old_zone is None
+            or abs(float(old_zone.get("top", 0.0)) - float(parsed.zone.top)) >= 0.01
+            or abs(float(old_zone.get("bottom", 0.0)) - float(parsed.zone.bottom)) >= 0.01
+        )
     )
+
+    if slots_left > 0 and not existing_signal.get("tp1_reached"):
+        if parsed.zone and (not zone_completed or zone_changed):
+            zone = parsed.zone
+            if is_legacy:
+                layer_specs = [
+                    ("MID", zone.mid, LAYER_LOTS.get("L2", 0.01), legacy_runner_tp, "TG Layer 2 (Edit Mid", "AUTO"),
+                    (
+                        "BOTTOM",
+                        zone.bottom if direction == "BUY" else zone.top,
+                        LAYER_LOTS.get("L4", 0.02),
+                        legacy_runner_tp,
+                        "TG Layer 3 (Edit Bottom" if direction == "BUY" else "TG Layer 3 (Edit Top",
+                        "AUTO",
+                    ),
+                ]
+            else:
+                tiers = zone.get_tiers(direction)
+                rem_base_lots = [
+                    0.0 if (f"L{i + 1}" in layers and layers[f"L{i + 1}"].get("ticket") is not None) else float(BASE_LAYER_LOTS[i])
+                    for i in range(4)
+                ]
+                alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol, rem_base_lots)
+                layer_specs = [
+                    (f"L{i + 1}", tiers[f"L{i + 1}"], alloc_lots[i], new_tp, f"TG L{i + 1} (Edit", "AUTO")
+                    for i in range(4)
+                ]
+
+            for l_name, target_px, l_lot, l_tp, c_prefix, l_intent in layer_specs:
+                if slots_left <= 0:
+                    break
+                existing_layer = layers.get(l_name)
+                if (isinstance(existing_layer, dict) and existing_layer.get("status") in ("OPEN", "PENDING", "CLOSED", "RUNNER")) or l_lot <= 0.0:
+                    continue
+                t, o_type = await _mt5_call(
+                    _place_edit_layer_order,
+                    symbol=symbol,
+                    direction=direction,
+                    target_price=target_px,
+                    lot=l_lot,
+                    sl=new_sl,
+                    tp=l_tp,
+                    comment_prefix=f"{c_prefix})",
+                    tick=tick,
+                    order_intent=l_intent,
+                )
+                if t:
+                    if o_type == "MARKET":
+                        market_tickets.append(t)
+                        l_status = "OPEN"
+                    else:
+                        pending_tickets.append(t)
+                        l_status = "PENDING"
+                    layers[l_name] = {
+                        "lot": l_lot,
+                        "target_price": target_px,
+                        "tp": l_tp,
+                        "tp_stage": "TP1",
+                        "ticket": t,
+                        "order_type": o_type,
+                        "status": l_status,
+                    }
+                    slots_left -= 1
+
+            zone_completed = True
+        elif parsed.single_price is not None and not parsed.zone and not zone_completed and not is_legacy:
+            sp_px = round(float(parsed.single_price), 2)
+            rem_base_lots = [
+                0.0 if (f"L{i + 1}" in layers and layers[f"L{i + 1}"].get("ticket") is not None) else float(BASE_LAYER_LOTS[i])
+                for i in range(4)
+            ]
+            alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol, rem_base_lots)
+            for i in range(4):
+                if slots_left <= 0:
+                    break
+                l_name = f"L{i + 1}"
+                existing_layer = layers.get(l_name)
+                l_lot = alloc_lots[i]
+                if (isinstance(existing_layer, dict) and existing_layer.get("status") in ("OPEN", "PENDING", "CLOSED", "RUNNER")) or l_lot <= 0.0:
+                    continue
+                t, o_type = await _mt5_call(
+                    _place_edit_layer_order,
+                    symbol=symbol,
+                    direction=direction,
+                    target_price=sp_px,
+                    lot=l_lot,
+                    sl=new_sl,
+                    tp=new_tp,
+                    comment_prefix=f"TG {l_name} (Edit)",
+                    tick=tick,
+                    order_intent=order_intent,
+                )
+                if t:
+                    if o_type == "MARKET":
+                        market_tickets.append(t)
+                        l_status = "OPEN"
+                    else:
+                        pending_tickets.append(t)
+                        l_status = "PENDING"
+                    layers[l_name] = {
+                        "lot": l_lot,
+                        "target_price": sp_px,
+                        "tp": new_tp,
+                        "tp_stage": "TP1",
+                        "ticket": t,
+                        "order_type": o_type,
+                        "status": l_status,
+                    }
+                    slots_left -= 1
+
+    signal_updates: Dict[str, Any] = {
+        "sl": new_sl,
+        "raw_tp1": raw_tp1,
+        "tp1_price": raw_tp1,
+        "raw_tp2": raw_tp2,
+        "raw_tp3": raw_tp3,
+        "raw_tp4": raw_tp4,
+        "raw_tp5": raw_tp5,
+        "tp_levels": merged_tp_levels or None,
+        "final_tp": new_tp,
+        "hard_broker_tp": new_tp,
+        "fallback_tp_applied": fallback_tp_flag,
+        "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
+        "zone": parsed.zone.to_dict() if parsed.zone else existing_signal.get("zone"),
+        "is_zone": True if parsed.zone else existing_signal.get("is_zone", False),
+        "is_zone_order": True if parsed.zone else existing_signal.get("is_zone_order", existing_signal.get("is_zone", False)),
+        "max_orders": MAX_ORDERS_PER_SIGNAL if (parsed.zone or not is_legacy) else existing_signal.get("max_orders", MAX_ORDERS_PER_SIGNAL),
+        "layers": layers,
+        "market_tickets": market_tickets,
+        "pending_tickets": pending_tickets,
+        "zone_completed": zone_completed,
+        "raw_text": raw_text,
+    }
+    if parsed.single_price is not None and not parsed.zone:
+        signal_updates["single_price"] = parsed.single_price
+    if tp1_changed_pre_tp1:
+        signal_updates["shortfall_armed"] = False
+        signal_updates["shortfall_reversal_ticks"] = 0
+        signal_updates["peak_price"] = None
+        signal_updates["tp1_guard_armed"] = _compute_initial_tp1_guard_armed(
+            tick, direction, raw_tp1, bool(market_tickets)
+        )
+
+    state_mgr.update_signal(msg_id, signal_updates, chat_id=chat_id)
 
     await notify_saved_messages(
         f"✏️ **Signal Updated via Edit [ID: {msg_id}]**\n"

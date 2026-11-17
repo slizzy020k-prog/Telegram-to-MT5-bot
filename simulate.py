@@ -366,8 +366,67 @@ async def run_simulation() -> None:
         f"runner broker TP={sig_p['layers']['L1']['tp']}!"
     )
 
+    # -----------------------------------------------------------------------
+    # STEP 9: Late Edit > 3 Minutes Later (Zone Expansion + Fallback TP Replacement + Risk Tag)
+    # -----------------------------------------------------------------------
+    print("\n[STEP 9] Testing Late Edit (>3m) with Zone Expansion, Fallback TP1 Replacement & 'High risk' Tag...")
+    from datetime import datetime, timedelta, timezone
+
+    main.state_mgr.create_signal(
+        message_id=20020,
+        chat_id=-1001234567890,
+        symbol=config.DEFAULT_SYMBOL,
+        direction="BUY",
+        layers={
+            "TOP": {
+                "lot": 0.01,
+                "target_price": None,
+                "tp": 3862.75,
+                "tp_stage": "TP1",
+                "ticket": 9901,
+                "order_type": "MARKET",
+                "status": "OPEN",
+            }
+        },
+        market_tickets=[9901],
+        pending_tickets=[],
+        zone_completed=False,
+        is_zone=False,
+        max_orders=1,
+        sl=None,
+        raw_tp1=3863.25,
+        tp_levels={"TP1": 3863.25, "TP2": 3873.25, "TP3": 3883.25, "TP4": 3893.25, "TP5": 3903.25},
+        final_tp=3862.75,
+        fallback_tp_applied=True,
+        shortfall_armed=True,
+        peak_price=3862.50,
+        initial_price=3858.56,
+        recorded_entry_price=3858.56,
+        raw_text="Buy xauusd now",
+        timestamp=(datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat(),
+    )
+    late_edit_evt = MockTelethonEvent(
+        msg_id=20020,
+        text="Buy xauusd 3858-3850\nTP 3864\nTP 3872\nTP 3885\nSL 3830\nHigh risk .",
+        chat_id=-1001234567890,
+    )
+    late_edit_evt.message.date = datetime.now(timezone.utc) - timedelta(minutes=4)
+    late_edit_evt.message.edit_date = datetime.now(timezone.utc)
+    with patch.object(main.executor, "get_tick", return_value=_make_tick(3856.80, 3857.00)):
+        await main.handle_message_edited(late_edit_evt)
+
+    sig_late = main.state_mgr.get_signal(20020, chat_id=-1001234567890)
+    assert set(sig_late["layers"].keys()) == {"L1", "L2", "L3", "L4"}
+    assert len(sig_late["market_tickets"]) + len(sig_late["pending_tickets"]) == 4
+    assert sig_late["sl"] == 3830.0 and sig_late["raw_tp1"] == 3864.0 and sig_late["final_tp"] == 3863.50
+    assert sig_late["fallback_tp_applied"] is False and sig_late["shortfall_armed"] is False
+    print(
+        f"  [OK] Late 4m edit expanded 1 -> 4 layers ({[sig_late['layers'][f'L{i}']['lot'] for i in range(1, 5)]}), "
+        f"replaced synthetic TP1 -> {sig_late['raw_tp1']}, and set SL -> {sig_late['sl']}!"
+    )
+
     print("\n" + "=" * 72)
-    print("  ALL 8 v3.3 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("  ALL 9 v3.3.2 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
     print("=" * 72)
 
 

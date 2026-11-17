@@ -1866,8 +1866,10 @@ class MT5Executor:
             sym_info = self.get_symbol_info(p_symbol)
             digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
 
-            new_sl = round(float(sl), digits) if sl is not None else _num(getattr(p, "sl", 0.0), 0.0)
-            new_tp = round(float(tp), digits) if tp is not None else _num(getattr(p, "tp", 0.0), 0.0)
+            cur_sl = round(_num(getattr(p, "sl", 0.0), 0.0), digits)
+            cur_tp = round(_num(getattr(p, "tp", 0.0), 0.0), digits)
+            new_sl = round(float(sl), digits) if sl is not None else cur_sl
+            new_tp = round(float(tp), digits) if tp is not None else cur_tp
 
             request = {
                 "action": _mt5_const("TRADE_ACTION_SLTP", 6),
@@ -1877,16 +1879,64 @@ class MT5Executor:
                 "tp": new_tp,
             }
 
-            result = mt5.order_send(request)
             done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+
+            def _is_mod_ok(res: Any) -> bool:
+                if not res:
+                    return False
+                if res.retcode in (done_code, no_changes_code):
+                    return True
+                return str(getattr(res, "comment", "")).strip().lower() == "no changes"
+
+            result = mt5.order_send(request)
             if result and result.retcode == done_code:
                 logger.info(f"Updated SL/TP on Position #{ticket}: SL={new_sl}, TP={new_tp}")
                 return True
-            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
             comment = getattr(result, "comment", "") if result else mt5.last_error()
-            if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
+            if _is_mod_ok(result):
                 logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
                 return True
+
+            # Independent leg fallback: if BOTH sl and tp were requested and combined modification
+            # failed (e.g. 10016 Invalid stops on one side), apply valid TP and valid SL independently
+            # so a stop-level conflict on SL never blocks TP updates (and vice versa).
+            if sl is not None and tp is not None:
+                tp_applied = False
+                sl_applied = False
+                eff_tp = cur_tp
+                if abs(new_tp - cur_tp) > 1e-6:
+                    res_tp = mt5.order_send({
+                        "action": _mt5_const("TRADE_ACTION_SLTP", 6),
+                        "position": ticket,
+                        "symbol": p_symbol,
+                        "sl": cur_sl,
+                        "tp": new_tp,
+                    })
+                    if _is_mod_ok(res_tp):
+                        tp_applied = True
+                        eff_tp = new_tp
+                        logger.info(
+                            f"Updated TP independently on Position #{ticket}: TP={new_tp} "
+                            f"(combined SL/TP rejected: {comment})"
+                        )
+                if abs(new_sl - cur_sl) > 1e-6:
+                    res_sl = mt5.order_send({
+                        "action": _mt5_const("TRADE_ACTION_SLTP", 6),
+                        "position": ticket,
+                        "symbol": p_symbol,
+                        "sl": new_sl,
+                        "tp": eff_tp,
+                    })
+                    if _is_mod_ok(res_sl):
+                        sl_applied = True
+                        logger.info(
+                            f"Updated SL independently on Position #{ticket}: SL={new_sl} "
+                            f"(combined SL/TP rejected: {comment})"
+                        )
+                if tp_applied or sl_applied:
+                    return True
+
             self.last_error = str(comment)
             logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
             return False
@@ -1915,29 +1965,83 @@ class MT5Executor:
             sym_info = self.get_symbol_info(o_symbol)
             digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
 
-            new_sl = round(float(sl), digits) if sl is not None else _num(getattr(order, "sl", 0.0), 0.0)
-            new_tp = round(float(tp), digits) if tp is not None else _num(getattr(order, "tp", 0.0), 0.0)
+            cur_sl = round(_num(getattr(order, "sl", 0.0), 0.0), digits)
+            cur_tp = round(_num(getattr(order, "tp", 0.0), 0.0), digits)
+            new_sl = round(float(sl), digits) if sl is not None else cur_sl
+            new_tp = round(float(tp), digits) if tp is not None else cur_tp
+            ord_price = _num(getattr(order, "price_open", 0.0), 0.0)
+            ord_time = _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0))
+            ord_fill = _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2))
 
             request = {
                 "action": _mt5_const("TRADE_ACTION_MODIFY", 7),
                 "order": ticket,
-                "price": _num(getattr(order, "price_open", 0.0), 0.0),
+                "price": ord_price,
                 "sl": new_sl,
                 "tp": new_tp,
-                "type_time": _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0)),
-                "type_filling": _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2)),
+                "type_time": ord_time,
+                "type_filling": ord_fill,
             }
 
-            result = mt5.order_send(request)
             done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+
+            def _is_ord_ok(res: Any) -> bool:
+                if not res:
+                    return False
+                if res.retcode in (done_code, no_changes_code):
+                    return True
+                return str(getattr(res, "comment", "")).strip().lower() == "no changes"
+
+            result = mt5.order_send(request)
             if result and result.retcode == done_code:
                 logger.info(f"Updated SL/TP on Pending Order #{ticket}: SL={new_sl}, TP={new_tp}")
                 return True
-            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
             comment = getattr(result, "comment", "") if result else mt5.last_error()
-            if result and (result.retcode == no_changes_code or str(comment).strip().lower() == "no changes"):
+            if _is_ord_ok(result):
                 logger.debug(f"Pending Order #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
                 return True
+
+            if sl is not None and tp is not None:
+                tp_applied = False
+                sl_applied = False
+                eff_tp = cur_tp
+                if abs(new_tp - cur_tp) > 1e-6:
+                    res_tp = mt5.order_send({
+                        "action": _mt5_const("TRADE_ACTION_MODIFY", 7),
+                        "order": ticket,
+                        "price": ord_price,
+                        "sl": cur_sl,
+                        "tp": new_tp,
+                        "type_time": ord_time,
+                        "type_filling": ord_fill,
+                    })
+                    if _is_ord_ok(res_tp):
+                        tp_applied = True
+                        eff_tp = new_tp
+                        logger.info(
+                            f"Updated TP independently on Pending Order #{ticket}: TP={new_tp} "
+                            f"(combined SL/TP rejected: {comment})"
+                        )
+                if abs(new_sl - cur_sl) > 1e-6:
+                    res_sl = mt5.order_send({
+                        "action": _mt5_const("TRADE_ACTION_MODIFY", 7),
+                        "order": ticket,
+                        "price": ord_price,
+                        "sl": new_sl,
+                        "tp": eff_tp,
+                        "type_time": ord_time,
+                        "type_filling": ord_fill,
+                    })
+                    if _is_ord_ok(res_sl):
+                        sl_applied = True
+                        logger.info(
+                            f"Updated SL independently on Pending Order #{ticket}: SL={new_sl} "
+                            f"(combined SL/TP rejected: {comment})"
+                        )
+                if tp_applied or sl_applied:
+                    return True
+
             self.last_error = str(comment)
             logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
             return False

@@ -715,11 +715,14 @@ class StateManager:
         target_sym = symbol.upper() if symbol else None
         priority_statuses = _ACTIVE_STATUSES + _PENDING_STATUSES
 
-        def _matches(data: Dict[str, Any]) -> bool:
+        def _matches(data: Dict[str, Any], allow_null_chat: bool = True) -> bool:
             if target_sym is not None and (data.get("symbol") or "").upper() != target_sym:
                 return False
-            if chat_id is not None and data.get("chat_id") is not None:
-                return str(data.get("chat_id")) == str(chat_id)
+            if chat_id is not None:
+                rec_chat = data.get("chat_id")
+                if rec_chat is None:
+                    return allow_null_chat
+                return _chat_ids_match(rec_chat, chat_id)
             return True
 
         with self._lock:
@@ -728,12 +731,20 @@ class StateManager:
                 if not str(k).startswith("_") and isinstance(v, dict)
             ]
             sorted_items = sorted(signal_items, key=self._sort_key, reverse=True)
+            if chat_id is not None:
+                for msg_id, data in sorted_items:
+                    if data.get("status") in priority_statuses and _matches(data, allow_null_chat=False):
+                        return msg_id, copy.deepcopy(data)
             for msg_id, data in sorted_items:
-                if data.get("status") in priority_statuses and _matches(data):
+                if data.get("status") in priority_statuses and _matches(data, allow_null_chat=True):
                     return msg_id, copy.deepcopy(data)
 
+            if chat_id is not None:
+                for msg_id, data in sorted_items:
+                    if _matches(data, allow_null_chat=False):
+                        return msg_id, copy.deepcopy(data)
             for msg_id, data in sorted_items:
-                if _matches(data):
+                if _matches(data, allow_null_chat=True):
                     return msg_id, copy.deepcopy(data)
 
             return None
@@ -818,7 +829,7 @@ class StateManager:
             return {"schema_version": 3, "catchup_watermarks": {}}
 
     def get_catchup_watermark(self, chat_id: int | str) -> Optional[Dict[str, Any]]:
-        """Return persisted catch-up watermark dict for chat_id, or None."""
+        """Return persisted catch-up watermark dict for chat_id (including supergroup ID variants), or None."""
         with self._lock:
             meta = self._state.get("_meta")
             if not isinstance(meta, dict):
@@ -827,7 +838,24 @@ class StateManager:
             if not isinstance(wms, dict):
                 return None
             entry = wms.get(str(chat_id))
-            return copy.deepcopy(entry) if isinstance(entry, dict) else None
+            best_entry: Optional[Dict[str, Any]] = entry if isinstance(entry, dict) else None
+            best_id = -1
+            if best_entry is not None:
+                try:
+                    best_id = int(best_entry.get("last_msg_id") or -1)
+                except (TypeError, ValueError):
+                    best_id = -1
+            for alt in _normalize_chat_id_variants(chat_id):
+                cand = wms.get(str(alt))
+                if isinstance(cand, dict):
+                    try:
+                        cid = int(cand.get("last_msg_id") or -1)
+                    except (TypeError, ValueError):
+                        cid = -1
+                    if best_entry is None or cid > best_id:
+                        best_entry = cand
+                        best_id = cid
+            return copy.deepcopy(best_entry) if isinstance(best_entry, dict) else None
 
     def get_last_seen_msg_id(self, chat_id: int | str) -> Optional[int]:
         """Return the highest persisted message_id seen for chat_id, or None."""

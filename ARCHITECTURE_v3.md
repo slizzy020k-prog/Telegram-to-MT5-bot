@@ -305,3 +305,12 @@ Guarantees that active or pending trades (`ACTIVE`, `BE_APPLIED`, `PARTIAL_CLOSE
     - **Trail / Step Milestones:** `/trail`, `trail`, `/trail <pips|price|tp1..tp4>`, `trail <pips|price|tp1..tp4>`, `lock tp1..tp4`, `tp1 hit`, `tp2 hit`, `tp3 hit`
     - **Active Trade Shortcuts:** `/be`, `be`, `/partial`, `partial`
     - **Manual Signal Execution:** `/trade <signal>`, `/exec <signal>` (runs full 6-gate `parse_message` -> preflight -> 4-layer execution pipeline).
+
+---
+
+## 7. Late-Edit Resilience & Multi-Layer Zone Re-Tiering (v3.3.2)
+
+- **No Elapsed-Time Limit on Active Signals:** Edits arriving 3 minutes, 15 minutes, or hours after an initial signal post always update `SL`, `TP1`–`TP5`, and unfilled/missing layers as long as the trade is non-terminal.
+- **Untracked Placeholder Edits vs Emoji Reactions:** `MAX_NEW_EDIT_AGE_SECONDS` defaults to `3600s` (`60m`), and fresh Telethon `msg.edit_date` timestamps (`<= MAX_EDIT_EVENT_FRESHNESS_SECONDS = 180s`) allow genuine text edits on older placeholder posts regardless of original post age while filtering out emoji-reaction / view updates (`edit_date=None` or stale `edit_date`).
+- **Gate 2 Risk-Tag Precision:** Soft risk disclaimers (`"High risk"`, `"Low risk"`, `"Manage your risk"`, `"Protect your capital"`, `"VIP"`) no longer reject structured Gold entries or TP/SL edits, while standalone risk/sizing tables and `"how to"` chatter remain blocked.
+- **Synthetic Fallback TP Replacement & Zone Re-Tiering:** When a real TP edit arrives after the `45s` `UNPRICED_TP_GRACE_SECONDS` fallback attached, synthetic `tp_levels` and stale `shortfall_armed` state are cleanly discarded and replaced. Unfilled pending limits are re-tiered across edited zone levels (with pending-to-market fill-race promotion), missing layers scale up to `4` (`[0.01, 0.01, 0.01, 0.02]`), and `modify_position_sltp` / `modify_pending_order_sltp` retry `TP` and `SL` independently if MT5 returns `10016 Invalid stops` on a combined modification.

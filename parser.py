@@ -25,18 +25,25 @@ logger = logging.getLogger("copier.parser")
 # GATE 2 KEYWORDS & PATTERNS
 # ---------------------------------------------------------------------------
 
-ACCOUNT_RISK_BLOCKERS = [
-    r"manage\s+your\s+risk",
-    r"protect\s+your\s+capital",
-    r"high\s+risk",
-    r"mid\s+risk",
-    r"low\s+risk",
+_HARD_ACCOUNT_BLOCKERS = [
     r"[£$€]?\s*\d+\s*account",
+    r"account\s+[£$€]?\s*\d+",
     r"[£$€]\s*\d+\s*(?:to|-|–|—|->)\s*[£$€]?\s*\d+",
     r"account\s+size",
     r"lot\s+size",
     r"\bhow\s+to\b",
 ]
+
+_SOFT_RISK_TAG_BLOCKERS = [
+    r"manage\s+your\s+risk",
+    r"protect\s+your\s+capital",
+    r"high\s+risk",
+    r"mid\s+risk",
+    r"low\s+risk",
+    r"\bvip\b",
+]
+
+ACCOUNT_RISK_BLOCKERS = _HARD_ACCOUNT_BLOCKERS + _SOFT_RISK_TAG_BLOCKERS
 
 VICTORY_RECAP_BLOCKERS = [
     r"\btp\d*\s+hit\b",                              # "TP1 hit", "TP hit"
@@ -46,7 +53,6 @@ VICTORY_RECAP_BLOCKERS = [
     r"\bbooked\s+\d",                                # "booked 50 pips"
     r"\bsecured\s+\d",                               # "secured 100 pips"
     r"\bboom\b",                                     # "BOOM 🚀"
-    r"\bvip\b",                                      # VIP announcement posts
     r"\bentry\s+was\b",                              # "Buy entry was 3895"
     r"\bwas\s+(?:a\s+)?(?:great|good|perfect|beautiful)\b",
     r"\+\s*\d+\s*pips?\b",                           # "+50 pips"
@@ -543,6 +549,44 @@ def gate_1_check_forward_and_empty(
     return True
 
 
+def _has_real_trade_structure(text: str) -> bool:
+    """
+    Return True when text contains structured Gold trade levels (explicit TP >= 500,
+    explicit SL >= 500, or a directional verb with a Gold entry price/zone >= 500),
+    so risk-tag disclaimers ('High risk', 'Manage your risk', 'VIP') on real signals
+    or late edits never cause false Gate 2 rejections.
+    """
+    for m in TP_PATTERN.finditer(text):
+        try:
+            if 500.0 <= float(m.group(3)) < 100000.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    sl_m = _EXPLICIT_SL_PATTERN.search(text)
+    if sl_m:
+        try:
+            if 500.0 <= float(sl_m.group(1)) < 100000.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+    if DIRECTION_PATTERN.search(text):
+        entry_segment = _strip_entry_text(text)
+        for pm in re.finditer(
+            r"(?<![.\d])(\d{3,6}(?:\.\d+)?)(?![.\d])(?!\s*(?:pips?|%|lots?|x)\b)",
+            entry_segment,
+            re.IGNORECASE,
+        ):
+            try:
+                if 500.0 <= float(pm.group(1)) < 100000.0:
+                    return True
+            except (TypeError, ValueError):
+                pass
+
+    return False
+
+
 def gate_2_check_announcements_and_recaps(
     text: str,
     is_reply: bool = False,
@@ -552,8 +596,10 @@ def gate_2_check_announcements_and_recaps(
     Gate 2: Announcement & Noise Filter + Ignored Symbols check.
     Blocks:
     1. Messages mentioning non-Gold tickers (from IGNORED_SYMBOLS).
-    2. Account / risk sizing tables.
-    3. Past-tense victory recaps (unless is_reply or is_edit).
+    2. Hard account / lot sizing tables & 'how to' questions.
+    3. Standalone risk disclaimers ('high risk', 'manage your risk', 'vip') ONLY when
+       no real Gold trade/target structure is present.
+    4. Past-tense victory recaps (unless is_reply or is_edit).
     """
     upper = text.upper()
     lower = text.lower()
@@ -564,11 +610,18 @@ def gate_2_check_announcements_and_recaps(
             logger.info(f"Gate 2 Reject (Non-Gold Symbol): Ignored pair '{sym}' detected in text.")
             return False
 
-    # 2. Account / Risk Table Blocker
-    for pattern in ACCOUNT_RISK_BLOCKERS:
+    # 2a. Hard Account / Sizing / 'How To' Blocker
+    for pattern in _HARD_ACCOUNT_BLOCKERS:
         if re.search(pattern, lower):
             logger.info(f"Gate 2 Reject (Account/Risk Table): Matched pattern '{pattern}'")
             return False
+
+    # 2b. Soft Risk-Tag Disclaimers (allowed when part of a genuine priced signal or TP/SL edit)
+    if not _has_real_trade_structure(text):
+        for pattern in _SOFT_RISK_TAG_BLOCKERS:
+            if re.search(pattern, lower):
+                logger.info(f"Gate 2 Reject (Account/Risk Table): Matched pattern '{pattern}'")
+                return False
 
     # 3. Past-Tense Victory Recap Blocker
     if not is_reply and not is_edit:
