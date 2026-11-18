@@ -1126,6 +1126,17 @@ class MT5Executor:
             is_buy, entry_price, sl, pip_size, digits, direction_norm, resolved_sym, "Market"
         )
         final_tp = round(float(tp), digits) if tp is not None else 0.0
+        if final_tp > 0.0:
+            if is_buy and final_tp <= entry_price:
+                logger.warning(
+                    f"Market BUY @ {entry_price} rejected invalid TP {final_tp} <= entry. Dropping TP to 0.0"
+                )
+                final_tp = 0.0
+            elif not is_buy and final_tp >= entry_price:
+                logger.warning(
+                    f"Market SELL @ {entry_price} rejected invalid TP {final_tp} >= entry. Dropping TP to 0.0"
+                )
+                final_tp = 0.0
 
         request = {
             "action": _mt5_const("TRADE_ACTION_DEAL", 1),
@@ -1192,6 +1203,17 @@ class MT5Executor:
             is_buy, target_price, sl, pip_size, digits, direction_norm, resolved_sym, kind_upper.title()
         )
         final_tp = round(float(tp), digits) if tp is not None else 0.0
+        if final_tp > 0.0:
+            if is_buy and final_tp <= target_price:
+                logger.warning(
+                    f"Pending {kind_upper} BUY @ {target_price} rejected invalid TP {final_tp} <= entry. Dropping TP to 0.0"
+                )
+                final_tp = 0.0
+            elif not is_buy and final_tp >= target_price:
+                logger.warning(
+                    f"Pending {kind_upper} SELL @ {target_price} rejected invalid TP {final_tp} >= entry. Dropping TP to 0.0"
+                )
+                final_tp = 0.0
 
         request = {
             "action": _mt5_const("TRADE_ACTION_PENDING", 5),
@@ -1370,6 +1392,7 @@ class MT5Executor:
         limit_comment: str,
         order_intent: str = "AUTO",
         stop_comment: Optional[str] = None,
+        allow_market_buffer: bool = True,
     ) -> Tuple[Optional[int], str]:
         """
         Route a single layer to MARKET, LIMIT, or STOP based on explicit order_intent
@@ -1404,7 +1427,15 @@ class MT5Executor:
             )
 
         # AUTO / LIMIT routing
-        should_market = (tick.ask <= target_price) if is_buy else (tick.bid >= target_price)
+        if intent == "AUTO" and allow_market_buffer:
+            pip_size = self.get_pip_size(symbol)
+            auto_market_buffer = float(_cfg("AUTO_MARKET_SLIPPAGE_PIPS", 15.0)) * pip_size
+            if is_buy:
+                should_market = (tick.ask <= target_price + auto_market_buffer)
+            else:
+                should_market = (tick.bid >= target_price - auto_market_buffer)
+        else:
+            should_market = (tick.ask <= target_price) if is_buy else (tick.bid >= target_price)
         if should_market:
             t = self.execute_market_order(
                 symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
@@ -1652,6 +1683,7 @@ class MT5Executor:
             if l_lot <= 0.0:
                 logger.info(f"Skipping {l_name} ({entry_label}): allocated lot is 0.0 (cap enforced).")
                 continue
+            allow_mkt_buf = (l_name in ("L1", "TOP") or entry_label == "SinglePrice")
             t, o_type = self._execute_layer_price(
                 symbol=symbol,
                 direction=direction,
@@ -1664,6 +1696,7 @@ class MT5Executor:
                 limit_comment=f"TG {l_name} (Limit)",
                 order_intent=order_intent,
                 stop_comment=f"TG {l_name} (Stop)",
+                allow_market_buffer=allow_mkt_buf,
             )
             if t:
                 if o_type == "MARKET":

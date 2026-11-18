@@ -1226,10 +1226,6 @@ def gate_5_validate_price_sanity(
     tiers = action.get("entry_tiers")
     single_p = action.get("single_price")
 
-    if raw_sl is None:
-        action["sl_valid"] = False
-        return action
-
     sl_ref = None
     tp_ref = None
     if tiers:
@@ -1241,6 +1237,19 @@ def gate_5_validate_price_sanity(
     elif live_price is not None:
         sl_ref = live_price
         tp_ref = live_price
+
+    # Validate TP sanity against entry price regardless of whether SL is present
+    if final_tp is not None and tp_ref is not None:
+        if direction == "BUY" and final_tp <= tp_ref:
+            logger.warning(f"Gate 5 Sanity Check: TP {final_tp} cannot be <= top entry {tp_ref} on BUY. Rejecting invalid TP!")
+            action["final_tp"] = None
+        elif direction == "SELL" and final_tp >= tp_ref:
+            logger.warning(f"Gate 5 Sanity Check: TP {final_tp} cannot be >= bottom entry {tp_ref} on SELL. Rejecting invalid TP!")
+            action["final_tp"] = None
+
+    if raw_sl is None:
+        action["sl_valid"] = False
+        return action
 
     if sl_ref is None:
         # No entry price available (e.g. "Buy now" without zone).

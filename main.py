@@ -4567,6 +4567,7 @@ def _place_edit_layer_order(
             comment=f"{comment_prefix} Limit",
         )
         return (t, "LIMIT") if t else (None, "FAILED")
+    is_l1 = ("L1" in comment_prefix or "TOP" in comment_prefix)
     return executor._execute_layer_price(
         symbol=symbol,
         direction=direction,
@@ -4579,6 +4580,7 @@ def _place_edit_layer_order(
         limit_comment=f"{comment_prefix} Limit",
         order_intent=order_intent,
         stop_comment=f"{comment_prefix} Stop",
+        allow_market_buffer=is_l1,
     )
 
 
@@ -4803,7 +4805,10 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
     raw_tp4 = merged_tp_levels.get("TP4") if "TP4" in merged_tp_levels else (parsed.raw_tp4 or existing_signal.get("raw_tp4"))
     raw_tp5 = merged_tp_levels.get("TP5") if "TP5" in merged_tp_levels else (parsed.raw_tp5 or existing_signal.get("raw_tp5"))
 
-    if raw_tp1 is not None:
+    if has_new_explicit_tps and parsed.final_tp is None:
+        # Gate 5 rejected the new TPs as chemically invalid (wrong direction / typo)!
+        new_tp = None
+    elif raw_tp1 is not None:
         new_tp = (
             round(float(raw_tp1) - TP_FRONT_RUN_OFFSET, 2)
             if str(direction).upper() == "BUY"
@@ -5227,8 +5232,9 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         )
     )
 
+    has_active_orders = bool(market_tickets or pending_tickets)
     if slots_left > 0 and not existing_signal.get("tp1_reached"):
-        if parsed.zone and (not zone_completed or zone_changed):
+        if parsed.zone and (not zone_completed or zone_changed or not has_active_orders):
             zone = parsed.zone
             if is_legacy:
                 layer_specs = [
@@ -5316,7 +5322,12 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                     }
                     slots_left -= 1
 
-            zone_completed = True
+            placed_any = any(
+                isinstance(ld, dict) and ld.get("status") in ("OPEN", "PENDING", "RUNNER") and ld.get("ticket") is not None
+                for ld in layers.values()
+            )
+            if placed_any:
+                zone_completed = True
 
     signal_updates: Dict[str, Any] = {
         "sl": new_sl,

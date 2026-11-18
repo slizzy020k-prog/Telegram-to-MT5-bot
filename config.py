@@ -347,6 +347,11 @@ CATCHUP_MARKET_MAX_AGE_SECONDS: int = _env_int("CATCHUP_MARKET_MAX_AGE_SECONDS",
 CATCHUP_MARKET_MAX_SLIPPAGE_PIPS: float = _env_float(
     "CATCHUP_MARKET_MAX_SLIPPAGE_PIPS", 15.0, min_val=0.0, max_val=500.0
 )
+# Auto Market Entry Slippage: when a signal says "SELL 3728" or "BUY 3728" without "LIMIT",
+# if live price is within this many pips of the quoted entry, activate at market immediately.
+AUTO_MARKET_SLIPPAGE_PIPS: float = _env_float(
+    "AUTO_MARKET_SLIPPAGE_PIPS", 15.0, min_val=0.0, max_val=100.0
+)
 
 # Deleted-Signal Trade Protection (0ms push + 1.5s fast sweep auto-closes positions & cancels pending orders ASAP)
 CLOSE_ON_SIGNAL_DELETED: bool = _env_bool("CLOSE_ON_SIGNAL_DELETED", True)
