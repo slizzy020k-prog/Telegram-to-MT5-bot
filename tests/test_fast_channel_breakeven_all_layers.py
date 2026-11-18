@@ -165,6 +165,8 @@ async def test_strict_per_channel_breakeven_isolation_and_all_4_layers():
         with patch.object(main, "state_mgr", sm), \
              patch.object(main, "executor", ex), \
              patch.object(main, "BE_LAYERS", ["L1", "L2", "L3", "L4"]), \
+             patch.object(main, "BE_OFFSET_PIPS", 5.0), \
+             patch.object(config, "BE_OFFSET_PIPS", 5.0), \
              patch.object(main, "CHANNEL_IDS", [chan_a, chan_a_raw, chan_b, chan_c]), \
              patch.object(main, "notify_saved_messages", new=AsyncMock()):
 
@@ -191,10 +193,10 @@ async def test_strict_per_channel_breakeven_isolation_and_all_4_layers():
             assert sig_a_after["status"] == "BE_APPLIED"
             assert sig_a_after["be_armed"] is True
             assert sig_a_after["be_done_tickets"] == [1001, 1002, 1003, 1004]
-            assert sig_a_after["layers"]["L1"]["be_sl"] == 3895.2
-            assert sig_a_after["layers"]["L2"]["be_sl"] == 3892.2
-            assert sig_a_after["layers"]["L3"]["be_sl"] == 3889.2
-            assert sig_a_after["layers"]["L4"]["be_sl"] == 3886.2
+            assert sig_a_after["layers"]["L1"]["be_sl"] == 3895.5
+            assert sig_a_after["layers"]["L2"]["be_sl"] == 3892.5
+            assert sig_a_after["layers"]["L3"]["be_sl"] == 3889.5
+            assert sig_a_after["layers"]["L4"]["be_sl"] == 3886.5
 
             # Channel B trade remains 100% untouched!
             assert sig_b_after["status"] == "ACTIVE"

@@ -335,6 +335,7 @@ async def test_3_pending_zone_never_invalidated_at_tp1_before_price_enters_zone(
 @pytest.mark.asyncio
 async def test_4_tp1_touch_bank_floor_and_pullback_closes_all_remaining_layers(tmp_path, monkeypatch):
     _reset_runtime(tmp_path, "bug4_tp1_touch_bank")
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False, raising=False)
     monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False, raising=False)
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()

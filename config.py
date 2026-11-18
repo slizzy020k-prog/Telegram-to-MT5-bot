@@ -252,7 +252,7 @@ RUNNER_EARLY_TP_LIFT_PCT: float = _env_float("RUNNER_EARLY_TP_LIFT_PCT", 0.70, m
 RUNNER_CONTINUOUS_TRAIL_ENABLED: bool = _env_bool("RUNNER_CONTINUOUS_TRAIL_ENABLED", False)
 
 RUNNER_DEEPEST_COUNT_FULL: int = _env_int("RUNNER_DEEPEST_COUNT_FULL", 1, min_val=1, max_val=2)
-RUNNER_MAX_TP_STAGE: int = _env_int("RUNNER_MAX_TP_STAGE", 4, min_val=1, max_val=5)
+RUNNER_MAX_TP_STAGE: int = _env_int("RUNNER_MAX_TP_STAGE", 5, min_val=1, max_val=5)
 RUNNER_PROACTIVE_TP_LIFT: bool = _env_bool("RUNNER_PROACTIVE_TP_LIFT", True)
 RUNNER_PROXIMITY_MODE: str = _env_choice("RUNNER_PROXIMITY_MODE", "PIPS", ("PIPS", "PCT", "BOTH"))
 RUNNER_PROXIMITY_BUFFER_PIPS: float = _env_float(
@@ -289,7 +289,7 @@ BE_LAYERS: List[str] = [
     for item in _parse_json_list("BE_LAYERS", _default_be_layers)
     if str(item).strip()
 ] or list(_default_be_layers)
-BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 2.0, min_val=0.0, max_val=50.0)
+BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 5.0, min_val=0.0, max_val=50.0)
 
 # Legacy runner / pre-TP1 shortfall thresholds (calibrated v3.1 anti-choke defaults)
 TP1_LOCK_BUFFER: float = _env_float("TP1_LOCK_BUFFER", 0.50, min_val=0.0, max_val=50.0)
@@ -460,10 +460,111 @@ HARD_GIVEBACK_CEILING_DOLLARS: float = _env_float(
 
 
 # ===========================================================================
-# v3.4.2 DYNAMIC ATR TP1 TRAILING STOP
+# v3.5.0 STAGED GOLD RUNNER EXIT ARCHITECTURE (reuses v3.4.2 Stage 1 keys)
 # ===========================================================================
+STAGED_EXIT_ENABLED: bool = _env_bool("STAGED_EXIT_ENABLED", True)
+
+# Stage 1 (TP1 cleared) — reuses v3.4.2 keys for .env compatibility
 TP1_TRAIL_ENABLED: bool = _env_bool("TP1_TRAIL_ENABLED", True)
 TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.5, min_val=0.1, max_val=20.0)
-TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.00, min_val=0.10, max_val=50.0)
-TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.00, min_val=0.20, max_val=100.0)
-TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.20, min_val=0.01, max_val=20.0)
+TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.50, min_val=0.10, max_val=100.0)
+TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.50, min_val=0.10, max_val=100.0)
+TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.25, min_val=0.01, max_val=20.0)
+
+# Stage 2 (TP2 cleared)
+TRAIL_TP2_ATR_MULT: float = _env_float("TRAIL_TP2_ATR_MULT", 2.0, min_val=0.1, max_val=20.0)
+TRAIL_TP2_MIN: float = _env_float("TRAIL_TP2_MIN", 3.00, min_val=0.10, max_val=100.0)
+TRAIL_TP2_MAX: float = _env_float("TRAIL_TP2_MAX", 4.50, min_val=0.10, max_val=100.0)
+
+# Stage 3 (TP3 cleared)
+TRAIL_TP3_ATR_MULT: float = _env_float("TRAIL_TP3_ATR_MULT", 2.5, min_val=0.1, max_val=20.0)
+TRAIL_TP3_MIN: float = _env_float("TRAIL_TP3_MIN", 4.00, min_val=0.10, max_val=100.0)
+TRAIL_TP3_MAX: float = _env_float("TRAIL_TP3_MAX", 6.00, min_val=0.10, max_val=100.0)
+
+# Stage 4 (TP4 cleared — active between TP4 and TP5; RUNNER_MAX_TP_STAGE defaults to 5)
+TRAIL_TP4_ATR_MULT: float = _env_float("TRAIL_TP4_ATR_MULT", 3.0, min_val=0.1, max_val=20.0)
+TRAIL_TP4_MIN: float = _env_float("TRAIL_TP4_MIN", 5.00, min_val=0.10, max_val=100.0)
+TRAIL_TP4_MAX: float = _env_float("TRAIL_TP4_MAX", 8.00, min_val=0.10, max_val=100.0)
+
+_STAGED_TRAIL_TIER_KEYS: Dict[int, Tuple[str, str, str]] = {
+    1: ("TP1_TRAIL_ATR_MULT", "TP1_TRAIL_MIN_DOLLARS", "TP1_TRAIL_MAX_DOLLARS"),
+    2: ("TRAIL_TP2_ATR_MULT", "TRAIL_TP2_MIN", "TRAIL_TP2_MAX"),
+    3: ("TRAIL_TP3_ATR_MULT", "TRAIL_TP3_MIN", "TRAIL_TP3_MAX"),
+    4: ("TRAIL_TP4_ATR_MULT", "TRAIL_TP4_MIN", "TRAIL_TP4_MAX"),
+}
+
+
+def validate_staged_trail_tiers(
+    tiers: Optional[Dict[int, Tuple[float, float, float]]] = None,
+    *,
+    update_globals: Optional[bool] = None,
+    emit_warnings: bool = True,
+) -> Dict[int, Tuple[float, float, float]]:
+    """
+    Validate and normalize the 4 staged ATR trail tiers (Stage 1 -> 2 -> 3 -> 4).
+
+    - When `tiers` is None, reads current module globals dynamically (respecting runtime
+      `monkeypatch.setattr(config, ...)`). If any tier has `min > max`, swaps them,
+      emits `_cfg_logger.warning(...)`, and updates the module globals (when
+      `update_globals` is True; defaults to True when `tiers is None`, False otherwise).
+    - When `tiers` is passed explicitly, validates/normalizes the passed dict without
+      mutating module globals (unless `update_globals=True` is explicitly passed).
+    - If tiers do not widen monotonically across consecutive stages (`atr_mult`, `min`,
+      `max` non-decreasing from Stage 1 -> 2 -> 3 -> 4), emits `_cfg_logger.warning(...)`
+      without crashing or altering the values.
+    - Returns normalized dict `{1: (mult, min_d, max_d), 2: ..., 3: ..., 4: ...}`.
+    """
+    g = globals()
+    if tiers is None:
+        raw_tiers: Dict[int, Tuple[float, float, float]] = {
+            stage: (float(g[mult_k]), float(g[min_k]), float(g[max_k]))
+            for stage, (mult_k, min_k, max_k) in _STAGED_TRAIL_TIER_KEYS.items()
+        }
+    else:
+        raw_tiers = {
+            int(stage): (float(vals[0]), float(vals[1]), float(vals[2]))
+            for stage, vals in tiers.items()
+        }
+
+    do_update = (tiers is None) if update_globals is None else bool(update_globals)
+    normalized: Dict[int, Tuple[float, float, float]] = {}
+
+    for stage in sorted(raw_tiers.keys()):
+        mult_f, min_f, max_f = raw_tiers[stage]
+        if min_f > max_f:
+            orig_min, orig_max = min_f, max_f
+            min_f, max_f = max_f, min_f
+            if emit_warnings:
+                _cfg_logger.warning(
+                    f"Staged trail Stage {stage} has min ({orig_min:.2f}) > max ({orig_max:.2f}); "
+                    f"swapped to min={min_f:.2f}, max={max_f:.2f}."
+                )
+            if do_update and stage in _STAGED_TRAIL_TIER_KEYS:
+                _, min_k, max_k = _STAGED_TRAIL_TIER_KEYS[stage]
+                g[min_k] = min_f
+                g[max_k] = max_f
+        normalized[stage] = (mult_f, min_f, max_f)
+
+    ordered_stages = sorted(normalized.keys())
+    for prev_s, cur_s in zip(ordered_stages, ordered_stages[1:]):
+        prev_mult, prev_min, prev_max = normalized[prev_s]
+        cur_mult, cur_min, cur_max = normalized[cur_s]
+        narrowed: List[str] = []
+        if cur_mult < prev_mult - 1e-9:
+            narrowed.append(f"atr_mult ({prev_mult:.2f} -> {cur_mult:.2f})")
+        if cur_min < prev_min - 1e-9:
+            narrowed.append(f"min (${prev_min:.2f} -> ${cur_min:.2f})")
+        if cur_max < prev_max - 1e-9:
+            narrowed.append(f"max (${prev_max:.2f} -> ${cur_max:.2f})")
+        if narrowed and emit_warnings:
+            _cfg_logger.warning(
+                f"Staged trail tiers do not widen from Stage {prev_s} to Stage {cur_s}: "
+                f"{', '.join(narrowed)} (keeping configured values)."
+            )
+
+    if do_update:
+        g["STAGED_TRAIL_TIERS"] = dict(normalized)
+    return normalized
+
+
+STAGED_TRAIL_TIERS: Dict[int, Tuple[float, float, float]] = validate_staged_trail_tiers()

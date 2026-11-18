@@ -68,6 +68,7 @@ from config import (
     SHORTFALL_ARM_PIPS,
     SHORTFALL_CONFIRM_TICKS,
     SHORTFALL_PULLBACK_PIPS,
+    STAGED_EXIT_ENABLED,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
     TP1_TOUCH_BANK_BUFFER_PIPS,
@@ -86,6 +87,15 @@ from config import (
     TP_FRONT_RUN_OFFSET,
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
+    TRAIL_TP2_ATR_MULT,
+    TRAIL_TP2_MAX,
+    TRAIL_TP2_MIN,
+    TRAIL_TP3_ATR_MULT,
+    TRAIL_TP3_MAX,
+    TRAIL_TP3_MIN,
+    TRAIL_TP4_ATR_MULT,
+    TRAIL_TP4_MAX,
+    TRAIL_TP4_MIN,
 )
 from parser import ZoneInfo, compute_zone_4tiers, derive_tp_levels
 
@@ -114,11 +124,21 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "TP1_LOCK_BUFFER",
         "TP1_TOUCH_BANK_ENABLED",
         "TP1_TOUCH_BANK_BUFFER_PIPS",
+        "STAGED_EXIT_ENABLED",
         "TP1_TRAIL_ENABLED",
         "TP1_TRAIL_ATR_MULT",
         "TP1_TRAIL_MIN_DOLLARS",
         "TP1_TRAIL_MAX_DOLLARS",
         "TP1_TRAIL_STEP_DOLLARS",
+        "TRAIL_TP2_ATR_MULT",
+        "TRAIL_TP2_MIN",
+        "TRAIL_TP2_MAX",
+        "TRAIL_TP3_ATR_MULT",
+        "TRAIL_TP3_MIN",
+        "TRAIL_TP3_MAX",
+        "TRAIL_TP4_ATR_MULT",
+        "TRAIL_TP4_MIN",
+        "TRAIL_TP4_MAX",
         "DEFAULT_TP_STEP_PIPS",
         "TP2_STEP_PIPS",
         "TP3_STEP_PIPS",
@@ -417,6 +437,45 @@ def _is_legacy_runner_signal(signal_data: Dict[str, Any]) -> bool:
         or "runner_milestone_idx" in signal_data
     )
     return not has_v3_markers
+
+
+def _get_runner_fsm_stage(signal_data: Optional[Dict[str, Any]]) -> int:
+    """
+    Derive canonical v3.5.0 runner stage (0..4) purely from existing persisted fields:
+      0 -> Pre-TP1 (all layers open, or pending/invalidated/aborted)
+      1 -> TP1 scaling handoff (L1-L3 banked, runner active) or TP1 clean break
+      2 -> TP2 clean break
+      3 -> TP3 clean break
+      4 -> TP4 clean break (TP5 mode) or TP4/TP5 ceiling
+    """
+    if not isinstance(signal_data, dict):
+        return 0
+    status = str(signal_data.get("status") or "").strip().upper()
+    if status in ("PENDING", "PENDING_DELAY", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD"):
+        return 0
+    cleared_stage = max(
+        (
+            int(s[2:])
+            for x in (signal_data.get("runner_cleared_milestones") or [])
+            if (s := str(x).strip().upper()).startswith("TP") and s[2:].isdigit()
+        ),
+        default=0,
+    )
+    raw_idx = signal_data.get("runner_milestone_idx")
+    idx_stage = (
+        (int(raw_idx) - 1)
+        if isinstance(raw_idx, numbers.Integral) and not isinstance(raw_idx, bool) and int(raw_idx) > 1
+        else 0
+    )
+    in_runner_phase = bool(
+        signal_data.get("tp1_reached")
+        or status == "RUNNER_ACTIVE"
+        or cleared_stage >= 1
+        or idx_stage >= 1
+    )
+    if not in_runner_phase:
+        return 0
+    return min(4, max(1, cleared_stage, idx_stage))
 
 
 class MT5Executor:
@@ -3935,6 +3994,258 @@ class MT5Executor:
 
         return eff_floor
 
+    @staticmethod
+    def get_runner_fsm_stage(signal_data: Optional[Dict[str, Any]]) -> int:
+        """Return canonical v3.5.0 runner stage (0..4) for signal_data."""
+        return _get_runner_fsm_stage(signal_data)
+
+    def _get_staged_trail_tier(self, stage: int) -> Tuple[float, float, float]:
+        """
+        Return normalized (atr_mult, min_dollars, max_dollars) for stage (1..4),
+        reading dynamic _cfg(...) keys and swapping (min_d, max_d) if min_d > max_d.
+        """
+        eff_stage = max(1, min(4, _int_num(stage, 1)))
+        if eff_stage == 1:
+            atr_mult = float(_cfg("TP1_TRAIL_ATR_MULT", TP1_TRAIL_ATR_MULT))
+            min_d = float(_cfg("TP1_TRAIL_MIN_DOLLARS", TP1_TRAIL_MIN_DOLLARS))
+            max_d = float(_cfg("TP1_TRAIL_MAX_DOLLARS", TP1_TRAIL_MAX_DOLLARS))
+        elif eff_stage == 2:
+            atr_mult = float(_cfg("TRAIL_TP2_ATR_MULT", TRAIL_TP2_ATR_MULT))
+            min_d = float(_cfg("TRAIL_TP2_MIN", TRAIL_TP2_MIN))
+            max_d = float(_cfg("TRAIL_TP2_MAX", TRAIL_TP2_MAX))
+        elif eff_stage == 3:
+            atr_mult = float(_cfg("TRAIL_TP3_ATR_MULT", TRAIL_TP3_ATR_MULT))
+            min_d = float(_cfg("TRAIL_TP3_MIN", TRAIL_TP3_MIN))
+            max_d = float(_cfg("TRAIL_TP3_MAX", TRAIL_TP3_MAX))
+        else:
+            atr_mult = float(_cfg("TRAIL_TP4_ATR_MULT", TRAIL_TP4_ATR_MULT))
+            min_d = float(_cfg("TRAIL_TP4_MIN", TRAIL_TP4_MIN))
+            max_d = float(_cfg("TRAIL_TP4_MAX", TRAIL_TP4_MAX))
+        if min_d > max_d:
+            min_d, max_d = max_d, min_d
+        return atr_mult, min_d, max_d
+
+    def _compute_staged_trail_dist(
+        self,
+        symbol: str,
+        stage: int,
+        digits: int,
+    ) -> Tuple[float, Dict[str, Any]]:
+        """
+        Compute M1-ATR-calibrated staged trailing stop distance for `stage` (1..4)
+        and return (trail_dist, trail_tier_used_dict).
+        Falls back to midpoint (min_d + max_d) / 2 when M1 ATR(14) <= 0.
+        """
+        eff_stage = max(1, min(4, _int_num(stage, 1)))
+        atr_mult, min_d, max_d = self._get_staged_trail_tier(eff_stage)
+        m1_atr = self.get_m1_atr(symbol)
+        if isinstance(m1_atr, numbers.Real) and not isinstance(m1_atr, bool) and math.isfinite(float(m1_atr)) and float(m1_atr) > 0.0:
+            atr_val = float(m1_atr)
+            trail_dist = round(max(min_d, min(max_d, atr_mult * atr_val)), digits)
+        else:
+            atr_val = 0.0
+            trail_dist = round((min_d + max_d) / 2.0, digits)
+        tier_used: Dict[str, Any] = {
+            "stage": eff_stage,
+            "atr_mult": round(float(atr_mult), 4),
+            "min_dollars": round(float(min_d), 4),
+            "max_dollars": round(float(max_d), 4),
+            "m1_atr_14": round(float(atr_val), 4),
+            "trail_dist": float(trail_dist),
+        }
+        return trail_dist, tier_used
+
+    def _compute_staged_fsm_floor(
+        self,
+        signal_data: Dict[str, Any],
+        stage: int,
+        tp_levels: Dict[str, float],
+        direction: str,
+        pip_size: float,
+        digits: int,
+        runner_entry: Optional[float] = None,
+    ) -> Optional[float]:
+        """
+        Compute PURE structural stage floor for Stage 1..4:
+          Stage 1: entry +/- BE_OFFSET_PIPS * pip_size
+          Stage 2: TP1
+          Stage 3: TP2
+          Stage 4: TP3
+        Ratcheted ONLY against prior `signal_data.get("fsm_floor")` (NEVER reading
+        `runner_sl_floor` or `trail_stop` so ATR stops never pollute `fsm_floor`).
+        """
+        if stage <= 0:
+            return None
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        eff_entry: Optional[float] = None
+        if runner_entry is not None and isinstance(runner_entry, numbers.Real) and not isinstance(runner_entry, bool) and float(runner_entry) > 0.0:
+            eff_entry = float(runner_entry)
+        else:
+            layers = signal_data.get("layers") or {}
+            raw_rls = signal_data.get("runner_layers")
+            rl_key = (
+                str(raw_rls[-1])
+                if (isinstance(raw_rls, list) and raw_rls)
+                else signal_data.get("runner_layer")
+            )
+            if rl_key and isinstance(layers.get(rl_key), dict):
+                tp_px = layers[rl_key].get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0.0:
+                    eff_entry = float(tp_px)
+            if eff_entry is None:
+                eff_entry = self._resolve_signal_primary_entry(signal_data)
+
+        be_offset = float(_cfg("BE_OFFSET_PIPS", BE_OFFSET_PIPS)) * (pip_size if pip_size > 0 else 0.10)
+        cands: List[float] = []
+        if eff_entry is not None and eff_entry > 0.0:
+            be_floor = round(eff_entry + be_offset, digits) if is_buy else round(eff_entry - be_offset, digits)
+            cands.append(be_floor)
+
+        if stage >= 2:
+            tp1_v = tp_levels.get("TP1") if isinstance(tp_levels, dict) else None
+            if tp1_v is None:
+                tp1_v = signal_data.get("raw_tp1")
+            if isinstance(tp1_v, numbers.Real) and not isinstance(tp1_v, bool) and float(tp1_v) > 0.0:
+                cands.append(round(float(tp1_v), digits))
+        if stage >= 3:
+            tp2_v = tp_levels.get("TP2") if isinstance(tp_levels, dict) else None
+            if tp2_v is None:
+                tp2_v = signal_data.get("raw_tp2")
+            if isinstance(tp2_v, numbers.Real) and not isinstance(tp2_v, bool) and float(tp2_v) > 0.0:
+                cands.append(round(float(tp2_v), digits))
+        if stage >= 4:
+            tp3_v = tp_levels.get("TP3") if isinstance(tp_levels, dict) else None
+            if tp3_v is None:
+                tp3_v = signal_data.get("raw_tp3")
+            if isinstance(tp3_v, numbers.Real) and not isinstance(tp3_v, bool) and float(tp3_v) > 0.0:
+                cands.append(round(float(tp3_v), digits))
+
+        prev_fsm = signal_data.get("fsm_floor")
+        if isinstance(prev_fsm, numbers.Real) and not isinstance(prev_fsm, bool) and float(prev_fsm) > 0.0:
+            cands.append(round(float(prev_fsm), digits))
+
+        if not cands:
+            return None
+        return round(max(cands) if is_buy else min(cands), digits)
+
+    def _populate_exit_telemetry(
+        self,
+        signal_data: Dict[str, Any],
+        exit_reason_code: Optional[str],
+        exit_price: Optional[float] = None,
+        exit_stage: Optional[int] = None,
+        runner_entry: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Populate v3.5.0 structured exit telemetry fields on `signal_data` and emit
+        a structured `[EXIT TELEMETRY]` log entry.
+        """
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+
+        if exit_stage is not None and isinstance(exit_stage, numbers.Integral) and not isinstance(exit_stage, bool):
+            stage_val = max(0, min(4, int(exit_stage)))
+        else:
+            stage_val = self.get_runner_fsm_stage(signal_data)
+
+        eff_exit_price: Optional[float] = None
+        if exit_price is not None and isinstance(exit_price, numbers.Real) and not isinstance(exit_price, bool) and float(exit_price) > 0.0:
+            eff_exit_price = round(float(exit_price), 4)
+        else:
+            prev_ep = signal_data.get("exit_price")
+            if isinstance(prev_ep, numbers.Real) and not isinstance(prev_ep, bool) and float(prev_ep) > 0.0:
+                eff_exit_price = round(float(prev_ep), 4)
+
+        peak_px: Optional[float] = None
+        for pk_key in ("trail_peak", "runner_peak_price", "peak_price"):
+            pv = signal_data.get(pk_key)
+            if isinstance(pv, numbers.Real) and not isinstance(pv, bool) and float(pv) > 0.0:
+                peak_px = round(float(pv), digits)
+                break
+        if peak_px is None and eff_exit_price is not None:
+            peak_px = round(float(eff_exit_price), digits)
+        elif peak_px is not None and eff_exit_price is not None and exit_reason_code == "TP_CEILING":
+            peak_px = round(max(peak_px, float(eff_exit_price)) if is_buy else min(peak_px, float(eff_exit_price)), digits)
+
+        ref_entry: Optional[float] = None
+        if runner_entry is not None and isinstance(runner_entry, numbers.Real) and not isinstance(runner_entry, bool) and float(runner_entry) > 0.0:
+            ref_entry = float(runner_entry)
+        else:
+            layers = signal_data.get("layers") or {}
+            raw_rls = signal_data.get("runner_layers")
+            rl_key = (
+                str(raw_rls[-1])
+                if (isinstance(raw_rls, list) and raw_rls)
+                else signal_data.get("runner_layer")
+            )
+            if rl_key and isinstance(layers.get(rl_key), dict):
+                tp_px = layers[rl_key].get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0.0:
+                    ref_entry = float(tp_px)
+            if ref_entry is None:
+                ref_entry = self._resolve_signal_primary_entry(signal_data)
+
+        peak_profit_per_oz: Optional[float] = None
+        if peak_px is not None and ref_entry is not None and ref_entry > 0.0:
+            peak_profit_per_oz = round(
+                max(0.0, (peak_px - ref_entry) if is_buy else (ref_entry - peak_px)),
+                4,
+            )
+        else:
+            raw_pp = signal_data.get("peak_profit")
+            if isinstance(raw_pp, numbers.Real) and not isinstance(raw_pp, bool) and float(raw_pp) >= 0.0:
+                peak_profit_per_oz = round(float(raw_pp), 4)
+
+        mfe: Dict[str, Optional[float]] = {
+            "peak_price": peak_px,
+            "peak_profit_per_oz": peak_profit_per_oz,
+        }
+
+        if exit_reason_code == "TP_CEILING":
+            giveback: Optional[float] = 0.0
+        elif peak_px is not None and eff_exit_price is not None:
+            giveback = round(
+                max(0.0, (peak_px - eff_exit_price) if is_buy else (eff_exit_price - peak_px)),
+                4,
+            )
+        else:
+            giveback = None
+
+        if stage_val == 0:
+            tier_used: Optional[Dict[str, Any]] = None
+        else:
+            cur_tier = signal_data.get("trail_tier_used")
+            if isinstance(cur_tier, dict):
+                tier_used = dict(cur_tier)
+            else:
+                _, tier_used = self._compute_staged_trail_dist(symbol, stage_val, digits)
+
+        if exit_reason_code is not None:
+            signal_data["exit_reason_code"] = str(exit_reason_code)
+        signal_data["exit_stage"] = stage_val
+        signal_data["exit_price"] = eff_exit_price
+        signal_data["max_favorable_excursion"] = mfe
+        signal_data["giveback_from_peak"] = giveback
+        signal_data["trail_tier_used"] = tier_used
+
+        logger.info(
+            f"[EXIT TELEMETRY] symbol={symbol} direction={direction} "
+            f"exit_reason_code={signal_data.get('exit_reason_code')} "
+            f"exit_stage={stage_val} exit_price={eff_exit_price} "
+            f"mfe={mfe} giveback_from_peak={giveback} trail_tier_used={tier_used}"
+        )
+        return {
+            "exit_reason_code": signal_data.get("exit_reason_code"),
+            "exit_stage": stage_val,
+            "exit_price": eff_exit_price,
+            "max_favorable_excursion": mfe,
+            "giveback_from_peak": giveback,
+            "trail_tier_used": tier_used,
+        }
+
     def _compute_tp1_trail_dist(self, symbol: str, digits: int) -> float:
         """
         Compute M1-ATR-calibrated TP1 trailing stop distance clamped to
@@ -4019,10 +4330,17 @@ class MT5Executor:
         step_dollars: float,
         extra_tp: Optional[float] = None,
         extra_tp_stage: Optional[str] = None,
+        force_sl_sync: bool = False,
+        fallback_sl: Optional[float] = None,
+        tick: Any = None,
+        sym_info: Any = None,
+        digits: int = 2,
     ) -> bool:
         """
         Apply TP1 trailing broker SL on a single open ticket forward-only, throttling
-        repeat updates to >= TP1_TRAIL_STEP_DOLLARS while letting explicit TP steps pass.
+        repeat updates to >= TP1_TRAIL_STEP_DOLLARS (unless `force_sl_sync=True`)
+        while letting explicit TP steps pass. On broker rejection of `desired_broker_sl`,
+        retries with clamped `fallback_sl` (e.g. `fsm_floor`) if strictly better than `cur_sl`.
         """
         cur_sl = 0.0
         if not self.dry_run:
@@ -4051,7 +4369,12 @@ class MT5Executor:
             is_better = True
             improvement = float("inf")
 
-        should_update_sl = is_better and ((not already_protected) or (cur_sl <= 0.0) or (improvement + 1e-9 >= step_dollars))
+        should_update_sl = is_better and (
+            bool(force_sl_sync)
+            or (not already_protected)
+            or (cur_sl <= 0.0)
+            or (improvement + 1e-9 >= step_dollars)
+        )
 
         already_at_tp = (
             extra_tp is not None
@@ -4070,7 +4393,7 @@ class MT5Executor:
                 return True
             return False
 
-        # Send desired SL (and optional TP step together in one IPC call); fall back to independent TP if SL rejected
+        # Send desired SL (and optional TP step together in one IPC call); fall back to fallback_sl or independent TP if SL rejected
         mod_ok = self.modify_position_sltp(ticket, sl=desired_broker_sl, tp=extra_tp)
         if mod_ok:
             tp1_sl_applied.add(ticket)
@@ -4084,6 +4407,36 @@ class MT5Executor:
             if is_runner:
                 signal_data["broker_sl"] = desired_broker_sl
             return True
+
+        if fallback_sl is not None and isinstance(fallback_sl, numbers.Real) and not isinstance(fallback_sl, bool) and float(fallback_sl) > 0.0:
+            symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+            eff_sym_info = sym_info if sym_info is not None else self.get_symbol_info(symbol)
+            eff_tick = tick if tick is not None else self.get_tick(symbol)
+            eff_digits = _int_num(getattr(eff_sym_info, "digits", digits), digits) if eff_sym_info else digits
+            clamped_fb = self._clamp_sl_for_broker_stops(
+                float(fallback_sl),
+                "BUY" if is_buy else "SELL",
+                eff_tick,
+                eff_sym_info,
+                eff_digits,
+            )
+            fb_better = (cur_sl <= 0.0) or (
+                (clamped_fb > cur_sl + 1e-9) if is_buy else (clamped_fb < cur_sl - 1e-9)
+            )
+            if fb_better and abs(clamped_fb - desired_broker_sl) > 1e-9:
+                if self.modify_position_sltp(ticket, sl=clamped_fb, tp=extra_tp):
+                    tp1_sl_applied.add(ticket)
+                    signal_data["_tp1_trail_sl_tickets"] = sorted(tp1_sl_applied)
+                    if l_info is not None:
+                        l_info["sl"] = clamped_fb
+                        if extra_tp is not None:
+                            l_info["tp"] = extra_tp
+                            if extra_tp_stage is not None:
+                                l_info["tp_stage"] = extra_tp_stage
+                    if is_runner:
+                        signal_data["broker_sl"] = clamped_fb
+                    return True
+
         if tp_arg is not None:
             if self.modify_position_sltp(ticket, sl=None, tp=tp_arg) and l_info is not None:
                 l_info["tp"] = tp_arg
@@ -4103,10 +4456,13 @@ class MT5Executor:
         skip_tickets: Sequence[int] = (),
         runner_tp: Optional[float] = None,
         runner_stage: Optional[str] = None,
+        force_sl_sync: bool = False,
+        fallback_sl: Optional[float] = None,
     ) -> int:
         """
         Sync hard broker SL across ALL remaining open layers (runner + non-runner L2/L3)
-        subject to stops-level clamping, forward-only ratchet, and TP1_TRAIL_STEP_DOLLARS.
+        subject to stops-level clamping, forward-only ratchet, and TP1_TRAIL_STEP_DOLLARS
+        (bypassed when `force_sl_sync=True`).
         """
         is_buy = (direction or "BUY").strip().upper() == "BUY"
         step_dollars = max(0.0, float(_cfg("TP1_TRAIL_STEP_DOLLARS", TP1_TRAIL_STEP_DOLLARS)))
@@ -4116,6 +4472,9 @@ class MT5Executor:
         if tick is None:
             tick = self.get_tick(symbol)
         desired_broker_sl = self._clamp_sl_for_broker_stops(desired_sl, direction, tick, sym_info, digits)
+        clamped_fb_sl: Optional[float] = None
+        if fallback_sl is not None and isinstance(fallback_sl, numbers.Real) and not isinstance(fallback_sl, bool) and float(fallback_sl) > 0.0:
+            clamped_fb_sl = self._clamp_sl_for_broker_stops(float(fallback_sl), direction, tick, sym_info, digits)
 
         layers = signal_data.get("layers") or {}
         ticket_to_layer: Dict[int, Dict[str, Any]] = {}
@@ -4153,6 +4512,11 @@ class MT5Executor:
                 step_dollars=step_dollars,
                 extra_tp=tp_rounded if is_r else None,
                 extra_tp_stage=runner_stage if is_r else None,
+                force_sl_sync=force_sl_sync,
+                fallback_sl=clamped_fb_sl,
+                tick=tick,
+                sym_info=sym_info,
+                digits=digits,
             ):
                 modified_cnt += 1
         return modified_cnt
@@ -4230,6 +4594,35 @@ class MT5Executor:
 
         return runner_ticket
 
+    @staticmethod
+    def _is_valid_tp(v: Any) -> bool:
+        return (
+            isinstance(v, numbers.Real)
+            and not isinstance(v, bool)
+            and math.isfinite(float(v))
+            and float(v) > 0.0
+        )
+
+    def _resolve_effective_max_stage(
+        self,
+        configured_max_stage: int,
+        tp_levels: Optional[Dict[str, Any]],
+    ) -> int:
+        """
+        Cap configured_max_stage against the highest valid TP stage (TP1..TP5) in tp_levels
+        so signals defining only TP1..TP4 (or setting higher TPs to None) cap cleanly at that stage.
+        """
+        cfg_cap = max(1, min(5, _int_num(configured_max_stage, 5)))
+        if not isinstance(tp_levels, dict) or not tp_levels:
+            return cfg_cap
+        highest_valid_tp = max(
+            (i for i in range(1, 6) if self._is_valid_tp(tp_levels.get(f"TP{i}"))),
+            default=0,
+        )
+        if highest_valid_tp > 0:
+            return max(1, min(5, cfg_cap, highest_valid_tp))
+        return cfg_cap
+
     def _ensure_signal_tp_levels(
         self,
         signal_data: Dict[str, Any],
@@ -4240,14 +4633,22 @@ class MT5Executor:
         """Build/sync TP1..TP5 dictionary on signal_data for Active Runner FSM."""
         tp_map = signal_data.get("tp_levels")
         merged: Dict[str, float] = {}
+        explicit_none_keys: Set[str] = set()
+        has_explicit_multi_tp = isinstance(tp_map, dict) and len(tp_map) >= 2
         if isinstance(tp_map, dict):
             for k, v in tp_map.items():
-                if v is not None:
-                    merged[str(k).upper()] = round(float(v), digits)
+                up_k = str(k).strip().upper()
+                if v is None:
+                    explicit_none_keys.add(up_k)
+                elif self._is_valid_tp(v):
+                    merged[up_k] = round(float(v), digits)
         for i in range(1, 6):
+            k = f"TP{i}"
+            if k in explicit_none_keys:
+                continue
             val = signal_data.get(f"raw_tp{i}")
-            if val is not None and f"TP{i}" not in merged:
-                merged[f"TP{i}"] = round(float(val), digits)
+            if self._is_valid_tp(val) and k not in merged:
+                merged[k] = round(float(val), digits)
 
         seed: List[float] = []
         for i in range(1, 6):
@@ -4257,7 +4658,7 @@ class MT5Executor:
             else:
                 break
 
-        if seed and len(merged) < 5:
+        if seed and len(merged) < 5 and not has_explicit_multi_tp:
             steps = [
                 float(_cfg("TP2_STEP_PIPS", TP2_STEP_PIPS)),
                 float(_cfg("TP3_STEP_PIPS", TP3_STEP_PIPS)),
@@ -4266,13 +4667,14 @@ class MT5Executor:
             ]
             derived = derive_tp_levels(seed, direction=direction, pip_size=pip_size, step_pips=steps)
             for k, v in derived.items():
-                merged.setdefault(k, round(float(v), digits))
+                if k not in explicit_none_keys and self._is_valid_tp(v):
+                    merged.setdefault(k, round(float(v), digits))
 
         if merged:
             signal_data["tp_levels"] = merged
             for i in range(1, 6):
                 k = f"TP{i}"
-                if k in merged and signal_data.get(f"raw_tp{i}") is None:
+                if k in merged and signal_data.get(f"raw_tp{i}") is None and k not in explicit_none_keys:
                     signal_data[f"raw_tp{i}"] = merged[k]
         return merged
 
@@ -4385,7 +4787,19 @@ class MT5Executor:
 
         lifted_tickets: List[int] = []
         proactive = bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT))
-        max_stage = max(1, min(5, _int_num(_cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 4)))
+        configured_max_stage = max(
+            1,
+            min(
+                5,
+                _int_num(
+                    signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
+                    5,
+                ),
+            ),
+        )
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
+        signal_data["runner_max_tp_stage"] = configured_max_stage
+        signal_data["effective_max_stage"] = max_stage
         if max_stage <= 1:
             proactive = False
         tp2 = tp_levels.get("TP2")
@@ -4489,6 +4903,27 @@ class MT5Executor:
         direction = (signal_data.get("direction") or "BUY").strip().upper()
         is_buy = direction == "BUY"
 
+        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+        if staged_exit_on and isinstance(signal_data, dict) and self.get_runner_fsm_stage(signal_data) >= 1:
+            signal_data["reversal_guard_armed"] = False
+            return {
+                "armed": False,
+                "triggered": False,
+                "hard_ceiling_triggered": False,
+                "paused_by_spread": False,
+                "disabled_post_tp1": True,
+                "spread_dollars": 0.0,
+                "max_allowed_spread": float(_cfg("MAX_ALLOWED_SPREAD_DOLLARS", MAX_ALLOWED_SPREAD_DOLLARS)),
+                "peak_profit": _num(signal_data.get("peak_profit", 0.0), 0.0),
+                "current_profit": 0.0,
+                "pullback_dollars": 0.0,
+                "drawdown_from_peak": 0.0,
+                "noise_floor_dollars": float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS)),
+                "m1_atr_14": 0.0,
+                "peak_price": signal_data.get("trail_peak") or signal_data.get("runner_peak_price"),
+                "live_price": None,
+            }
+
         if tick is None:
             tick = self.get_tick(symbol)
         if tick is None:
@@ -4559,7 +4994,7 @@ class MT5Executor:
             tick_peak_px = max(float(prev_peak_px), exec_price) if is_buy else min(float(prev_peak_px), exec_price)
 
         if not armed:
-            if signal_data.get("tp1_reached") or signal_data.get("tp1_touched"):
+            if (not staged_exit_on) and (signal_data.get("tp1_reached") or signal_data.get("tp1_touched")):
                 armed = True
             elif raw_tp1 is not None and sig_entry is not None:
                 tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
@@ -4807,7 +5242,17 @@ class MT5Executor:
                 if isinstance(layers.get(lk), dict) and _int_num(layers[lk].get("ticket"), 0) in market_tickets
             ]
 
-        max_stage = max(1, min(5, _int_num(_cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 4)))
+        configured_max_stage = max(
+            1,
+            min(
+                5,
+                _int_num(
+                    signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
+                    5,
+                ),
+            ),
+        )
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
         bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False)) or (max_stage <= 1)
         bank_single_tp1 = bool(_cfg("BANK_SINGLE_LAYER_AT_TP1", False))
 
@@ -4870,6 +5315,7 @@ class MT5Executor:
             cleared = []
 
         # 5. Lock runner SL floor & step all runner_tickets' broker TP to TP2
+        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
         be_after_tp1 = bool(_cfg("BE_AFTER_TP1", BE_AFTER_TP1))
         offset_value = float(_cfg("BE_OFFSET_PIPS", BE_OFFSET_PIPS)) * pip_size
         tp1_floor_price = floor_price
@@ -4890,49 +5336,113 @@ class MT5Executor:
         )
         trail_step_dollars = max(0.0, float(_cfg("TP1_TRAIL_STEP_DOLLARS", TP1_TRAIL_STEP_DOLLARS)))
 
-        if runner_tickets:
-            primary_info = layers.get(runner_layer) if (runner_layer and isinstance(layers.get(runner_layer), dict)) else {}
-            r_open: Optional[float] = None
-            if not self.dry_run and runner_ticket:
-                with self._mt5_lock:
-                    r_pos = mt5.positions_get(ticket=runner_ticket)
-                if r_pos:
-                    val = _num(getattr(r_pos[0], "price_open", 0.0), 0.0)
-                    if val > 0:
-                        r_open = val
-            if r_open is None and isinstance(primary_info, dict) and primary_info.get("target_price"):
-                r_open = float(primary_info["target_price"])
-            if r_open is None and signal_data.get("recorded_entry_price"):
-                r_open = float(signal_data["recorded_entry_price"])
-
-            runner_be_sl: Optional[float] = None
-            if r_open is not None and r_open > 0:
-                runner_be_sl = round(r_open + offset_value, digits) if is_buy else round(r_open - offset_value, digits)
-
-            gold_guard_on = bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED))
-            past_tp1_floor = True
-            if live_price is not None:
-                past_tp1_floor = (live_price >= tp1_floor_price) if is_buy else (live_price <= tp1_floor_price)
-
+        if staged_exit_on:
             sl_applied_tickets: Set[int] = set()
-            target_tp_val = round(float(next_stage_tp), digits) if next_stage_tp is not None else None
-            eff_touch_floor: Optional[float] = None
+            signal_data["runner_layers"] = list(runner_layers)
+            signal_data["runner_tickets"] = list(runner_tickets)
+            signal_data["runner_layer"] = runner_layer
+            signal_data["runner_ticket"] = runner_ticket
+            signal_data["runner_milestone_idx"] = milestone_idx
+            signal_data["runner_milestone_name"] = f"TP{milestone_idx}"
+            signal_data["runner_cleared_milestones"] = list(cleared)
+            signal_data["tp1_reached"] = True
+            signal_data["reversal_guard_armed"] = False
 
-            if tp1_trail_on and tp1_touched:
-                # v3.4.2: Remove TP1 - $0.50 clean-break choke; initialize dynamic ATR trailing stop instead
-                use_tp1_lock = False
-                touch_px = live_price if live_price is not None else (signal_data.get("tp1_touch_price") or float(raw_tp1))
-                _, _, trail_stop_val = self._update_tp1_trail_state(
+            if runner_tickets:
+                primary_info = layers.get(runner_layer) if (runner_layer and isinstance(layers.get(runner_layer), dict)) else {}
+                r_open: Optional[float] = None
+                if not self.dry_run and runner_ticket:
+                    with self._mt5_lock:
+                        r_pos = mt5.positions_get(ticket=runner_ticket)
+                    if r_pos:
+                        val = _num(getattr(r_pos[0], "price_open", 0.0), 0.0)
+                        if val > 0:
+                            r_open = val
+                if r_open is None and isinstance(primary_info, dict) and primary_info.get("target_price"):
+                    r_open = float(primary_info["target_price"])
+                if r_open is None and signal_data.get("recorded_entry_price"):
+                    r_open = float(signal_data["recorded_entry_price"])
+                if r_open is None:
+                    r_open = self._resolve_signal_primary_entry(signal_data)
+
+                stage = self.get_runner_fsm_stage(signal_data)
+                fsm_floor = self._compute_staged_fsm_floor(
                     signal_data,
-                    symbol,
+                    stage,
+                    tp_levels,
                     direction,
-                    float(touch_px),
                     pip_size,
                     digits,
-                    runner_entry_fallback=r_open,
+                    runner_entry=r_open,
                 )
-                floor_price = trail_stop_val
-                clamped_trail_sl = self._clamp_sl_for_broker_stops(floor_price, direction, tick, sym_info, digits)
+
+                seed_px = (
+                    live_price
+                    if live_price is not None
+                    else (
+                        float(raw_tp1)
+                        if raw_tp1 is not None
+                        else (float(r_open) if r_open is not None else 0.0)
+                    )
+                )
+                prev_tp = signal_data.get("trail_peak")
+                if isinstance(prev_tp, numbers.Real) and not isinstance(prev_tp, bool) and float(prev_tp) > 0.0 and seed_px > 0.0:
+                    trail_peak = round(
+                        max(float(prev_tp), float(seed_px)) if is_buy else min(float(prev_tp), float(seed_px)),
+                        digits,
+                    )
+                else:
+                    trail_peak = round(float(seed_px), digits)
+
+                trail_dist, tier_used = self._compute_staged_trail_dist(symbol, stage, digits)
+                atr_stop = round((trail_peak - trail_dist) if is_buy else (trail_peak + trail_dist), digits)
+
+                stop_cands: List[float] = [atr_stop]
+                if fsm_floor is not None:
+                    stop_cands.append(fsm_floor)
+                prev_ts = signal_data.get("trail_stop")
+                if isinstance(prev_ts, numbers.Real) and not isinstance(prev_ts, bool) and float(prev_ts) > 0.0:
+                    stop_cands.append(round(float(prev_ts), digits))
+                trail_stop = round(max(stop_cands) if is_buy else min(stop_cands), digits)
+
+                active_stop_source = (
+                    "FSM_FLOOR"
+                    if (
+                        fsm_floor is not None
+                        and (
+                            (is_buy and fsm_floor >= trail_stop - 1e-9)
+                            or (not is_buy and fsm_floor <= trail_stop + 1e-9)
+                        )
+                    )
+                    else "ATR_TRAIL"
+                )
+
+                signal_data["tp1_touched"] = True
+                signal_data["fsm_floor"] = fsm_floor
+                signal_data["trail_peak"] = trail_peak
+                signal_data["runner_peak_price"] = trail_peak
+                signal_data["trail_dist"] = trail_dist
+                signal_data["trail_tier_used"] = tier_used
+                signal_data["atr_stop"] = atr_stop
+                signal_data["trail_stop"] = trail_stop
+                signal_data["active_stop_source"] = active_stop_source
+                floor_price = trail_stop
+                new_peak_px: Optional[float] = trail_peak
+
+                if r_open is not None and r_open > 0 and trail_peak > 0:
+                    pk_prof = round(max(0.0, (trail_peak - r_open) if is_buy else (r_open - trail_peak)), 6)
+                    prev_pk_prof = _num(signal_data.get("peak_profit", 0.0), 0.0)
+                    signal_data["peak_profit"] = round(max(pk_prof, prev_pk_prof), 6)
+                    signal_data["reversal_guard_peak_profit"] = signal_data["peak_profit"]
+                    signal_data["reversal_guard_runner_entry"] = r_open
+
+                target_tp_val = round(float(next_stage_tp), digits) if next_stage_tp is not None else None
+                clamped_trail_sl = self._clamp_sl_for_broker_stops(trail_stop, direction, tick, sym_info, digits)
+                clamped_fb_sl = (
+                    self._clamp_sl_for_broker_stops(fsm_floor, direction, tick, sym_info, digits)
+                    if fsm_floor is not None
+                    else None
+                )
                 for idx_r, rt in enumerate(runner_tickets):
                     lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
                     l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
@@ -4946,145 +5456,39 @@ class MT5Executor:
                         step_dollars=trail_step_dollars,
                         extra_tp=target_tp_val,
                         extra_tp_stage=next_stage_key if target_tp_val is not None else None,
+                        force_sl_sync=True,
+                        fallback_sl=clamped_fb_sl,
+                        tick=tick,
+                        sym_info=sym_info,
+                        digits=digits,
                     ):
                         sl_applied_tickets.add(rt)
                     if l_info is not None:
                         l_info["status"] = "RUNNER"
-                        if target_tp_val is not None:
-                            l_info["tp"] = target_tp_val
-                            l_info["tp_stage"] = next_stage_key
             else:
-                if tp1_touched and tp1_touch_enabled and not tp1_trail_on:
-                    eff_touch_floor = self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
-                    signal_data["tp1_touched"] = True
-                    signal_data["tp1_touch_floor"] = eff_touch_floor
-
-                # Legacy non-trail mode: on clean break (+5p) lock TP1-0.50; on TP1 touch fallback lock TP1-$1.20
-                use_tp1_lock = (not tp1_trail_on) and past_tp1_floor and (already_clean_tp1 or not gold_guard_on)
-
-                if use_tp1_lock:
-                    cands = [tp1_floor_price]
-                    if eff_touch_floor is not None:
-                        cands.append(eff_touch_floor)
-                    if be_after_tp1 and runner_be_sl is not None:
-                        cands.append(runner_be_sl)
-                    floor_price = round(max(cands) if is_buy else min(cands), digits)
-                elif eff_touch_floor is not None:
-                    cands = [eff_touch_floor]
-                    if be_after_tp1 and runner_be_sl is not None:
-                        cands.append(runner_be_sl)
-                    floor_price = round(max(cands) if is_buy else min(cands), digits)
+                r_open = None
+                prev_peak_px = signal_data.get("runner_peak_price")
+                cand_peak = live_price if live_price is not None else raw_tp1
+                if prev_peak_px is not None and cand_peak is not None:
+                    new_peak_px = max(float(prev_peak_px), float(cand_peak)) if is_buy else min(float(prev_peak_px), float(cand_peak))
                 else:
-                    floor_price = runner_be_sl if (be_after_tp1 and runner_be_sl is not None) else None
+                    new_peak_px = cand_peak if cand_peak is not None else prev_peak_px
+                floor_price = None
 
-                for idx_r, rt in enumerate(runner_tickets):
-                    lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
-                    l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
-                    t_be_sl = runner_be_sl
-                    if l_info and l_info.get("target_price"):
-                        t_open = float(l_info["target_price"])
-                        t_be_sl = round(t_open + offset_value, digits) if is_buy else round(t_open - offset_value, digits)
+            signal_data["last_banked_tickets"] = banked_tickets
+            signal_data["tp_stage"] = next_stage_key if runner_tickets else "TP1"
+            signal_data["runner_max_tp_stage"] = configured_max_stage
+            signal_data["effective_max_stage"] = max_stage
+            signal_data["soft_tp1_floor"] = floor_price
+            signal_data["runner_sl_floor"] = floor_price
+            signal_data["runner_proximity_armed"] = False
+            signal_data["runner_reversal_ticks"] = 0
+            signal_data["shortfall_reversal_ticks"] = 0
+            signal_data["tp2_shortfall_armed"] = False
+            signal_data["runner_peak_price"] = new_peak_px
+            signal_data["market_tickets"] = surviving_tickets
 
-                    if use_tp1_lock or eff_touch_floor is not None:
-                        sl_cands = [floor_price] if floor_price is not None else []
-                        if be_after_tp1 and t_be_sl is not None:
-                            sl_cands.append(t_be_sl)
-                        desired_sl = round(max(sl_cands) if is_buy else min(sl_cands), digits) if sl_cands else None
-                    else:
-                        desired_sl = t_be_sl if be_after_tp1 else None
-
-                    t_sl = (
-                        self._clamp_sl_for_broker_stops(desired_sl, direction, tick, sym_info, digits)
-                        if desired_sl is not None
-                        else None
-                    )
-                    if t_sl is not None:
-                        if self.modify_position_sltp(rt, sl=t_sl, tp=target_tp_val):
-                            sl_applied_tickets.add(rt)
-                            signal_data["broker_sl"] = t_sl
-                            if l_info is not None:
-                                l_info["sl"] = t_sl
-                        elif be_after_tp1 and t_be_sl is not None and t_be_sl != t_sl:
-                            if self.modify_position_sltp(rt, sl=t_be_sl, tp=target_tp_val):
-                                sl_applied_tickets.add(rt)
-                                if l_info is not None:
-                                    l_info["sl"] = t_be_sl
-                            elif target_tp_val is not None:
-                                self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
-                        elif target_tp_val is not None:
-                            self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
-                    elif target_tp_val is not None:
-                        self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
-
-                    if l_info is not None:
-                        l_info["status"] = "RUNNER"
-                        if target_tp_val is not None:
-                            l_info["tp"] = target_tp_val
-                            l_info["tp_stage"] = next_stage_key
-        else:
-            r_open = None
-            sl_applied_tickets = set()
-            if tp1_trail_on and tp1_touched and raw_tp1 is not None:
-                touch_px = live_price if live_price is not None else (signal_data.get("tp1_touch_price") or float(raw_tp1))
-                _, _, trail_stop_val = self._update_tp1_trail_state(
-                    signal_data,
-                    symbol,
-                    direction,
-                    float(touch_px),
-                    pip_size,
-                    digits,
-                )
-                floor_price = trail_stop_val if surviving_tickets else None
-            else:
-                eff_touch_floor = (
-                    self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
-                    if (tp1_touched and tp1_touch_enabled and not tp1_trail_on)
-                    else None
-                )
-                floor_price = eff_touch_floor if surviving_tickets else None
-
-        # Scaling Continuity: carry forward peak_price & peak_profit and keep reversal_guard_armed = True
-        prev_peak_px = signal_data.get("runner_peak_price")
-        cand_peak = live_price if live_price is not None else raw_tp1
-        if prev_peak_px is not None and cand_peak is not None:
-            new_peak_px = max(float(prev_peak_px), float(cand_peak)) if is_buy else min(float(prev_peak_px), float(cand_peak))
-        else:
-            new_peak_px = cand_peak if cand_peak is not None else prev_peak_px
-
-        if runner_tickets and bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)):
-            signal_data["reversal_guard_armed"] = True
-            if r_open is not None and r_open > 0 and new_peak_px is not None:
-                pk_prof = round((float(new_peak_px) - r_open) if is_buy else (r_open - float(new_peak_px)), 6)
-                prev_pk_prof = _num(signal_data.get("peak_profit", 0.0), 0.0)
-                if signal_data.get("reversal_guard_runner_entry") not in (None, r_open):
-                    prev_pk_prof = pk_prof
-                best_prof = max(0.0, pk_prof, prev_pk_prof)
-                signal_data["peak_profit"] = round(best_prof, 6)
-                signal_data["reversal_guard_peak_profit"] = round(best_prof, 6)
-                signal_data["reversal_guard_runner_entry"] = r_open
-
-        signal_data["last_banked_tickets"] = banked_tickets
-        signal_data["runner_layers"] = list(runner_layers)
-        signal_data["runner_tickets"] = list(runner_tickets)
-        signal_data["runner_layer"] = runner_layer
-        signal_data["runner_ticket"] = runner_ticket
-        signal_data["tp_stage"] = next_stage_key if runner_tickets else "TP1"
-        signal_data["runner_max_tp_stage"] = max_stage
-        signal_data["soft_tp1_floor"] = floor_price
-        signal_data["runner_sl_floor"] = floor_price
-        signal_data["runner_milestone_idx"] = milestone_idx
-        signal_data["runner_milestone_name"] = f"TP{milestone_idx}"
-        signal_data["runner_cleared_milestones"] = cleared
-        signal_data["runner_proximity_armed"] = False
-        signal_data["runner_reversal_ticks"] = 0
-        signal_data["shortfall_reversal_ticks"] = 0
-        signal_data["tp2_shortfall_armed"] = False
-        signal_data["runner_peak_price"] = new_peak_px
-        signal_data["tp1_reached"] = True
-        signal_data["market_tickets"] = surviving_tickets
-
-        if tp1_touched and raw_tp1 is not None:
-            if tp1_trail_on and floor_price is not None:
+            if runner_tickets and floor_price is not None:
                 self._sync_tp1_trail_broker_sl(
                     signal_data,
                     symbol,
@@ -5094,20 +5498,226 @@ class MT5Executor:
                     tick=tick,
                     sym_info=sym_info,
                     skip_tickets=sorted(sl_applied_tickets),
+                    force_sl_sync=True,
+                    fallback_sl=signal_data.get("fsm_floor"),
                 )
-            elif tp1_touch_enabled and not tp1_trail_on:
-                self._apply_tp1_touch_protection(
-                    signal_data,
-                    symbol,
-                    direction,
-                    float(raw_tp1),
-                    pip_size,
-                    digits,
-                    tick=tick,
-                    sym_info=sym_info,
-                    skip_tickets=sorted(sl_applied_tickets),
-                    preferred_floor=floor_price,
-                )
+        else:
+            if runner_tickets:
+                primary_info = layers.get(runner_layer) if (runner_layer and isinstance(layers.get(runner_layer), dict)) else {}
+                r_open = None
+                if not self.dry_run and runner_ticket:
+                    with self._mt5_lock:
+                        r_pos = mt5.positions_get(ticket=runner_ticket)
+                    if r_pos:
+                        val = _num(getattr(r_pos[0], "price_open", 0.0), 0.0)
+                        if val > 0:
+                            r_open = val
+                if r_open is None and isinstance(primary_info, dict) and primary_info.get("target_price"):
+                    r_open = float(primary_info["target_price"])
+                if r_open is None and signal_data.get("recorded_entry_price"):
+                    r_open = float(signal_data["recorded_entry_price"])
+
+                runner_be_sl: Optional[float] = None
+                if r_open is not None and r_open > 0:
+                    runner_be_sl = round(r_open + offset_value, digits) if is_buy else round(r_open - offset_value, digits)
+
+                gold_guard_on = bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED))
+                past_tp1_floor = True
+                if live_price is not None:
+                    past_tp1_floor = (live_price >= tp1_floor_price) if is_buy else (live_price <= tp1_floor_price)
+
+                sl_applied_tickets = set()
+                target_tp_val = round(float(next_stage_tp), digits) if next_stage_tp is not None else None
+                eff_touch_floor: Optional[float] = None
+
+                if tp1_trail_on and tp1_touched:
+                    # v3.4.2: Remove TP1 - $0.50 clean-break choke; initialize dynamic ATR trailing stop instead
+                    use_tp1_lock = False
+                    touch_px = live_price if live_price is not None else (signal_data.get("tp1_touch_price") or float(raw_tp1))
+                    _, _, trail_stop_val = self._update_tp1_trail_state(
+                        signal_data,
+                        symbol,
+                        direction,
+                        float(touch_px),
+                        pip_size,
+                        digits,
+                        runner_entry_fallback=r_open,
+                    )
+                    floor_price = trail_stop_val
+                    clamped_trail_sl = self._clamp_sl_for_broker_stops(floor_price, direction, tick, sym_info, digits)
+                    for idx_r, rt in enumerate(runner_tickets):
+                        lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                        l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                        if self._sync_one_ticket_tp1_trail_sl(
+                            signal_data=signal_data,
+                            ticket=rt,
+                            l_info=l_info,
+                            is_runner=True,
+                            is_buy=is_buy,
+                            desired_broker_sl=clamped_trail_sl,
+                            step_dollars=trail_step_dollars,
+                            extra_tp=target_tp_val,
+                            extra_tp_stage=next_stage_key if target_tp_val is not None else None,
+                        ):
+                            sl_applied_tickets.add(rt)
+                        if l_info is not None:
+                            l_info["status"] = "RUNNER"
+                else:
+                    if tp1_touched and tp1_touch_enabled and not tp1_trail_on:
+                        eff_touch_floor = self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
+                        signal_data["tp1_touched"] = True
+                        signal_data["tp1_touch_floor"] = eff_touch_floor
+
+                    # Legacy non-trail mode: on clean break (+5p) lock TP1-0.50; on TP1 touch fallback lock TP1-$1.20
+                    use_tp1_lock = (not tp1_trail_on) and past_tp1_floor and (already_clean_tp1 or not gold_guard_on)
+
+                    if use_tp1_lock:
+                        cands = [tp1_floor_price]
+                        if eff_touch_floor is not None:
+                            cands.append(eff_touch_floor)
+                        if be_after_tp1 and runner_be_sl is not None:
+                            cands.append(runner_be_sl)
+                        floor_price = round(max(cands) if is_buy else min(cands), digits)
+                    elif eff_touch_floor is not None:
+                        cands = [eff_touch_floor]
+                        if be_after_tp1 and runner_be_sl is not None:
+                            cands.append(runner_be_sl)
+                        floor_price = round(max(cands) if is_buy else min(cands), digits)
+                    else:
+                        floor_price = runner_be_sl if (be_after_tp1 and runner_be_sl is not None) else None
+
+                    for idx_r, rt in enumerate(runner_tickets):
+                        lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                        l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                        t_be_sl = runner_be_sl
+                        if l_info and l_info.get("target_price"):
+                            t_open = float(l_info["target_price"])
+                            t_be_sl = round(t_open + offset_value, digits) if is_buy else round(t_open - offset_value, digits)
+
+                        if use_tp1_lock or eff_touch_floor is not None:
+                            sl_cands = [floor_price] if floor_price is not None else []
+                            if be_after_tp1 and t_be_sl is not None:
+                                sl_cands.append(t_be_sl)
+                            desired_sl = round(max(sl_cands) if is_buy else min(sl_cands), digits) if sl_cands else None
+                        else:
+                            desired_sl = t_be_sl if be_after_tp1 else None
+
+                        t_sl = (
+                            self._clamp_sl_for_broker_stops(desired_sl, direction, tick, sym_info, digits)
+                            if desired_sl is not None
+                            else None
+                        )
+                        if t_sl is not None:
+                            if self.modify_position_sltp(rt, sl=t_sl, tp=target_tp_val):
+                                sl_applied_tickets.add(rt)
+                                signal_data["broker_sl"] = t_sl
+                                if l_info is not None:
+                                    l_info["sl"] = t_sl
+                            elif be_after_tp1 and t_be_sl is not None and t_be_sl != t_sl:
+                                if self.modify_position_sltp(rt, sl=t_be_sl, tp=target_tp_val):
+                                    sl_applied_tickets.add(rt)
+                                    if l_info is not None:
+                                        l_info["sl"] = t_be_sl
+                                elif target_tp_val is not None:
+                                    self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
+                            elif target_tp_val is not None:
+                                self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
+                        elif target_tp_val is not None:
+                            self.modify_position_sltp(rt, sl=None, tp=target_tp_val)
+
+                        if l_info is not None:
+                            l_info["status"] = "RUNNER"
+                            if target_tp_val is not None:
+                                l_info["tp"] = target_tp_val
+                                l_info["tp_stage"] = next_stage_key
+            else:
+                r_open = None
+                sl_applied_tickets = set()
+                if tp1_trail_on and tp1_touched and raw_tp1 is not None:
+                    touch_px = live_price if live_price is not None else (signal_data.get("tp1_touch_price") or float(raw_tp1))
+                    _, _, trail_stop_val = self._update_tp1_trail_state(
+                        signal_data,
+                        symbol,
+                        direction,
+                        float(touch_px),
+                        pip_size,
+                        digits,
+                    )
+                    floor_price = trail_stop_val if surviving_tickets else None
+                else:
+                    eff_touch_floor = (
+                        self._compute_tp1_touch_floor(float(raw_tp1), direction, pip_size, digits)
+                        if (tp1_touched and tp1_touch_enabled and not tp1_trail_on)
+                        else None
+                    )
+                    floor_price = eff_touch_floor if surviving_tickets else None
+
+            # Scaling Continuity: carry forward peak_price & peak_profit and keep reversal_guard_armed = True
+            prev_peak_px = signal_data.get("runner_peak_price")
+            cand_peak = live_price if live_price is not None else raw_tp1
+            if prev_peak_px is not None and cand_peak is not None:
+                new_peak_px = max(float(prev_peak_px), float(cand_peak)) if is_buy else min(float(prev_peak_px), float(cand_peak))
+            else:
+                new_peak_px = cand_peak if cand_peak is not None else prev_peak_px
+
+            if runner_tickets and bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)):
+                signal_data["reversal_guard_armed"] = True
+                if r_open is not None and r_open > 0 and new_peak_px is not None:
+                    pk_prof = round((float(new_peak_px) - r_open) if is_buy else (r_open - float(new_peak_px)), 6)
+                    prev_pk_prof = _num(signal_data.get("peak_profit", 0.0), 0.0)
+                    if signal_data.get("reversal_guard_runner_entry") not in (None, r_open):
+                        prev_pk_prof = pk_prof
+                    best_prof = max(0.0, pk_prof, prev_pk_prof)
+                    signal_data["peak_profit"] = round(best_prof, 6)
+                    signal_data["reversal_guard_peak_profit"] = round(best_prof, 6)
+                    signal_data["reversal_guard_runner_entry"] = r_open
+
+            signal_data["last_banked_tickets"] = banked_tickets
+            signal_data["runner_layers"] = list(runner_layers)
+            signal_data["runner_tickets"] = list(runner_tickets)
+            signal_data["runner_layer"] = runner_layer
+            signal_data["runner_ticket"] = runner_ticket
+            signal_data["tp_stage"] = next_stage_key if runner_tickets else "TP1"
+            signal_data["runner_max_tp_stage"] = configured_max_stage
+            signal_data["effective_max_stage"] = max_stage
+            signal_data["soft_tp1_floor"] = floor_price
+            signal_data["runner_sl_floor"] = floor_price
+            signal_data["runner_milestone_idx"] = milestone_idx
+            signal_data["runner_milestone_name"] = f"TP{milestone_idx}"
+            signal_data["runner_cleared_milestones"] = cleared
+            signal_data["runner_proximity_armed"] = False
+            signal_data["runner_reversal_ticks"] = 0
+            signal_data["shortfall_reversal_ticks"] = 0
+            signal_data["tp2_shortfall_armed"] = False
+            signal_data["runner_peak_price"] = new_peak_px
+            signal_data["tp1_reached"] = True
+            signal_data["market_tickets"] = surviving_tickets
+
+            if tp1_touched and raw_tp1 is not None:
+                if tp1_trail_on and floor_price is not None:
+                    self._sync_tp1_trail_broker_sl(
+                        signal_data,
+                        symbol,
+                        direction,
+                        float(floor_price),
+                        digits,
+                        tick=tick,
+                        sym_info=sym_info,
+                        skip_tickets=sorted(sl_applied_tickets),
+                    )
+                elif tp1_touch_enabled and not tp1_trail_on:
+                    self._apply_tp1_touch_protection(
+                        signal_data,
+                        symbol,
+                        direction,
+                        float(raw_tp1),
+                        pip_size,
+                        digits,
+                        tick=tick,
+                        sym_info=sym_info,
+                        skip_tickets=sorted(sl_applied_tickets),
+                        preferred_floor=floor_price,
+                    )
 
         if runner_tickets:
             signal_data["status"] = "RUNNER_ACTIVE"
@@ -5239,10 +5849,14 @@ class MT5Executor:
         close_position: bool = True,
         ceiling_stage: Optional[int] = None,
         close_all_market_tickets: bool = False,
+        exit_reason_code: Optional[str] = None,
+        exit_price: Optional[float] = None,
+        exit_stage: Optional[int] = None,
     ) -> bool:
         """
         Atomically close active runner_tickets (and optionally any remaining non-runner open
-        market_tickets when banking on TP1-Touch Fallback Bank) under `is_closing = True` lock.
+        market_tickets when banking on TP1-Touch Fallback Bank or v3.5.0 Staged Exit) under
+        `is_closing = True` lock.
         """
         if not self.try_begin_signal_close(signal_data):
             logger.warning(f"Atomic exit lock: duplicate _finalize_runner_exit skipped ({reason}).")
@@ -5266,6 +5880,25 @@ class MT5Executor:
                 signal_data["_closed_tickets_once"] = sorted(already_closed_once)
             else:
                 self.invalidate_realized_pnl_cache()
+
+            if ceiling_stage is not None:
+                c_key = f"TP{ceiling_stage}"
+                signal_data[f"tp{ceiling_stage}_reached"] = True
+                if ceiling_stage >= 2:
+                    signal_data["tp2_reached"] = True
+                signal_data["tp_stage"] = c_key
+                cleared = list(signal_data.get("runner_cleared_milestones") or [])
+                if c_key not in cleared:
+                    cleared.append(c_key)
+                signal_data["runner_cleared_milestones"] = cleared
+
+            if exit_reason_code is not None or exit_price is not None or exit_stage is not None:
+                self._populate_exit_telemetry(
+                    signal_data,
+                    exit_reason_code=exit_reason_code,
+                    exit_price=exit_price,
+                    exit_stage=exit_stage,
+                )
 
             close_set = set(to_close)
             layers = signal_data.get("layers") or {}
@@ -5291,17 +5924,6 @@ class MT5Executor:
             signal_data["runner_proximity_armed"] = False
             signal_data["runner_reversal_ticks"] = 0
             signal_data["tp2_shortfall_armed"] = False
-
-            if ceiling_stage is not None:
-                c_key = f"TP{ceiling_stage}"
-                signal_data[f"tp{ceiling_stage}_reached"] = True
-                if ceiling_stage >= 2:
-                    signal_data["tp2_reached"] = True
-                signal_data["tp_stage"] = c_key
-                cleared = list(signal_data.get("runner_cleared_milestones") or [])
-                if c_key not in cleared:
-                    cleared.append(c_key)
-                signal_data["runner_cleared_milestones"] = cleared
 
             has_open_or_pending = bool(remaining_mkt or signal_data.get("pending_tickets"))
             signal_data["status"] = "BE_APPLIED" if has_open_or_pending else "CLOSED"
@@ -5383,12 +6005,23 @@ class MT5Executor:
                         live_positions_map[rt] = pos_res[0]
 
             if not live_positions_map:
+                staged_on_close = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+                bsl = _num(
+                    signal_data.get("broker_sl")
+                    or signal_data.get("trail_stop")
+                    or signal_data.get("runner_sl_floor")
+                    or signal_data.get("soft_tp1_floor"),
+                    0.0,
+                )
                 return self._finalize_runner_exit(
                     signal_data,
                     runner_tickets,
                     runner_layers,
                     reason="Trailed Stop Loss Hit (Locked in Gain)",
                     close_position=False,
+                    exit_reason_code="BROKER_SL" if staged_on_close else None,
+                    exit_price=bsl if (staged_on_close and bsl > 0.0) else None,
+                    exit_stage=self.get_runner_fsm_stage(signal_data) if staged_on_close else None,
                 )
 
             if len(live_positions_map) < len(runner_tickets):
@@ -5435,17 +6068,286 @@ class MT5Executor:
 
         pip_size = self.get_pip_size(p_symbol)
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
-        max_stage = max(
+        configured_max_stage = max(
             1,
             min(
                 5,
                 _int_num(
                     signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
-                    4,
+                    5,
                 ),
             ),
         )
-        signal_data["runner_max_tp_stage"] = max_stage
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
+        signal_data["runner_max_tp_stage"] = configured_max_stage
+        signal_data["effective_max_stage"] = max_stage
+
+        if bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED)):
+            # ===================================================================
+            # v3.5.0 STAGED GOLD RUNNER EXIT ARCHITECTURE (11-Step Tick Order)
+            # ===================================================================
+            # (1) Read live price + spread spike check; hard-disable Stage 0 Gold Guard
+            is_spike, spread_dollars, eff_max_spread = self.check_spread_spike(p_symbol, tick)
+            signal_data["spread_spike_paused"] = is_spike
+            signal_data["tp1_reached"] = True
+            signal_data["tp1_touched"] = True
+            signal_data["reversal_guard_armed"] = False
+
+            # (2) Update single canonical trail_peak (seeded at TP1 scaling handoff)
+            prev_peak = signal_data.get("trail_peak")
+            if not (isinstance(prev_peak, numbers.Real) and not isinstance(prev_peak, bool) and float(prev_peak) > 0.0):
+                prev_peak = signal_data.get("runner_peak_price")
+            if isinstance(prev_peak, numbers.Real) and not isinstance(prev_peak, bool) and float(prev_peak) > 0.0:
+                trail_peak = round(
+                    max(float(prev_peak), live_price) if is_buy else min(float(prev_peak), live_price),
+                    digits,
+                )
+            else:
+                trail_peak = round(live_price, digits)
+            signal_data["trail_peak"] = trail_peak
+            signal_data["runner_peak_price"] = trail_peak
+
+            ref_entry = (
+                float(runner_entry)
+                if (runner_entry is not None and isinstance(runner_entry, numbers.Real) and not isinstance(runner_entry, bool) and float(runner_entry) > 0.0)
+                else self._resolve_signal_primary_entry(signal_data)
+            )
+            if ref_entry is not None and ref_entry > 0.0:
+                pk_prof = round(max(0.0, (trail_peak - ref_entry) if is_buy else (ref_entry - trail_peak)), 6)
+                prev_pk_prof = _num(signal_data.get("peak_profit", 0.0), 0.0)
+                signal_data["peak_profit"] = round(max(pk_prof, prev_pk_prof), 6)
+                signal_data["reversal_guard_peak_profit"] = signal_data["peak_profit"]
+
+            # (3) Ceiling check at TP{max_stage} -> close runner + ALL open layers
+            ceiling_key = f"TP{max_stage}"
+            ceiling_tp = tp_levels.get(ceiling_key)
+            if ceiling_tp is not None:
+                ceiling_val = float(ceiling_tp)
+                if (is_buy and live_price >= ceiling_val) or (not is_buy and live_price <= ceiling_val):
+                    exit_stage_val = min(4, max_stage)
+                    _, tier_snap = self._compute_staged_trail_dist(p_symbol, exit_stage_val, digits)
+                    signal_data["trail_tier_used"] = tier_snap
+                    logger.info(
+                        f"Runner {runner_tickets}: Reached {ceiling_key} ceiling ({ceiling_val})! "
+                        f"Closing runner + all open layers at market."
+                    )
+                    return self._finalize_runner_exit(
+                        signal_data,
+                        runner_tickets,
+                        runner_layers,
+                        reason=f"Target {ceiling_key} Reached ({ceiling_val})",
+                        ceiling_stage=max_stage,
+                        close_all_market_tickets=True,
+                        exit_reason_code="TP_CEILING",
+                        exit_price=live_price,
+                        exit_stage=exit_stage_val,
+                    )
+
+            # (4) Non-runner L2 (TP2) & L3 (TP3) backstop auto-close
+            self._close_reached_layer_targets(signal_data, tp_levels, is_buy, live_price, runner_tickets)
+
+            # (5) Sequential while loop clean-break progression (TPk +/- RUNNER_CLEAN_BREAK_PIPS * pip_size)
+            prev_stage = self.get_runner_fsm_stage(signal_data)
+            k = max(1, min(max_stage, _int_num(signal_data.get("runner_milestone_idx", 1), 1)))
+            cleared = list(signal_data.get("runner_cleared_milestones") or [])
+            clean_break_dist = float(_cfg("RUNNER_CLEAN_BREAK_PIPS", RUNNER_CLEAN_BREAK_PIPS)) * pip_size
+            stepped_milestone_tp: Optional[float] = None
+            stepped_milestone_stage: Optional[str] = None
+            milestone_advanced = False
+
+            while k < max_stage:
+                target = tp_levels.get(f"TP{k}")
+                if target is None:
+                    break
+                target_f = float(target)
+                clean_level = round(target_f + clean_break_dist, digits) if is_buy else round(target_f - clean_break_dist, digits)
+                broke_clean = (live_price >= clean_level) if is_buy else (live_price <= clean_level)
+                if not broke_clean:
+                    break
+
+                m_name = f"TP{k}"
+                if m_name not in cleared:
+                    cleared.append(m_name)
+                if k >= 2:
+                    signal_data[f"tp{k}_reached"] = True
+
+                signal_data["runner_proximity_armed"] = False
+                signal_data["runner_reversal_ticks"] = 0
+                signal_data["tp2_shortfall_armed"] = False
+
+                k += 1
+                milestone_advanced = True
+                step_stage = f"TP{k}"
+                step_tp = tp_levels.get(step_stage)
+                stepped_milestone_tp = float(step_tp) if step_tp is not None else None
+                stepped_milestone_stage = step_stage
+                signal_data["tp_stage"] = step_stage
+                signal_data["runner_milestone_idx"] = k
+                signal_data["runner_milestone_name"] = step_stage
+                signal_data["runner_cleared_milestones"] = list(cleared)
+
+                iter_stage = self.get_runner_fsm_stage(signal_data)
+                iter_floor = self._compute_staged_fsm_floor(
+                    signal_data,
+                    iter_stage,
+                    tp_levels,
+                    direction,
+                    pip_size,
+                    digits,
+                    runner_entry=runner_entry,
+                )
+                if iter_floor is not None:
+                    signal_data["fsm_floor"] = iter_floor
+
+                logger.info(
+                    f"Runner {runner_tickets}: Clean break past {m_name} ({target_f}); "
+                    f"stepped to {step_stage}={step_tp}, stage={iter_stage}, fsm_floor={signal_data.get('fsm_floor')}"
+                )
+
+            signal_data["runner_milestone_idx"] = k
+            signal_data["runner_milestone_name"] = f"TP{k}"
+            signal_data["runner_cleared_milestones"] = cleared
+
+            stage = self.get_runner_fsm_stage(signal_data)
+            fsm_floor = self._compute_staged_fsm_floor(
+                signal_data,
+                stage,
+                tp_levels,
+                direction,
+                pip_size,
+                digits,
+                runner_entry=runner_entry,
+            )
+            if fsm_floor is not None:
+                signal_data["fsm_floor"] = fsm_floor
+            stage_changed = bool(stage != prev_stage or milestone_advanced)
+
+            # (6) Proactive broker TP lift at >= RUNNER_EARLY_TP_LIFT_PCT (70%) of leg OR proximity buffer
+            cur_target = tp_levels.get(f"TP{k}")
+            if cur_target is not None and bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT)) and k < max_stage:
+                cur_target_f = float(cur_target)
+                anchor = self._resolve_milestone_anchor(signal_data, tp_levels, k, fallback_entry=runner_entry)
+                lift_now = False
+                if anchor is not None and float(anchor) > 0:
+                    leg_span = (cur_target_f - float(anchor)) if is_buy else (float(anchor) - cur_target_f)
+                    if leg_span > 1e-9:
+                        prog = ((live_price - float(anchor)) / leg_span) if is_buy else ((float(anchor) - live_price) / leg_span)
+                        if prog + 1e-9 >= float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT)):
+                            lift_now = True
+                if not lift_now:
+                    eff_buf, _ = self._compute_proximity_and_pullback(cur_target_f, live_price, pip_size, anchor=anchor)
+                    dist_t = (cur_target_f - live_price) if is_buy else (live_price - cur_target_f)
+                    if dist_t <= eff_buf + 1e-9:
+                        lift_now = True
+                if lift_now:
+                    lift_idx = min(max_stage, k + 1)
+                    lift_stage = f"TP{lift_idx}"
+                    lift_tp = tp_levels.get(lift_stage)
+                    if lift_tp is not None:
+                        lift_tp_rounded = round(float(lift_tp), digits)
+                        needs_tp_lift = False
+                        for lk in runner_layers:
+                            l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                            if l_info is None or abs(_num(l_info.get("tp"), 0.0) - lift_tp_rounded) >= 1e-6 or l_info.get("tp_stage") != lift_stage:
+                                needs_tp_lift = True
+                                break
+                        if needs_tp_lift or not runner_layers:
+                            stepped_milestone_tp = float(lift_tp)
+                            stepped_milestone_stage = lift_stage
+                        signal_data["tp_stage"] = lift_stage
+
+            # (7) Stage tier (mult, min_d, max_d) -> trail_dist, trail_tier_used, atr_stop
+            trail_dist, tier_used = self._compute_staged_trail_dist(p_symbol, stage, digits)
+            atr_stop = round((trail_peak - trail_dist) if is_buy else (trail_peak + trail_dist), digits)
+            signal_data["trail_dist"] = trail_dist
+            signal_data["trail_tier_used"] = tier_used
+            signal_data["atr_stop"] = atr_stop
+
+            # (8) Protective selection + monotonic trail_stop ratchet (never loosens on stage handoff or ATR expansion)
+            prev_trail_stop: Optional[float] = None
+            for prev_key in ("trail_stop", "runner_sl_floor", "soft_tp1_floor"):
+                pv = signal_data.get(prev_key)
+                if isinstance(pv, numbers.Real) and not isinstance(pv, bool) and float(pv) > 0.0:
+                    prev_trail_stop = round(float(pv), digits)
+                    break
+
+            stop_cands: List[float] = [atr_stop]
+            if fsm_floor is not None:
+                stop_cands.append(fsm_floor)
+            if prev_trail_stop is not None:
+                stop_cands.append(prev_trail_stop)
+
+            trail_stop = round(max(stop_cands) if is_buy else min(stop_cands), digits)
+            signal_data["trail_stop"] = trail_stop
+            signal_data["runner_sl_floor"] = trail_stop
+            signal_data["soft_tp1_floor"] = trail_stop
+
+            # (9) Tie-breaker for active_stop_source (FSM_FLOOR wins on exact tie fsm_floor == trail_stop)
+            active_stop_source = (
+                "FSM_FLOOR"
+                if (
+                    fsm_floor is not None
+                    and (
+                        (is_buy and fsm_floor >= trail_stop - 1e-9)
+                        or (not is_buy and fsm_floor <= trail_stop + 1e-9)
+                    )
+                )
+                else "ATR_TRAIL"
+            )
+            signal_data["active_stop_source"] = active_stop_source
+
+            # (10) Broker SL/TP sync (immediate on stage change, throttled by TP1_TRAIL_STEP_DOLLARS otherwise)
+            self._sync_tp1_trail_broker_sl(
+                signal_data,
+                p_symbol,
+                direction,
+                float(trail_stop),
+                digits,
+                tick=tick,
+                sym_info=sym_info,
+                runner_tp=stepped_milestone_tp,
+                runner_stage=stepped_milestone_stage,
+                force_sl_sync=stage_changed,
+                fallback_sl=fsm_floor,
+            )
+
+            # (11) Exit check (paused during spread spike; otherwise close runner + ALL open layers)
+            stop_hit = (live_price <= trail_stop + 1e-9) if is_buy else (live_price >= trail_stop - 1e-9)
+            if stop_hit:
+                if is_spike:
+                    logger.info(
+                        f"Runner {runner_tickets}: Staged {active_stop_source} exit PAUSED due to spread spike "
+                        f"(live={live_price}, trail_stop={trail_stop}, spread=${spread_dollars:.2f} > ${eff_max_spread:.2f} max)"
+                    )
+                    return True
+
+                if active_stop_source == "FSM_FLOOR":
+                    floor_label = "Virtual TP1 Floor Protected" if stage <= 1 else "Virtual Floor Protected"
+                    reason = (
+                        f"Staged FSM Floor (Stage {stage}, {floor_label}, "
+                        f"peak={trail_peak:.{digits}f}, floor={trail_stop:.{digits}f})"
+                    )
+                else:
+                    reason = (
+                        f"Staged ATR Trail (Stage {stage}, TP1 Trailing Stop, "
+                        f"peak={trail_peak:.{digits}f}, stop={trail_stop:.{digits}f})"
+                    )
+                logger.info(
+                    f"Runner {runner_tickets}: {reason} triggered at live={live_price}. "
+                    f"Closing runner + all open layers."
+                )
+                return self._finalize_runner_exit(
+                    signal_data,
+                    runner_tickets,
+                    runner_layers,
+                    reason=reason,
+                    close_all_market_tickets=True,
+                    exit_reason_code=active_stop_source,
+                    exit_price=live_price,
+                    exit_stage=stage,
+                )
+
+            return True
 
         # 0. Dynamic ATR TP1 Trailing Stop (v3.4.2) with v3.4.1 TP1-Touch Fallback when disabled
         raw_tp1_val = signal_data.get("raw_tp1") or tp_levels.get("TP1")
@@ -6253,11 +7155,17 @@ class MT5Executor:
                         else round(tp_levels["TP1"] + prox_dist, digits)
                     )
 
+        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
         is_runner_phase = bool(signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"))
-        cur_floor = (
-            signal_data.get("runner_sl_floor")
-            if signal_data.get("runner_sl_floor") is not None
-            else signal_data.get("soft_tp1_floor")
+        existing_stops: List[float] = []
+        for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+            sv = signal_data.get(stop_k)
+            if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
+                existing_stops.append(round(float(sv), digits))
+        cur_floor: Optional[float] = (
+            (max(existing_stops) if is_buy else min(existing_stops))
+            if existing_stops
+            else None
         )
         eff_sl: Optional[float] = cur_floor if (is_runner_phase and cur_floor is not None) else signal_data.get("sl")
         rejected_sl_reason: Optional[str] = None
@@ -6265,7 +7173,8 @@ class MT5Executor:
 
         if new_sl is not None and isinstance(new_sl, numbers.Real) and not isinstance(new_sl, bool) and float(new_sl) > 0:
             cand_sl = round(float(new_sl), digits)
-            if ratchet_sl_only and is_runner_phase and cur_floor is not None:
+            enforce_ratchet = bool(ratchet_sl_only or staged_exit_on)
+            if enforce_ratchet and is_runner_phase and cur_floor is not None:
                 worse_or_equal = (
                     (is_buy and cand_sl <= float(cur_floor) + 1e-9)
                     or (not is_buy and cand_sl >= float(cur_floor) - 1e-9)
@@ -6282,25 +7191,50 @@ class MT5Executor:
                 sl_updated = True
                 signal_data["sl"] = cand_sl
                 if is_runner_phase:
-                    signal_data["runner_sl_floor"] = cand_sl
-                    signal_data["soft_tp1_floor"] = cand_sl
-                    signal_data["broker_sl"] = cand_sl
+                    if staged_exit_on:
+                        prev_ts = signal_data.get("trail_stop")
+                        if isinstance(prev_ts, numbers.Real) and not isinstance(prev_ts, bool) and float(prev_ts) > 0.0:
+                            new_ts = round(
+                                max(float(prev_ts), cand_sl) if is_buy else min(float(prev_ts), cand_sl),
+                                digits,
+                            )
+                        else:
+                            new_ts = cand_sl
+                        signal_data["trail_stop"] = new_ts
+                        signal_data["runner_sl_floor"] = new_ts
+                        signal_data["soft_tp1_floor"] = new_ts
+                        cur_fsm = signal_data.get("fsm_floor")
+                        if isinstance(cur_fsm, numbers.Real) and not isinstance(cur_fsm, bool) and float(cur_fsm) > 0.0:
+                            signal_data["active_stop_source"] = (
+                                "FSM_FLOOR"
+                                if (
+                                    (is_buy and float(cur_fsm) >= new_ts - 1e-9)
+                                    or (not is_buy and float(cur_fsm) <= new_ts + 1e-9)
+                                )
+                                else "ATR_TRAIL"
+                            )
+                    else:
+                        signal_data["runner_sl_floor"] = cand_sl
+                        signal_data["soft_tp1_floor"] = cand_sl
 
         mod_pos: List[int] = []
         mod_ord: List[int] = []
         layers = signal_data.get("layers") or {}
         market_tickets = [_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0]
         pending_tickets = [_int_num(t, 0) for t in (signal_data.get("pending_tickets") or []) if _int_num(t, 0) > 0]
-        max_stage = max(
+        configured_max_stage = max(
             1,
             min(
                 5,
                 _int_num(
                     signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
-                    4,
+                    5,
                 ),
             ),
         )
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
+        signal_data["runner_max_tp_stage"] = configured_max_stage
+        signal_data["effective_max_stage"] = max_stage
 
         if is_runner_phase:
             raw_rts = signal_data.get("runner_tickets") or (
@@ -6324,18 +7258,29 @@ class MT5Executor:
             signal_data["tp_stage"] = raw_stage
 
             sl_arg = eff_sl if sl_updated else None
+            runner_sl_applied = False
             for idx_r, rt in enumerate(runner_tickets):
                 lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
                 l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
                 if self.modify_position_sltp(rt, sl=sl_arg, tp=runner_tp):
                     if rt not in mod_pos:
                         mod_pos.append(rt)
+                    if sl_arg is not None:
+                        runner_sl_applied = True
+                        if l_info is not None:
+                            l_info["sl"] = sl_arg
+                    if l_info is not None and runner_tp is not None:
+                        l_info["tp"] = runner_tp
+                        l_info["tp_stage"] = raw_stage
                 elif sl_arg is not None and runner_tp is not None:
-                    if self.modify_position_sltp(rt, sl=None, tp=runner_tp) and rt not in mod_pos:
-                        mod_pos.append(rt)
-                if l_info is not None and runner_tp is not None:
-                    l_info["tp"] = runner_tp
-                    l_info["tp_stage"] = raw_stage
+                    if self.modify_position_sltp(rt, sl=None, tp=runner_tp):
+                        if rt not in mod_pos:
+                            mod_pos.append(rt)
+                        if l_info is not None:
+                            l_info["tp"] = runner_tp
+                            l_info["tp_stage"] = raw_stage
+            if runner_sl_applied and sl_arg is not None:
+                signal_data["broker_sl"] = sl_arg
 
             runner_set = set(runner_tickets)
             for l_name, l_data in layers.items():
@@ -6445,17 +7390,19 @@ class MT5Executor:
         min_stop_dist = stops_lvl * (pt or 0.01)
 
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
-        max_stage = max(
+        configured_max_stage = max(
             1,
             min(
                 5,
                 _int_num(
                     signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE),
-                    4,
+                    5,
                 ),
             ),
         )
-        signal_data["runner_max_tp_stage"] = max_stage
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
+        signal_data["runner_max_tp_stage"] = configured_max_stage
+        signal_data["effective_max_stage"] = max_stage
 
         tick = self.get_tick(symbol)
         live_px: Optional[float] = None
@@ -6494,12 +7441,17 @@ class MT5Executor:
             signal_data["tp1_reached"] = True
 
             if m_idx >= max_stage and runner_tickets:
+                staged_prompt_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
                 self._finalize_runner_exit(
                     signal_data,
                     runner_tickets,
                     runner_layers,
                     reason=f"Target TP{m_idx} Reached (Prompt)",
                     ceiling_stage=m_idx,
+                    close_all_market_tickets=staged_prompt_on,
+                    exit_reason_code="TP_CEILING" if staged_prompt_on else None,
+                    exit_price=live_px if staged_prompt_on else None,
+                    exit_stage=min(4, m_idx) if staged_prompt_on else None,
                 )
                 return {
                     "new_sl": signal_data.get("runner_sl_floor"),
@@ -6512,14 +7464,114 @@ class MT5Executor:
                     "status": signal_data.get("status"),
                 }
 
+            next_idx = min(max_stage, m_idx + 1)
+            next_stage = f"TP{next_idx}"
+            next_tp = tp_levels.get(next_stage)
+            signal_data["runner_milestone_idx"] = next_idx
+            signal_data["runner_milestone_name"] = next_stage
+            signal_data["tp_stage"] = next_stage
+            signal_data["runner_proximity_armed"] = False
+            signal_data["runner_reversal_ticks"] = 0
+            signal_data["tp2_shortfall_armed"] = False
+            if runner_tickets:
+                signal_data["status"] = "RUNNER_ACTIVE"
+
+            if bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED)):
+                new_stage = self.get_runner_fsm_stage(signal_data)
+                fsm_floor = self._compute_staged_fsm_floor(
+                    signal_data,
+                    new_stage,
+                    tp_levels,
+                    direction,
+                    pip_size,
+                    digits,
+                )
+                if fsm_floor is not None:
+                    signal_data["fsm_floor"] = fsm_floor
+
+                prev_peak = signal_data.get("trail_peak")
+                if not (isinstance(prev_peak, numbers.Real) and not isinstance(prev_peak, bool) and float(prev_peak) > 0.0):
+                    prev_peak = signal_data.get("runner_peak_price")
+                seed_px = live_px if live_px is not None else tp_levels.get(f"TP{m_idx}")
+                if isinstance(prev_peak, numbers.Real) and not isinstance(prev_peak, bool) and float(prev_peak) > 0.0:
+                    if seed_px is not None and float(seed_px) > 0.0:
+                        trail_peak = round(
+                            max(float(prev_peak), float(seed_px)) if is_buy else min(float(prev_peak), float(seed_px)),
+                            digits,
+                        )
+                    else:
+                        trail_peak = round(float(prev_peak), digits)
+                elif seed_px is not None and float(seed_px) > 0.0:
+                    trail_peak = round(float(seed_px), digits)
+                else:
+                    trail_peak = round(float(self._resolve_signal_primary_entry(signal_data) or 3895.0), digits)
+                signal_data["trail_peak"] = trail_peak
+                signal_data["runner_peak_price"] = trail_peak
+
+                trail_dist_s, tier_used = self._compute_staged_trail_dist(symbol, new_stage, digits)
+                atr_stop = round((trail_peak - trail_dist_s) if is_buy else (trail_peak + trail_dist_s), digits)
+                signal_data["trail_dist"] = trail_dist_s
+                signal_data["trail_tier_used"] = tier_used
+                signal_data["atr_stop"] = atr_stop
+
+                stop_cands: List[float] = [atr_stop]
+                if fsm_floor is not None:
+                    stop_cands.append(fsm_floor)
+                for prev_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+                    pv = signal_data.get(prev_k)
+                    if isinstance(pv, numbers.Real) and not isinstance(pv, bool) and float(pv) > 0.0:
+                        stop_cands.append(round(float(pv), digits))
+                active_stop = round(max(stop_cands) if is_buy else min(stop_cands), digits)
+                active_stop_source = (
+                    "FSM_FLOOR"
+                    if (
+                        fsm_floor is not None
+                        and (
+                            (is_buy and fsm_floor >= active_stop - 1e-9)
+                            or (not is_buy and fsm_floor <= active_stop + 1e-9)
+                        )
+                    )
+                    else "ATR_TRAIL"
+                )
+                signal_data["trail_stop"] = active_stop
+                signal_data["runner_sl_floor"] = active_stop
+                signal_data["soft_tp1_floor"] = active_stop
+                signal_data["active_stop_source"] = active_stop_source
+                signal_data["sl"] = active_stop
+
+                self._sync_tp1_trail_broker_sl(
+                    signal_data,
+                    symbol,
+                    direction,
+                    float(active_stop),
+                    digits,
+                    tick=tick,
+                    sym_info=sym_info,
+                    runner_tp=next_tp,
+                    runner_stage=next_stage,
+                    force_sl_sync=True,
+                    fallback_sl=fsm_floor,
+                )
+
+                return {
+                    "new_sl": active_stop,
+                    "tp_stage": next_stage,
+                    "next_tp": next_tp,
+                    "cleared_milestones": list(cleared),
+                    "modified_tickets": list(runner_tickets),
+                    "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
+                    "status": signal_data.get("status"),
+                }
+
             raw_lock = float(_cfg("TP1_LOCK_BUFFER", TP1_LOCK_BUFFER))
             lock_buf = raw_lock * (pip_size / 0.10) if pip_size > 0 else raw_lock
             trail_dist = float(_cfg("TRAIL_DISTANCE_PIPS", TRAIL_DISTANCE_PIPS)) * pip_size
-            cur_floor = (
-                signal_data.get("runner_sl_floor")
-                if signal_data.get("runner_sl_floor") is not None
-                else signal_data.get("soft_tp1_floor")
-            )
+            existing_floors: List[float] = []
+            for fk in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+                fv = signal_data.get(fk)
+                if isinstance(fv, numbers.Real) and not isinstance(fv, bool) and float(fv) > 0.0:
+                    existing_floors.append(round(float(fv), digits))
+            cur_floor = (max(existing_floors) if is_buy else min(existing_floors)) if existing_floors else None
 
             if m_idx == 1:
                 tp1_val = tp_levels.get("TP1")
@@ -6527,6 +7579,8 @@ class MT5Executor:
                     cand_floor = round(float(tp1_val) - lock_buf, digits) if is_buy else round(float(tp1_val) + lock_buf, digits)
                 else:
                     cand_floor = self._compute_initial_tp1_floor(signal_data, symbol, direction, pip_size, digits)
+                if cur_floor is not None:
+                    cand_floor = round(max(float(cur_floor), float(cand_floor)) if is_buy else min(float(cur_floor), float(cand_floor)), digits)
             else:
                 prev_tp = tp_levels.get(f"TP{m_idx - 1}")
                 cur_m_tp = tp_levels.get(f"TP{m_idx}")
@@ -6549,32 +7603,56 @@ class MT5Executor:
                 elif not is_buy and cand_floor < live_px + safe_gap:
                     cand_floor = round(live_px + safe_gap, digits)
 
-            next_idx = min(max_stage, m_idx + 1)
-            next_stage = f"TP{next_idx}"
-            next_tp = tp_levels.get(next_stage)
+            # Never loosen below existing cur_floor / broker_sl
+            if cur_floor is not None and cand_floor is not None:
+                cand_floor = round(
+                    max(float(cur_floor), float(cand_floor)) if is_buy else min(float(cur_floor), float(cand_floor)),
+                    digits,
+                )
 
-            signal_data["runner_milestone_idx"] = next_idx
-            signal_data["runner_milestone_name"] = next_stage
-            signal_data["tp_stage"] = next_stage
+            cur_bsl = _num(signal_data.get("broker_sl"), 0.0)
+            sl_to_send: Optional[float] = cand_floor
+            if sl_to_send is not None and cur_bsl > 0.0:
+                if (is_buy and sl_to_send <= cur_bsl + 1e-9) or (not is_buy and sl_to_send >= cur_bsl - 1e-9):
+                    sl_to_send = None
+            if sl_to_send is not None and live_px is not None:
+                safe_gap = max(min_stop_dist, 2.0 * pip_size)
+                if (is_buy and sl_to_send > live_px - safe_gap + 1e-9) or (not is_buy and sl_to_send < live_px + safe_gap - 1e-9):
+                    sl_to_send = None
+
             signal_data["runner_sl_floor"] = cand_floor
             signal_data["soft_tp1_floor"] = cand_floor
-            signal_data["broker_sl"] = cand_floor
             signal_data["sl"] = cand_floor
-            signal_data["runner_proximity_armed"] = False
-            signal_data["runner_reversal_ticks"] = 0
-            signal_data["tp2_shortfall_armed"] = False
-            if runner_tickets:
-                signal_data["status"] = "RUNNER_ACTIVE"
 
-            self._step_runner_broker_tp_and_sl(
-                signal_data,
-                runner_tickets,
-                runner_layers,
-                new_sl=cand_floor,
-                new_tp=next_tp,
-                new_stage=next_stage,
-                digits=digits,
-            )
+            layers = signal_data.get("layers") or {}
+            tp_rounded = round(float(next_tp), digits) if next_tp is not None else None
+            sl_rounded = round(float(sl_to_send), digits) if sl_to_send is not None else None
+            sl_mod_ok = False
+            for idx_r, rt in enumerate(runner_tickets):
+                lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                already_at_tp = (
+                    l_info is not None
+                    and tp_rounded is not None
+                    and abs(_num(l_info.get("tp"), 0.0) - tp_rounded) < 1e-6
+                    and l_info.get("tp_stage") == next_stage
+                )
+                if sl_rounded is None and already_at_tp:
+                    continue
+                if self.modify_position_sltp(rt, sl=sl_rounded, tp=tp_rounded):
+                    if sl_rounded is not None:
+                        sl_mod_ok = True
+                        if l_info is not None:
+                            l_info["sl"] = sl_rounded
+                    if l_info is not None and tp_rounded is not None:
+                        l_info["tp"] = tp_rounded
+                        l_info["tp_stage"] = next_stage
+                elif sl_rounded is not None and tp_rounded is not None and not already_at_tp:
+                    if self.modify_position_sltp(rt, sl=None, tp=tp_rounded) and l_info is not None:
+                        l_info["tp"] = tp_rounded
+                        l_info["tp_stage"] = next_stage
+            if sl_mod_ok and sl_rounded is not None:
+                signal_data["broker_sl"] = sl_rounded
 
             return {
                 "new_sl": cand_floor,
@@ -6622,6 +7700,38 @@ class MT5Executor:
             [signal_data["runner_ticket"]] if signal_data.get("runner_ticket") else []
         )
         runner_tickets = [_int_num(t, 0) for t in raw_rts if _int_num(t, 0) > 0]
+        runner_set = set(runner_tickets)
+        is_runner_phase = bool(signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"))
+        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+
+        if is_runner_phase and staged_exit_on:
+            prev_stops: List[float] = []
+            for sk in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+                sv = signal_data.get(sk)
+                if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
+                    prev_stops.append(round(float(sv), digits))
+            prev_stop: Optional[float] = (
+                (max(prev_stops) if is_buy else min(prev_stops))
+                if prev_stops
+                else None
+            )
+            if prev_stop is not None:
+                worse_or_equal = (
+                    (is_buy and cand_sl <= prev_stop + 1e-9)
+                    or (not is_buy and cand_sl >= prev_stop - 1e-9)
+                )
+                if worse_or_equal:
+                    cur_stage = str(signal_data.get("tp_stage") or signal_data.get("runner_milestone_name") or "TP1").upper()
+                    return {
+                        "new_sl": prev_stop,
+                        "tp_stage": cur_stage,
+                        "next_tp": tp_levels.get(cur_stage) or signal_data.get("final_tp"),
+                        "cleared_milestones": list(signal_data.get("runner_cleared_milestones") or []),
+                        "modified_tickets": [],
+                        "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
+                        "status": signal_data.get("status"),
+                    }
+
         target_tickets = (
             runner_tickets
             if (signal_data.get("status") == "RUNNER_ACTIVE" and runner_tickets)
@@ -6634,10 +7744,37 @@ class MT5Executor:
                 mod_tkts.append(t)
 
         signal_data["sl"] = cand_sl
-        signal_data["broker_sl"] = cand_sl
-        if signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"):
-            signal_data["runner_sl_floor"] = cand_sl
-            signal_data["soft_tp1_floor"] = cand_sl
+        if is_runner_phase:
+            if any(t in runner_set for t in mod_tkts) or (not runner_set and mod_tkts):
+                signal_data["broker_sl"] = cand_sl
+            if staged_exit_on:
+                prev_ts = signal_data.get("trail_stop")
+                if isinstance(prev_ts, numbers.Real) and not isinstance(prev_ts, bool) and float(prev_ts) > 0.0:
+                    new_ts = round(
+                        max(float(prev_ts), cand_sl) if is_buy else min(float(prev_ts), cand_sl),
+                        digits,
+                    )
+                else:
+                    new_ts = cand_sl
+                signal_data["trail_stop"] = new_ts
+                signal_data["runner_sl_floor"] = new_ts
+                signal_data["soft_tp1_floor"] = new_ts
+                cur_fsm = signal_data.get("fsm_floor")
+                if isinstance(cur_fsm, numbers.Real) and not isinstance(cur_fsm, bool) and float(cur_fsm) > 0.0:
+                    signal_data["active_stop_source"] = (
+                        "FSM_FLOOR"
+                        if (
+                            (is_buy and float(cur_fsm) >= new_ts - 1e-9)
+                            or (not is_buy and float(cur_fsm) <= new_ts + 1e-9)
+                        )
+                        else "ATR_TRAIL"
+                    )
+            else:
+                signal_data["runner_sl_floor"] = cand_sl
+                signal_data["soft_tp1_floor"] = cand_sl
+        else:
+            if mod_tkts:
+                signal_data["broker_sl"] = cand_sl
 
         cur_stage = str(signal_data.get("tp_stage") or signal_data.get("runner_milestone_name") or "TP1").upper()
         return {

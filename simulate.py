@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 _SIM_TEMP_DIR = tempfile.TemporaryDirectory(prefix="xauusd_copier_sim_")
 _SIM_DIR = Path(_SIM_TEMP_DIR.name)
 os.environ["DRY_RUN"] = "true"
+os.environ["STAGED_EXIT_ENABLED"] = "true"
 os.environ["LOG_FILE_PATH"] = str(_SIM_DIR / "sim_copier.log")
 os.environ["STATE_FILE_PATH"] = str(_SIM_DIR / "sim_signals_state.json")
 os.environ["TRADES_LEDGER_PATH"] = str(_SIM_DIR / "sim_trades_ledger.jsonl")
@@ -73,11 +74,13 @@ def _shutdown_sim_loggers() -> None:
 
 async def run_simulation() -> None:
     print("=" * 72)
-    print("  TELEGRAM-TO-MT5 XAUUSD SIGNAL COPIER v3.1 - ISOLATED LIVE SIMULATION")
+    print("  TELEGRAM-TO-MT5 XAUUSD SIGNAL COPIER v3.5.0 - ISOLATED LIVE SIMULATION")
     print("=" * 72)
     print(f"  Temp Isolation Dir : {_SIM_DIR}")
     print(f"  Dry-Run Enforced   : {config.DRY_RUN}")
+    print(f"  Staged Exit Mode   : {config.STAGED_EXIT_ENABLED}")
     assert config.DRY_RUN is True
+    assert config.STAGED_EXIT_ENABLED is True
     assert Path(config.LOG_FILE_PATH).parent == _SIM_DIR
     assert Path(config.STATE_FILE_PATH).parent == _SIM_DIR
     assert Path(config.TRADES_LEDGER_PATH).parent == _SIM_DIR
@@ -214,10 +217,18 @@ async def run_simulation() -> None:
     for px in (3910.60, 3920.60):
         with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
             assert main.executor.manage_designated_runner(sig_single) is True
-    with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
-        assert main.executor.manage_designated_runner(sig_single) is False
-    assert sig_single["tp4_reached"] is True and sig_single["status"] == "CLOSED"
-    print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP3->TP4!")
+    if config.RUNNER_MAX_TP_STAGE >= 5:
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.60, 3930.80)):
+            assert main.executor.manage_designated_runner(sig_single) is True
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3940.10, 3940.30)):
+            assert main.executor.manage_designated_runner(sig_single) is False
+        assert sig_single["tp5_reached"] is True and sig_single["status"] == "CLOSED"
+        print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP5!")
+    else:
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+            assert main.executor.manage_designated_runner(sig_single) is False
+        assert sig_single["tp4_reached"] is True and sig_single["status"] == "CLOSED"
+        print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP3->TP4!")
 
     # [6b] Full 4-layer trade: L1..L3 bank at TP1, L4 runner scales TP2->TP3 with Anti-Choke noise immunity
     all_tickets = []
@@ -352,19 +363,30 @@ async def run_simulation() -> None:
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20013, text="TP1 hit", chat_id="me"))
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["status"] == "RUNNER_ACTIVE" and sig_p["tp_stage"] == "TP2"
+    assert sig_p["fsm_floor"] == round(3895.0 + config.BE_OFFSET_PIPS * 0.10, 2)
+    assert sig_p["trail_stop"] == 3897.2
+    assert sig_p["runner_sl_floor"] == sig_p["trail_stop"]
 
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3914.40, 3914.60)):
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20014, text="trail tp2", chat_id="me"))
+        sig_mid_trail = main.state_mgr.get_signal(20010, chat_id="me")
+        assert sig_mid_trail["fsm_floor"] == 3900.0
+        assert sig_mid_trail["trail_stop"] == 3910.65
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20015, text="/sl 3912", chat_id="me"))
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20016, text="/tp3 3928", chat_id="me"))
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["tp_stage"] == "TP3"
     assert sig_p["sl"] == 3912.0
+    assert sig_p["fsm_floor"] == 3900.0
+    assert sig_p["trail_stop"] == 3912.0
+    assert sig_p["runner_sl_floor"] == 3912.0
+    assert sig_p["broker_sl"] == 3912.0
     assert sig_p["raw_tp3"] == 3928.0
     assert sig_p["layers"]["L1"]["tp"] == 3928.0
     print(
-        f"  [8c] Stepped TP1 -> TP2 -> TP3: stage={sig_p['tp_stage']}, locked SL={sig_p['sl']}, "
-        f"runner broker TP={sig_p['layers']['L1']['tp']}!"
+        f"  [8c] Stepped TP1 -> TP2 -> TP3: stage={sig_p['tp_stage']}, SL={sig_p['sl']}, "
+        f"fsm_floor={sig_p['fsm_floor']}, trail_stop={sig_p['trail_stop']}, "
+        f"runner_sl_floor={sig_p['runner_sl_floor']}, broker TP={sig_p['layers']['L1']['tp']}!"
     )
 
     # -----------------------------------------------------------------------
@@ -470,11 +492,12 @@ async def run_simulation() -> None:
     sig_alpha = main.state_mgr.get_signal(20030, chat_id=chan_alpha)
     sig_beta = main.state_mgr.get_signal(20031, chat_id=chan_beta)
     assert sig_alpha["status"] == "BE_APPLIED" and sig_alpha["be_done_tickets"] == [9801, 9802, 9803, 9804]
+    assert sig_alpha["layers"]["L1"]["be_sl"] == round(3890.0 + config.BE_OFFSET_PIPS * 0.10, 2)
     assert sig_beta["status"] == "ACTIVE" and not sig_beta.get("be_done_tickets")
     print("  [OK] Standalone 'Go breakeven!' protected all 4 layers (9801..9804) in Channel Alpha ONLY; Channel Beta untouched!")
 
     print("\n" + "=" * 72)
-    print("  ALL 10 v3.3.3 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
+    print("  ALL 10 v3.5.0 SIMULATION CHECKS PASSED (ZERO LIVE FILES TOUCHED)!")
     print("=" * 72)
 
 

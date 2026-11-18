@@ -271,8 +271,13 @@ async def test_ab_buy_and_sell_tp1_trailing_stop_wiggle_holds_rally_ratchets_and
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cde_forward_ratchet_step_gate_atr_clamp_and_be_floor(tmp_path):
+async def test_cde_forward_ratchet_step_gate_atr_clamp_and_be_floor(tmp_path, monkeypatch):
     _reset_runtime(tmp_path, "scen_cde")
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
+    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
+    monkeypatch.setattr(config, "TP1_TRAIL_STEP_DOLLARS", 0.20)
+    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 2.0)
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
 
@@ -361,8 +366,9 @@ async def test_cde_forward_ratchet_step_gate_atr_clamp_and_be_floor(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fg_clean_break_no_tp1_050_choke_hard_ceiling_and_pre_tp1_guard_intact(tmp_path):
+async def test_fg_clean_break_no_tp1_050_choke_hard_ceiling_and_pre_tp1_guard_intact(tmp_path, monkeypatch):
     _reset_runtime(tmp_path, "scen_fg")
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
     atr_250 = 2.50 / 1.5

@@ -39,13 +39,15 @@ def _tick(bid: float, ask: float = None, spread: float = 0.20) -> SimpleNamespac
 
 
 @pytest.mark.asyncio
-async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_arms_85pct_and_scales_tp2_to_tp4(tmp_path):
+async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_arms_85pct_and_scales_tp2_to_tp4(tmp_path, monkeypatch):
     """
     Scenario 1 (Single-layer trade, 1 active layer):
     - Confirm Layer 1 dynamically becomes the deepest runner and disables the tight TP1 Shortfall rule.
     - Confirm Reversal Guard stays OFF below 85%, lifts broker TP early at 70% so TP1-$0.50 never caps L1,
       arms at >=85% of TP1, keeps `reversal_guard_armed = True` across TP1 breakout, and scales TP2->TP3->TP4.
     """
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     main.state_mgr = StateManager(tmp_path / "s1_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "s1_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)
@@ -139,7 +141,7 @@ async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_
 
 
 @pytest.mark.asyncio
-async def test_2_multilayer_4_active_layers_layer_separation_and_l4_scaling_to_tp4(tmp_path):
+async def test_2_multilayer_4_active_layers_layer_separation_and_l4_scaling_to_tp4(tmp_path, monkeypatch):
     """
     Scenario 2 (Multi-layer trade, 4 active layers):
     - Part A: L1-L3 keep TP1 front-run (3899.5) and bank at TP1 while L4 (0.02) scales to TP2-TP4
@@ -147,6 +149,9 @@ async def test_2_multilayer_4_active_layers_layer_separation_and_l4_scaling_to_t
     - Part B: Pre-TP1 $2.10 pullback (3 ticks) triggers TP1 Shortfall ONLY on base layers L1-L3,
       sparing L4 (since $2.10 < 30% of $9.50 = $2.85) so L4 holds and rides the recovery to TP4!
     """
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
+    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 5.0)
+    monkeypatch.setattr(main, "BE_OFFSET_PIPS", 5.0)
     main.state_mgr = StateManager(tmp_path / "s2_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "s2_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)
@@ -214,7 +219,7 @@ async def test_2_multilayer_4_active_layers_layer_separation_and_l4_scaling_to_t
         assert s_sep["market_tickets"] == [2204]  # L4 SPARED!
         assert all(s_sep["layers"][k]["status"] == "CLOSED" for k in ("L1", "L2", "L3"))
         assert s_sep["layers"]["L4"]["status"] == "OPEN"
-        assert s_sep["layers"]["L4"]["be_sl"] == 3890.2
+        assert s_sep["layers"]["L4"]["be_sl"] == 3890.5
 
         # L4 recovers and rides all the way to TP4!
         with patch.object(main.executor, "get_tick", return_value=_tick(3900.60)):
@@ -300,7 +305,7 @@ async def test_3_near_miss_reversal_at_90pct_tp1_banks_profit_and_respects_m1_at
 
 
 @pytest.mark.asyncio
-async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and_puprime_baseline(tmp_path):
+async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and_puprime_baseline(tmp_path, monkeypatch):
     """
     Scenario 4 (Gold wick & spread spike test):
     - Price reaches 90% of TP1 (3899.00), dips by $1.00 (normal Gold noise) -> holds!
@@ -308,6 +313,7 @@ async def test_4_gold_wick_1_dollar_and_spread_spike_hold_through_tp1_to_tp4_and
     - Continues cleanly through TP1 -> TP2 -> TP3 -> TP4!
     - Also verifies PU Prime $0.52 normal spread baseline adapts to $0.80 ceiling without blocking exits.
     """
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     main.state_mgr = StateManager(tmp_path / "s4_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "s4_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)

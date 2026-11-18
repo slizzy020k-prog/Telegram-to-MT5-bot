@@ -14,6 +14,19 @@ _DEFAULT_LEDGER_PATH = Path(
 )
 _FILLED_LAYER_STATUSES = {"OPEN", "FILLED", "RUNNER", "BANKED"}
 _TERMINAL_UNFILLED_STATUSES = {"CANCELLED", "EXPIRED", "ABORTED"}
+_CANONICAL_EXIT_REASON_CODES = {
+    "GOLD_GUARD",
+    "SHORTFALL_BASE",
+    "FSM_FLOOR",
+    "ATR_TRAIL",
+    "TP_CEILING",
+    "BROKER_SL",
+    "MANUAL",
+}
+
+
+def _is_num(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -33,6 +46,129 @@ def _safe_int(val: Any) -> Optional[int]:
             return int(val.strip())
     except (TypeError, ValueError):
         pass
+    return None
+
+
+def _infer_exit_stage(signal_data: Dict[str, Any]) -> int:
+    """Derive canonical v3.5.0 exit stage (0..4) from signal state."""
+    if not isinstance(signal_data, dict):
+        return 0
+    raw_stage = signal_data.get("exit_stage")
+    if _is_num(raw_stage):
+        return max(0, min(4, int(raw_stage)))
+
+    status = str(signal_data.get("status") or "").strip().upper()
+    if status in ("PENDING", "PENDING_DELAY", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD"):
+        return 0
+
+    cleared_stage = 0
+    for x in signal_data.get("runner_cleared_milestones") or []:
+        s = str(x).strip().upper()
+        if s.startswith("TP") and s[2:].isdigit():
+            cleared_stage = max(cleared_stage, int(s[2:]))
+
+    raw_idx = signal_data.get("runner_milestone_idx")
+    idx_stage = (
+        (int(raw_idx) - 1)
+        if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and int(raw_idx) > 1
+        else 0
+    )
+    in_runner_phase = bool(
+        signal_data.get("tp1_reached")
+        or status == "RUNNER_ACTIVE"
+        or cleared_stage >= 1
+        or idx_stage >= 1
+    )
+    if not in_runner_phase:
+        return 0
+    return min(4, max(1, cleared_stage, idx_stage))
+
+
+def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> str:
+    """Resolve canonical v3.5.0 exit_reason_code or preserve descriptive unmapped reason."""
+    raw_code = signal_data.get("exit_reason_code")
+    if isinstance(raw_code, str) and raw_code.strip():
+        up_code = raw_code.strip().upper()
+        if up_code in _CANONICAL_EXIT_REASON_CODES:
+            return up_code
+
+    text = f"{exit_reason or ''} {signal_data.get('runner_close_reason') or ''}".strip()
+    low = text.lower()
+    up = str(exit_reason or "").strip().upper()
+
+    if up in _CANONICAL_EXIT_REASON_CODES:
+        return up
+    if "signal deleted" in low or signal_data.get("deleted_from_chat"):
+        return str(exit_reason or "Signal Deleted")
+    if "gold reversal guard" in low or "gold_guard" in low:
+        return "GOLD_GUARD"
+    if "shortfall" in low:
+        return "SHORTFALL_BASE"
+    if (
+        "fsm_floor" in low
+        or "fsm floor" in low
+        or "structural floor" in low
+        or "virtual tp" in low
+        or "floor hit" in low
+    ):
+        return "FSM_FLOOR"
+    if "atr_trail" in low or "atr trail" in low or "trailing stop" in low or "trailed sl" in low:
+        return "ATR_TRAIL"
+    if (
+        "tp_ceiling" in low
+        or "ceiling" in low
+        or "tp5 reached" in low
+        or "tp4 reached" in low
+        or "tp3 reached" in low
+        or "tp2 reached" in low
+        or "tp1 full bank" in low
+        or "broker take profit" in low
+        or up in ("TP", "TP1", "TP2", "TP3", "TP4", "TP5")
+    ):
+        return "TP_CEILING"
+    if "broker_sl" in low or "stop loss" in low or up == "SL":
+        return "BROKER_SL"
+    if (
+        "manual" in low
+        or "/bank" in low
+        or "panic" in low
+        or "full close" in low
+        or "partial close" in low
+    ):
+        return "MANUAL"
+    if isinstance(raw_code, str) and raw_code.strip():
+        return raw_code.strip()
+    return str(exit_reason or "CLOSED")
+
+
+def _resolve_ref_entry(signal_data: Dict[str, Any], is_buy: bool) -> Optional[float]:
+    """Resolve best available reference entry price for MFE computation."""
+    layers = signal_data.get("layers")
+    runner_layer = signal_data.get("runner_layer")
+    if runner_layer and isinstance(layers, dict):
+        r_obj = layers.get(runner_layer)
+        if isinstance(r_obj, dict):
+            for k in ("entry", "price_open", "target_price"):
+                if _is_num(r_obj.get(k)) and float(r_obj[k]) > 0:
+                    return float(r_obj[k])
+
+    for k in ("recorded_entry_price", "initial_price", "single_price"):
+        if _is_num(signal_data.get(k)) and float(signal_data[k]) > 0:
+            return float(signal_data[k])
+
+    zone = signal_data.get("zone")
+    if isinstance(zone, dict):
+        z_px = zone.get("top") if is_buy else zone.get("bottom")
+        if _is_num(z_px) and float(z_px) > 0:
+            return float(z_px)
+
+    if isinstance(layers, dict):
+        for lk in ("L4", "L3", "L2", "L1", "BOTTOM", "MID", "TOP"):
+            l_obj = layers.get(lk)
+            if isinstance(l_obj, dict):
+                for k in ("entry", "price_open", "target_price"):
+                    if _is_num(l_obj.get(k)) and float(l_obj[k]) > 0:
+                        return float(l_obj[k])
     return None
 
 
@@ -113,7 +249,7 @@ def build_trade_record(
     dry_run: bool = False,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build a canonical v3.0 trades_ledger.jsonl record for a closed signal."""
+    """Build a canonical v3.5.0 trades_ledger.jsonl record for a closed signal (schema_version=3)."""
     total_lots, filled_lots, layers_filled, tickets = _extract_layers_summary(signal_data)
     cleared = list(signal_data.get("runner_cleared_milestones") or [])
     if cleared:
@@ -128,6 +264,75 @@ def build_trade_record(
         tail = str(signal_key).rsplit(":", 1)[-1]
         raw_mid = int(tail) if tail.lstrip("-").isdigit() else tail
 
+    direction = str(signal_data.get("direction") or "BUY").upper()
+    is_buy = direction == "BUY"
+
+    raw_explicit_code = signal_data.get("exit_reason_code")
+    explicit_code = (
+        raw_explicit_code.strip().upper()
+        if isinstance(raw_explicit_code, str)
+        and raw_explicit_code.strip().upper() in _CANONICAL_EXIT_REASON_CODES
+        else None
+    )
+    verbatim_reason = str(exit_reason or signal_data.get("runner_close_reason") or "CLOSED")
+    if explicit_code is not None:
+        resolved_exit_reason = explicit_code
+        resolved_exit_detail = str(exit_reason or signal_data.get("runner_close_reason") or "")
+        resolved_exit_code = explicit_code
+    else:
+        resolved_exit_reason = verbatim_reason
+        resolved_exit_detail = verbatim_reason
+        resolved_exit_code = _infer_exit_reason_code(signal_data, verbatim_reason)
+
+    exit_stage = _infer_exit_stage(signal_data)
+    raw_exit_px = signal_data.get("exit_price")
+    exit_price: Optional[float] = round(float(raw_exit_px), 4) if _is_num(raw_exit_px) else None
+
+    raw_mfe = signal_data.get("max_favorable_excursion")
+    raw_pk = raw_mfe.get("peak_price") if isinstance(raw_mfe, dict) else None
+    raw_pp_oz = raw_mfe.get("peak_profit_per_oz") if isinstance(raw_mfe, dict) else None
+
+    if not _is_num(raw_pk):
+        for pk_key in ("trail_peak", "runner_peak_price", "peak_price", "reversal_guard_peak_price"):
+            if _is_num(signal_data.get(pk_key)):
+                raw_pk = signal_data[pk_key]
+                break
+
+    peak_price: Optional[float] = round(float(raw_pk), 4) if _is_num(raw_pk) else None
+    if _is_num(raw_pp_oz):
+        peak_profit_per_oz: Optional[float] = round(max(0.0, float(raw_pp_oz)), 4)
+    else:
+        ref_entry = _resolve_ref_entry(signal_data, is_buy)
+        if peak_price is not None and ref_entry is not None:
+            raw_exc = (peak_price - ref_entry) if is_buy else (ref_entry - peak_price)
+            peak_profit_per_oz = round(max(0.0, raw_exc), 4)
+        else:
+            fallback_pp = (
+                signal_data.get("reversal_guard_peak_profit")
+                if _is_num(signal_data.get("reversal_guard_peak_profit"))
+                else signal_data.get("peak_profit")
+            )
+            peak_profit_per_oz = round(max(0.0, float(fallback_pp)), 4) if _is_num(fallback_pp) else None
+
+    mfe_dict: Dict[str, Optional[float]] = {
+        "peak_price": peak_price,
+        "peak_profit_per_oz": peak_profit_per_oz,
+    }
+
+    raw_gb = signal_data.get("giveback_from_peak")
+    if _is_num(raw_gb):
+        giveback_from_peak: Optional[float] = round(max(0.0, float(raw_gb)), 4)
+    elif resolved_exit_code == "TP_CEILING" and (peak_price is not None or exit_price is not None):
+        giveback_from_peak = 0.0
+    elif peak_price is not None and exit_price is not None:
+        raw_drop = (peak_price - exit_price) if is_buy else (exit_price - peak_price)
+        giveback_from_peak = round(max(0.0, raw_drop), 4)
+    else:
+        giveback_from_peak = None
+
+    raw_tier = signal_data.get("trail_tier_used")
+    trail_tier_used: Optional[Dict[str, Any]] = dict(raw_tier) if isinstance(raw_tier, dict) else None
+
     record: Dict[str, Any] = {
         "schema_version": 3,
         "closed_at": datetime.now(timezone.utc).isoformat(),
@@ -136,7 +341,7 @@ def build_trade_record(
         "chat_id": signal_data.get("chat_id"),
         "message_id": raw_mid,
         "symbol": signal_data.get("symbol", getattr(_config, "DEFAULT_SYMBOL", "XAUUSD.s")),
-        "direction": str(signal_data.get("direction") or "BUY").upper(),
+        "direction": direction,
         "entry_type": _infer_entry_type(signal_data),
         "total_lots": total_lots,
         "filled_lots": filled_lots,
@@ -148,7 +353,14 @@ def build_trade_record(
             signal_data.get("runner_layers")
             or ([signal_data["runner_layer"]] if signal_data.get("runner_layer") else [])
         ),
-        "exit_reason": str(exit_reason or "CLOSED"),
+        "exit_reason": resolved_exit_reason,
+        "exit_reason_code": resolved_exit_code,
+        "exit_reason_detail": resolved_exit_detail,
+        "exit_stage": exit_stage,
+        "exit_price": exit_price,
+        "max_favorable_excursion": mfe_dict,
+        "giveback_from_peak": giveback_from_peak,
+        "trail_tier_used": trail_tier_used,
         "realized_pnl": round(_safe_float(realized_pnl, 0.0), 2),
         "currency": str(currency or "GBP"),
         "dry_run": bool(dry_run),

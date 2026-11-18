@@ -447,6 +447,9 @@ def _make_4layer_sig(direction: str = "BUY") -> dict:
 
 
 def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
+    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 2.0)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -526,6 +529,9 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     (4, 3929.20, 3929.80, 3928.50),  # Tight 10p zone near TP4=3930, 13p pullback
 ])
 def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(monkeypatch, target_idx, approach_px, peak_px, pullback_px):
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
     ex = MT5Executor(dry_run=True)
     ex.connect()
@@ -565,6 +571,9 @@ def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(monkeypatch, target_i
 
 
 def test_runner_fsm_pct_both_modes_and_m1_candle_confirm(monkeypatch):
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
     ex = MT5Executor(dry_run=True)
     ex.connect()
@@ -638,6 +647,7 @@ def test_runner_fsm_pct_both_modes_and_m1_candle_confirm(monkeypatch):
 
 
 def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch):
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -703,12 +713,16 @@ def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch)
 # 5. V3.1 SIMULATION SCENARIOS: SINGLE-LAYER, MULTI-LAYER, STRICT/ANTI-CHOKE
 # ---------------------------------------------------------------------------
 
-def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4():
+def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4(monkeypatch):
     """
     Scenario 1 (1 active layer): L1 starts at TP1 (3899.5), enters tight TP1 zone so
     prepare_deepest_runners_for_tp_breakout proactively lifts L1 -> TP2 (preventing permanent
     broker TP1 closure), handles TP1 breakout with 0 closed layers, and steps TP2 -> TP3 -> TP4!
     """
+    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
+    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
+    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     tps = derive_tp_levels([3900.0, 3910.0, 3920.0, 3930.0], direction="BUY")
@@ -781,6 +795,7 @@ def test_v31_multilayer_2_3_4_and_dual_runner_scaling_and_late_fill_reset(monkey
     - 4 open layers (RUNNER_DEEPEST_COUNT_FULL=1) -> L1..L3 bank at TP1, L4 scales TP2..TP4.
     - 4 open layers (RUNNER_DEEPEST_COUNT_FULL=2) -> L1..L2 bank at TP1, L3 & L4 BOTH step TP2..TP4 & finish at TP4.
     """
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -912,7 +927,7 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
 
 
 @pytest.mark.asyncio
-async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_path):
+async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_path, monkeypatch):
     """
     Scenario 4 (Anti-Choke Noise Immunity):
     - Trade enters at 3890 with 4 layers at TP1 (3899.5), approaches TP1 (3899.40), suffers healthy
@@ -920,6 +935,7 @@ async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_pa
       to 3899.10 -> confirm counter resets to 0 and NEVER chokes early!
     - Then breaks TP1 -> early layers bank TP1 -> L4 ignores 6-pip noisy dips near TP2 & TP3 -> reaches TP4!
     """
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     main.state_mgr = StateManager(tmp_path / "antichoke_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "antichoke_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)

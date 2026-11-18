@@ -102,6 +102,7 @@ from config import (
     IDLE_MT5_POLL_INTERVAL_SECONDS,
     TELEGRAM_KEEPALIVE_SECONDS,
     CONSOLE_TITLE_UPDATES,
+    STAGED_EXIT_ENABLED,
 )
 from parser import (
     parse_message,
@@ -460,6 +461,189 @@ def _has_executed_exposure(sig: Dict[str, Any]) -> bool:
     return False
 
 
+_MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
+    "STAGED_EXIT_ENABLED": STAGED_EXIT_ENABLED,
+}
+
+
+def _is_staged_exit_enabled() -> bool:
+    """Resolve STAGED_EXIT_ENABLED dynamically across config and main for runtime/monkeypatch safety."""
+    if STAGED_EXIT_ENABLED != _MAIN_CFG_SNAPSHOT["STAGED_EXIT_ENABLED"]:
+        return bool(STAGED_EXIT_ENABLED)
+    _cfg_mod = sys.modules.get("config")
+    return bool(getattr(_cfg_mod, "STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+
+
+def _is_num(val: Any) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
+def _get_signal_stage(sig: Dict[str, Any]) -> int:
+    """Derive canonical v3.5.0 runner stage (0..4) from persisted signal fields."""
+    if not isinstance(sig, dict):
+        return 0
+    fn = getattr(executor, "get_runner_fsm_stage", None)
+    if callable(fn):
+        try:
+            res = fn(sig)
+            if isinstance(res, int) and not isinstance(res, bool):
+                return max(0, min(4, res))
+        except Exception:
+            pass
+
+    status = str(sig.get("status") or "").strip().upper()
+    if status in ("PENDING", "PENDING_DELAY", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD"):
+        return 0
+    cleared_stage = 0
+    for x in sig.get("runner_cleared_milestones") or []:
+        s = str(x).strip().upper()
+        if s.startswith("TP") and s[2:].isdigit():
+            cleared_stage = max(cleared_stage, int(s[2:]))
+    raw_idx = sig.get("runner_milestone_idx")
+    idx_stage = (
+        (int(raw_idx) - 1)
+        if isinstance(raw_idx, int) and not isinstance(raw_idx, bool) and int(raw_idx) > 1
+        else 0
+    )
+    in_runner_phase = bool(
+        sig.get("tp1_reached")
+        or status == "RUNNER_ACTIVE"
+        or cleared_stage >= 1
+        or idx_stage >= 1
+    )
+    if not in_runner_phase:
+        return 0
+    return min(4, max(1, cleared_stage, idx_stage))
+
+
+def _resolve_signal_ref_entry(sig: Dict[str, Any]) -> Optional[float]:
+    """Resolve reference entry price for MFE computation."""
+    if not isinstance(sig, dict):
+        return None
+    is_buy = str(sig.get("direction") or "BUY").strip().upper() == "BUY"
+    layers = sig.get("layers")
+    runner_layer = sig.get("runner_layer")
+    if runner_layer and isinstance(layers, dict):
+        r_obj = layers.get(runner_layer)
+        if isinstance(r_obj, dict):
+            for k in ("entry", "price_open", "target_price"):
+                if _is_num(r_obj.get(k)) and float(r_obj[k]) > 0:
+                    return float(r_obj[k])
+
+    for k in ("recorded_entry_price", "initial_price", "single_price"):
+        if _is_num(sig.get(k)) and float(sig[k]) > 0:
+            return float(sig[k])
+
+    zone = sig.get("zone")
+    if isinstance(zone, dict):
+        z_px = zone.get("top") if is_buy else zone.get("bottom")
+        if _is_num(z_px) and float(z_px) > 0:
+            return float(z_px)
+
+    if isinstance(layers, dict):
+        for lk in ("L4", "L3", "L2", "L1", "BOTTOM", "MID", "TOP"):
+            l_obj = layers.get(lk)
+            if isinstance(l_obj, dict):
+                for k in ("entry", "price_open", "target_price"):
+                    if _is_num(l_obj.get(k)) and float(l_obj[k]) > 0:
+                        return float(l_obj[k])
+    return None
+
+
+def _ensure_signal_exit_telemetry(
+    sig: Dict[str, Any],
+    exit_reason_code: Optional[str] = None,
+    exit_stage: Optional[int] = None,
+    exit_price: Optional[float] = None,
+    overwrite_code: bool = False,
+) -> None:
+    """Populate or backfill v3.5.0 exit telemetry fields on signal_data before ledger persistence."""
+    if not isinstance(sig, dict):
+        return
+    is_buy = str(sig.get("direction") or "BUY").strip().upper() == "BUY"
+
+    if exit_reason_code is not None and (overwrite_code or not sig.get("exit_reason_code")):
+        sig["exit_reason_code"] = str(exit_reason_code).strip().upper()
+
+    if exit_stage is not None:
+        sig["exit_stage"] = max(0, min(4, int(exit_stage)))
+    elif not _is_num(sig.get("exit_stage")):
+        sig["exit_stage"] = _get_signal_stage(sig)
+
+    if _is_num(exit_price):
+        sig["exit_price"] = round(float(exit_price), 4)
+    elif _is_num(sig.get("exit_price")):
+        sig["exit_price"] = round(float(sig["exit_price"]), 4)
+
+    cur_exit_px = sig.get("exit_price") if _is_num(sig.get("exit_price")) else None
+    raw_mfe = sig.get("max_favorable_excursion")
+    raw_pk = raw_mfe.get("peak_price") if isinstance(raw_mfe, dict) else None
+    raw_pp_oz = raw_mfe.get("peak_profit_per_oz") if isinstance(raw_mfe, dict) else None
+
+    if not _is_num(raw_pk):
+        for pk_key in ("trail_peak", "runner_peak_price", "peak_price", "reversal_guard_peak_price"):
+            if _is_num(sig.get(pk_key)):
+                raw_pk = sig[pk_key]
+                break
+    peak_px = round(float(raw_pk), 4) if _is_num(raw_pk) else None
+
+    if _is_num(raw_pp_oz):
+        peak_prof_oz: Optional[float] = round(max(0.0, float(raw_pp_oz)), 4)
+    else:
+        ref_entry = _resolve_signal_ref_entry(sig)
+        if peak_px is not None and ref_entry is not None:
+            raw_exc = (peak_px - ref_entry) if is_buy else (ref_entry - peak_px)
+            peak_prof_oz = round(max(0.0, raw_exc), 4)
+        else:
+            fallback_pp = (
+                sig.get("reversal_guard_peak_profit")
+                if _is_num(sig.get("reversal_guard_peak_profit"))
+                else sig.get("peak_profit")
+            )
+            peak_prof_oz = round(max(0.0, float(fallback_pp)), 4) if _is_num(fallback_pp) else None
+
+    sig["max_favorable_excursion"] = {
+        "peak_price": peak_px,
+        "peak_profit_per_oz": peak_prof_oz,
+    }
+
+    if not _is_num(sig.get("giveback_from_peak")):
+        if sig.get("exit_reason_code") == "TP_CEILING" and (peak_px is not None or cur_exit_px is not None):
+            sig["giveback_from_peak"] = 0.0
+        elif peak_px is not None and cur_exit_px is not None:
+            raw_drop = (peak_px - float(cur_exit_px)) if is_buy else (float(cur_exit_px) - peak_px)
+            sig["giveback_from_peak"] = round(max(0.0, raw_drop), 4)
+        else:
+            sig.setdefault("giveback_from_peak", None)
+
+    if int(sig.get("exit_stage") or 0) == 0:
+        sig["trail_tier_used"] = None
+    elif not isinstance(sig.get("trail_tier_used"), dict):
+        sig["trail_tier_used"] = None
+
+
+def _emit_exit_telemetry_log(
+    msg_id: Any,
+    sig: Dict[str, Any],
+    realized_pnl: float,
+    exit_reason: Optional[str] = None,
+) -> None:
+    """Emit structured v3.5.0 [EXIT TELEMETRY] log entry on trade exit."""
+    code = sig.get("exit_reason_code") or exit_reason or sig.get("runner_close_reason") or "CLOSED"
+    detail = exit_reason or sig.get("runner_close_reason") or str(code)
+    stage = sig.get("exit_stage") if _is_num(sig.get("exit_stage")) else _get_signal_stage(sig)
+    exit_px = sig.get("exit_price")
+    mfe = sig.get("max_favorable_excursion")
+    giveback = sig.get("giveback_from_peak")
+    tier = sig.get("trail_tier_used")
+    logger.info(
+        f"[EXIT TELEMETRY] msg_id={msg_id} | exit_reason={code} ({detail}) | "
+        f"exit_stage={stage} | exit_price={exit_px} | "
+        f"max_favorable_excursion={mfe} | realized_pnl={realized_pnl:.2f} | "
+        f"giveback_from_peak={giveback} | trail_tier_used={tier}"
+    )
+
+
 async def _record_signal_to_ledger(
     msg_id: Any,
     sig: Dict[str, Any],
@@ -508,16 +692,46 @@ def _resolve_signal_tps_dict(sig: Dict[str, Any]) -> Dict[str, float]:
     """Return ordered TP1..TP5 target dictionary from signal state."""
     out: Dict[str, float] = {}
     tp_map = sig.get("tp_levels")
+    has_explicit_map = isinstance(tp_map, dict) and len(tp_map) >= 2
     if isinstance(tp_map, dict):
         for idx in range(1, 6):
             val = tp_map.get(f"TP{idx}")
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if isinstance(val, (int, float)) and not isinstance(val, bool) and float(val) > 0.0:
                 out[f"TP{idx}"] = float(val)
     for idx in range(1, 6):
+        key = f"TP{idx}"
+        if isinstance(tp_map, dict) and key in tp_map and tp_map.get(key) is None:
+            continue
+        if has_explicit_map and key not in tp_map:
+            continue
         val = sig.get(f"raw_tp{idx}")
-        if isinstance(val, (int, float)) and not isinstance(val, bool) and f"TP{idx}" not in out:
-            out[f"TP{idx}"] = float(val)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and float(val) > 0.0 and key not in out:
+            out[key] = float(val)
     return out
+
+
+def _resolve_effective_max_stage(sig: Dict[str, Any]) -> int:
+    """Resolve effective maximum TP stage (1..5) capped by highest valid TP in signal."""
+    if not isinstance(sig, dict):
+        return int(RUNNER_MAX_TP_STAGE)
+    raw_eff = sig.get("effective_max_stage")
+    if isinstance(raw_eff, int) and not isinstance(raw_eff, bool) and 1 <= raw_eff <= 5:
+        return int(raw_eff)
+    _cfg_mod = sys.modules.get("config")
+    cfg_max = int(
+        sig.get("runner_max_tp_stage")
+        or getattr(_cfg_mod, "RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE)
+        or RUNNER_MAX_TP_STAGE
+    )
+    cfg_max = max(1, min(5, cfg_max))
+    tps = _resolve_signal_tps_dict(sig)
+    highest_valid_tp = max(
+        (i for i in range(1, 6) if _is_num(tps.get(f"TP{i}")) and float(tps[f"TP{i}"]) > 0.0),
+        default=0,
+    )
+    if highest_valid_tp > 0:
+        return max(1, min(5, cfg_max, highest_valid_tp))
+    return cfg_max
 
 
 def _format_tp_summary(sig: Dict[str, Any]) -> str:
@@ -590,6 +804,21 @@ async def _execute_tp1_scaling_handoff(
     hit_line = f"\n• Hit Price: `{curr_price}` (TP1: `{raw_tp1}`)" if curr_price is not None else f"\n• TP1: `{raw_tp1}`"
 
     if sig.get("status") == "CLOSED":
+        src_low = str(source_label or "").lower()
+        code_tp1 = "MANUAL" if ("manual" in src_low or "/bank" in src_low) else "TP_CEILING"
+        _ensure_signal_exit_telemetry(
+            sig,
+            exit_reason_code=code_tp1,
+            exit_stage=1,
+            exit_price=curr_price if _is_num(curr_price) else (_safe_float_or_none(raw_tp1)),
+        )
+        state_mgr.update_signal(msg_id, sig, chat_id=eff_chat)
+        _emit_exit_telemetry_log(
+            msg_id,
+            sig,
+            float(sig.get("banked_profit") or tp1_added_profit),
+            exit_reason=f"TP1 Full Bank ({source_label})",
+        )
         await _record_signal_to_ledger(msg_id, sig, exit_reason=f"TP1 Full Bank ({source_label})", currency=curr)
         alert = (
             f"🎯 **TP1 Reached & 100% Banked ({source_label})! [ID: {msg_id}]**\n"
@@ -627,6 +856,10 @@ async def _execute_tp1_scaling_handoff(
         f"{fin['formatted']}"
     )
     return runner_t, tp1_added_profit, alert
+
+
+def _safe_float_or_none(val: Any) -> Optional[float]:
+    return float(val) if _is_num(val) else None
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +920,7 @@ async def _close_all_bot_exposure_and_signals_async(exit_reason: str = "Session 
     closed_set = set(res.get("closed_tickets") or [])
     fin = await _mt5_call(executor.get_account_financials)
     curr = fin.get("currency", "GBP")
+    is_manual_close = any(w in str(exit_reason or "").lower() for w in ("manual", "panic", "closeall"))
 
     for mid, s in active_signals:
         s_chat = s.get("chat_id")
@@ -697,6 +931,9 @@ async def _close_all_bot_exposure_and_signals_async(exit_reason: str = "Session 
         for lk in layers:
             if isinstance(layers[lk], dict):
                 layers[lk]["status"] = "CLOSED"
+        if is_manual_close:
+            _ensure_signal_exit_telemetry(s, exit_reason_code="MANUAL", overwrite_code=True)
+            _emit_exit_telemetry_log(mid, s, float(s.get("banked_profit") or 0.0), exit_reason=exit_reason)
         s["status"] = "CLOSED"
         s["market_tickets"] = []
         s["pending_tickets"] = []
@@ -712,6 +949,18 @@ async def _close_all_bot_exposure_and_signals_async(exit_reason: str = "Session 
                 "layers": layers,
                 "accounted_tickets": s.get("accounted_tickets", []),
                 "banked_profit": s.get("banked_profit", 0.0),
+                **(
+                    {
+                        "exit_reason_code": s.get("exit_reason_code"),
+                        "exit_stage": s.get("exit_stage"),
+                        "exit_price": s.get("exit_price"),
+                        "max_favorable_excursion": s.get("max_favorable_excursion"),
+                        "giveback_from_peak": s.get("giveback_from_peak"),
+                        "trail_tier_used": s.get("trail_tier_used"),
+                    }
+                    if is_manual_close
+                    else {}
+                ),
             },
             chat_id=s_chat,
         )
@@ -2778,6 +3027,13 @@ async def _reconcile_live_mt5_signals(
                     "MANUAL/BOT": "Closed manually / from MT5 app",
                     "UNKNOWN": "Closed on broker",
                 }
+                r_code_map = {
+                    "TP": "TP_CEILING",
+                    "SL": "BROKER_SL",
+                    "MANUAL/BOT": "MANUAL",
+                    "MANUAL": "MANUAL",
+                }
+                raw_r_reason = str(r_info.get("reason", "UNKNOWN")).upper()
                 updates["last_runner_tickets"] = closed_runner_tkts
                 updates["last_runner_ticket"] = runner_t
                 updates["runner_tickets"] = []
@@ -2785,14 +3041,49 @@ async def _reconcile_live_mt5_signals(
                 updates["runner_proximity_armed"] = False
                 updates["runner_reversal_ticks"] = 0
                 updates["tp2_shortfall_armed"] = False
-                updates["runner_close_reason"] = r_reason_map.get(r_info.get("reason", "UNKNOWN"), "Closed on broker")
-                max_stage = int(sig.get("runner_max_tp_stage") or RUNNER_MAX_TP_STAGE)
-                if r_info.get("reason") == "TP":
-                    updates[f"tp{max_stage}_reached"] = True
-                    if sig.get("raw_tp5") is not None:
+                updates["runner_close_reason"] = r_reason_map.get(raw_r_reason, "Closed on broker")
+                if raw_r_reason in r_code_map:
+                    updates["exit_reason_code"] = r_code_map[raw_r_reason]
+                eff_max_stage = _resolve_effective_max_stage(sig)
+                if raw_r_reason == "TP":
+                    tp_map_r = _resolve_signal_tps_dict(sig)
+                    updates[f"tp{eff_max_stage}_reached"] = True
+                    if eff_max_stage == 5 and _is_num(tp_map_r.get("TP5")):
                         updates["tp5_reached"] = True
+                    updates["exit_stage"] = min(4, max(1, eff_max_stage))
+                    updates["giveback_from_peak"] = 0.0
+                    ceil_px = tp_map_r.get(f"TP{eff_max_stage}") or sig.get(f"raw_tp{eff_max_stage}")
+                    if _is_num(ceil_px) and not _is_num(sig.get("exit_price")):
+                        updates["exit_price"] = round(float(ceil_px), 4)
+                elif raw_r_reason == "SL":
+                    sl_px_r = sig.get("broker_sl") or sig.get("trail_stop") or sig.get("runner_sl_floor") or sig.get("sl")
+                    if _is_num(sl_px_r) and not _is_num(sig.get("exit_price")):
+                        updates["exit_price"] = round(float(sl_px_r), 4)
 
             sig.update(updates)
+            if runner_closed_now or new_status == "CLOSED":
+                last_b_reason = (
+                    str(close_infos[broker_closed[-1]].get("reason", "UNKNOWN")).upper()
+                    if broker_closed
+                    else "UNKNOWN"
+                )
+                inferred_b_code = {
+                    "TP": "TP_CEILING",
+                    "SL": "BROKER_SL",
+                    "MANUAL/BOT": "MANUAL",
+                    "MANUAL": "MANUAL",
+                }.get(last_b_reason)
+                _ensure_signal_exit_telemetry(sig, exit_reason_code=inferred_b_code)
+                for tk_k in (
+                    "exit_reason_code",
+                    "exit_stage",
+                    "exit_price",
+                    "max_favorable_excursion",
+                    "giveback_from_peak",
+                    "trail_tier_used",
+                ):
+                    if tk_k in sig:
+                        updates[tk_k] = sig[tk_k]
             state_mgr.update_signal(msg_id, updates, chat_id=sig_chat)
 
             if early_tp1_hit_on_broker:
@@ -2845,11 +3136,20 @@ async def _reconcile_live_mt5_signals(
                 cleared = list(sig.get("runner_cleared_milestones") or [])
                 cleared_str = ", ".join(cleared) if cleared else "None"
                 rem_note = f"\n• Remaining Open Tickets: `{new_mk_tickets}`" if new_mk_tickets else ""
+                stage_val_b = sig.get("exit_stage") if _is_num(sig.get("exit_stage")) else _get_signal_stage(sig)
+                code_val_b = sig.get("exit_reason_code") or r_info.get("reason", "UNKNOWN")
+                mfe_b = sig.get("max_favorable_excursion") if isinstance(sig.get("max_favorable_excursion"), dict) else {}
+                pk_b = mfe_b.get("peak_price") if mfe_b.get("peak_price") is not None else (sig.get("trail_peak") or sig.get("runner_peak_price"))
+                pp_b = mfe_b.get("peak_profit_per_oz")
+                gb_b = sig.get("giveback_from_peak")
+                mfe_str_b = f"{pk_b} (+${pp_b:.2f}/oz)" if (_is_num(pk_b) and _is_num(pp_b)) else f"{pk_b}"
+                gb_str_b = f"${float(gb_b):.2f}" if _is_num(gb_b) else "N/A"
                 await notify_saved_messages(
                     f"🏁 **Runner Closed by Broker & Unified Summary [ID: {msg_id}]**\n"
                     f"• Symbol: `{sig.get('symbol')}` ({sig.get('direction')})\n"
-                    f"• Runner: `Layer {sig.get('runner_layer')}` [Ticket #{runner_t}]\n"
-                    f"• Exit: {reason_map.get(r_info.get('reason', 'UNKNOWN'), r_info.get('reason'))}\n"
+                    f"• Runner: `Layer {sig.get('runner_layer')}` [Ticket #{runner_t}] | Stage Reached: `Stage {stage_val_b}`\n"
+                    f"• Exit: {reason_map.get(r_info.get('reason', 'UNKNOWN'), r_info.get('reason'))} (`{code_val_b}`)\n"
+                    f"• Peak / MFE: `{mfe_str_b}` | Giveback from Peak: `{gb_str_b}`\n"
                     f"• Milestones Cleared: `{cleared_str}`{rem_note}\n"
                     f"• 💰 **Amount Made on Runner:** `{format_profit(runner_profit, curr)}`\n"
                     f"• 🏦 **Previously Banked:** `{format_profit(prior_banked, curr)}`\n"
@@ -2860,6 +3160,12 @@ async def _reconcile_live_mt5_signals(
             if new_status == "CLOSED":
                 exit_lbl = sig.get("runner_close_reason") or (
                     close_infos[broker_closed[-1]].get("reason", "CLOSED") if broker_closed else "CLOSED"
+                )
+                _emit_exit_telemetry_log(
+                    msg_id,
+                    sig,
+                    float(sig.get("banked_profit") or 0.0),
+                    exit_reason=str(exit_lbl),
                 )
                 await _record_signal_to_ledger(msg_id, sig, exit_reason=str(exit_lbl), currency=curr)
 
@@ -2903,7 +3209,9 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
         if not sig.get("accounted_tickets") and prior_banked != 0.0:
             total_trade_profit = runner_profit + prior_banked
 
+        _ensure_signal_exit_telemetry(sig)
         state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+        _emit_exit_telemetry_log(msg_id, sig, total_trade_profit, exit_reason=str(close_reason))
 
         fin = await _mt5_call(executor.get_account_financials)
         curr = fin.get("currency", "GBP")
@@ -2931,11 +3239,22 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
         else:
             headline = f"🏁 **Runner Trade Closed & Banked [ID: {msg_id}]**"
 
+        stage_val = sig.get("exit_stage") if _is_num(sig.get("exit_stage")) else _get_signal_stage(sig)
+        code_val = sig.get("exit_reason_code")
+        reason_disp = f"{code_val} — {close_reason}" if (code_val and str(code_val) != str(close_reason)) else f"{close_reason}"
+        mfe_obj = sig.get("max_favorable_excursion") if isinstance(sig.get("max_favorable_excursion"), dict) else {}
+        pk_val = mfe_obj.get("peak_price") if mfe_obj.get("peak_price") is not None else (sig.get("trail_peak") or sig.get("runner_peak_price"))
+        pp_val = mfe_obj.get("peak_profit_per_oz")
+        gb_val = sig.get("giveback_from_peak")
+        mfe_str = f"{pk_val} (+${pp_val:.2f}/oz)" if (_is_num(pk_val) and _is_num(pp_val)) else f"{pk_val}"
+        gb_str = f"${float(gb_val):.2f}" if _is_num(gb_val) else "N/A"
+
         await notify_saved_messages(
             f"{headline}\n"
             f"• Symbol: `{sig.get('symbol', DEFAULT_SYMBOL)}` ({sig.get('direction')})\n"
-            f"• Runner: `Layer {runner_layer}` [Ticket #{last_runner_t}]\n"
-            f"• Exit Reason: 🔒 `{close_reason}`\n"
+            f"• Runner: `Layer {runner_layer}` [Ticket #{last_runner_t}] | Stage Reached: `Stage {stage_val}`\n"
+            f"• Exit Reason: 🔒 `{reason_disp}`\n"
+            f"• Peak Price / MFE: `{mfe_str}` | Giveback from Peak: `{gb_str}`\n"
             f"• Milestones Cleared: `{cleared_str}`{rem_note}\n"
             f"• 💰 **Amount Made on Runner:** `{profit_str}`\n"
             f"• 💵 **Total Trade Profit:** `{total_profit_str}`\n\n"
@@ -2954,6 +3273,10 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
         "runner_cleared_milestones", "runner_proximity_armed", "runner_reversal_ticks", "tp2_shortfall_armed",
         "reversal_guard_armed", "peak_profit", "reversal_guard_peak_profit",
         "runner_sl_floor", "soft_tp1_floor", "broker_sl",
+        "fsm_floor", "atr_stop", "trail_stop", "trail_peak", "trail_dist",
+        "trail_tier_used", "active_stop_source",
+        "exit_reason_code", "exit_stage", "exit_price",
+        "max_favorable_excursion", "giveback_from_peak",
         "tp2_reached", "tp3_reached", "tp4_reached", "tp5_reached",
         "accounted_tickets", "banked_profit", "tp_levels",
     )
@@ -3007,10 +3330,21 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                     has_open_or_pending = bool(sig.get("market_tickets") or sig.get("pending_tickets"))
                     if not has_open_or_pending:
                         sig["status"] = "CLOSED"
+                        _ensure_signal_exit_telemetry(
+                            sig,
+                            exit_reason_code="TP_CEILING",
+                            exit_price=float(curr_price),
+                        )
                     state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
                     fin = await _mt5_call(executor.get_account_financials)
                     curr = fin.get("currency", "GBP")
                     if sig.get("status") == "CLOSED":
+                        _emit_exit_telemetry_log(
+                            msg_id,
+                            sig,
+                            float(sig.get("banked_profit") or added_bs),
+                            exit_reason="TP2/TP3 Milestone Backstop",
+                        )
                         await _record_signal_to_ledger(
                             msg_id, sig, exit_reason="TP2/TP3 Milestone Backstop", currency=curr
                         )
@@ -3213,9 +3547,10 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
             and int(layers_map[lk]["ticket"]) in mkt_tkts
         ]
 
-    # C1. Gold Calibrated Peak-Profit Giveback Guard on Active Deepest Runner(s)
+    # C1. Stage 0 Gold Calibrated Peak-Profit Giveback Guard on Active Deepest Runner(s) (Pre-TP1 ONLY)
     is_spike = False
-    if gold_guard_on and (runner_tickets_pre or mkt_tkts):
+    stage_pre = _get_signal_stage(sig)
+    if gold_guard_on and (runner_tickets_pre or mkt_tkts) and (not _is_staged_exit_enabled() or stage_pre == 0):
         sig_before_rg = copy.deepcopy(sig)
         rg_res = await _mt5_call(executor.evaluate_gold_reversal_guard, sig, tick)
         is_spike = bool(rg_res.get("paused_by_spread"))
@@ -3242,6 +3577,8 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                         layers_map[lk]["status"] = "CLOSED"
 
                 added_profit, _ = await _account_closed_tickets(sig, closed_tickets)
+                pk_px_f = round(float(pk_px), 4) if _is_num(pk_px) else round(float(curr_price), 4)
+                pk_prof_f = round(max(0.0, float(rg_res.get("peak_profit") or 0.0)), 4)
                 sig["status"] = "CLOSED"
                 sig["market_tickets"] = []
                 sig["pending_tickets"] = []
@@ -3251,12 +3588,27 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 sig["runner_close_reason"] = (
                     f"Gold Reversal Guard (TP1, Peak: {pk_px}, Giveback: {dd_pct:.1f}% / ${pb_dlr:.2f})"
                 )
+                sig["exit_reason_code"] = "GOLD_GUARD"
+                sig["exit_stage"] = 0
+                sig["exit_price"] = round(float(curr_price), 4)
+                sig["max_favorable_excursion"] = {
+                    "peak_price": pk_px_f,
+                    "peak_profit_per_oz": pk_prof_f,
+                }
+                sig["giveback_from_peak"] = round(max(0.0, float(pb_dlr)), 4)
+                sig["trail_tier_used"] = None
             finally:
                 await _mt5_call(executor.end_signal_close, sig)
 
             state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
             fin = await _mt5_call(executor.get_account_financials)
             curr = fin.get("currency", "GBP")
+            _emit_exit_telemetry_log(
+                msg_id,
+                sig,
+                float(sig.get("banked_profit") or added_profit),
+                exit_reason="Gold Reversal Guard (TP1 Near-Miss)",
+            )
             await _record_signal_to_ledger(
                 msg_id, sig, exit_reason="Gold Reversal Guard (TP1 Near-Miss)", currency=curr
             )
@@ -3411,9 +3763,29 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                     )
                 sig["status"] = "BE_APPLIED" if BE_AFTER_TP1 else "ACTIVE"
             else:
+                is_buy_sf = direction == "BUY"
+                pk_sf = round(float(peak_val), 4) if _is_num(peak_val) else round(float(curr_price), 4)
+                cur_sf = round(float(curr_price), 4)
+                if _is_num(entry_ref):
+                    ref_sf = float(entry_ref)
+                    pk_prof_sf: Optional[float] = round(
+                        max(0.0, (pk_sf - ref_sf) if is_buy_sf else (ref_sf - pk_sf)), 4
+                    )
+                else:
+                    pk_prof_sf = None
+                gb_sf = round(max(0.0, (pk_sf - cur_sf) if is_buy_sf else (cur_sf - pk_sf)), 4)
                 sig["status"] = "CLOSED"
                 sig["runner_tickets"] = []
                 sig["runner_ticket"] = None
+                sig["exit_reason_code"] = "SHORTFALL_BASE"
+                sig["exit_stage"] = 0
+                sig["exit_price"] = cur_sf
+                sig["max_favorable_excursion"] = {
+                    "peak_price": pk_sf,
+                    "peak_profit_per_oz": pk_prof_sf,
+                }
+                sig["giveback_from_peak"] = gb_sf
+                sig["trail_tier_used"] = None
         finally:
             await _mt5_call(executor.end_signal_close, sig)
 
@@ -3423,6 +3795,12 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
         profit_str = format_profit(added_profit, curr)
 
         if sig["status"] == "CLOSED":
+            _emit_exit_telemetry_log(
+                msg_id,
+                sig,
+                float(sig.get("banked_profit") or added_profit),
+                exit_reason="TP1 Shortfall Guard",
+            )
             await _record_signal_to_ledger(msg_id, sig, exit_reason="TP1 Shortfall Guard", currency=curr)
             await notify_saved_messages(
                 f"⚠️ **TP1 Shortfall Guard Triggered & Banked! [ID: {msg_id}]**\n"
@@ -3724,10 +4102,17 @@ async def _apply_adjust_or_trail_unlocked(
         ]
         if closed_runners:
             await _account_closed_tickets(target_signal, closed_runners)
+        _ensure_signal_exit_telemetry(target_signal, exit_reason_code="TP_CEILING")
         state_mgr.update_signal(target_msg_id, target_signal, chat_id=target_chat_id)
         fin = await _mt5_call(executor.get_account_financials)
         curr = fin.get("currency", "GBP")
         exit_rsn = target_signal.get("runner_close_reason") or f"Ceiling Reached ({source_label})"
+        _emit_exit_telemetry_log(
+            target_msg_id,
+            target_signal,
+            float(target_signal.get("banked_profit") or 0.0),
+            exit_reason=str(exit_rsn),
+        )
         await _record_signal_to_ledger(target_msg_id, target_signal, exit_reason=str(exit_rsn), currency=curr)
         total_pnl_str = format_profit(float(target_signal.get("banked_profit") or 0.0), curr)
         return (
@@ -4019,6 +4404,8 @@ async def _handle_trade_management_action(
         target_signal["market_tickets"] = market_tickets
         target_signal["layers"] = layers
         target_signal["status"] = new_status
+        if new_status == "CLOSED":
+            _ensure_signal_exit_telemetry(target_signal, exit_reason_code="MANUAL", overwrite_code=True)
         state_mgr.update_signal(
             target_msg_id,
             {
@@ -4029,10 +4416,28 @@ async def _handle_trade_management_action(
                 "banked_profit": target_signal.get("banked_profit", 0.0),
                 "runner_ticket": target_signal.get("runner_ticket"),
                 "last_runner_ticket": target_signal.get("last_runner_ticket"),
+                **(
+                    {
+                        "exit_reason_code": target_signal.get("exit_reason_code"),
+                        "exit_stage": target_signal.get("exit_stage"),
+                        "exit_price": target_signal.get("exit_price"),
+                        "max_favorable_excursion": target_signal.get("max_favorable_excursion"),
+                        "giveback_from_peak": target_signal.get("giveback_from_peak"),
+                        "trail_tier_used": target_signal.get("trail_tier_used"),
+                    }
+                    if new_status == "CLOSED"
+                    else {}
+                ),
             },
             chat_id=target_chat_id,
         )
         if new_status == "CLOSED":
+            _emit_exit_telemetry_log(
+                target_msg_id,
+                target_signal,
+                float(target_signal.get("banked_profit") or 0.0),
+                exit_reason="Partial Close (Final Position)",
+            )
             await _record_signal_to_ledger(
                 target_msg_id, target_signal, exit_reason="Partial Close (Final Position)", currency=curr
             )
@@ -4063,6 +4468,7 @@ async def _handle_trade_management_action(
         for l_data in layers.values():
             if isinstance(l_data, dict):
                 l_data["status"] = "CLOSED"
+        _ensure_signal_exit_telemetry(target_signal, exit_reason_code="MANUAL", overwrite_code=True)
         target_signal["market_tickets"] = []
         target_signal["pending_tickets"] = []
         target_signal["runner_ticket"] = None
@@ -4078,9 +4484,16 @@ async def _handle_trade_management_action(
                 "status": "CLOSED",
                 "accounted_tickets": target_signal.get("accounted_tickets", []),
                 "banked_profit": target_signal.get("banked_profit", 0.0),
+                "exit_reason_code": target_signal.get("exit_reason_code"),
+                "exit_stage": target_signal.get("exit_stage"),
+                "exit_price": target_signal.get("exit_price"),
+                "max_favorable_excursion": target_signal.get("max_favorable_excursion"),
+                "giveback_from_peak": target_signal.get("giveback_from_peak"),
+                "trail_tier_used": target_signal.get("trail_tier_used"),
             },
             chat_id=target_chat_id,
         )
+        _emit_exit_telemetry_log(target_msg_id, target_signal, total_profit, exit_reason="Full Close Command")
         await _record_signal_to_ledger(target_msg_id, target_signal, exit_reason="Full Close Command", currency=curr)
         await notify_saved_messages(
             f"🚪 **Full Close Executed on `{symbol}` [Msg ID: {target_msg_id}]**\n"
@@ -5056,9 +5469,13 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         stage_key = str(existing_signal.get("tp_stage") or existing_signal.get("runner_milestone_name") or "TP2").upper()
         if stage_key == "TP1":
             stage_key = "TP2"
+        eff_max_edit = _resolve_effective_max_stage(existing_signal)
+        tp_map_edit = _resolve_signal_tps_dict(existing_signal)
         target_runner_tp = (
-            (existing_signal.get("tp_levels") or {}).get(stage_key)
-            or (existing_signal.get("tp_levels") or {}).get(f"TP{RUNNER_MAX_TP_STAGE}")
+            tp_map_edit.get(stage_key)
+            or tp_map_edit.get(f"TP{eff_max_edit}")
+            or (existing_signal.get("tp_levels") or {}).get(stage_key)
+            or (existing_signal.get("tp_levels") or {}).get(f"TP{eff_max_edit}")
             or v3_runner_tp
         )
         await notify_saved_messages(
@@ -5975,22 +6392,38 @@ async def handle_saved_messages_command(event: Any) -> None:
             fresh_sig = state_mgr.get_signal(msg_id, chat_id=sig_chat) or sig
             if fresh_sig.get("status") == "RUNNER_ACTIVE":
                 closed_tkts = []
-                r_tkts = list(fresh_sig.get("runner_tickets") or ([fresh_sig.get("runner_ticket")] if fresh_sig.get("runner_ticket") else []))
-                for rt in r_tkts:
+                r_tkts = list(
+                    fresh_sig.get("runner_tickets")
+                    or ([fresh_sig.get("runner_ticket")] if fresh_sig.get("runner_ticket") else [])
+                )
+                all_open_tkts = list(dict.fromkeys([t for t in (r_tkts + list(fresh_sig.get("market_tickets") or [])) if t]))
+                for rt in all_open_tkts:
                     if rt and await _mt5_call(executor.close_market_position, rt):
                         closed_tkts.append(rt)
                 for pt in list(fresh_sig.get("pending_tickets") or []):
                     await _mt5_call(executor.cancel_pending_order, pt)
+                layers_b = fresh_sig.get("layers") if isinstance(fresh_sig.get("layers"), dict) else {}
+                for lv in layers_b.values():
+                    if isinstance(lv, dict) and lv.get("ticket") in set(closed_tkts):
+                        lv["status"] = "CLOSED"
                 added_prof, _ = await _account_closed_tickets(fresh_sig, closed_tkts)
+                _ensure_signal_exit_telemetry(fresh_sig, exit_reason_code="MANUAL", overwrite_code=True)
                 fresh_sig["status"] = "CLOSED"
                 fresh_sig["market_tickets"] = []
                 fresh_sig["pending_tickets"] = []
                 fresh_sig["runner_tickets"] = []
                 fresh_sig["runner_ticket"] = None
+                fresh_sig["layers"] = layers_b
                 fresh_sig["runner_close_reason"] = "Manual /bank on Runner"
                 state_mgr.update_signal(msg_id, fresh_sig, chat_id=sig_chat)
                 fin = await _mt5_call(executor.get_account_financials)
                 curr = fin.get("currency", "GBP")
+                _emit_exit_telemetry_log(
+                    msg_id,
+                    fresh_sig,
+                    float(fresh_sig.get("banked_profit") or added_prof),
+                    exit_reason="Manual /bank on Runner",
+                )
                 await _record_signal_to_ledger(msg_id, fresh_sig, exit_reason="Manual /bank on Runner", currency=curr)
                 profit_str = format_profit(added_prof, curr)
                 await event.reply(
@@ -6255,6 +6688,8 @@ async def handle_saved_messages_command(event: Any) -> None:
             fresh_sig["market_tickets"] = market_tickets
             fresh_sig["layers"] = layers
             fresh_sig["status"] = new_status
+            if new_status == "CLOSED":
+                _ensure_signal_exit_telemetry(fresh_sig, exit_reason_code="MANUAL", overwrite_code=True)
             state_mgr.update_signal(
                 target_mid,
                 {
@@ -6265,10 +6700,28 @@ async def handle_saved_messages_command(event: Any) -> None:
                     "banked_profit": fresh_sig.get("banked_profit", 0.0),
                     "runner_ticket": fresh_sig.get("runner_ticket"),
                     "last_runner_ticket": fresh_sig.get("last_runner_ticket"),
+                    **(
+                        {
+                            "exit_reason_code": fresh_sig.get("exit_reason_code"),
+                            "exit_stage": fresh_sig.get("exit_stage"),
+                            "exit_price": fresh_sig.get("exit_price"),
+                            "max_favorable_excursion": fresh_sig.get("max_favorable_excursion"),
+                            "giveback_from_peak": fresh_sig.get("giveback_from_peak"),
+                            "trail_tier_used": fresh_sig.get("trail_tier_used"),
+                        }
+                        if new_status == "CLOSED"
+                        else {}
+                    ),
                 },
                 chat_id=target_chat,
             )
             if new_status == "CLOSED":
+                _emit_exit_telemetry_log(
+                    target_mid,
+                    fresh_sig,
+                    float(fresh_sig.get("banked_profit") or 0.0),
+                    exit_reason="Partial Close (Saved Messages Prompt)",
+                )
                 await _record_signal_to_ledger(
                     target_mid, fresh_sig, exit_reason="Partial Close (Saved Messages Prompt)", currency=curr
                 )
@@ -6481,10 +6934,10 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         tp_map = derive_tp_levels([3900.0], direction="BUY")
         sample_layers = {
-            "L1": {"lot": 0.01, "ticket": 901, "order_type": "MARKET", "status": "OPEN"},
-            "L2": {"lot": 0.01, "ticket": 902, "order_type": "LIMIT", "status": "PENDING"},
-            "L3": {"lot": 0.01, "ticket": 903, "order_type": "LIMIT", "status": "PENDING"},
-            "L4": {"lot": 0.02, "ticket": 904, "order_type": "LIMIT", "status": "PENDING"},
+            "L1": {"lot": 0.01, "ticket": 901, "order_type": "MARKET", "status": "OPEN", "target_price": 3895.0},
+            "L2": {"lot": 0.01, "ticket": 902, "order_type": "LIMIT", "status": "PENDING", "target_price": 3892.33},
+            "L3": {"lot": 0.01, "ticket": 903, "order_type": "LIMIT", "status": "PENDING", "target_price": 3889.67},
+            "L4": {"lot": 0.02, "ticket": 904, "order_type": "LIMIT", "status": "PENDING", "target_price": 3887.0},
         }
 
         r1 = test_exec.apply_smart_tp1_runner_strategy(sample_layers, [901], [902, 903, 904], DEFAULT_SYMBOL, "BUY", 3900.0, tp_map["TP2"])
@@ -6492,12 +6945,57 @@ async def handle_saved_messages_command(event: Any) -> None:
         r3 = test_exec.apply_smart_tp1_runner_strategy(sample_layers, [901, 902, 903], [904], DEFAULT_SYMBOL, "BUY", 3900.0, tp_map["TP2"])
         r4 = test_exec.apply_smart_tp1_runner_strategy(sample_layers, [901, 902, 903, 904], [], DEFAULT_SYMBOL, "BUY", 3900.0, tp_map["TP2"])
 
+        sim_4layer_sig: Dict[str, Any] = {
+            "symbol": DEFAULT_SYMBOL,
+            "direction": "BUY",
+            "layers": copy.deepcopy(sample_layers),
+            "market_tickets": [901, 902, 903, 904],
+            "pending_tickets": [],
+            "raw_tp1": tp_map["TP1"],
+            "raw_tp2": tp_map["TP2"],
+            "raw_tp3": tp_map["TP3"],
+            "raw_tp4": tp_map["TP4"],
+            "raw_tp5": tp_map["TP5"],
+            "tp_levels": tp_map,
+        }
+        for lk in sim_4layer_sig["layers"]:
+            sim_4layer_sig["layers"][lk]["status"] = "OPEN"
+        test_exec.handle_tp1_scaling_and_select_runner(sim_4layer_sig)
+
+        staged_on = _is_staged_exit_enabled()
+        mode_badge = "🟢 STAGED v3.5.0 (STAGED_EXIT_ENABLED=True)" if staged_on else "⚪ LEGACY v3.4.2 (STAGED_EXIT_ENABLED=False)"
+        sim_stage = _get_signal_stage(sim_4layer_sig)
+        sim_fsm = sim_4layer_sig.get("fsm_floor")
+        sim_atr = sim_4layer_sig.get("atr_stop")
+        sim_act = sim_4layer_sig.get("trail_stop") if sim_4layer_sig.get("trail_stop") is not None else sim_4layer_sig.get("runner_sl_floor")
+        sim_src = sim_4layer_sig.get("active_stop_source") or ("FSM_FLOOR" if sim_fsm is not None else "LEGACY")
+        sim_bsl = sim_4layer_sig.get("broker_sl")
+        sim_pk = sim_4layer_sig.get("trail_peak") if sim_4layer_sig.get("trail_peak") is not None else sim_4layer_sig.get("runner_peak_price")
+
+        live_runner_lines = ""
+        for mid_tr, s_tr in state_mgr.get_active_signals():
+            st_tr = _get_signal_stage(s_tr)
+            act_tr = s_tr.get("trail_stop") if s_tr.get("trail_stop") is not None else (s_tr.get("runner_sl_floor") or s_tr.get("soft_tp1_floor"))
+            src_tr = s_tr.get("active_stop_source") or ("FSM_FLOOR" if s_tr.get("fsm_floor") is not None else "LEGACY")
+            pk_tr = s_tr.get("trail_peak") if s_tr.get("trail_peak") is not None else (s_tr.get("runner_peak_price") or s_tr.get("peak_price"))
+            live_runner_lines += (
+                f"\n• Live Signal `{mid_tr}` (`{s_tr.get('status')}`): Stage=`{st_tr}` | "
+                f"FSM Floor=`{s_tr.get('fsm_floor')}` | ATR Stop=`{s_tr.get('atr_stop')}` | "
+                f"Active Stop=`{act_tr}` (`{src_tr}`) | Broker SL=`{s_tr.get('broker_sl')}` | Peak=`{pk_tr}`"
+            )
+
         await event.reply(
-            f"🏃 **v3.0 4-Layer Smart TP1 & Runner Hierarchy Test Results:**\n\n"
+            f"🏃 **v3.0 4-Layer Smart TP1 & Runner Hierarchy Test Results:**\n"
+            f"• Mode: `{mode_badge}`\n\n"
             f"1️⃣ **Case 1 (L1 only):** Banked=`{r1['banked']}`, Runner=`{r1['runner']}`, Status=`{r1['status']}`\n"
             f"2️⃣ **Case 2 (L1+L2):** Banked=`{r2['banked']}`, Runner=`{r2['runner']}` [#{r2['runner_ticket']}], Floor=`{r2['trailed_sl']}`, Status=`{r2['status']}`\n"
             f"3️⃣ **Case 3 (L1+L2+L3):** Banked=`{r3['banked']}`, Open=`{r3['remaining_market_tickets']}`, Runner=`{r3['runner']}`, Status=`{r3['status']}`\n"
             f"4️⃣ **Case 4 (All 4 L1..L4):** Banked=`{r4['banked']}`, Open=`{r4['remaining_market_tickets']}`, Runner=`{r4['runner']}` (0.02), Floor=`{r4['trailed_sl']}`, Status=`{r4['status']}`\n\n"
+            f"📐 **v3.5.0 Stage 1 Handoff Telemetry Snapshot (L4 Runner):**\n"
+            f"• Stage: `{sim_stage}` | Peak: `{sim_pk}`\n"
+            f"• FSM Floor: `{sim_fsm}` | ATR Stop: `{sim_atr}`\n"
+            f"• Active Stop: `{sim_act}` (`{sim_src}`) | Broker SL: `{sim_bsl}`"
+            f"{live_runner_lines}\n\n"
             f"🎉 **4-Layer Coexistence & Runner Hierarchy Verified 100%!**"
         )
         return
@@ -6649,6 +7147,12 @@ async def handle_saved_messages_command(event: Any) -> None:
                 spread = f"{round((ask - bid) / float(point), 1)} pts"
             gold_info = f"\n• Live Quote ({DEFAULT_SYMBOL}): Bid=`{bid}` | Ask=`{ask}` | Spread=`{spread}`"
 
+        staged_on = _is_staged_exit_enabled()
+        staged_badge = (
+            "🟢 STAGED v3.5.0 (STAGED_EXIT_ENABLED=True)"
+            if staged_on
+            else "⚪ LEGACY v3.4.2 (STAGED_EXIT_ENABLED=False)"
+        )
         active_signals = state_mgr.get_active_signals()
         if not active_signals:
             trades_str = "\n• Active Signals: None (Listening for next signal)"
@@ -6656,7 +7160,8 @@ async def handle_saved_messages_command(event: Any) -> None:
             trades_str = f"\n• Active Signals ({len(active_signals)}):"
             for mid, s in active_signals:
                 st = s.get("status")
-                trades_str += f"\n  - ID `{mid}`: `{s.get('direction')}` {s.get('symbol')} | Status: `{st}`"
+                stage_num = _get_signal_stage(s)
+                trades_str += f"\n  - ID `{mid}`: `{s.get('direction')}` {s.get('symbol')} | Status: `{st}` | Stage: `{stage_num}`"
                 trades_str += f"\n    • Layers: `{_format_layers_summary(s)}`"
                 trades_str += f"\n    • Targets: {_format_tp_summary(s)}"
                 if s.get("shortfall_armed"):
@@ -6668,10 +7173,25 @@ async def handle_saved_messages_command(event: Any) -> None:
                         else "STANDBY"
                     )
                     cleared = s.get("runner_cleared_milestones") or []
+                    fsm_fl = s.get("fsm_floor")
+                    atr_st = s.get("atr_stop")
+                    act_st = (
+                        s.get("trail_stop")
+                        if s.get("trail_stop") is not None
+                        else (s.get("runner_sl_floor") or s.get("soft_tp1_floor"))
+                    )
+                    act_src = s.get("active_stop_source") or ("FSM_FLOOR" if fsm_fl is not None else "LEGACY")
+                    brk_sl = s.get("broker_sl")
+                    pk_val = (
+                        s.get("trail_peak")
+                        if s.get("trail_peak") is not None
+                        else s.get("runner_peak_price")
+                    )
                     trades_str += (
                         f"\n    • 🚀 Runner: Layer `{s.get('runner_layer')}` [Ticket #{s.get('runner_ticket')}]"
-                        f" | Milestone: `{s.get('runner_milestone_name', 'TP1')}` (Cleared: `{cleared or 'None'}`)"
-                        f"\n    • 🛡️ Floor: `{s.get('runner_sl_floor') or s.get('soft_tp1_floor')}` | "
+                        f" | Stage: `{stage_num}` | Milestone: `{s.get('runner_milestone_name', 'TP1')}` (Cleared: `{cleared or 'None'}`)"
+                        f"\n    • 🛡️ Active Stop: `{act_st}` (`{act_src}`) | FSM Floor: `{fsm_fl}` | ATR Stop: `{atr_st}`"
+                        f"\n    • 🔒 Broker SL: `{brk_sl}` | Peak: `{pk_val}` | Floor: `{s.get('runner_sl_floor') or s.get('soft_tp1_floor')}` | "
                         f"Proximity Guard ({RUNNER_PROXIMITY_MODE}): `{guard_state}`"
                     )
 
@@ -6734,6 +7254,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"{gold_info}"
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
+            f"\n• Runner Exit Architecture: `{staged_badge}`"
             f"{trades_str}\n\n"
             f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
@@ -6835,6 +7356,8 @@ async def handle_saved_messages_command(event: Any) -> None:
                     fresh_sig["market_tickets"] = market_tickets
                     fresh_sig["layers"] = layers
                     fresh_sig["status"] = new_status
+                    if new_status == "CLOSED":
+                        _ensure_signal_exit_telemetry(fresh_sig, exit_reason_code="MANUAL", overwrite_code=True)
                     state_mgr.update_signal(
                         target_mid,
                         {
@@ -6845,10 +7368,28 @@ async def handle_saved_messages_command(event: Any) -> None:
                             "banked_profit": fresh_sig.get("banked_profit", 0.0),
                             "runner_ticket": fresh_sig.get("runner_ticket"),
                             "last_runner_ticket": fresh_sig.get("last_runner_ticket"),
+                            **(
+                                {
+                                    "exit_reason_code": fresh_sig.get("exit_reason_code"),
+                                    "exit_stage": fresh_sig.get("exit_stage"),
+                                    "exit_price": fresh_sig.get("exit_price"),
+                                    "max_favorable_excursion": fresh_sig.get("max_favorable_excursion"),
+                                    "giveback_from_peak": fresh_sig.get("giveback_from_peak"),
+                                    "trail_tier_used": fresh_sig.get("trail_tier_used"),
+                                }
+                                if new_status == "CLOSED"
+                                else {}
+                            ),
                         },
                         chat_id=target_chat,
                     )
                     if new_status == "CLOSED":
+                        _emit_exit_telemetry_log(
+                            target_mid,
+                            fresh_sig,
+                            float(fresh_sig.get("banked_profit") or 0.0),
+                            exit_reason="Partial Close (Saved Messages Prompt)",
+                        )
                         await _record_signal_to_ledger(
                             target_mid, fresh_sig, exit_reason="Partial Close (Saved Messages Prompt)", currency=curr
                         )

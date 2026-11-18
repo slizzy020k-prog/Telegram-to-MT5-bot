@@ -1,7 +1,7 @@
-# XAUUSD Copier v3.3 — Architecture & API Contract
+# XAUUSD Copier v3.5.0 — Architecture & API Contract
 
-**Status:** LOCKED (v3.3 Back-to-Front Audit + Active-Trade SL & TP1/TP2/TP3 Adjust/Trail Prompts)  
-**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), Strict Activation Zone + Anti-Choke Reversal Guard, Deleted-Signal Trade Protection, Active-Trade SL/TP1–TP3 Adjust & Trail Prompt Control Plane, Async Concurrency, Ledger & Safety Hardening.
+**Status:** LOCKED (v3.5.0 Staged Gold Runner Exit Architecture + v3.3–v3.4 Active-Trade Control Plane & Gold Guard)  
+**Scope:** Local Windows production upgrade (`telegram-mt5-copier`) — 4-Layer All-at-TP1 Entry, Dynamic Deepest-Layer Runner Detection (`1..4` layers), Stepped Momentum Scaling (`TP1 -> TP2 -> TP3 -> TP4`), v3.5.0 Mutually-Exclusive Stage 0 (`GOLD_REVERSAL_GUARD` + `SHORTFALL_BASE`) vs Stages 1–4 (`fsm_floor` + Proactive TP Lift + Staged ATR Trail + Ceiling Exit), Deleted-Signal Trade Protection, Active-Trade SL/TP1–TP3 Adjust & Trail Prompt Control Plane, Async Concurrency, Ledger Telemetry & Safety Hardening.
 
 ---
 
@@ -89,7 +89,7 @@ Entry price mapping per entry type:
 
 ### 3.1 Configuration (`config.py`)
 - `RUNNER_DEEPEST_COUNT_FULL = 1` (`int` clamped `1..2`; `1` = `L4` only when all 4 layers active, `2` = `L3 & L4` together)
-- `RUNNER_MAX_TP_STAGE = 4` (`int` clamped `1..5`; default `4` scaling up to `TP4`, optionally `5` if configured)
+- `RUNNER_MAX_TP_STAGE = 5` (`int` clamped `1..5`; v3.5.0 default `5` scaling up to `TP5`, dynamically capped via `effective_max_stage` to the highest valid TP on signals that only define `TP1..TP4` or set `TP5: None`)
 - `RUNNER_PROACTIVE_TP_LIFT = True` (proactively lift runner broker TP to `TP{k+1}` inside tight `TPk` zone when `k < RUNNER_MAX_TP_STAGE`)
 - `RUNNER_PROXIMITY_MODE = "PIPS"` (`"PIPS"` | `"PCT"` | `"BOTH"`)
 - `RUNNER_PROXIMITY_BUFFER_PIPS = 10.0` (10 pips = `$1.00` tight activation zone on XAUUSD)
@@ -332,3 +332,99 @@ Guarantees that active or pending trades (`ACTIVE`, `BE_APPLIED`, `PARTIAL_CLOSE
 - **Peak-Profit Giveback + Gold Noise Floor (`GIVEBACK_PCT = 0.30`, `MIN_GOLD_PULLBACK_DOLLARS = 1.50`, `MAX_GIVEBACK_DOLLARS = 4.50`):** Tracks `drawdown_from_peak = (peak_profit - current_profit) / peak_profit`. Pre-TP1 triggers when `drawdown_from_peak >= 0.30` AND `pullback >= max($1.50, 0.35 * M1_ATR_14)`; post-TP1 (`TP2–TP4`) caps the `30%` giveback requirement at `$4.50` (`RUNNER_CONTINUOUS_TRAIL_ENABLED = False`, locking hard broker SL at cleared milestones `BE -> TP1 -> TP2 -> TP3` without 15-pip SL choke) while keeping `reversal_guard_armed = True`.
 - **Adaptive Spread Spike Filter (`MAX_ALLOWED_SPREAD_DOLLARS = 0.40`, `ADAPTIVE_SPREAD_CEILING_DOLLARS = 0.80`):** Pauses reversal exits on momentary spread spikes (`> $0.40` on low-spread ECN feeds; adapts automatically to `max($0.80, 1.5 * rolling_median_spread)` on standard feeds such as PU Prime's `$0.50–$0.52` baseline).
 - **Rule Priority, Layer Separation & Atomic Exit Lock (`is_closing = True`):** Calibrated `TP1 Shortfall` (`SHORTFALL_ARM_PIPS = 8.0`, `SHORTFALL_PULLBACK_PIPS = 20.0`, `SHORTFALL_CONFIRM_TICKS = 3`) runs ONLY on non-runner base layers (`L1–L3`) and is automatically disabled on the dynamic deepest runner (`L4` on 4-layer trades; `L1` on 1-layer trades). All close paths are guarded by thread-safe `_closing_tickets` and `signal_data["is_closing"]` locks.
+
+---
+
+## 10. Staged Gold Runner Exit Architecture & Telemetry Contract (v3.5.0)
+
+Eliminates overlapping post-`TP1` exit mechanisms by enforcing **strict mutual exclusivity** between **Stage 0 (Pre-`TP1`)** and **Stages 1–4 (Post-`TP1` Active Runner)** when `STAGED_EXIT_ENABLED = True`.
+
+### 10.1 Stage Mutual Exclusivity & Instant Rollback (`STAGED_EXIT_ENABLED`)
+- **Master Switch (`STAGED_EXIT_ENABLED: bool = True`):**
+  - When `STAGED_EXIT_ENABLED = True`:
+    - **Stage 0 (Pre-`TP1` Only):**
+      1. **`GOLD_REVERSAL_GUARD` (`exit_reason_code = "GOLD_GUARD"`, `exit_stage = 0`):** Arms at `ARM_THRESHOLD_PCT = 0.85` (`0.80` when `|TP1 - entry| <= $4.00`) and exits when open profit gives back `GIVEBACK_PCT = 0.30` with pullback `>= max(MIN_GOLD_PULLBACK_DOLLARS = $1.50, 0.35 * M1_ATR_14)` (scaled down for tight scalps `<= $4.00`), OR when giveback reaches `HARD_GIVEBACK_CEILING_DOLLARS = $3.50`.
+      2. **`SHORTFALL_BASE` (`exit_reason_code = "SHORTFALL_BASE"`, `exit_stage = 0`):** Arms on non-runner base layers (`L1–L3`) within `SHORTFALL_ARM_PIPS = 8.0` (`$0.80`) of `TP1` and banks `L1–L3` on a `SHORTFALL_PULLBACK_PIPS = 20.0` (`$2.00`) reversal over `SHORTFALL_CONFIRM_TICKS = 3` consecutive ticks while leaving the deepest runner open.
+      3. **Hard-Disabled at `Stage >= 1`:** `evaluate_gold_reversal_guard` checks `_get_runner_fsm_stage(signal_data) >= 1` at the top and immediately returns unarmed/untriggered without mutating state (disabling both the `30%` giveback check and the `$3.50` hard giveback ceiling once `TP1` is reached).
+    - **Stages 1–4 (Post-`TP1` Active Runner):**
+      - Governed exclusively by **4 mechanisms**:
+        1. **Pure Structural Stage Floor (`fsm_floor`)** (`exit_reason_code = "FSM_FLOOR"`)
+        2. **Proactive Broker TP Lift (`RUNNER_EARLY_TP_LIFT_PCT = 0.70` or proximity zone)**
+        3. **Staged M1-ATR Trailing Stop (`atr_stop` -> `trail_stop`)** (`exit_reason_code = "ATR_TRAIL"`)
+        4. **Ceiling Target Exit (`TP{RUNNER_MAX_TP_STAGE}`)** (`exit_reason_code = "TP_CEILING"`)
+      - All legacy post-`TP1` exit paths (post-`TP1` Gold Reversal Guard call, separate virtual-floor check, `TP1_TOUCH_BANK` fallback, `TP2` shortfall guard, FSM `12p` proximity reversal guard, and fixed-pip continuous trail) are bypassed.
+  - **Instant Rollback (`STAGED_EXIT_ENABLED = False`):**
+    - Setting `STAGED_EXIT_ENABLED=false` in `.env` restores exact v3.4.2 behavior without code changes. Legacy 3-layer (`TOP`/`MID`/`BOTTOM`) signals continue using `_manage_legacy_runner` regardless of switch state.
+
+### 10.2 Deterministic Stage Derivation (`_get_runner_fsm_stage(signal_data) -> int`)
+Derived purely from existing persisted fields (`0..4`), requiring zero new mandatory state fields for restart or legacy-state compatibility:
+1. If `not isinstance(signal_data, dict)` or `status.upper() in ("PENDING", "PENDING_DELAY", "INVALIDATED_TP1", "ABORTED_PRICE_GUARD")`: return `0`.
+2. `cleared_stage = max((int(s[2:]) for x in (signal_data.get("runner_cleared_milestones") or []) if (s := str(x).strip().upper()).startswith("TP") and s[2:].isdigit()), default=0)`.
+3. `idx_stage = (int(raw_idx) - 1) if isinstance(raw_idx, Integral) and not isinstance(raw_idx, bool) and int(raw_idx) > 1 else 0` (where `raw_idx = signal_data.get("runner_milestone_idx")`).
+4. `in_runner_phase = bool(signal_data.get("tp1_reached") or status == "RUNNER_ACTIVE" or cleared_stage >= 1 or idx_stage >= 1)`.
+5. Return `0` if `not in_runner_phase` else `min(4, max(1, cleared_stage, idx_stage))`.
+
+### 10.3 Staged ATR Trail Tiers, Structural Floors, Dynamic `effective_max_stage` & Config Validator (`config.py`, `mt5_executor.py`)
+- **Approved v3.5.0 Defaults:**
+  - `RUNNER_MAX_TP_STAGE = 5` (`TP5` ceiling default; Stage 4 `3.0x ATR [$5.00–$8.00]` active on the `TP4 -> TP5` leg)
+  - `BE_OFFSET_PIPS = 5.0` (`$0.50` on Gold; updated from `2.0`)
+  - `TP1_TRAIL_STEP_DOLLARS = 0.25` (`$0.25` minimum intra-stage broker `SL` step; updated from `0.20`)
+- **Dynamic `effective_max_stage` Cap (`_resolve_effective_max_stage(configured_max_stage, tp_levels)`):**
+  - Evaluates `_is_valid_tp(v)` (`isinstance(v, Real) and not isinstance(v, bool) and float(v) > 0.0`) across `TP1..TP5` to find `highest_valid_tp`.
+  - Computes `effective_max_stage = max(1, min(5, configured_max_stage, highest_valid_tp))` when `highest_valid_tp > 0` (else `max(1, min(5, configured_max_stage))`).
+  - `_ensure_signal_tp_levels` never fabricates missing higher TPs (`TP5`, etc.) when `signal_data["tp_levels"]` already contains an explicit multi-TP dictionary (`len(tp_map) >= 2`) and never synthesizes a key explicitly set to `None` (only auto-deriving `TP2..TP5` for single-TP / legacy `raw_tp1`-only signals).
+  - If a signal only defines `TP1..TP4` (or sets `TP5: None`), `effective_max_stage` caps cleanly at `4` (`TP4` ceiling) while preserving `signal_data["runner_max_tp_stage"] = configured_max_stage` (`5`) in case a later message edit adds `TP5`.
+
+| Stage | Milestone State | Structural Floor (`fsm_floor`) | Config Keys (`MULT` / `MIN` / `MAX`) | ATR Formula (`M1_ATR_14`) | Clamp Range (`$`) | Fallback (`ATR <= 0`) | Active Broker TP |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Stage 0** | Pre-`TP1` | `None` (Initial SL / BE) | `GOLD_REVERSAL_GUARD` (`85%` arm, `30%` giveback, `$3.50` ceiling) + `SHORTFALL_BASE` (`L1–L3`) | N/A | N/A | N/A | `TP1` (Runner lifts to `TP2` at `70%`) |
+| **Stage 1** | `TP1` Reached / Cleared | `runner_entry ± BE_OFFSET_PIPS` (`BE + $0.50`) | `TP1_TRAIL_ATR_MULT=1.5`, `TP1_TRAIL_MIN_DOLLARS=2.50`, `TP1_TRAIL_MAX_DOLLARS=3.50` | `1.5 x M1_ATR_14` | `$2.50 – $3.50` | `$3.00` | `TP2` (Lifts to `TP3` at `70%` of `TP1->TP2`) |
+| **Stage 2** | `TP2` Cleared (`+5.0p`) | `TP1` | `TRAIL_TP2_ATR_MULT=2.0`, `TRAIL_TP2_MIN=3.00`, `TRAIL_TP2_MAX=4.50` | `2.0 x M1_ATR_14` | `$3.00 – $4.50` | `$3.75` | `TP3` (Lifts to `TP4` at `70%` of `TP2->TP3`) |
+| **Stage 3** | `TP3` Cleared (`+5.0p`) | `TP2` | `TRAIL_TP3_ATR_MULT=2.5`, `TRAIL_TP3_MIN=4.00`, `TRAIL_TP3_MAX=6.00` | `2.5 x M1_ATR_14` | `$4.00 – $6.00` | `$5.00` | `TP4` (Lifts to `TP5` at `70%`, or Ceiling if `effective_max_stage=4`) |
+| **Stage 4** | `TP4` Cleared (`+5.0p`) | `TP3` | `TRAIL_TP4_ATR_MULT=3.0`, `TRAIL_TP4_MIN=5.00`, `TRAIL_TP4_MAX=8.00` | `3.0 x M1_ATR_14` | `$5.00 – $8.00` | `$6.50` | `TP5` (Default Ceiling, `RUNNER_MAX_TP_STAGE=5`) |
+
+- **`validate_staged_trail_tiers(tiers=None, *, update_globals=None, emit_warnings=True) -> Dict[int, Tuple[float, float, float]]`:**
+  - Validates Stages `1..4` at startup (`STAGED_TRAIL_TIERS`) and dynamically respects runtime `monkeypatch.setattr(config, ...)`.
+  - If `min_d > max_d` on any stage, swaps `min_d, max_d` and logs a warning.
+  - Emits a warning (without crashing or mutating) if `atr_mult`, `min_d`, or `max_d` narrows across consecutive stages `1 -> 2 -> 3 -> 4`.
+
+### 10.4 Monotonic Ratchet Rule, Tie-Breaker & 11-Step Tick Execution (`mt5_executor.py`)
+On every watcher tick in `Stages 1–4` (`_manage_4layer_runner` with `STAGED_EXIT_ENABLED = True`, using `effective_max_stage`):
+1. **Live Price & Spread-Spike Detection:** Reads `bid` (`BUY`) / `ask` (`SELL`) and evaluates `check_spread_spike(symbol)`.
+2. **Single Canonical Peak (`trail_peak`):** Seeds at `TP1` scaling handoff and updates monotonically (`max(trail_peak, bid)` for `BUY`, `min(trail_peak, ask)` for `SELL`; mirrored to `runner_peak_price`).
+3. **Ceiling Target Check (`TP{effective_max_stage}`):** If `live_price` reaches `tp_levels[f"TP{effective_max_stage}"]`, closes runner and all remaining open layers (`close_all_market_tickets=True`) with `exit_reason_code = "TP_CEILING"`, `exit_stage = min(4, effective_max_stage)`, `giveback_from_peak = 0.0`.
+4. **Non-Runner Layer Backstop:** Closes any non-runner open `L2`/`L3` layers whose individual `TP2`/`TP3` target was reached.
+5. **Sequential Multi-Milestone Clean-Break Loop (`while k < effective_max_stage`):** When `live_price` clears `TPk ± RUNNER_CLEAN_BREAK_PIPS * pip_size` (`5.0 pips`), appends `"TPk"` to `runner_cleared_milestones`, advances `runner_milestone_idx = k + 1`, ratchets `fsm_floor` purely against prior `fsm_floor` (`Stage 1`: `runner_entry ± BE_OFFSET_PIPS * pip_size`; `Stage 2`: `TP1`; `Stage 3`: `TP2`; `Stage 4`: `TP3` — never polluted by `atr_stop` or `runner_sl_floor`), and marks `stage_changed = True`.
+6. **Proactive `70%` Broker TP Lift:** When `RUNNER_PROACTIVE_TP_LIFT = True`, `k < effective_max_stage`, and `tp_levels.get(f"TP{k+1}")` is valid, lifts runner broker `TP` to `TP{k+1}` once price reaches `>= RUNNER_EARLY_TP_LIFT_PCT` (`70%`) of the current leg or enters the proximity buffer.
+7. **Stage Tier Lookup & Raw ATR Stop (`atr_stop`):** Looks up `(atr_mult, min_d, max_d)` for current `stage = _get_runner_fsm_stage(sig)`, computes `trail_dist = round(clamp(atr_mult * m1_atr_14, min_d, max_d), digits)` (or midpoint `(min_d + max_d) / 2` when `m1_atr_14 <= 0`), snapshots `trail_tier_used`, and computes `atr_stop = round(trail_peak -/+ trail_dist, digits)`.
+8. **Monotonic `trail_stop` Ratchet:**
+   - `BUY`: `trail_stop = max(fsm_floor, atr_stop, prev_trail_stop)`
+   - `SELL`: `trail_stop = min(fsm_floor, atr_stop, prev_trail_stop)`
+   - Guarantees `trail_stop` **never loosens** across stage handoffs (when `atr_mult` widens from `1.5x -> 2.0x -> 2.5x -> 3.0x`) or during ATR expansion. Mirrors `trail_stop` to `runner_sl_floor` and `soft_tp1_floor`.
+9. **Stop-Source Attribution (`active_stop_source` Tie-Breaker):**
+   - `active_stop_source = "FSM_FLOOR"` iff `fsm_floor` is at or ahead of `trail_stop` within `1e-9` (`fsm_floor >= trail_stop - 1e-9` for `BUY`; `fsm_floor <= trail_stop + 1e-9` for `SELL`), else `"ATR_TRAIL"`.
+   - `FSM_FLOOR` wins on an exact tie (`fsm_floor == atr_stop`), while a prior ratcheted `ATR_TRAIL` stop remains `"ATR_TRAIL"` on stage handoff if `prev_trail_stop` still sits ahead of the newly stepped `fsm_floor`.
+10. **Broker SL/TP Synchronization:**
+    - On `stage_changed = True`, pushes broker `SL` (`trail_stop`) and new broker `TP` immediately (`force_sl_push = True`), bypassing the `$0.25` step throttle.
+    - Intra-stage updates push to MT5 only when `trail_stop` improves over `broker_sl` by `>= TP1_TRAIL_STEP_DOLLARS` (`$0.25`), clamped outside broker `trade_stops_level`. If MT5 rejects an `SL` update, `broker_sl` retains the last accepted broker value while internal `trail_stop` remains enforced.
+11. **Internal Exit & Spread-Spike Pause:**
+    - If `live_price <= trail_stop + 1e-9` (`BUY`) or `live_price >= trail_stop - 1e-9` (`SELL`):
+      - If `is_spike == True` (abnormal spread spike), **pauses** the internal market exit for that tick (leaving hard `broker_sl >= fsm_floor` active on MT5).
+      - Otherwise closes the runner and all remaining open layers (`close_all_market_tickets=True`) with `exit_reason_code = active_stop_source` (`"FSM_FLOOR"` or `"ATR_TRAIL"`), `exit_stage = stage`, and `exit_price = live_price`.
+
+### 10.5 `trades_ledger.jsonl` v3.5.0 Telemetry Schema (`trade_ledger.py`, `main.py`)
+`TradeLedger.build_trade_record` (`schema_version = 3`) persists the following 7 exit telemetry fields on every closed trade record:
+- **`exit_reason_code: str`** — Canonical 7-value attribution enum:
+  - `"GOLD_GUARD"`: Stage 0 Gold Reversal Guard (`30%` giveback + noise floor or `$3.50` pre-`TP1` hard ceiling)
+  - `"SHORTFALL_BASE"`: Stage 0 pre-`TP1` base-layer (`L1–L3`) shortfall close
+  - `"FSM_FLOOR"`: Stage `1..4` structural stage floor exit (`BE+$0.50`, `TP1`, `TP2`, or `TP3`)
+  - `"ATR_TRAIL"`: Stage `1..4` staged M1-ATR trailing stop exit above structural floor
+  - `"TP_CEILING"`: Stage `1..4` final ceiling target (`TP4`, or `TP5` when `RUNNER_MAX_TP_STAGE=5`) or broker `TP` deal on runner
+  - `"BROKER_SL"`: Broker-side hard `SL` execution detected during position reconciliation
+  - `"MANUAL"`: User/channel manual close (`/bank`, `/closeall`, deleted signal, channel close prompt, or manual MT5 terminal close)
+- **`exit_reason: str`** — Set to `exit_reason_code` when `signal_data["exit_reason_code"]` is explicitly populated by the v3.5.0 exit engine (with human-readable text preserved in `exit_reason_detail`); preserves legacy verbatim strings (e.g. `"Signal Deleted (...)"`) when `exit_reason_code` is inferred by fallback classification.
+- **`exit_stage: int`** — Integer stage `0..4` at trade termination (`0` for Stage 0 pre-`TP1` exits; `1..4` for active runner exits).
+- **`exit_price: Optional[float]`** — Execution/tick exit price (`bid` for `BUY`, `ask` for `SELL`, or broker deal close price; `None` if unavailable).
+- **`max_favorable_excursion: Dict[str, Optional[float]]`** — `{"peak_price": float | None, "peak_profit_per_oz": float | None}` where `peak_profit_per_oz = round(max(0.0, (peak_price - ref_entry) if is_buy else (ref_entry - peak_price)), 4)`.
+- **`giveback_from_peak: Optional[float]`** — `round(max(0.0, (peak_price - exit_price) if is_buy else (exit_price - peak_price)), 4)` (`0.0` on `TP_CEILING`; `None` if `peak_price` or `exit_price` is missing).
+- **`trail_tier_used: Optional[Dict[str, Any]]`** — Snapshot of the active staged trail tier at exit: `{"stage": int, "atr_mult": float, "min_dollars": float, "max_dollars": float, "m1_atr_14": float, "trail_dist": float}` for `exit_stage >= 1` (`None` at `exit_stage == 0`).
