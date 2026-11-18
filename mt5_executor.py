@@ -4353,8 +4353,7 @@ class MT5Executor:
         lifted_tickets: List[int] = []
         proactive = bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT))
         max_stage = max(1, min(5, _int_num(_cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 4)))
-        bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False))
-        if bank_all_tp1 or max_stage <= 1:
+        if max_stage <= 1:
             proactive = False
         tp2 = tp_levels.get("TP2")
 
