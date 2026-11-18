@@ -4353,6 +4353,9 @@ class MT5Executor:
         lifted_tickets: List[int] = []
         proactive = bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT))
         max_stage = max(1, min(5, _int_num(_cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 4)))
+        bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False))
+        if bank_all_tp1 or max_stage <= 1:
+            proactive = False
         tp2 = tp_levels.get("TP2")
 
         if proactive and max_stage >= 2 and raw_tp1 is not None and tp2 is not None and live_price is not None and runner_layers:
@@ -4529,10 +4532,12 @@ class MT5Executor:
             elif raw_tp1 is not None and sig_entry is not None:
                 tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
                 if tp1_leg > 1e-9:
-                    # Only arm on genuine market move (do not arm on an artificial negative-bid spread spike)
-                    eff_arm_pct = min(arm_pct, 0.70) if tp1_leg <= 4.0 else arm_pct
+                    # Require price to reach >= arm_pct (default 85%) of TP1 leg.
+                    # On tight legs (<= 4.0), require at least 80% progress (e.g. 82.4% in scalp test).
+                    # Never arm prematurely on tiny 15-pip wiggles before reaching 80% of TP1.
+                    eff_arm_pct = min(arm_pct, 0.80) if tp1_leg <= 4.0 else arm_pct
                     sig_progress = ((exec_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - exec_price) / tp1_leg)
-                    if (sig_progress + 1e-9 >= eff_arm_pct or (tp1_leg <= 4.0 and current_profit >= 1.50)) and current_profit > 0:
+                    if sig_progress + 1e-9 >= eff_arm_pct and current_profit > 0:
                         armed = True
 
             if armed:
@@ -4599,7 +4604,9 @@ class MT5Executor:
             and 0.0 < tp1_leg_dollars <= 4.0
             and not signal_data.get("tp2_reached")
         ):
-            noise_floor_dollars = min(noise_floor_dollars, round(0.45 * tp1_leg_dollars, 4))
+            # Scale floor proportionally to the leg but require at least 50% leg giveback
+            # (e.g. $2.50 leg -> $1.25 floor; $3.00 leg -> $1.50 floor; $4.00 leg -> $2.00 floor)
+            noise_floor_dollars = min(noise_floor_dollars, max(1.10, round(0.50 * tp1_leg_dollars, 4)))
 
         giveback_pct = float(_cfg("GIVEBACK_PCT", GIVEBACK_PCT))
         max_gb_dollars = float(_cfg("MAX_GIVEBACK_DOLLARS", MAX_GIVEBACK_DOLLARS))
@@ -4657,25 +4664,35 @@ class MT5Executor:
                 "live_price": exec_price,
             }
 
+        cand_trigger = False
         tp1_trail_on = bool(_cfg("TP1_TRAIL_ENABLED", TP1_TRAIL_ENABLED))
         if signal_data.get("tp1_reached") or signal_data.get("tp1_touched"):
             if tp1_trail_on:
                 # v3.4.2: Post-TP1 exits are governed by the dynamic ATR trailing stop (+ $3.50 hard ceiling backstop).
-                triggered = False
+                cand_trigger = False
             elif hard_ceiling_dollars > 0.0 or max_gb_dollars > 0.0:
                 eff_cap = hard_ceiling_dollars if hard_ceiling_dollars > 0.0 else max_gb_dollars
                 pct_req = giveback_pct * peak_profit
                 eff_req_dollars = max(noise_floor_dollars, min(eff_cap, pct_req))
-                triggered = (pullback_dollars + 1e-9 >= eff_req_dollars) and (peak_profit > 0.0)
+                cand_trigger = (pullback_dollars + 1e-9 >= eff_req_dollars) and (peak_profit > 0.0)
             else:
-                triggered = False
+                cand_trigger = False
         else:
-            # Pre-TP1: exact 85% peak-profit arming / 30% giveback AND >= Gold noise floor
-            triggered = (
+            # Pre-TP1: exact arming / giveback AND >= Gold noise floor
+            cand_trigger = (
                 peak_profit > 0.0
                 and drawdown_from_peak + 1e-9 >= giveback_pct
                 and pullback_dollars + 1e-9 >= noise_floor_dollars
             )
+
+        confirm_req = max(1, _int_num(_cfg("REVERSAL_CONFIRM_TICKS", 1), 1))
+        if cand_trigger:
+            rev_ticks = _int_num(signal_data.get("reversal_guard_ticks", 0), 0) + 1
+            signal_data["reversal_guard_ticks"] = rev_ticks
+            triggered = rev_ticks >= confirm_req
+        else:
+            signal_data["reversal_guard_ticks"] = 0
+            triggered = False
 
         return {
             "armed": True,

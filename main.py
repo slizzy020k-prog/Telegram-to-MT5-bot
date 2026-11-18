@@ -5498,6 +5498,7 @@ _KNOWN_SAVED_COMMANDS = {
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
     "/floatcap", "floatcap",
+    "/reversal", "reversal", "/gold_reversal", "gold_reversal",
     "/resume", "resume", "/unpause", "unpause", "/reset_loss", "reset_loss", "/reset_drawdown", "reset_drawdown",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
@@ -5515,6 +5516,7 @@ _KNOWN_SAVED_PREFIXES = (
     "/set_daily_loss ", "set_daily_loss ",
     "/bank_tp1 ", "bank_tp1 ",
     "/floatcap ", "floatcap ",
+    "/reversal ", "reversal ", "/gold_reversal ", "gold_reversal ",
     "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
     "/trail ", "/trade ", "/exec ",
 )
@@ -5810,6 +5812,105 @@ async def handle_saved_messages_command(event: Any) -> None:
                 f"• The bot force-closes ALL open trades if floating loss hits this level.\n"
                 f"• Change: `/floatcap <pct>` (e.g. `/floatcap 50` or `/floatcap 70`)"
             )
+        return
+
+    # LIVE CONTROL: /reversal [wide|tight|<giveback_pct> [floor] [ticks]]
+    if text in ("/reversal", "reversal", "/gold_reversal", "gold_reversal") or any(
+        text.startswith(p) for p in ("/reversal ", "reversal ", "/gold_reversal ", "gold_reversal ")
+    ):
+        parts = text.split()
+        subcmd = parts[1].strip().lower() if len(parts) > 1 else ""
+        _cfg_mod = sys.modules.get("config")
+
+        if subcmd in ("on", "true", "enable", "enabled", "1"):
+            if _cfg_mod:
+                setattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True)
+            await event.reply("🟢 **Gold Reversal Guard: ENABLED**\n• The bot actively watches runners near TP1 and post-TP1 to bank profits on major reversals.")
+            return
+
+        if subcmd in ("off", "false", "disable", "disabled", "0"):
+            if _cfg_mod:
+                setattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
+            await event.reply("⚪ **Gold Reversal Guard: DISABLED**\n• Trades will run strictly to TP / SL without giveback-banking protection.")
+            return
+
+        if subcmd in ("wide", "widen", "loose", "relaxed", "balance", "balanced"):
+            if _cfg_mod:
+                setattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True)
+                setattr(_cfg_mod, "ARM_THRESHOLD_PCT", 0.85)
+                setattr(_cfg_mod, "GIVEBACK_PCT", 0.45)
+                setattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", 2.20)
+                setattr(_cfg_mod, "REVERSAL_CONFIRM_TICKS", 2)
+            await event.reply(
+                "🛡️ **Gold Reversal Guard: WIDENED BALANCED MODE ACTIVE**\n"
+                "• **Arm Threshold:** `85%` (Requires price to reach >=85% of leg before arming)\n"
+                "• **Giveback Breathing Room:** `45%` (Allows 45% pullbacks without stopping you out early)\n"
+                "• **Noise Floor:** `$2.20` (22 pips buffer tailored for wide broker spread & Gold volatility)\n"
+                "• **Confirmations:** `2 consecutive ticks` required to confirm a genuine reversal\n"
+                "• 🚀 **Balanced:** Price has room to breathe during dramatic Gold wicks, but will still bank when it gives back too much!"
+            )
+            return
+
+        if subcmd in ("tight", "scalp", "default", "reset"):
+            if _cfg_mod:
+                setattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True)
+                setattr(_cfg_mod, "ARM_THRESHOLD_PCT", 0.85)
+                setattr(_cfg_mod, "GIVEBACK_PCT", 0.30)
+                setattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", 1.50)
+                setattr(_cfg_mod, "REVERSAL_CONFIRM_TICKS", 1)
+            await event.reply(
+                "🛡️ **Gold Reversal Guard: STANDARD MODE ACTIVE**\n"
+                "• **Arm Threshold:** `85%`\n"
+                "• **Giveback Trigger:** `30%`\n"
+                "• **Noise Floor:** `$1.50` (15 pips)\n"
+                "• **Confirmations:** `1 tick`"
+            )
+            return
+
+        # Numeric customization: e.g. /reversal 45 2.0 2
+        if len(parts) >= 2 and parts[1].replace(".", "", 1).isdigit():
+            try:
+                new_gb = float(parts[1])
+                if new_gb > 1.0:
+                    new_gb = new_gb / 100.0  # e.g. 45 -> 0.45
+                new_floor = float(parts[2]) if len(parts) >= 3 else float(getattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", 1.80))
+                new_ticks = int(parts[3]) if len(parts) >= 4 else int(getattr(_cfg_mod, "REVERSAL_CONFIRM_TICKS", 1))
+
+                if _cfg_mod:
+                    setattr(_cfg_mod, "GIVEBACK_PCT", new_gb)
+                    setattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", new_floor)
+                    setattr(_cfg_mod, "REVERSAL_CONFIRM_TICKS", new_ticks)
+
+                await event.reply(
+                    f"✅ **Gold Reversal Guard Custom Calibration Applied:**\n"
+                    f"• **Giveback Trigger:** `{new_gb*100:.0f}%` of peak profit\n"
+                    f"• **Noise Floor:** `${new_floor:.2f}` ({int(new_floor*10)} pips)\n"
+                    f"• **Confirm Ticks:** `{new_ticks}` tick(s)"
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Failed to parse /reversal args: {e}")
+
+        # Status display
+        cur_on = bool(getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True))
+        cur_arm = float(getattr(_cfg_mod, "ARM_THRESHOLD_PCT", 0.85)) * 100.0
+        cur_gb = float(getattr(_cfg_mod, "GIVEBACK_PCT", 0.30)) * 100.0
+        cur_floor = float(getattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", 1.50))
+        cur_ticks = int(getattr(_cfg_mod, "REVERSAL_CONFIRM_TICKS", 1))
+        st_icon = "🟢 ACTIVE" if cur_on else "⚪ DISABLED"
+
+        await event.reply(
+            f"🛡️ **Gold Reversal Guard Status:** {st_icon}\n"
+            f"• **Arm Threshold:** `{cur_arm:.0f}%` of TP1 leg (only arms near target)\n"
+            f"• **Giveback Trigger:** `{cur_gb:.0f}%` of peak profit\n"
+            f"• **Noise Floor:** `${cur_floor:.2f}` ({int(cur_floor*10)} pips buffer)\n"
+            f"• **Confirmations Required:** `{cur_ticks} tick(s)`\n\n"
+            f"• **Quick Controls:**\n"
+            f"  - `/reversal wide` : Widen settings for high volatility / wide spread (45% giveback, $2.20 floor, 2 ticks)\n"
+            f"  - `/reversal tight` : Reset to standard scalp mode (30% giveback, $1.50 floor, 1 tick)\n"
+            f"  - `/reversal <giveback_pct> [floor] [ticks]` : e.g. `/reversal 45 2.2 2`\n"
+            f"  - `/reversal on` or `/reversal off` : Toggle guard"
+        )
         return
 
     # LIVE CONTROL: /resume or /unpause or /reset_loss

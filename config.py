@@ -235,6 +235,7 @@ GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.9
 MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
     "MIN_GOLD_PULLBACK_DOLLARS", 1.50, min_val=0.10, max_val=50.0, positive_only=True
 )
+REVERSAL_CONFIRM_TICKS: int = _env_int("REVERSAL_CONFIRM_TICKS", 1, min_val=1, max_val=10)
 ATR_NOISE_FLOOR_MULT: float = _env_float("ATR_NOISE_FLOOR_MULT", 0.35, min_val=0.0, max_val=5.0)
 M1_ATR_PERIOD: int = _env_int("M1_ATR_PERIOD", 14, min_val=2, max_val=200)
 MAX_GIVEBACK_DOLLARS: float = _env_float("MAX_GIVEBACK_DOLLARS", 4.50, min_val=0.0, max_val=200.0)
