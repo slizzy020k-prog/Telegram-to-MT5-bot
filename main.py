@@ -4638,12 +4638,20 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
         edit_date = getattr(msg, "edit_date", None)
         is_telethon_msg = type(msg).__module__.startswith("telethon")
+        # 1. Age of the ORIGINAL message: an untracked message posted hours ago must NEVER
+        # be treated as a brand new signal, even if the channel admin just edited it now.
+        if age_sec is not None and age_sec > MAX_NEW_EDIT_AGE_SECONDS:
+            logger.info(
+                f"Ignoring edit/reaction on old untracked message {msg_id} "
+                f"(age={age_sec:.0f}s > {MAX_NEW_EDIT_AGE_SECONDS}s limit)."
+            )
+            return
+
+        # 2. Freshness of the edit event itself:
         if isinstance(edit_date, datetime):
             edit_dt_utc = edit_date if edit_date.tzinfo is not None else edit_date.replace(tzinfo=timezone.utc)
             edit_age_sec = max(0.0, (now_utc - edit_dt_utc).total_seconds())
-            if edit_age_sec > MAX_EDIT_EVENT_FRESHNESS_SECONDS and (
-                age_sec is None or age_sec > MAX_EDIT_EVENT_FRESHNESS_SECONDS
-            ):
+            if edit_age_sec > MAX_EDIT_EVENT_FRESHNESS_SECONDS:
                 logger.info(
                     f"Ignoring stale reaction/update on untracked message {msg_id} "
                     f"(edit_age={edit_age_sec:.0f}s > {MAX_EDIT_EVENT_FRESHNESS_SECONDS}s)."
@@ -4652,12 +4660,6 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         elif is_telethon_msg and edit_date is None and age_sec is not None and age_sec > 15.0:
             logger.info(
                 f"Ignoring non-text reaction/view update on unedited message {msg_id} (age={age_sec:.0f}s)."
-            )
-            return
-        elif age_sec is not None and age_sec > MAX_NEW_EDIT_AGE_SECONDS:
-            logger.info(
-                f"Ignoring edit/reaction on old untracked message {msg_id} "
-                f"(age={age_sec:.0f}s > {MAX_NEW_EDIT_AGE_SECONDS}s limit)."
             )
             return
 

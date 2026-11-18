@@ -396,20 +396,33 @@ async def test_untracked_late_edits_accepted_while_reactions_blocked_and_rapid_e
         assert len(sig_a["market_tickets"]) + len(sig_a["pending_tickets"]) == 4
         assert sig_a["sl"] == 3840.0 and sig_a["raw_tp1"] == 3862.0
 
-        # Case B: Placeholder posted 90 minutes ago (> 3600s), genuinely edited right now (edit_date = now_utc) -> ACCEPTED!
-        t_90m_ago = now_utc - timedelta(minutes=90)
+        # Case B: Placeholder posted 25 minutes ago (< 3600s), genuinely edited right now (edit_date = now_utc) -> ACCEPTED!
+        t_25m_ago = now_utc - timedelta(minutes=25)
         await main.handle_message_edited(
             FakeEvent(
                 8802,
                 "Buy limit XAUUSD 3845\nTP 3860\nSL 3835",
-                date=t_90m_ago,
+                date=t_25m_ago,
                 edit_date=now_utc,
             )
         )
         sig_b = main.state_mgr.get_signal(8802, chat_id=-1004369388188)
         assert sig_b is not None and len(sig_b["pending_tickets"]) == 4
 
+        # Case B2: Untracked message from 6 hours ago (> 3600s), edited right now (real-world Msg 9857) -> IGNORED!
+        t_6h_ago = now_utc - timedelta(hours=6)
+        await main.handle_message_edited(
+            FakeEvent(
+                8805,
+                "Sell xauusd 3776-3785\nTp 3771\nSl 3790",
+                date=t_6h_ago,
+                edit_date=now_utc,
+            )
+        )
+        assert main.state_mgr.get_signal(8805, chat_id=-1004369388188) is None
+
         # Case C: Old message from 90m ago where edit_date was ALSO 85m ago (subscriber clicked emoji reaction now) -> IGNORED!
+        t_90m_ago = now_utc - timedelta(minutes=90)
         await main.handle_message_edited(
             FakeEvent(
                 8803,
