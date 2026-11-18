@@ -1101,17 +1101,91 @@ async def check_and_enforce_daily_drawdown() -> str:
         return "EMERGENCY_CUTOFF"
 
     if dd.get("pause_new_signals"):
+        _cfg_mod = sys.modules.get("config")
+        close_trades_on_pause = bool(getattr(_cfg_mod, "DAILY_LOSS_CLOSE_OPEN_TRADES", DAILY_LOSS_CLOSE_OPEN_TRADES))
+        closed_50_mk: List[int] = []
+        cancelled_50_pd: List[int] = []
+        if close_trades_on_pause:
+            active_sigs = state_mgr.get_active_signals()
+            all_mk_50: List[int] = []
+            all_pd_50: List[int] = []
+            for _, s in active_sigs:
+                all_mk_50.extend(s.get("market_tickets", []))
+                all_pd_50.extend(s.get("pending_tickets", []))
+
+            res_50 = await _mt5_call(executor.emergency_cutoff_losing_trades, all_mk_50, all_pd_50)
+            closed_50_mk = res_50.get("closed_tickets", [])
+            cancelled_50_pd = res_50.get("cancelled_orders", [])
+            closed_50_set = set(closed_50_mk)
+            cancelled_50_set = set(cancelled_50_pd)
+
+            for mid, s in active_sigs:
+                s_chat = s.get("chat_id")
+                orig_mk = list(s.get("market_tickets") or [])
+                orig_pd = list(s.get("pending_tickets") or [])
+                sig_closed_mk = [t for t in orig_mk if t in closed_50_set]
+                sig_rem_mk = [t for t in orig_mk if t not in closed_50_set]
+                sig_rem_pd = [t for t in orig_pd if t not in cancelled_50_set]
+                sig_cancelled_pd = [t for t in orig_pd if t in cancelled_50_set]
+
+                if sig_closed_mk:
+                    await _account_closed_tickets(s, sig_closed_mk)
+
+                layers = copy.deepcopy(s.get("layers") or {})
+                for lk, l_data in layers.items():
+                    if not isinstance(l_data, dict):
+                        continue
+                    lt = l_data.get("ticket")
+                    if lt in closed_50_set:
+                        l_data["status"] = "CLOSED"
+                    elif lt in cancelled_50_set:
+                        l_data["status"] = "CANCELLED"
+
+                runner_t = s.get("runner_ticket")
+                new_runner_t = None if (runner_t is not None and runner_t in closed_50_set) else runner_t
+                still_open = bool(sig_rem_mk or sig_rem_pd)
+                new_status = "CLOSED" if not still_open else s.get("status")
+
+                if sig_closed_mk or sig_cancelled_pd or not still_open:
+                    s["status"] = new_status
+                    s["market_tickets"] = sig_rem_mk
+                    s["pending_tickets"] = sig_rem_pd
+                    s["runner_ticket"] = new_runner_t
+                    s["layers"] = layers
+                    state_mgr.update_signal(
+                        mid,
+                        {
+                            "status": new_status,
+                            "market_tickets": sig_rem_mk,
+                            "pending_tickets": sig_rem_pd,
+                            "runner_ticket": new_runner_t,
+                            "layers": layers,
+                            "accounted_tickets": s.get("accounted_tickets", []),
+                            "banked_profit": s.get("banked_profit", 0.0),
+                        },
+                        chat_id=s_chat,
+                    )
+                    if new_status == "CLOSED":
+                        await _record_signal_to_ledger(
+                            mid, s, exit_reason=f"{int(DAILY_LOSS_PAUSE_PCT)}% Drawdown Guard", currency=curr
+                        )
+
         if _daily_50pct_alert_date != today_str:
             _daily_50pct_alert_date = today_str
             logger.warning(
                 f"🛑 50% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
-                f"Holding existing open trades to SL/TP; new signals paused."
+                f"Losing trades closed={closed_50_mk}, pending orders cancelled={cancelled_50_pd}; new signals paused."
+            )
+            note_str = (
+                f"• 🛡️ **Capital Preservation Active:** Closed `{len(closed_50_mk)}` losing position(s) ({closed_50_mk}) and cancelled `{len(cancelled_50_pd)}` pending order(s) to protect your balance!\n"
+                if (closed_50_mk or cancelled_50_pd)
+                else f"• 🛡️ **Existing Trades Held:** Currently open positions are **NOT** closed — waiting naturally for their SL or TP.\n"
             )
             await notify_saved_messages(
                 f"🛑 **{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Threshold Reached — New Signals Paused**\n"
                 f"• Current Daily/Floating Loss: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
-                f"• 🛡️ **Existing Trades Held:** Currently open positions are **NOT** closed — waiting naturally for their SL or TP.\n"
-                f"• 🚨 **90% Urgency Cut-Off:** Open losing trades will only be force-closed if drawdown reaches `{int(EMERGENCY_CUTOFF_LOSS_PCT)}%` (`-{dd['emergency_cutoff_amount']:.2f} {curr}`)."
+                f"{note_str}"
+                f"• 🚨 **90% Urgency Cut-Off:** Any remaining open positions will be force-closed if drawdown reaches `{int(EMERGENCY_CUTOFF_LOSS_PCT)}%` (`-{dd['emergency_cutoff_amount']:.2f} {curr}`)."
             )
         return "PAUSED_50PCT"
 
@@ -3025,7 +3099,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
 
     # C1. Gold Calibrated Peak-Profit Giveback Guard on Active Deepest Runner(s)
     is_spike = False
-    if gold_guard_on and runner_tickets_pre:
+    if gold_guard_on and (runner_tickets_pre or mkt_tkts):
         sig_before_rg = copy.deepcopy(sig)
         rg_res = await _mt5_call(executor.evaluate_gold_reversal_guard, sig, tick)
         is_spike = bool(rg_res.get("paused_by_spread"))
@@ -5309,7 +5383,7 @@ _KNOWN_SAVED_COMMANDS = {
     "/dailywin", "dailywin", "/daily_win", "daily_win",
     "/dailyloss", "dailyloss", "/daily_loss", "daily_loss",
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
-    "/bank", "bank", "/closeall", "closeall", "/panic", "panic",
+    "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
     "/health", "health", "/status", "status", "/ping", "ping",
@@ -5324,6 +5398,7 @@ _KNOWN_SAVED_PREFIXES = (
     "/dailywin ", "dailywin ", "/daily_win ", "daily_win ",
     "/dailyloss ", "dailyloss ", "/daily_loss ", "daily_loss ",
     "/set_daily_loss ", "set_daily_loss ",
+    "/bank_tp1 ", "bank_tp1 ",
     "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
     "/trail ", "/trade ", "/exec ",
 )
@@ -5544,8 +5619,41 @@ async def handle_saved_messages_command(event: Any) -> None:
             await _apply_daily_loss_input(event, raw_msg)
             return
 
-    # LIVE CONTROL: /bank
-    if text in ("/bank", "bank"):
+    # LIVE CONTROL: /bank_tp1 [on|off]
+    if text in ("/bank_tp1", "bank_tp1") or any(text.startswith(p) for p in ("/bank_tp1 ", "bank_tp1 ")):
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        _cfg_mod = sys.modules.get("config")
+        if arg in ("on", "true", "1", "all", "100%", "full"):
+            setattr(_cfg_mod, "BANK_ALL_AT_TP1", True)
+            await event.reply(
+                "✅ **Bank TP1 Feature: ENABLED (100% Bank All)**\n"
+                "• When TP1 is hit, the bot will close ALL active market positions at market, cancel pending limits, and bank 100% of all potential profit immediately!\n"
+                "• Type `/bank_tp1 off` anytime to switch back to Runner mode (scaling to TP2-TP4)."
+            )
+            return
+        elif arg in ("off", "false", "0", "runner", "partial"):
+            setattr(_cfg_mod, "BANK_ALL_AT_TP1", False)
+            await event.reply(
+                "ℹ️ **Bank TP1 Feature: RUNNER MODE (Scale TP1->TP4)**\n"
+                "• When TP1 is hit, early layers bank profit while deepest runner(s) scale to TP2/TP3/TP4 with ATR trailing stop protection.\n"
+                "• Type `/bank_tp1 on` to switch to 100% Bank All mode."
+            )
+            return
+        else:
+            cur_st = bool(getattr(_cfg_mod, "BANK_ALL_AT_TP1", False))
+            mode_str = "🟢 100% BANK ALL (Closes all positions at TP1)" if cur_st else "🔵 RUNNER MODE (Scales runner TP1->TP4)"
+            await event.reply(
+                f"🏦 **Bank TP1 Feature Status:** {mode_str}\n\n"
+                f"• Commands:\n"
+                f"  - `/bank_tp1 on`: Close 100% of positions at TP1 & bank all profit\n"
+                f"  - `/bank_tp1 off`: Scale deepest runner to TP2/TP3/TP4\n"
+                f"  - `/bank`: Manually bank the current open trade right now at market"
+            )
+            return
+
+    # LIVE CONTROL: /bank or /bankall
+    if text in ("/bank", "bank", "/bankall", "bankall"):
         latest = state_mgr.get_latest_signal()
         if not latest or latest[1].get("status") == "CLOSED":
             await event.reply("⚠️ No active signals found to bank.")
@@ -5553,17 +5661,37 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         msg_id, sig = latest
         sig_chat = sig.get("chat_id")
-        if sig.get("status") == "RUNNER_ACTIVE":
-            await event.reply(
-                f"ℹ️ Signal `{msg_id}` is already in `RUNNER_ACTIVE` mode.\n"
-                f"• Runner: `Layer {sig.get('runner_layer')}` [Ticket #{sig.get('runner_ticket')}]\n"
-                f"• Milestone: `{sig.get('runner_milestone_name', 'TP1')}` | "
-                f"Soft Floor: `{sig.get('runner_sl_floor') or sig.get('soft_tp1_floor')}`"
-            )
-            return
-
         async with _get_signal_lock(sig_chat, msg_id):
             fresh_sig = state_mgr.get_signal(msg_id, chat_id=sig_chat) or sig
+            if fresh_sig.get("status") == "RUNNER_ACTIVE":
+                closed_tkts = []
+                r_tkts = list(fresh_sig.get("runner_tickets") or ([fresh_sig.get("runner_ticket")] if fresh_sig.get("runner_ticket") else []))
+                for rt in r_tkts:
+                    if rt and await _mt5_call(executor.close_market_position, rt):
+                        closed_tkts.append(rt)
+                for pt in list(fresh_sig.get("pending_tickets") or []):
+                    await _mt5_call(executor.cancel_pending_order, pt)
+                added_prof, _ = await _account_closed_tickets(fresh_sig, closed_tkts)
+                fresh_sig["status"] = "CLOSED"
+                fresh_sig["market_tickets"] = []
+                fresh_sig["pending_tickets"] = []
+                fresh_sig["runner_tickets"] = []
+                fresh_sig["runner_ticket"] = None
+                fresh_sig["runner_close_reason"] = "Manual /bank on Runner"
+                state_mgr.update_signal(msg_id, fresh_sig, chat_id=sig_chat)
+                fin = await _mt5_call(executor.get_account_financials)
+                curr = fin.get("currency", "GBP")
+                await _record_signal_to_ledger(msg_id, fresh_sig, exit_reason="Manual /bank on Runner", currency=curr)
+                profit_str = format_profit(added_prof, curr)
+                await event.reply(
+                    f"💰 **Runner Banked Manually! [ID: {msg_id}]**\n"
+                    f"• Closed Tickets: `{closed_tkts}`\n"
+                    f"• 💰 **Banked Profit:** `{profit_str}` | **Total Trade Profit:** `{format_profit(fresh_sig.get('banked_profit', 0.0), curr)}`\n"
+                    f"• Signal closed & pending orders cancelled!\n\n"
+                    f"{fin['formatted']}"
+                )
+                return
+
             _, _, alert = await _execute_tp1_scaling_handoff(
                 msg_id, fresh_sig, chat_id=sig_chat, source_label="Manual /bank"
             )
@@ -6297,7 +6425,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/bank`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/bank_tp1`, `/bank`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return

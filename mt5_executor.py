@@ -4400,8 +4400,9 @@ class MT5Executor:
                 tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
                 if tp1_leg > 1e-9:
                     # Only arm on genuine market move (do not arm on an artificial negative-bid spread spike)
+                    eff_arm_pct = min(arm_pct, 0.70) if tp1_leg <= 4.0 else arm_pct
                     sig_progress = ((exec_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - exec_price) / tp1_leg)
-                    if sig_progress + 1e-9 >= arm_pct and current_profit > 0:
+                    if (sig_progress + 1e-9 >= eff_arm_pct or (tp1_leg <= 4.0 and current_profit >= 1.50)) and current_profit > 0:
                         armed = True
 
             if armed:
@@ -4628,7 +4629,20 @@ class MT5Executor:
             ]
 
         max_stage = max(1, min(5, _int_num(_cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 4)))
-        if max_stage <= 1:
+        bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False)) or (max_stage <= 1)
+        bank_single_tp1 = bool(_cfg("BANK_SINGLE_LAYER_AT_TP1", False))
+
+        if bank_all_tp1:
+            early_tickets = list(dict.fromkeys(early_tickets + runner_tickets + market_tickets))
+            early_layers = list(dict.fromkeys(early_layers + runner_layers + list(layers.keys())))
+            runner_tickets = []
+            runner_layers = []
+        elif bank_single_tp1 and len(market_tickets) == 1 and not early_tickets:
+            early_tickets = list(market_tickets)
+            early_layers = list(runner_layers) if runner_layers else (list(layers.keys()) if layers else ["L1"])
+            runner_tickets = []
+            runner_layers = []
+        elif max_stage <= 1:
             early_tickets = list(dict.fromkeys(early_tickets + runner_tickets))
             early_layers = list(dict.fromkeys(early_layers + runner_layers))
             runner_tickets = []

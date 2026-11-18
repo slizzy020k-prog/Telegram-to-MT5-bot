@@ -278,6 +278,8 @@ RUNNER_CLEAN_BREAK_PIPS: float = _env_float(
 )
 
 # TP1 Scaling, Breakeven & Pending Order Policy
+BANK_ALL_AT_TP1: bool = _env_bool("BANK_ALL_AT_TP1", False)
+BANK_SINGLE_LAYER_AT_TP1: bool = _env_bool("BANK_SINGLE_LAYER_AT_TP1", False)
 CANCEL_PENDING_ON_TP1: bool = _env_bool("CANCEL_PENDING_ON_TP1", True)
 BE_AFTER_TP1: bool = _env_bool("BE_AFTER_TP1", True)
 _default_be_layers = ["L1", "L2", "L3", "L4"]
