@@ -81,6 +81,7 @@ from config import (
     UNPRICED_TP_GRACE_SECONDS,
     DAILY_LOSS_PAUSE_PCT,
     EMERGENCY_CUTOFF_LOSS_PCT,
+    FLOAT_LOSS_FORCE_CLOSE_PCT,
     TP1_LOCK_BUFFER,
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
@@ -263,6 +264,9 @@ _last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
 
 # Tracks date string (YYYY-MM-DD) when 50% daily loss pause alert was last sent
 _daily_50pct_alert_date: Optional[str] = None
+
+# Tracks date string when the floating-loss force-close alert was last sent (avoid repeat messages)
+_daily_float_cap_alert_date: Optional[str] = None
 
 # Global trading-halted circuit breaker (set when Daily Realized Loss Limit triggers)
 TRADING_HALTED: bool = False
@@ -1099,6 +1103,103 @@ async def check_and_enforce_daily_drawdown() -> str:
                 f"{fin['formatted']}"
             )
         return "EMERGENCY_CUTOFF"
+
+    # ── STAGE 1b: Hard Floating-Loss Force-Close Cap ──────────────────────────────
+    # Fires when floating-only loss breaches FLOAT_LOSS_FORCE_CLOSE_PCT (default 60%) of balance.
+    # This is a harder, faster protection than the 90% emergency cutoff — it closes EVERYTHING
+    # immediately when open trades alone are drowning the account, before broker margin stop-out hits.
+    global _daily_float_cap_alert_date
+    if dd.get("float_force_close_triggered"):
+        active_sigs_fc = state_mgr.get_active_signals()
+        all_mk_fc: List[int] = []
+        all_pd_fc: List[int] = []
+        for _, s in active_sigs_fc:
+            all_mk_fc.extend(s.get("market_tickets", []))
+            all_pd_fc.extend(s.get("pending_tickets", []))
+
+        res_fc = await _mt5_call(executor.emergency_cutoff_losing_trades, all_mk_fc, all_pd_fc)
+        closed_fc_tkts = res_fc.get("closed_tickets", [])
+        cancelled_fc_ords = res_fc.get("cancelled_orders", [])
+        closed_fc_set = set(closed_fc_tkts)
+        cancelled_fc_set = set(cancelled_fc_ords)
+
+        for mid, s in active_sigs_fc:
+            s_chat = s.get("chat_id")
+            orig_mk = list(s.get("market_tickets") or [])
+            orig_pd = list(s.get("pending_tickets") or [])
+            sig_closed_mk = [t for t in orig_mk if t in closed_fc_set]
+            sig_rem_mk = [t for t in orig_mk if t not in closed_fc_set]
+            sig_rem_pd = [t for t in orig_pd if t not in cancelled_fc_set]
+            sig_cancelled_pd = [t for t in orig_pd if t in cancelled_fc_set]
+
+            if sig_closed_mk:
+                await _account_closed_tickets(s, sig_closed_mk)
+
+            layers = copy.deepcopy(s.get("layers") or {})
+            for lk, l_data in layers.items():
+                if not isinstance(l_data, dict):
+                    continue
+                lt = l_data.get("ticket")
+                if lt in closed_fc_set:
+                    l_data["status"] = "CLOSED"
+                elif lt in cancelled_fc_set:
+                    l_data["status"] = "CANCELLED"
+
+            runner_t = s.get("runner_ticket")
+            new_runner_t = None if (runner_t is not None and runner_t in closed_fc_set) else runner_t
+            still_open = bool(sig_rem_mk or sig_rem_pd)
+            if not still_open:
+                new_status = "CLOSED"
+            else:
+                new_status = s.get("status")
+                if new_runner_t is None and new_status == "RUNNER_ACTIVE":
+                    new_status = "BE_APPLIED" if s.get("tp1_reached") else "ACTIVE"
+
+            if sig_closed_mk or sig_cancelled_pd or not still_open:
+                s["status"] = new_status
+                s["market_tickets"] = sig_rem_mk
+                s["pending_tickets"] = sig_rem_pd
+                s["runner_ticket"] = new_runner_t
+                s["layers"] = layers
+                state_mgr.update_signal(
+                    mid,
+                    {
+                        "status": new_status,
+                        "market_tickets": sig_rem_mk,
+                        "pending_tickets": sig_rem_pd,
+                        "runner_ticket": new_runner_t,
+                        "layers": layers,
+                        "accounted_tickets": s.get("accounted_tickets", []),
+                        "banked_profit": s.get("banked_profit", 0.0),
+                    },
+                    chat_id=s_chat,
+                )
+                if new_status == "CLOSED":
+                    float_cap_pct_val = dd.get("float_cap_pct", FLOAT_LOSS_FORCE_CLOSE_PCT)
+                    await _record_signal_to_ledger(
+                        mid, s, exit_reason=f"{int(float_cap_pct_val)}% Float-Loss Force-Close", currency=curr
+                    )
+
+        if closed_fc_tkts or cancelled_fc_ords or active_sigs_fc:
+            fin = await _mt5_call(executor.get_account_financials)
+            float_cap_pct_val = dd.get("float_cap_pct", FLOAT_LOSS_FORCE_CLOSE_PCT)
+            float_cap_lim = dd.get("float_cap_limit", 0.0)
+            logger.error(
+                f"🔴 {int(float_cap_pct_val)}% FLOAT-LOSS FORCE-CLOSE! Floating loss=-{dd['floating_loss']:.2f} {curr} "
+                f"(cap=-{float_cap_lim:.2f} {curr}). Closed={closed_fc_tkts}, Cancelled={cancelled_fc_ords}"
+            )
+            if _daily_float_cap_alert_date != today_str:
+                _daily_float_cap_alert_date = today_str
+                await notify_saved_messages(
+                    f"🔴 **{int(float_cap_pct_val)}% FLOATING LOSS CAP — ALL TRADES FORCE-CLOSED!**\n"
+                    f"• Floating Loss: `-{dd['floating_loss']:.2f} {curr}` breached the `{int(float_cap_pct_val)}%` hard cap (`-{float_cap_lim:.2f} {curr}`).\n"
+                    f"• Closed Positions: `{closed_fc_tkts}`\n"
+                    f"• Cancelled Pending Limits: `{cancelled_fc_ords}`\n"
+                    f"• 🛡️ All open trades force-closed to prevent broker margin stop-out.\n"
+                    f"• 💡 Change this cap anytime: `/floatcap <pct>` (e.g. `/floatcap 50` for 50%).\n\n"
+                    f"{fin['formatted']}"
+                )
+        return "FLOAT_FORCE_CLOSE"
 
     if dd.get("pause_new_signals"):
         _cfg_mod = sys.modules.get("config")
@@ -5384,6 +5485,7 @@ _KNOWN_SAVED_COMMANDS = {
     "/dailyloss", "dailyloss", "/daily_loss", "daily_loss",
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
+    "/floatcap", "floatcap",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
     "/health", "health", "/status", "status", "/ping", "ping",
@@ -5399,6 +5501,7 @@ _KNOWN_SAVED_PREFIXES = (
     "/dailyloss ", "dailyloss ", "/daily_loss ", "daily_loss ",
     "/set_daily_loss ", "set_daily_loss ",
     "/bank_tp1 ", "bank_tp1 ",
+    "/floatcap ", "floatcap ",
     "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
     "/trail ", "/trade ", "/exec ",
 )
@@ -5651,6 +5754,50 @@ async def handle_saved_messages_command(event: Any) -> None:
                 f"  - `/bank`: Manually bank the current open trade right now at market"
             )
             return
+
+    # LIVE CONTROL: /floatcap [pct] — change the floating-loss force-close hard cap
+    if text in ("/floatcap", "floatcap") or any(text.startswith(p) for p in ("/floatcap ", "floatcap ")):
+        _cfg_mod = sys.modules.get("config")
+        parts = text.split()
+        if len(parts) >= 2:
+            try:
+                new_pct = float(parts[1].strip().rstrip("%"))
+                if not (1.0 <= new_pct <= 100.0):
+                    raise ValueError("out of range")
+                if _cfg_mod:
+                    setattr(_cfg_mod, "FLOAT_LOSS_FORCE_CLOSE_PCT", new_pct)
+                fin = await _mt5_call(executor.get_account_financials)
+                bal = fin.get("balance", 0.0)
+                curr = fin.get("currency", "GBP")
+                cap_amt = round(bal * new_pct / 100.0, 2)
+                confirm_msg = (
+                    f"🔴 **Floating Loss Hard Cap Updated → `{new_pct:.0f}%`**\n"
+                    f"• The bot will now force-close ALL open trades if floating loss breaches `-{cap_amt:.2f} {curr}` "
+                    f"(`{new_pct:.0f}%` of `{bal:.2f} {curr}` balance).\n"
+                    f"• This fires before the 90% emergency cutoff to block broker margin stop-outs.\n"
+                    f"• Change again anytime: `/floatcap <pct>` (e.g. `/floatcap 50`)"
+                )
+                logger.info(f"[/floatcap] FLOAT_LOSS_FORCE_CLOSE_PCT updated to {new_pct:.1f}%")
+                await event.reply(confirm_msg)
+                await notify_saved_messages(confirm_msg)
+            except (ValueError, IndexError):
+                await event.reply(
+                    "⚠️ **Invalid value.** Usage: `/floatcap <1-100>`\n"
+                    "Example: `/floatcap 60` → force-close all trades when floating loss hits -60% of balance."
+                )
+        else:
+            _cfg_mod2 = sys.modules.get("config")
+            cur_pct = float(getattr(_cfg_mod2, "FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT))
+            fin = await _mt5_call(executor.get_account_financials)
+            bal = fin.get("balance", 0.0)
+            curr = fin.get("currency", "GBP")
+            cap_amt = round(bal * cur_pct / 100.0, 2)
+            await event.reply(
+                f"🔴 **Floating Loss Hard Cap:** `{cur_pct:.0f}%` (≈ `-{cap_amt:.2f} {curr}`)\n"
+                f"• The bot force-closes ALL open trades if floating loss hits this level.\n"
+                f"• Change: `/floatcap <pct>` (e.g. `/floatcap 50` or `/floatcap 70`)"
+            )
+        return
 
     # LIVE CONTROL: /bank or /bankall
     if text in ("/bank", "bank", "/bankall", "bankall"):
@@ -6425,7 +6572,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/bank_tp1`, `/bank`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/bank_tp1`, `/bank`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return

@@ -315,6 +315,12 @@ EMERGENCY_CUTOFF_LOSS_PCT: float = _env_float(
     "EMERGENCY_CUTOFF_LOSS_PCT", 90.0, min_val=1.0, max_val=100.0, positive_only=True
 )
 DAILY_LOSS_CLOSE_OPEN_TRADES: bool = _env_bool("DAILY_LOSS_CLOSE_OPEN_TRADES", False)
+# Hard floating-loss cap: force-close ALL open positions the moment floating-only loss hits this % of balance.
+# This fires BEFORE the 90% emergency cutoff to stop broker margin stop-outs.
+# Default 60.0% — change live with /floatcap <pct> in Saved Messages.
+FLOAT_LOSS_FORCE_CLOSE_PCT: float = _env_float(
+    "FLOAT_LOSS_FORCE_CLOSE_PCT", 60.0, min_val=1.0, max_val=100.0, positive_only=True
+)
 
 # Delayed Market Entry, Price Guard & Reconnect Catch-Up
 SELL_NOW_DELAY_SECONDS: float = _env_float("SELL_NOW_DELAY_SECONDS", 0.0, min_val=0.0, max_val=300.0)

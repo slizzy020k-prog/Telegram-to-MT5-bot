@@ -28,6 +28,7 @@ from config import (
     DEFAULT_SYMBOL,
     DEFAULT_TP_STEP_PIPS,
     EMERGENCY_CUTOFF_LOSS_PCT,
+    FLOAT_LOSS_FORCE_CLOSE_PCT,
     ENFORCE_HIGH_RISK_LOT_CAP,
     FALLBACK_SL_PIPS,
     GIVEBACK_PCT,
@@ -2893,6 +2894,11 @@ class MT5Executor:
             or (curr_bal > 0 and floating_loss >= cutoff_limit_curr - 1e-9)
         )
 
+        # Hard floating-loss cap: force-close ALL open trades when floating-only loss breaches this %.
+        float_cap_pct = _cfg("FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT)
+        float_cap_limit = round(max(0.0, curr_bal) * (float_cap_pct / 100.0), 2)
+        float_force_close = bool(curr_bal > 0 and float_cap_limit > 0 and floating_loss >= float_cap_limit - 1e-9)
+
         return {
             "currency": curr,
             "current_balance": round(curr_bal, 2),
@@ -2904,6 +2910,9 @@ class MT5Executor:
             "loss_pct": max(loss_pct, floating_loss_pct),
             "pause_limit_amount": pause_limit,
             "emergency_cutoff_amount": min(cutoff_limit_ref, cutoff_limit_curr) if cutoff_limit_curr > 0 else cutoff_limit_ref,
+            "float_cap_pct": float_cap_pct,
+            "float_cap_limit": float_cap_limit,
+            "float_force_close_triggered": float_force_close,
             "pause_new_signals": pause_new,
             "emergency_cutoff_triggered": emergency_cutoff,
         }
