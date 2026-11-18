@@ -95,6 +95,7 @@ def _reset_runtime(tmp_path, name: str = "v33"):
 async def test_1_end_to_end_trade_reading_execution_and_exact_broker_sl_tp_placement(tmp_path, monkeypatch):
     _reset_runtime(tmp_path, "e2e_exec")
     monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)  # test validates 4-layer-at-once behaviour
 
     ex = MT5Executor(dry_run=False)
     ex._connected = True
@@ -298,6 +299,8 @@ async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp
     _reset_runtime(tmp_path, "chan_trail")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
+    orig_staged = main.STAGED_MARKET_ENTRY
+    main.STAGED_MARKET_ENTRY = False  # test expects 4 open market layers at once
 
     with patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
         # --- BUY Trade (#301): 4 open market layers ---
@@ -386,6 +389,8 @@ async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp
             sig_sell = main.state_mgr.get_signal(350, chat_id=-1001234567890)
             assert sig_sell["tp_stage"] == "TP4"
             assert sig_sell["layers"]["L4"]["tp"] == pytest.approx(3860.0)
+
+    main.STAGED_MARKET_ENTRY = orig_staged
 
 
 # ---------------------------------------------------------------------------

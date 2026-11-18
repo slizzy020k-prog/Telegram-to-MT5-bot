@@ -575,6 +575,8 @@ async def test_spec_7_zero_delay_immediate_now_execution(tmp_path):
 
     orig_delay = main.SELL_NOW_DELAY_SECONDS
     main.SELL_NOW_DELAY_SECONDS = 0.0
+    orig_staged = main.STAGED_MARKET_ENTRY
+    main.STAGED_MARKET_ENTRY = False
     for p in env["patches"]:
         p.start()
     try:
@@ -605,6 +607,7 @@ async def test_spec_7_zero_delay_immediate_now_execution(tmp_path):
         assert s_edit["sl"] == 3865.0
         assert s_edit["layers"]["L1"]["tp"] == 3840.50
     finally:
+        main.STAGED_MARKET_ENTRY = orig_staged
         main.SELL_NOW_DELAY_SECONDS = orig_delay
         for p in reversed(env["patches"]):
             p.stop()

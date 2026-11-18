@@ -601,6 +601,11 @@ def _has_real_trade_structure(text: str) -> bool:
             pass
 
     if DIRECTION_PATTERN.search(text):
+        # Actionable directional market execution ("Sell xauusd now", "Buy gold now", "Sell now", etc.)
+        # even without explicit prices yet must not be blocked by soft risk-tag blockers.
+        if re.search(r"\b(?:now|market|instant|instantly|gold|xauusd)\b", text, re.IGNORECASE):
+            return True
+
         entry_segment = _strip_entry_text(text)
         for pm in re.finditer(
             r"(?<![.\d])(\d{3,6}(?:\.\d+)?)(?![.\d])(?!\s*(?:pips?|%|lots?|x)\b)",

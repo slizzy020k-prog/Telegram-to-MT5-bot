@@ -327,6 +327,10 @@ FLOAT_LOSS_FORCE_CLOSE_PCT: float = _env_float(
 )
 
 # Delayed Market Entry, Price Guard & Reconnect Catch-Up
+# Staged Market Entry: when True, bare BUY/SELL market orders (no zone) execute ONLY L1 at market,
+# then wait for the provider's edit with zone/limits before placing L2..L4.
+# Prevents stacking all 4 layers at the same market entry price. Default True.
+STAGED_MARKET_ENTRY: bool = _env_bool("STAGED_MARKET_ENTRY", True)
 SELL_NOW_DELAY_SECONDS: float = _env_float("SELL_NOW_DELAY_SECONDS", 0.0, min_val=0.0, max_val=300.0)
 DELAYED_POLL_INTERVAL_SECONDS: float = _env_float(
     "DELAYED_POLL_INTERVAL_SECONDS", 0.25, min_val=0.05, max_val=1.0

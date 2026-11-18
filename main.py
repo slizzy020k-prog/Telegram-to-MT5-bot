@@ -13,6 +13,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 
 from telethon import TelegramClient, events
 
+import config
 from config import (
     BASE_DIR,
     TELEGRAM_API_ID,
@@ -70,6 +71,7 @@ from config import (
     TRADES_LEDGER_PATH,
     LOCK_FILE_PATH,
     DEDUPLICATION_WINDOW_SECONDS,
+    STAGED_MARKET_ENTRY,
     SELL_NOW_DELAY_SECONDS,
     DELAYED_POLL_INTERVAL_SECONDS,
     NOW_PRICE_GUARD_ABORT_ON_MISMATCH,
@@ -1933,7 +1935,8 @@ async def _delayed_sell_now_task(
                 return
 
             prev_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
-            is_delayed_stub = bool(sl is None and not sig.get("tp_levels") and tp1_price is None)
+            staged_entry = bool(STAGED_MARKET_ENTRY)
+            is_delayed_stub = bool(sl is None and not sig.get("tp_levels") and tp1_price is None) or staged_entry
             mk_tkts, pd_tkts, layers_data = await _mt5_call(
                 executor.execute_4layer_market,
                 symbol=symbol,
@@ -4379,7 +4382,8 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         elif float(SELL_NOW_DELAY_SECONDS) <= 0.0:
             now_tick = await _mt5_call(executor.get_tick, symbol)
             initial_price = _get_live_entry_price(now_tick, direction)
-            is_market_stub = bool(sl is None and not tp_levels)
+            staged_entry = bool(STAGED_MARKET_ENTRY)
+            is_market_stub = bool(sl is None and not tp_levels) or staged_entry
             market_tickets, pending_tickets, layers_data = await _mt5_call(
                 executor.execute_4layer_market,
                 symbol=symbol,
@@ -4394,6 +4398,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
                 tp_levels=tp_levels or None,
                 max_layers=1 if is_market_stub else None,
             )
+            zone_completed = not is_market_stub
         else:
             now_tick = await _mt5_call(executor.get_tick, symbol)
             initial_price = _get_live_entry_price(now_tick, direction)
@@ -4510,12 +4515,17 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         extra_notes.extend(risk_alerts)
         risk_block = ("\n\n" + "\n".join(extra_notes)) if extra_notes else ""
 
+        # Detect staged (L1-only) vs full execution
+        is_staged_entry = (not is_zone and parsed.single_price is None and len(market_tickets) == 1 and not pending_tickets)
+        staged_note = "\n• ⏳ **L2/L3/L4 waiting** — edit the signal with zone/limit prices to place them." if is_staged_entry else ""
+
         await notify_saved_messages(
-            f"🚀 **New 4-Layer Signal Executed ({order_intent}) [ID: {msg_id}]**\n"
+            f"🚀 **New {'L1 Staged' if is_staged_entry else '4-Layer'} Signal Executed ({order_intent}) [ID: {msg_id}]**\n"
             f"• Direction: `{direction}` {symbol}\n"
             f"• Orders: Market={market_tickets}, Pending={pending_tickets}\n"
             f"• Layers: {_format_layers_summary(created_sig)}\n"
             f"• SL: `{sl}` | Broker TP1: `{final_tp}` | Targets: {_format_tp_summary(created_sig)}"
+            f"{staged_note}"
             f"{risk_block}"
         )
         await _update_live_terminal_status_async()

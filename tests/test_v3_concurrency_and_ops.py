@@ -114,7 +114,9 @@ async def test_duplicate_message_and_concurrent_edit_lock_serialization(tmp_path
     main.executor.connect()
 
     orig_delay = main.SELL_NOW_DELAY_SECONDS
+    orig_staged = main.STAGED_MARKET_ENTRY
     main.SELL_NOW_DELAY_SECONDS = 0.0
+    main.STAGED_MARKET_ENTRY = False  # test expects 4 market layers at once
     call_count = {"n": 0}
     orig_exec_market = main.executor.execute_4layer_market
 
@@ -153,6 +155,7 @@ async def test_duplicate_message_and_concurrent_edit_lock_serialization(tmp_path
         assert sig2["raw_tp1"] == 3910.0
     finally:
         main.SELL_NOW_DELAY_SECONDS = orig_delay
+        main.STAGED_MARKET_ENTRY = orig_staged
 
 
 # ---------------------------------------------------------------------------

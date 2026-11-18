@@ -218,9 +218,13 @@ async def test_2_stub_l1_only_and_zone_edit_expansion_never_exceeds_4_layers(tmp
         assert sig_a2["layers"]["L4"]["lot"] == pytest.approx(0.02)
 
         # --- Part A2: Zone edit when L1..L4 are ALL already filled -> 0 new orders placed! ---
+        # Disable staged entry so 9802 fires all 4 layers at once (simulates full market fill scenario)
+        _orig_staged = main.STAGED_MARKET_ENTRY
+        main.STAGED_MARKET_ENTRY = False
         await main.handle_new_message(
             FakeEvent(9802, "Buy now\nSL 3820\nTP 3855", chat_id=-1003712081715)
         )
+        main.STAGED_MARKET_ENTRY = _orig_staged
         sig_full = main.state_mgr.get_signal(9802, chat_id=-1003712081715)
         assert len(sig_full["market_tickets"]) == 4
         orig_full_tkts = list(sig_full["market_tickets"])
