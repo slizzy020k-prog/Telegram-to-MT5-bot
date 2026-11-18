@@ -310,6 +310,9 @@ MAX_SL_PIPS: float = _env_float("MAX_SL_PIPS", 350.0, min_val=10.0, max_val=5000
 FALLBACK_TP1_PIPS: float = _env_float("FALLBACK_TP1_PIPS", 50.0, min_val=1.0, max_val=2000.0, positive_only=True)
 UNPRICED_TP_GRACE_SECONDS: float = _env_float("UNPRICED_TP_GRACE_SECONDS", 45.0, min_val=0.0, max_val=600.0)
 ENFORCE_HIGH_RISK_LOT_CAP: bool = _env_bool("ENFORCE_HIGH_RISK_LOT_CAP", True)
+# Automatically adjust layer lots & max risk cap based on live balance following the Risk Guide:
+# £50 -> 0.05 max | £100 -> 0.10 max | £200 -> 0.20 max | £500 -> 0.50 max | £1000 -> 1.00 max
+AUTO_ADJUST_LOTS_TO_BALANCE: bool = _env_bool("AUTO_ADJUST_LOTS_TO_BALANCE", False)
 DAILY_LOSS_PAUSE_PCT: float = _env_float("DAILY_LOSS_PAUSE_PCT", 50.0, min_val=1.0, max_val=100.0, positive_only=True)
 EMERGENCY_CUTOFF_LOSS_PCT: float = _env_float(
     "EMERGENCY_CUTOFF_LOSS_PCT", 90.0, min_val=1.0, max_val=100.0, positive_only=True

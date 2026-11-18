@@ -1202,12 +1202,20 @@ async def check_and_enforce_daily_drawdown() -> str:
         return "FLOAT_FORCE_CLOSE"
 
     if dd.get("pause_new_signals"):
+        active_sigs = state_mgr.get_active_signals()
+        open_mkt = await _mt5_call(executor.get_open_market_tickets)
+        # If there are NO active signals and NO open positions, previous loss is realized and has passed.
+        # Automatically update baseline to current balance and allow new trades to be actioned.
+        if not active_sigs and not open_mkt:
+            await _mt5_call(executor.update_daily_loss_baseline)
+            logger.info("Previous daily loss has passed (0 open trades). Baseline updated to current balance — ready to action new trades.")
+            return "OK"
+
         _cfg_mod = sys.modules.get("config")
         close_trades_on_pause = bool(getattr(_cfg_mod, "DAILY_LOSS_CLOSE_OPEN_TRADES", DAILY_LOSS_CLOSE_OPEN_TRADES))
         closed_50_mk: List[int] = []
         cancelled_50_pd: List[int] = []
         if close_trades_on_pause:
-            active_sigs = state_mgr.get_active_signals()
             all_mk_50: List[int] = []
             all_pd_50: List[int] = []
             for _, s in active_sigs:
@@ -1270,6 +1278,10 @@ async def check_and_enforce_daily_drawdown() -> str:
                         await _record_signal_to_ledger(
                             mid, s, exit_reason=f"{int(DAILY_LOSS_PAUSE_PCT)}% Drawdown Guard", currency=curr
                         )
+
+            if not state_mgr.get_active_signals():
+                await _mt5_call(executor.update_daily_loss_baseline)
+                logger.info("All losing trades closed on 50% pause. Daily loss baseline updated to remaining balance — ready for new trades.")
 
         if _daily_50pct_alert_date != today_str:
             _daily_50pct_alert_date = today_str
@@ -5486,6 +5498,7 @@ _KNOWN_SAVED_COMMANDS = {
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
     "/floatcap", "floatcap",
+    "/resume", "resume", "/unpause", "unpause", "/reset_loss", "reset_loss", "/reset_drawdown", "reset_drawdown",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
     "/health", "health", "/status", "status", "/ping", "ping",
@@ -5608,7 +5621,7 @@ def _format_uptime() -> str:
 
 async def handle_saved_messages_command(event: Any) -> None:
     """Remote monitoring commands sent to Saved Messages ('me')."""
-    global _awaiting_dailywin_input, _awaiting_dailyloss_input
+    global _awaiting_dailywin_input, _awaiting_dailyloss_input, _daily_50pct_alert_date, _daily_loss_locked, TRADING_HALTED
     msg = event.message
     if not msg or not msg.message:
         return
@@ -5797,6 +5810,32 @@ async def handle_saved_messages_command(event: Any) -> None:
                 f"• The bot force-closes ALL open trades if floating loss hits this level.\n"
                 f"• Change: `/floatcap <pct>` (e.g. `/floatcap 50` or `/floatcap 70`)"
             )
+        return
+
+    # LIVE CONTROL: /resume or /unpause or /reset_loss
+    if text in ("/resume", "resume", "/unpause", "unpause", "/reset_loss", "reset_loss", "/reset_drawdown", "reset_drawdown"):
+        _daily_loss_locked = False
+        TRADING_HALTED = False
+        _daily_50pct_alert_date = None
+        upd = await _mt5_call(executor.update_daily_loss_baseline)
+        fin = await _mt5_call(executor.get_account_financials)
+        curr = fin.get("currency", "GBP")
+        bal = fin.get("balance", 0.0)
+        risk_st = await _mt5_call(executor.get_risk_exposure_status)
+        high_l = risk_st["high_risk_lots"]
+        mid_l = risk_st["mid_risk_lots"]
+        low_l = risk_st["low_risk_lots"]
+
+        msg = (
+            f"🟢 **Trading Resumed & Daily Drawdown Reset**\n"
+            f"• Previous daily loss has passed and is archived as realized.\n"
+            f"• **Active Capital Baseline:** `{bal:.2f} {curr}`\n"
+            f"• **Drawdown Status:** `0.0%` (Unpaused — ready for new signals)\n"
+            f"• **Max Lots Guide:** `{high_l:.2f} Max` (High: `{high_l:.2f}` | Mid: `{mid_l:.2f}` | Low: `{low_l:.2f}`)\n"
+            f"• 🚀 **The bot is actively listening and will action new trades immediately!**"
+        )
+        logger.info(f"[/resume] Daily loss baseline updated to {bal:.2f} {curr}. Trading resumed.")
+        await event.reply(msg)
         return
 
     # LIVE CONTROL: /bank or /bankall
@@ -6572,7 +6611,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Bot Uptime: `{uptime_str}`"
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/bank_tp1`, `/bank`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return
@@ -6776,6 +6815,19 @@ async def main() -> None:
                 logger.warning(
                     f"🔒 Daily loss limit already triggered today ({dl_prog['date']}); "
                     f"starting in LOCKED mode (new signals blocked until next broker day or `dailyloss off`)."
+                )
+            # If all open positions are closed and there are no active signals,
+            # but previous realized loss would pause new signals, acknowledge
+            # that the previous loss has passed and update the baseline so new trades can be actioned.
+            open_pos = await _mt5_call(executor.get_open_market_tickets)
+            active_s = state_mgr.get_active_signals()
+            dd_init = await _mt5_call(executor.get_daily_drawdown_status)
+            if not open_pos and not active_s and dd_init.get("pause_new_signals"):
+                upd = await _mt5_call(executor.update_daily_loss_baseline)
+                logger.info(
+                    f"Previous daily loss (-{dd_init['total_daily_loss']:.2f} {dd_init['currency']}) "
+                    f"has passed (0 open positions). Daily loss baseline updated to current balance "
+                    f"{upd['current_balance']:.2f} {dd_init['currency']}. Ready to action new trades."
                 )
             await _update_live_terminal_status_async(force_print=True)
 

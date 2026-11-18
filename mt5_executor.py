@@ -18,6 +18,7 @@ from config import (
     ALLOW_BELOW_ZONE_WICK,
     ARM_THRESHOLD_PCT,
     ATR_NOISE_FLOOR_MULT,
+    AUTO_ADJUST_LOTS_TO_BALANCE,
     BASE_LAYER_LOTS,
     BE_AFTER_TP1,
     BE_LAYERS,
@@ -294,6 +295,42 @@ def calculate_risk_guide_thresholds(capital: float) -> Dict[str, float]:
     }
 
 
+def compute_dynamic_layer_lots_for_balance(capital: float, risk_mode: str = "high") -> List[float]:
+    """
+    Compute 4-layer lot vector [L1, L2, L3, L4] scaled to live account balance
+    following the user's Professional Risk Guide:
+      £50   account -> High: 0.05 | Mid: 0.02 | Low: 0.01 -> [0.01, 0.01, 0.01, 0.02]
+      £100  account -> High: 0.10 | Mid: 0.05 | Low: 0.01 -> [0.02, 0.02, 0.02, 0.04]
+      £200  account -> High: 0.20 | Mid: 0.10 | Low: 0.02 -> [0.04, 0.04, 0.04, 0.08]
+      £500  account -> High: 0.50 | Mid: 0.25 | Low: 0.05 -> [0.10, 0.10, 0.10, 0.20]
+      £1000 account -> High: 1.00 | Mid: 0.50 | Low: 0.10 -> [0.20, 0.20, 0.20, 0.40]
+
+    Splits the target lot total into 4 layers with the canonical 1:1:1:2 ratio:
+      L1 = 20%
+      L2 = 20%
+      L3 = 20%
+      L4 = 40% (Runner)
+    """
+    thresholds = calculate_risk_guide_thresholds(capital)
+    mode = (risk_mode or "high").strip().lower()
+    if mode == "low":
+        target = thresholds["low_risk_lots"]
+    elif mode == "mid":
+        target = thresholds["mid_risk_lots"]
+    else:
+        target = thresholds["high_risk_lots"]
+
+    # When target lot total <= 0.05 (e.g. <= £50 account), return base [0.01, 0.01, 0.01, 0.02]
+    if target <= 0.05 + 1e-9:
+        return [0.01, 0.01, 0.01, 0.02]
+
+    l1 = max(0.01, round(target * 0.20, 2))
+    l2 = max(0.01, round(target * 0.20, 2))
+    l3 = max(0.01, round(target * 0.20, 2))
+    l4 = max(0.01, round(target - (l1 + l2 + l3), 2))
+    return [l1, l2, l3, l4]
+
+
 def _is_legacy_3layer_dict(layers: Any) -> bool:
     """Return True if a layers dict uses TOP/MID/BOTTOM without canonical L1..L4 keys."""
     if not isinstance(layers, dict) or not layers:
@@ -407,6 +444,9 @@ class MT5Executor:
         self._closing_lock = threading.Lock()
         self._closing_tickets: Set[int] = set()
         self._spread_history: Dict[str, Deque[float]] = {}
+        self._daily_loss_baseline_realized: float = 0.0
+        self._daily_drawdown_ref_balance: Optional[float] = None
+        self._daily_drawdown_baseline_date: Optional[str] = None
 
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal."""
@@ -1393,7 +1433,13 @@ class MT5Executor:
         normalized to symbol volume constraints, and fitted within available_lots cap.
         """
         sym_info = self.get_symbol_info(symbol)
-        eff_base = base_lots if base_lots is not None else _cfg("BASE_LAYER_LOTS", BASE_LAYER_LOTS)
+        auto_adj = bool(_cfg("AUTO_ADJUST_LOTS_TO_BALANCE", AUTO_ADJUST_LOTS_TO_BALANCE))
+        if base_lots is None and auto_adj and not (self.dry_run and self._dry_run_capital is None):
+            status = self.get_risk_exposure_status()
+            cap = float(status.get("capital", 0.0))
+            eff_base = compute_dynamic_layer_lots_for_balance(cap)
+        else:
+            eff_base = base_lots if base_lots is not None else _cfg("BASE_LAYER_LOTS", BASE_LAYER_LOTS)
         eff_mult = multiplier if multiplier is not None else _cfg("RISK_LOT_MULTIPLIER", RISK_LOT_MULTIPLIER)
         if (
             isinstance(base_lots, (list, tuple))
@@ -2462,19 +2508,22 @@ class MT5Executor:
     def get_account_financials(self) -> Dict[str, Any]:
         """Retrieve current live balance, credit, equity, and currency from MT5 (thread-safe)."""
         if self.dry_run or not self._connected:
+            bal = float(self._dry_run_capital) if self._dry_run_capital is not None else 11.03
+            cred = 7.03
+            eq = round(bal + cred, 2)
             return {
-                "balance": 11.03,
-                "credit": 7.03,
-                "equity": 18.06,
+                "balance": bal,
+                "credit": cred,
+                "equity": eq,
                 "profit": 0.0,
                 "margin": 0.0,
-                "margin_free": 18.06,
+                "margin_free": eq,
                 "currency": "GBP",
                 "formatted": (
                     "💳 **Account Update:**\n"
-                    "• Balance: `11.03 GBP`\n"
-                    "• Credit: `7.03 GBP`\n"
-                    "• Equity: `18.06 GBP`"
+                    f"• Balance: `{bal:.2f} GBP`\n"
+                    f"• Credit: `{cred:.2f} GBP`\n"
+                    f"• Equity: `{eq:.2f} GBP`"
                 ),
             }
         try:
@@ -2548,6 +2597,23 @@ class MT5Executor:
         except Exception as e:
             logger.warning(f"Could not query active lots: {e}")
             return {"open_lots": 0.0, "pending_lots": 0.0, "total_lots": 0.0}
+
+    def get_open_market_tickets(self) -> List[int]:
+        """Return list of open market position tickets tracked by this bot."""
+        if self.dry_run or not self._connected:
+            return list(self._dry_run_ticket_lots.keys())
+        magic = _cfg("MAGIC_NUMBER", MAGIC_NUMBER)
+        try:
+            with self._mt5_lock:
+                positions = mt5.positions_get() or []
+            return [
+                _int_num(getattr(p, "ticket", 0), 0)
+                for p in positions
+                if _int_num(getattr(p, "magic", 0), 0) == magic and _int_num(getattr(p, "ticket", 0), 0) > 0
+            ]
+        except Exception as e:
+            logger.warning(f"Could not query open positions: {e}")
+            return []
 
     def get_risk_exposure_status(self) -> Dict[str, Any]:
         """
@@ -2874,10 +2940,32 @@ class MT5Executor:
 
         realized_today = round(realized_today, 2)
         floating_pnl = round(floating_pnl, 2)
-        ref_bal = max(0.0, curr_bal, round(curr_bal - min(0.0, realized_today), 2))
+
+        # Rollover check: If date changes, reset baseline to 0.0
+        srv_date = None
+        if not self.dry_run and self._connected:
+            try:
+                offset = self.get_server_time_offset_seconds()
+                srv_now = datetime.fromtimestamp(time.time() + offset, tz=timezone.utc)
+                srv_date = srv_now.strftime("%Y-%m-%d")
+            except Exception:
+                srv_date = None
+        if srv_date and srv_date != getattr(self, "_daily_drawdown_baseline_date", None):
+            self._daily_loss_baseline_realized = 0.0
+            self._daily_drawdown_ref_balance = None
+            self._daily_drawdown_baseline_date = srv_date
+
+        # Active daily realized loss relative to the baseline (updated when previous losses are realized & passed)
+        base_realized = float(getattr(self, "_daily_loss_baseline_realized", 0.0) or 0.0)
+        active_realized_loss = max(0.0, round(-(realized_today - base_realized), 2))
         floating_loss = max(0.0, round(-floating_pnl, 2))
-        realized_loss = max(0.0, round(-realized_today, 2))
-        total_daily_loss = round(realized_loss + floating_loss, 2)
+        total_daily_loss = round(active_realized_loss + floating_loss, 2)
+
+        base_ref = getattr(self, "_daily_drawdown_ref_balance", None)
+        if base_ref is not None and base_ref > 0:
+            ref_bal = round(max(curr_bal, base_ref), 2)
+        else:
+            ref_bal = max(0.0, curr_bal, round(curr_bal + active_realized_loss, 2))
 
         pause_pct = _cfg("DAILY_LOSS_PAUSE_PCT", DAILY_LOSS_PAUSE_PCT)
         cutoff_pct = _cfg("EMERGENCY_CUTOFF_LOSS_PCT", EMERGENCY_CUTOFF_LOSS_PCT)
@@ -2915,6 +3003,39 @@ class MT5Executor:
             "float_force_close_triggered": float_force_close,
             "pause_new_signals": pause_new,
             "emergency_cutoff_triggered": emergency_cutoff,
+        }
+
+    def update_daily_loss_baseline(self, new_ref_balance: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Update the daily loss baseline so that previously realized losses (that have passed)
+        are acknowledged as realized and archived, resetting active drawdown tracking to 0% against
+        the current account balance.
+        """
+        fin = self.get_account_financials()
+        curr_bal = float(fin.get("balance") or (self._dry_run_capital or 0.0))
+        realized_today = float(
+            self.get_realized_today_pnl()
+            if (not self.dry_run and self._connected)
+            else (self._dry_run_daily_realized_pnl or 0.0)
+        )
+
+        self._daily_loss_baseline_realized = round(realized_today, 2)
+        self._daily_drawdown_ref_balance = round(new_ref_balance if new_ref_balance is not None else curr_bal, 2)
+        if not self.dry_run and self._connected:
+            try:
+                offset = self.get_server_time_offset_seconds()
+                srv_now = datetime.fromtimestamp(time.time() + offset, tz=timezone.utc)
+                self._daily_drawdown_baseline_date = srv_now.strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        logger.info(
+            f"[copier.mt5] Daily loss baseline updated: baseline_realized={self._daily_loss_baseline_realized:.2f}, "
+            f"ref_balance={self._daily_drawdown_ref_balance:.2f} {fin.get('currency', 'GBP')}"
+        )
+        return {
+            "baseline_realized": self._daily_loss_baseline_realized,
+            "ref_balance": self._daily_drawdown_ref_balance,
+            "current_balance": curr_bal,
         }
 
     def emergency_cutoff_losing_trades(
