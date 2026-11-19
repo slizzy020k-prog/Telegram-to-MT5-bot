@@ -6845,12 +6845,21 @@ class MT5Executor:
                 and role in ("CORE_RUNNER", "SOLO_RUNNER", "STAGE2_BANKER")
                 and str(lv.get("tp_stage") or "TP1").strip().upper() == "TP1"
             )
+            layer_tp1_leg: Optional[float] = tp1_leg
+            layer_prog_to_tp1: float = prog_to_tp1
+            if raw_tp1 is not None and entry_px > 0.0:
+                layer_tp1_leg = (float(raw_tp1) - entry_px) if is_buy else (entry_px - float(raw_tp1))
+                if layer_tp1_leg > 1e-9:
+                    layer_prog_to_tp1 = ((chart_price - entry_px) / layer_tp1_leg) if is_buy else ((entry_px - chart_price) / layer_tp1_leg)
+                else:
+                    layer_prog_to_tp1 = 0.0
+
             r_res = self.compute_ticket_ratchet_levels(
                 direction=direction,
                 entry_price=entry_px,
                 mfe_exec=new_mfe,
-                tp1_leg=tp1_leg,
-                prog_to_tp1=prog_to_tp1,
+                tp1_leg=layer_tp1_leg,
+                prog_to_tp1=layer_prog_to_tp1,
                 stage=eff_stage,
                 leg_prog=leg_prog,
                 leg_span=leg_span,
@@ -6871,7 +6880,12 @@ class MT5Executor:
 
             if new_tier is not None:
                 lock_roles_now = True
-                sweep_pendings_now = True
+                # Only sweep unfilled deep zone limits when price is above L1 entry (in profit on L1) or MFE >= $5.00
+                if (
+                    new_mfe + 1e-9 >= float(_cfg("RATCHET_TIER2_MFE_DOLLARS", RATCHET_TIER2_MFE_DOLLARS))
+                    or (sig_entry is not None and ((chart_price >= sig_entry) if is_buy else (chart_price <= sig_entry)))
+                ):
+                    sweep_pendings_now = True
                 lv["ratchet_tier"] = new_tier
                 if r_res.get("arm_bank_harvest") and not lv.get("bank_harvest_armed"):
                     lv["bank_harvest_armed"] = True

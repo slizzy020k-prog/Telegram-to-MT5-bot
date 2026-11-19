@@ -452,3 +452,60 @@ async def test_fix_d_limit_entry_front_run_offset_050_msg_13191(tmp_path, monkey
         assert s_single is not None
         assert s_single["layers"]["L1"]["target_price"] == pytest.approx(3705.50)
 
+
+@pytest.mark.asyncio
+async def test_fix_e_deep_layer_uses_own_tp1_leg_and_preserves_l3_l4_pendings_msg_13199(tmp_path):
+    """
+    Reproduce Msg 13199 ('BUY LIMIT 3700-3690 SL 3675 TP 3703 TP 3710 ...'):
+    - L1 filled at 3700.50, L2 filled at 3697.17, L3 (3693.83) and L4 (3690.50) pending.
+    - When price bounces from 3697.17 to 3699.82:
+      * L1 is still underwater (-$0.68/oz, below 3700.50).
+      * L2 has MFE = +$2.65/oz, which is only 45.5% of L2's own $5.83 leg to TP1 (3703.0 - 3697.17),
+        and L2's own tp1_leg ($5.83) is > $3.50 (RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS).
+      * Therefore, L2 MUST NOT trigger TIER_0T (which only applies when a layer's OWN tp1_leg <= $3.50),
+        L2's SL must stay at 3675.0 (not choked at 3697.67), and L3/L4 pending limits MUST NOT be cancelled!
+    """
+    ex = _setup_test_env(tmp_path, "fix_e_13199")
+    main.state_mgr.create_signal(
+        message_id=13199,
+        chat_id=-1003712081715,
+        symbol="XAUUSD.s",
+        direction="BUY",
+        sl=3675.0,
+        layers={
+            "L1": {"lot": 0.01, "target_price": 3700.50, "entry_price": 3700.50, "tp": 3702.5, "tp_stage": "TP1", "ticket": 154321761, "order_type": "LIMIT", "status": "FILLED"},
+            "L2": {"lot": 0.01, "target_price": 3697.17, "entry_price": 3697.17, "tp": 3702.5, "tp_stage": "TP1", "ticket": 154321762, "order_type": "LIMIT", "status": "FILLED"},
+            "L3": {"lot": 0.01, "target_price": 3693.83, "tp": 3702.5, "tp_stage": "TP1", "ticket": 154321763, "order_type": "LIMIT", "status": "PENDING"},
+            "L4": {"lot": 0.02, "target_price": 3690.50, "tp": 3702.5, "tp_stage": "TP1", "ticket": 154321764, "order_type": "LIMIT", "status": "PENDING"},
+        },
+        market_tickets=[154321761, 154321762],
+        pending_tickets=[154321763, 154321764],
+        all_placed_tickets=[154321761, 154321762, 154321763, 154321764],
+        raw_tp1=3703.0,
+        raw_tp2=3710.0,
+        raw_tp3=3713.0,
+        tp_levels={"TP1": 3703.0, "TP2": 3710.0, "TP3": 3713.0},
+        final_tp=3702.5,
+        recorded_entry_price=3700.50,
+        initial_price=3700.50,
+        status="ACTIVE",
+    )
+    for t_id, lot in ((154321761, 0.01), (154321762, 0.01)):
+        ex._dry_run_ticket_lots[t_id] = lot
+    for t_id, lot in ((154321763, 0.01), (154321764, 0.02)):
+        ex._dry_run_pending_ticket_lots[t_id] = lot
+
+    with patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
+        # Bounce to bid=3699.82, ask=3700.14 (L2 MFE = +$2.65/oz, still below L1=3700.50)
+        with patch.object(ex, "get_tick", return_value=SimpleNamespace(bid=3699.82, ask=3700.14, time=1700000500)):
+            await main._process_pre_tp1_or_backstop_tick(13199, main.state_mgr.get_signal(13199, chat_id=-1003712081715))
+
+        s_after = main.state_mgr.get_signal(13199, chat_id=-1003712081715)
+        assert s_after["layers"]["L2"].get("ratchet_tier") is None
+        assert s_after["layers"]["L2"]["status"] == "FILLED"
+        # L3 and L4 pending limits MUST still be alive!
+        assert s_after["pending_tickets"] == [154321763, 154321764]
+        assert s_after["layers"]["L3"]["status"] == "PENDING"
+        assert s_after["layers"]["L4"]["status"] == "PENDING"
+
+

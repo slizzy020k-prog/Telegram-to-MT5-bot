@@ -3484,14 +3484,21 @@ async def _reconcile_live_mt5_signals(
 
             had_fills = bool(new_mk_tickets or broker_closed or accounted_set or _has_executed_exposure(sig))
             ratchet_locked = bool(
-                sig.get("roles_locked")
-                or any(isinstance(ld, dict) and ld.get("ratchet_tier") for ld in layers.values())
+                any(
+                    isinstance(ld, dict)
+                    and str(ld.get("status") or "").strip().upper() in ("OPEN", "FILLED", "RUNNER")
+                    and (
+                        str(ld.get("ratchet_tier") or "").strip().upper() in ("TIER_2", "TIER_3", "TIER_4", "TIER_5", "STAGE4_SQUEEZE", "BANK_HARVEST")
+                        or float(ld.get("mfe_dollars") or 0.0) >= 3.50
+                    )
+                    for ld in layers.values()
+                )
             )
             tp1_sweep = bool(sig.get("tp1_reached") and CANCEL_PENDING_ON_TP1)
-            s0_sweep_pending = bool(sig.get("stage0_profit_lock_active") and _is_cancel_pending_on_stage0_lock_exit())
+            s0_sweep_pending = bool(sig.get("stage0_profit_lock_active") and not new_mk_tickets and _is_cancel_pending_on_stage0_lock_exit())
             be_sweep = bool(sig.get("be_armed") and bool(_main_cfg("CANCEL_PENDING_ON_BE", CANCEL_PENDING_ON_BE)) and had_fills)
             profit_lock_sweep = bool(
-                (ratchet_locked or sig.get("stage0_profit_lock_active"))
+                ratchet_locked
                 and bool(_main_cfg("CANCEL_PENDING_ON_PROFIT_LOCK", CANCEL_PENDING_ON_PROFIT_LOCK))
                 and had_fills
             )
