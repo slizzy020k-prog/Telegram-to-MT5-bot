@@ -242,6 +242,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "ENFORCE_HIGH_RISK_LOT_CAP",
         "DAILY_LOSS_PAUSE_PCT",
         "EMERGENCY_CUTOFF_LOSS_PCT",
+        "FLOAT_LOSS_FORCE_CLOSE_PCT",
         "DEFAULT_SYMBOL",
         "DAILY_PNL_CACHE_TTL_SECONDS",
         "PROFIT_RATCHET_ENABLED",
@@ -3919,7 +3920,10 @@ class MT5Executor:
         """
         Check which Risk Guide thresholds (Low Risk, Mid Risk, High Risk Cap) were crossed
         as total exposure increased from prev_lots to new_lots.
+        Returns no alerts when ENFORCE_HIGH_RISK_LOT_CAP is disabled (unlimited mode).
         """
+        if not _cfg("ENFORCE_HIGH_RISK_LOT_CAP", ENFORCE_HIGH_RISK_LOT_CAP):
+            return []
         status = self.get_risk_exposure_status()
         low_l = status["low_risk_lots"]
         mid_l = status["mid_risk_lots"]
@@ -4191,25 +4195,37 @@ class MT5Executor:
         else:
             ref_bal = max(0.0, curr_bal, round(curr_bal + active_realized_loss, 2))
 
-        pause_pct = _cfg("DAILY_LOSS_PAUSE_PCT", DAILY_LOSS_PAUSE_PCT)
-        cutoff_pct = _cfg("EMERGENCY_CUTOFF_LOSS_PCT", EMERGENCY_CUTOFF_LOSS_PCT)
-        pause_limit = round(ref_bal * (pause_pct / 100.0), 2)
-        cutoff_limit_ref = round(ref_bal * (cutoff_pct / 100.0), 2)
-        cutoff_limit_curr = round(max(0.0, curr_bal) * (cutoff_pct / 100.0), 2)
+        pause_pct = float(_cfg("DAILY_LOSS_PAUSE_PCT", DAILY_LOSS_PAUSE_PCT) or 0.0)
+        cutoff_pct = float(_cfg("EMERGENCY_CUTOFF_LOSS_PCT", EMERGENCY_CUTOFF_LOSS_PCT) or 0.0)
+        float_cap_pct = float(_cfg("FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT) or 0.0)
+
+        pause_limit = round(ref_bal * (pause_pct / 100.0), 2) if pause_pct > 0.0 else 0.0
+        cutoff_limit_ref = round(ref_bal * (cutoff_pct / 100.0), 2) if cutoff_pct > 0.0 else 0.0
+        cutoff_limit_curr = round(max(0.0, curr_bal) * (cutoff_pct / 100.0), 2) if cutoff_pct > 0.0 else 0.0
+        float_cap_limit = round(max(0.0, curr_bal) * (float_cap_pct / 100.0), 2) if float_cap_pct > 0.0 else 0.0
 
         loss_pct = round((total_daily_loss / ref_bal) * 100.0, 1) if ref_bal > 0 else 0.0
         floating_loss_pct = round((floating_loss / curr_bal) * 100.0, 1) if curr_bal > 0 else 0.0
 
-        pause_new = bool(ref_bal > 0 and total_daily_loss >= pause_limit - 1e-9)
-        emergency_cutoff = bool(
-            (ref_bal > 0 and total_daily_loss >= cutoff_limit_ref - 1e-9)
-            or (curr_bal > 0 and floating_loss >= cutoff_limit_curr - 1e-9)
+        pause_new = bool(
+            pause_pct > 0.0
+            and ref_bal > 0
+            and pause_limit > 0.0
+            and total_daily_loss >= pause_limit - 1e-9
         )
-
-        # Hard floating-loss cap: force-close ALL open trades when floating-only loss breaches this %.
-        float_cap_pct = _cfg("FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT)
-        float_cap_limit = round(max(0.0, curr_bal) * (float_cap_pct / 100.0), 2)
-        float_force_close = bool(curr_bal > 0 and float_cap_limit > 0 and floating_loss >= float_cap_limit - 1e-9)
+        emergency_cutoff = bool(
+            cutoff_pct > 0.0
+            and (
+                (ref_bal > 0 and cutoff_limit_ref > 0.0 and total_daily_loss >= cutoff_limit_ref - 1e-9)
+                or (curr_bal > 0 and cutoff_limit_curr > 0.0 and floating_loss >= cutoff_limit_curr - 1e-9)
+            )
+        )
+        float_force_close = bool(
+            float_cap_pct > 0.0
+            and curr_bal > 0
+            and float_cap_limit > 0.0
+            and floating_loss >= float_cap_limit - 1e-9
+        )
 
         return {
             "currency": curr,
@@ -4220,6 +4236,8 @@ class MT5Executor:
             "floating_loss": floating_loss,
             "total_daily_loss": total_daily_loss,
             "loss_pct": max(loss_pct, floating_loss_pct),
+            "pause_pct": pause_pct,
+            "cutoff_pct": cutoff_pct,
             "pause_limit_amount": pause_limit,
             "emergency_cutoff_amount": min(cutoff_limit_ref, cutoff_limit_curr) if cutoff_limit_curr > 0 else cutoff_limit_ref,
             "float_cap_pct": float_cap_pct,

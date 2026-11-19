@@ -97,7 +97,7 @@ def _setup_test_env(tmp_path, tag: str) -> MT5Executor:
 
 
 @pytest.mark.asyncio
-async def test_fix_a_daily_loss_unpause_with_unfilled_pending_limits_13187(tmp_path):
+async def test_fix_a_daily_loss_unpause_with_unfilled_pending_limits_13187(tmp_path, monkeypatch):
     """
     Reproduce live state after Msg 9953 SL (-28.98 GBP / 51.8% from 55.91 -> 26.93 GBP):
     - 0 open market positions on MT5
@@ -105,6 +105,8 @@ async def test_fix_a_daily_loss_unpause_with_unfilled_pending_limits_13187(tmp_p
     - Verify check_and_enforce_daily_drawdown() & handle_new_message automatically reset
       daily_start_balance to 26.93 GBP, unpause new signals, and keep all 4 pending orders of 13187 intact!
     """
+    monkeypatch.setattr(config, "DAILY_LOSS_PAUSE_PCT", 50.0)
+    monkeypatch.setattr(config, "EMERGENCY_CUTOFF_LOSS_PCT", 90.0)
     ex = _setup_test_env(tmp_path, "fix_a_13187")
     today_str = ex.get_server_date_str()
 

@@ -152,6 +152,7 @@ async def test_v351_signal_13164_reproducer_pending_limits_allowed(tmp_path, mon
 
 def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
     """At 0.05/0.05 active open lots on £50, pending limits/stops succeed while market & stops-fallback block."""
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 50.0
@@ -232,8 +233,9 @@ def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
     assert not any(r.get("action") == deal_action for r in sent_requests)
 
 
-def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap():
+def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch):
     """Mixed zones skip/cap only the layers crossing at market and preserve full lots on pending layers."""
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     # 1. Full cap (0.05/0.05 on £50): L1=3895 crosses market (ask=3895.00) -> skipped; L2..L4 limits kept
     ex = MT5Executor(dry_run=True)
     ex.connect()
@@ -279,7 +281,6 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap():
     assert ex2.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.03, "total_lots": 0.08}
 
     # 3. Single-price: below-market LIMIT succeeds at 0.05/0.05; at-market AUTO blocked
-    import config
     orig_cons = getattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
     config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
     ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
@@ -302,6 +303,7 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap():
 @pytest.mark.asyncio
 async def test_v351_active_market_cap_end_to_end_50_and_80(tmp_path, monkeypatch):
     """End-to-end handle_new_message enforces 0.05 (£50) & 0.08 (£80) on active buys/sells while allowing pending zones."""
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)
     monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(main, "CHANNEL_IDS", [-1001234567890])
@@ -364,6 +366,7 @@ async def test_v351_active_market_cap_end_to_end_50_and_80(tmp_path, monkeypatch
 
 def test_v351_live_mode_positions_get_and_orders_get_separation(monkeypatch):
     """Live MT5 positions_get vs orders_get: ignores unrelated magic and counts only active positions toward cap."""
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     tick_ref = {"tick": _make_tick(3739.78, 3740.30)}
     magic = config.MAGIC_NUMBER
     account = _make_account_info(balance=57.73, currency="GBP")

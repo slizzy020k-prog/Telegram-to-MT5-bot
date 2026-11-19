@@ -323,20 +323,22 @@ FALLBACK_SL_PIPS: float = _env_float("FALLBACK_SL_PIPS", 150.0, min_val=1.0, max
 MAX_SL_PIPS: float = _env_float("MAX_SL_PIPS", 350.0, min_val=10.0, max_val=5000.0, positive_only=True)
 FALLBACK_TP1_PIPS: float = _env_float("FALLBACK_TP1_PIPS", 50.0, min_val=1.0, max_val=2000.0, positive_only=True)
 UNPRICED_TP_GRACE_SECONDS: float = _env_float("UNPRICED_TP_GRACE_SECONDS", 45.0, min_val=0.0, max_val=600.0)
-ENFORCE_HIGH_RISK_LOT_CAP: bool = _env_bool("ENFORCE_HIGH_RISK_LOT_CAP", True)
+# Risk & Loss Caps — disabled (unlimited) by default; toggle live via Saved Messages
+# (/lotcap, /losslimit, /floatcap, dailyloss).
+ENFORCE_HIGH_RISK_LOT_CAP: bool = _env_bool("ENFORCE_HIGH_RISK_LOT_CAP", False)
 # Automatically adjust layer lots & max risk cap based on live balance following the Risk Guide:
 # £50 -> 0.05 max | £100 -> 0.10 max | £200 -> 0.20 max | £500 -> 0.50 max | £1000 -> 1.00 max
 AUTO_ADJUST_LOTS_TO_BALANCE: bool = _env_bool("AUTO_ADJUST_LOTS_TO_BALANCE", False)
-DAILY_LOSS_PAUSE_PCT: float = _env_float("DAILY_LOSS_PAUSE_PCT", 50.0, min_val=1.0, max_val=100.0, positive_only=True)
+DAILY_LOSS_PAUSE_PCT: float = _env_float(
+    "DAILY_LOSS_PAUSE_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False
+)
 EMERGENCY_CUTOFF_LOSS_PCT: float = _env_float(
-    "EMERGENCY_CUTOFF_LOSS_PCT", 90.0, min_val=1.0, max_val=100.0, positive_only=True
+    "EMERGENCY_CUTOFF_LOSS_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False
 )
 DAILY_LOSS_CLOSE_OPEN_TRADES: bool = _env_bool("DAILY_LOSS_CLOSE_OPEN_TRADES", False)
-# Hard floating-loss cap: force-close ALL open positions the moment floating-only loss hits this % of balance.
-# This fires BEFORE the 90% emergency cutoff to stop broker margin stop-outs.
-# Default 60.0% — change live with /floatcap <pct> in Saved Messages.
+# Optional floating-loss hard cap: 0.0 = disabled (unlimited). Enable live with /floatcap <1-100>.
 FLOAT_LOSS_FORCE_CLOSE_PCT: float = _env_float(
-    "FLOAT_LOSS_FORCE_CLOSE_PCT", 60.0, min_val=1.0, max_val=100.0, positive_only=True
+    "FLOAT_LOSS_FORCE_CLOSE_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False
 )
 
 # Delayed Market Entry, Price Guard & Reconnect Catch-Up

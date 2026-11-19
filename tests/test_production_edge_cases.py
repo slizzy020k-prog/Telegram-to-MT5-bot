@@ -525,6 +525,8 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
     assert calculate_risk_guide_thresholds(120) == {"capital": 120.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.06, "high_risk_lots": 0.12}
 
     # 2. Enforce High Risk Lot Cap for active open buys/sells on a £50 account (High Risk = 0.05 lots)
+    import config
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)
     monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state.json"))
@@ -629,13 +631,17 @@ async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_two_stage_daily_loss_50pct_hold_and_90pct_emergency_cutoff(tmp_path):
+async def test_two_stage_daily_loss_50pct_hold_and_90pct_emergency_cutoff(tmp_path, monkeypatch):
     """
     Verify two-stage daily loss guard:
     - At 50% loss (£60 on £120): holds existing open trades to natural SL/TP, blocks new signals.
     - At 90% loss (£108 on £120): urgency cut-off immediately closes losing positions & cancels limits.
     """
+    import config
     from tests.test_copier_scenarios import MockTelethonEvent
+
+    monkeypatch.setattr(config, "DAILY_LOSS_PAUSE_PCT", 50.0)
+    monkeypatch.setattr(config, "EMERGENCY_CUTOFF_LOSS_PCT", 90.0)
 
     main.state_mgr = StateManager(tmp_path / "drawdown_state.json")
     main.executor = MT5Executor(dry_run=True)

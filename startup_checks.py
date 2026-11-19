@@ -470,15 +470,20 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"FALLBACK_SL_PIPS ({fallback_sl}) cannot exceed MAX_SL_PIPS ({max_sl})."
         )
 
-    pause_pct = getattr(cfg, "DAILY_LOSS_PAUSE_PCT", 50.0)
-    cutoff_pct = getattr(cfg, "EMERGENCY_CUTOFF_LOSS_PCT", 90.0)
-    if not (_is_finite_number(pause_pct) and 0 < float(pause_pct) <= 100):
-        errors.append(f"DAILY_LOSS_PAUSE_PCT must be in (0, 100], got {pause_pct!r}.")
-    if not (_is_finite_number(cutoff_pct) and 0 < float(cutoff_pct) <= 100):
-        errors.append(f"EMERGENCY_CUTOFF_LOSS_PCT must be in (0, 100], got {cutoff_pct!r}.")
+    pause_pct = getattr(cfg, "DAILY_LOSS_PAUSE_PCT", 0.0)
+    cutoff_pct = getattr(cfg, "EMERGENCY_CUTOFF_LOSS_PCT", 0.0)
+    float_cap_pct = getattr(cfg, "FLOAT_LOSS_FORCE_CLOSE_PCT", 0.0)
+    if not (_is_finite_number(pause_pct) and 0 <= float(pause_pct) <= 100):
+        errors.append(f"DAILY_LOSS_PAUSE_PCT must be in [0, 100], got {pause_pct!r}.")
+    if not (_is_finite_number(cutoff_pct) and 0 <= float(cutoff_pct) <= 100):
+        errors.append(f"EMERGENCY_CUTOFF_LOSS_PCT must be in [0, 100], got {cutoff_pct!r}.")
+    if not (_is_finite_number(float_cap_pct) and 0 <= float(float_cap_pct) <= 100):
+        errors.append(f"FLOAT_LOSS_FORCE_CLOSE_PCT must be in [0, 100], got {float_cap_pct!r}.")
     if (
         _is_finite_number(pause_pct)
         and _is_finite_number(cutoff_pct)
+        and float(pause_pct) > 0
+        and float(cutoff_pct) > 0
         and float(pause_pct) >= float(cutoff_pct)
     ):
         errors.append(

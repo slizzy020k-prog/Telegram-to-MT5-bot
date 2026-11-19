@@ -130,7 +130,8 @@ def test_normalize_lot_to_symbol_and_scale_layer_lots():
     assert scale_layer_lots([0.01, -1.0, 0.01, 0.02], -5.0, sym_std) == [0.01, 0.01, 0.01, 0.02]
 
 
-def test_allocate_4layer_lots_atomic_budget_cap():
+def test_allocate_4layer_lots_atomic_budget_cap(monkeypatch):
+    monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 

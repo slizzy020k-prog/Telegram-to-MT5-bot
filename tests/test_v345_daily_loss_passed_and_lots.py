@@ -102,6 +102,8 @@ async def test_daily_loss_realized_and_passed_unpauses(tmp_path, monkeypatch):
     - Because the loss has passed and all positions are closed, the bot updates
       the baseline, unpauses 50% drawdown, and check_preflight allows new trades.
     """
+    monkeypatch.setattr(config, "DAILY_LOSS_PAUSE_PCT", 50.0)
+    monkeypatch.setattr(config, "EMERGENCY_CUTOFF_LOSS_PCT", 90.0)
     main.state_mgr = StateManager(tmp_path / "dd_passed_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "dd_passed_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)

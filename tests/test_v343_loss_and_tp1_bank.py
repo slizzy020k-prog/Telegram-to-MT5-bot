@@ -250,6 +250,8 @@ async def test_50pct_loss_pause_closes_losing_trades_when_enabled(tmp_path, monk
     Verify capital preservation on 50% daily loss pause when DAILY_LOSS_CLOSE_OPEN_TRADES=True:
     Losing trades are cut immediately at 50% loss, preventing margin stop-out liquidation.
     """
+    monkeypatch.setattr(config, "DAILY_LOSS_PAUSE_PCT", 50.0)
+    monkeypatch.setattr(config, "EMERGENCY_CUTOFF_LOSS_PCT", 90.0)
     monkeypatch.setattr(config, "DAILY_LOSS_CLOSE_OPEN_TRADES", True)
     main.state_mgr = StateManager(tmp_path / "dd_50_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "dd_50_ledger.jsonl")

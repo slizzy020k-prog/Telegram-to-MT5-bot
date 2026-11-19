@@ -139,6 +139,13 @@ from startup_checks import (
     release_single_instance_lock,
     validate_environment,
 )
+from risk_controls import (
+    apply_float_cap_command,
+    apply_loss_limit_command,
+    apply_lot_cap_command,
+    format_limits_status_lines,
+    read_risk_limits,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +283,9 @@ _mt5_last_ping_ms: Optional[float] = None
 _runner_save_throttle_ts: Dict[str, float] = {}
 
 # Last printed terminal financial/risk snapshot to avoid spamming identical lines
-_last_terminal_snapshot: Optional[Tuple[float, float, float]] = None
+_last_terminal_snapshot: Optional[Tuple[Any, ...]] = None
 
-# Tracks date string (YYYY-MM-DD) when 50% daily loss pause alert was last sent
+# Tracks date string (YYYY-MM-DD) when daily loss pause alert was last sent
 _daily_50pct_alert_date: Optional[str] = None
 
 # Tracks date string when the floating-loss force-close alert was last sent (avoid repeat messages)
@@ -1341,7 +1348,7 @@ def get_daily_loss_progress() -> Dict[str, Any]:
     """
     Daily Loss Limit progress based ONLY on REALIZED (closed) P&L for the broker trading day:
     trades that hit Stop Loss / were closed in a loss and left a negative number on the account.
-    Open floating trades are deliberately ignored (the 50%/90% drawdown guard covers those).
+    Open floating trades are deliberately ignored (covered by optional /losslimit & /floatcap when enabled).
     """
     cfg = state_mgr.get_daily_loss_config()
     today_str = _trading_day_str()
@@ -1512,19 +1519,40 @@ async def check_and_enforce_daily_loss_limit(exit_on_trigger: bool = True) -> st
     return "DAILY_LOSS_REACHED"
 
 
+def _fmt_pct(pct: float) -> str:
+    """Format a percentage cleanly (e.g. 50.0 -> '50', 45.5 -> '45.5')."""
+    val = float(pct)
+    return str(int(val)) if val.is_integer() else f"{val:.1f}"
+
+
 async def check_and_enforce_daily_drawdown() -> str:
     """
-    Two-Stage Daily Loss & Account Drawdown Protection:
-    - Stage 2 (90% of balance): Urgency cut-off immediately closes all losing open positions & cancels limits.
-    - Stage 1 (50% of balance): Pauses NEW signals, while holding existing open trades naturally to SL/TP.
-    Returns "EMERGENCY_CUTOFF", "PAUSED_50PCT", or "OK".
+    Daily Loss & Account Drawdown Protection (all percentage caps OFF / unlimited by default;
+    manually configurable at runtime via Saved Messages `/losslimit` and `/floatcap`):
+    - Stage 2 (`EMERGENCY_CUTOFF_LOSS_PCT`, when > 0): Urgency cut-off closes losing open positions & cancels limits.
+    - Stage 1b (`FLOAT_LOSS_FORCE_CLOSE_PCT`, when > 0): Floating-loss force-close cap closes open positions & cancels limits.
+    - Stage 1 (`DAILY_LOSS_PAUSE_PCT`, when > 0): Pauses NEW signals, while holding existing open trades naturally to SL/TP.
+    Returns "EMERGENCY_CUTOFF", "FLOAT_FORCE_CLOSE", "PAUSED_50PCT", or "OK".
     """
-    global _daily_50pct_alert_date
+    global _daily_50pct_alert_date, _daily_float_cap_alert_date
     dd = await _mt5_call(executor.get_daily_drawdown_status)
     curr = dd.get("currency", "GBP")
     today_str = await _trading_day_str_async()
 
-    if dd.get("emergency_cutoff_triggered"):
+    _cfg_mod = sys.modules.get("config") or config
+    live_pause_pct = float(getattr(_cfg_mod, "DAILY_LOSS_PAUSE_PCT", DAILY_LOSS_PAUSE_PCT) or 0.0)
+    live_cutoff_pct = float(getattr(_cfg_mod, "EMERGENCY_CUTOFF_LOSS_PCT", EMERGENCY_CUTOFF_LOSS_PCT) or 0.0)
+    live_float_cap_pct = float(getattr(_cfg_mod, "FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT) or 0.0)
+
+    eff_pause_pct = float(dd["pause_pct"]) if dd.get("pause_pct") is not None else live_pause_pct
+    eff_cutoff_pct = float(dd["cutoff_pct"]) if dd.get("cutoff_pct") is not None else live_cutoff_pct
+    eff_float_cap_pct = float(dd["float_cap_pct"]) if dd.get("float_cap_pct") is not None else live_float_cap_pct
+
+    if eff_pause_pct <= 0.0 and eff_cutoff_pct <= 0.0 and eff_float_cap_pct <= 0.0:
+        return "OK"
+
+    if dd.get("emergency_cutoff_triggered") and eff_cutoff_pct > 0.0:
+        cutoff_lbl = _fmt_pct(eff_cutoff_pct)
         active_sigs = state_mgr.get_active_signals()
         all_mk: List[int] = []
         all_pd: List[int] = []
@@ -1592,17 +1620,17 @@ async def check_and_enforce_daily_drawdown() -> str:
                 )
                 if new_status == "CLOSED":
                     await _record_signal_to_ledger(
-                        mid, s, exit_reason=f"{int(EMERGENCY_CUTOFF_LOSS_PCT)}% Emergency Cutoff", currency=curr
+                        mid, s, exit_reason=f"{cutoff_lbl}% Emergency Cutoff", currency=curr
                     )
 
         if closed_tkts or cancelled_ords or active_sigs:
             fin = await _mt5_call(executor.get_account_financials)
             logger.error(
-                f"🚨 90% EMERGENCY CUT-OFF TRIGGERED! Drawdown=-{dd['total_daily_loss']:.2f} {curr} "
+                f"🚨 {cutoff_lbl}% EMERGENCY CUT-OFF TRIGGERED! Drawdown=-{dd['total_daily_loss']:.2f} {curr} "
                 f"({dd['loss_pct']:.1f}%). Closed={closed_tkts}, Cancelled={cancelled_ords}"
             )
             await notify_saved_messages(
-                f"🚨 **{int(EMERGENCY_CUTOFF_LOSS_PCT)}% EMERGENCY DRAWDOWN CUT-OFF TRIGGERED!**\n"
+                f"🚨 **{cutoff_lbl}% EMERGENCY DRAWDOWN CUT-OFF TRIGGERED!**\n"
                 f"• Loss Risked: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
                 f"• Closed Losing Positions: `{closed_tkts}`\n"
                 f"• Cancelled Pending Limits: `{cancelled_ords}`\n"
@@ -1612,11 +1640,9 @@ async def check_and_enforce_daily_drawdown() -> str:
         return "EMERGENCY_CUTOFF"
 
     # ── STAGE 1b: Hard Floating-Loss Force-Close Cap ──────────────────────────────
-    # Fires when floating-only loss breaches FLOAT_LOSS_FORCE_CLOSE_PCT (default 60%) of balance.
-    # This is a harder, faster protection than the 90% emergency cutoff — it closes EVERYTHING
-    # immediately when open trades alone are drowning the account, before broker margin stop-out hits.
-    global _daily_float_cap_alert_date
-    if dd.get("float_force_close_triggered"):
+    # Fires when FLOAT_LOSS_FORCE_CLOSE_PCT > 0 and floating-only loss breaches that cap.
+    if dd.get("float_force_close_triggered") and eff_float_cap_pct > 0.0:
+        float_lbl = _fmt_pct(eff_float_cap_pct)
         active_sigs_fc = state_mgr.get_active_signals()
         all_mk_fc: List[int] = []
         all_pd_fc: List[int] = []
@@ -1683,33 +1709,33 @@ async def check_and_enforce_daily_drawdown() -> str:
                     chat_id=s_chat,
                 )
                 if new_status == "CLOSED":
-                    float_cap_pct_val = dd.get("float_cap_pct", FLOAT_LOSS_FORCE_CLOSE_PCT)
                     await _record_signal_to_ledger(
-                        mid, s, exit_reason=f"{int(float_cap_pct_val)}% Float-Loss Force-Close", currency=curr
+                        mid, s, exit_reason=f"{float_lbl}% Float-Loss Force-Close", currency=curr
                     )
 
         if closed_fc_tkts or cancelled_fc_ords or active_sigs_fc:
             fin = await _mt5_call(executor.get_account_financials)
-            float_cap_pct_val = dd.get("float_cap_pct", FLOAT_LOSS_FORCE_CLOSE_PCT)
             float_cap_lim = dd.get("float_cap_limit", 0.0)
             logger.error(
-                f"🔴 {int(float_cap_pct_val)}% FLOAT-LOSS FORCE-CLOSE! Floating loss=-{dd['floating_loss']:.2f} {curr} "
+                f"🔴 {float_lbl}% FLOAT-LOSS FORCE-CLOSE! Floating loss=-{dd['floating_loss']:.2f} {curr} "
                 f"(cap=-{float_cap_lim:.2f} {curr}). Closed={closed_fc_tkts}, Cancelled={cancelled_fc_ords}"
             )
             if _daily_float_cap_alert_date != today_str:
                 _daily_float_cap_alert_date = today_str
                 await notify_saved_messages(
-                    f"🔴 **{int(float_cap_pct_val)}% FLOATING LOSS CAP — ALL TRADES FORCE-CLOSED!**\n"
-                    f"• Floating Loss: `-{dd['floating_loss']:.2f} {curr}` breached the `{int(float_cap_pct_val)}%` hard cap (`-{float_cap_lim:.2f} {curr}`).\n"
+                    f"🔴 **{float_lbl}% FLOATING LOSS CAP — ALL TRADES FORCE-CLOSED!**\n"
+                    f"• Floating Loss: `-{dd['floating_loss']:.2f} {curr}` breached the `{float_lbl}%` hard cap (`-{float_cap_lim:.2f} {curr}`).\n"
                     f"• Closed Positions: `{closed_fc_tkts}`\n"
                     f"• Cancelled Pending Limits: `{cancelled_fc_ords}`\n"
                     f"• 🛡️ All open trades force-closed to prevent broker margin stop-out.\n"
-                    f"• 💡 Change this cap anytime: `/floatcap <pct>` (e.g. `/floatcap 50` for 50%).\n\n"
+                    f"• 💡 Change this cap anytime: `/floatcap <pct>` (e.g. `/floatcap 50`) or disable with `/floatcap off`.\n\n"
                     f"{fin['formatted']}"
                 )
         return "FLOAT_FORCE_CLOSE"
 
-    if dd.get("pause_new_signals"):
+    if dd.get("pause_new_signals") and eff_pause_pct > 0.0:
+        pause_lbl = _fmt_pct(eff_pause_pct)
+        cutoff_lbl = _fmt_pct(eff_cutoff_pct)
         active_sigs = state_mgr.get_active_signals()
         open_mkt = await _mt5_call(executor.get_open_market_tickets)
         has_open_mkt = bool(open_mkt) or any(
@@ -1724,7 +1750,6 @@ async def check_and_enforce_daily_drawdown() -> str:
             logger.info("Previous daily loss has passed (0 open trades). Baseline updated to current balance — ready to action new trades.")
             return "OK"
 
-        _cfg_mod = sys.modules.get("config")
         close_trades_on_pause = bool(getattr(_cfg_mod, "DAILY_LOSS_CLOSE_OPEN_TRADES", DAILY_LOSS_CLOSE_OPEN_TRADES))
         closed_50_mk: List[int] = []
         cancelled_50_pd: List[int] = []
@@ -1790,7 +1815,7 @@ async def check_and_enforce_daily_drawdown() -> str:
                     )
                     if new_status == "CLOSED":
                         await _record_signal_to_ledger(
-                            mid, s, exit_reason=f"{int(DAILY_LOSS_PAUSE_PCT)}% Drawdown Guard", currency=curr
+                            mid, s, exit_reason=f"{pause_lbl}% Drawdown Guard", currency=curr
                         )
 
             rem_active = state_mgr.get_active_signals()
@@ -1798,23 +1823,23 @@ async def check_and_enforce_daily_drawdown() -> str:
             if not has_rem_open_mkt:
                 if closed_50_mk or cancelled_50_pd:
                     logger.warning(
-                        f"🛑 50% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
+                        f"🛑 {pause_lbl}% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
                         f"Losing trades closed={closed_50_mk}, pending orders cancelled={cancelled_50_pd}; baseline reset."
                     )
                     await notify_saved_messages(
-                        f"🛑 **{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Threshold Reached — Losing Trades Cut**\n"
+                        f"🛑 **{pause_lbl}% Daily Loss Threshold Reached — Losing Trades Cut**\n"
                         f"• Current Daily/Floating Loss: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
                         f"• 🛡️ **Capital Preservation Active:** Closed `{len(closed_50_mk)}` losing position(s) ({closed_50_mk}) and cancelled `{len(cancelled_50_pd)}` pending order(s) to protect your balance!"
                     )
                 await _mt5_call(executor.update_daily_loss_baseline)
                 _daily_50pct_alert_date = None
-                logger.info("All losing trades closed on 50% pause. Daily loss baseline updated to remaining balance — ready for new trades.")
+                logger.info(f"All losing trades closed on {pause_lbl}% pause. Daily loss baseline updated to remaining balance — ready for new trades.")
                 return "PAUSED_50PCT" if (closed_50_mk or cancelled_50_pd) else "OK"
 
         if _daily_50pct_alert_date != today_str:
             _daily_50pct_alert_date = today_str
             logger.warning(
-                f"🛑 50% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
+                f"🛑 {pause_lbl}% Daily Loss Limit Reached (-{dd['total_daily_loss']:.2f} {curr} / {dd['loss_pct']:.1f}%). "
                 f"Losing trades closed={closed_50_mk}, pending orders cancelled={cancelled_50_pd}; new signals paused."
             )
             note_str = (
@@ -1822,19 +1847,24 @@ async def check_and_enforce_daily_drawdown() -> str:
                 if (closed_50_mk or cancelled_50_pd)
                 else f"• 🛡️ **Existing Trades Held:** Currently open positions are **NOT** closed — waiting naturally for their SL or TP.\n"
             )
+            cutoff_note = (
+                f"• 🚨 **{cutoff_lbl}% Urgency Cut-Off:** Any remaining open positions will be force-closed if drawdown reaches `{cutoff_lbl}%` (`-{dd['emergency_cutoff_amount']:.2f} {curr}`)."
+                if eff_cutoff_pct > 0.0
+                else "• ⚪ **Urgency Cut-Off:** `OFF (Unlimited)` — enable anytime via `/losslimit <pause%> <cutoff%>`."
+            )
             await notify_saved_messages(
-                f"🛑 **{int(DAILY_LOSS_PAUSE_PCT)}% Daily Loss Threshold Reached — New Signals Paused**\n"
+                f"🛑 **{pause_lbl}% Daily Loss Threshold Reached — New Signals Paused**\n"
                 f"• Current Daily/Floating Loss: `-{dd['total_daily_loss']:.2f} {curr}` (`{dd['loss_pct']:.1f}%` of `{dd['reference_balance']:.2f} {curr}` balance)\n"
                 f"{note_str}"
-                f"• 🚨 **90% Urgency Cut-Off:** Any remaining open positions will be force-closed if drawdown reaches `{int(EMERGENCY_CUTOFF_LOSS_PCT)}%` (`-{dd['emergency_cutoff_amount']:.2f} {curr}`)."
+                f"{cutoff_note}"
             )
         return "PAUSED_50PCT"
 
     return "OK"
 
 
-# Last rendered HUD state (bal, cred, eq, pnl, tot_lots, high_l) so we only redraw when values change
-_last_hud_state: Optional[Tuple[float, float, float, float, float, float]] = None
+# Last rendered HUD state so we only redraw when values change
+_last_hud_state: Optional[Tuple[Any, ...]] = None
 
 
 def _set_windows_keep_awake(enable: bool) -> None:
@@ -1895,24 +1925,43 @@ def _render_terminal_status(st: Dict[str, Any], force_print: bool = False) -> No
     mid_l = st.get("mid_risk_lots", 0.01)
     high_l = round(st.get("high_risk_lots", 0.01), 2)
 
-    snap = (bal, cred, open_lots, pending_lots)
+    _cfg_mod = sys.modules.get("config") or config
+    lot_cap_on = bool(getattr(_cfg_mod, "ENFORCE_HIGH_RISK_LOT_CAP", False))
+
+    snap = (bal, cred, open_lots, pending_lots, lot_cap_on)
     if force_print or snap != _last_terminal_snapshot:
         _last_terminal_snapshot = snap
+        if lot_cap_on:
+            lots_log = (
+                f"Active Lots: {open_lots:.2f}/{high_l:.2f} Max | Pending: {pending_lots:.2f} "
+                f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
+            )
+        else:
+            lots_log = (
+                f"Active Lots: {open_lots:.2f} (Unlimited) | Pending: {pending_lots:.2f} "
+                f"(Lot Cap: OFF)"
+            )
         logger.info(
             f"💳 [LIVE ACCOUNT & RISK GUIDE] Balance: {bal:.2f} {curr} | Credit: {cred:.2f} {curr} | "
-            f"Equity: {eq:.2f} {curr} | Active Lots: {open_lots:.2f}/{high_l:.2f} Max | Pending: {pending_lots:.2f} "
-            f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
+            f"Equity: {eq:.2f} {curr} | {lots_log}"
         )
 
-    hud_state = (bal, cred, eq, pnl, open_lots, pending_lots, high_l)
+    hud_state = (bal, cred, eq, pnl, open_lots, pending_lots, high_l, lot_cap_on)
     if not force_print and hud_state == _last_hud_state:
         return
     _last_hud_state = hud_state
 
+    if lot_cap_on:
+        title_lots = f"Lots: {open_lots:.2f}/{high_l:.2f} (Pend: {pending_lots:.2f})"
+        hud_lots = f"{open_lots:.2f}/{high_l:.2f}"
+    else:
+        title_lots = f"Lots: {open_lots:.2f} (Unlim, Pend: {pending_lots:.2f})"
+        hud_lots = f"{open_lots:.2f} (Unlim)"
+
     title_str = (
         f"[XAUUSD COPIER v3.0] Bal: {sym_char}{bal:.2f} | Cred: {sym_char}{cred:.2f} | "
         f"Eq: {sym_char}{eq:.2f} | P&L: {'+' if pnl >= 0 else '-'}{sym_char}{abs(pnl):.2f} | "
-        f"Lots: {open_lots:.2f}/{high_l:.2f} (Pend: {pending_lots:.2f})"
+        f"{title_lots}"
     )
     if os.name == "nt" and CONSOLE_TITLE_UPDATES:
         try:
@@ -1929,7 +1978,7 @@ def _render_terminal_status(st: Dict[str, Any], force_print: bool = False) -> No
         f"Cred: \033[96m{sym_char}{cred:.2f}\033[0m | "
         f"Eq: {pnl_color}{sym_char}{eq:.2f}\033[0m | "
         f"P&L: {pnl_color}{pnl_sign}{sym_char}{abs(pnl):.2f}\033[0m | "
-        f"Lots: \033[93m{open_lots:.2f}/{high_l:.2f}\033[0m"
+        f"Lots: \033[93m{hud_lots}\033[0m"
     )
     sys.stdout.write(f"\r\033[2K{_current_hud_line}")
     sys.stdout.flush()
@@ -7108,9 +7157,18 @@ async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
         _daily_loss_locked = False
         _daily_loss_lock_notified_date = None
         state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, triggered_date=None, triggered_at=0.0)
+        _cfg_mod = sys.modules.get("config") or config
+        snap = read_risk_limits(_cfg_mod)
+        if snap.daily_loss_pause_pct > 0.0 or snap.emergency_cutoff_pct > 0.0:
+            guard_note = (
+                f"drawdown guard remains active "
+                f"(pause={_fmt_pct(snap.daily_loss_pause_pct)}%, cutoff={_fmt_pct(snap.emergency_cutoff_pct)}%)"
+            )
+        else:
+            guard_note = "drawdown guards are also OFF — Unlimited"
         await event.reply(
             "⚪ **Daily Loss Limit Disabled**\n"
-            "• The realized daily loss limit is now OFF (50%/90% emergency drawdown guards remain active).\n"
+            f"• The realized daily loss limit is now OFF ({guard_note}).\n"
             "• Type `dailyloss` anytime to set a new realized daily loss cap."
         )
         return
@@ -7169,6 +7227,8 @@ _KNOWN_SAVED_COMMANDS = {
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
     "/floatcap", "floatcap",
+    "/losslimit", "losslimit", "/drawdown", "drawdown", "/ddcap", "ddcap",
+    "/lotcap", "lotcap", "/riskcap", "riskcap", "/tradecap", "tradecap",
     "/reversal", "reversal", "/gold_reversal", "gold_reversal",
     "/resume", "resume", "/unpause", "unpause", "/reset_loss", "reset_loss", "/reset_drawdown", "reset_drawdown",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
@@ -7187,6 +7247,8 @@ _KNOWN_SAVED_PREFIXES = (
     "/set_daily_loss ", "set_daily_loss ",
     "/bank_tp1 ", "bank_tp1 ",
     "/floatcap ", "floatcap ",
+    "/losslimit ", "losslimit ", "/drawdown ", "drawdown ", "/ddcap ", "ddcap ",
+    "/lotcap ", "lotcap ", "/riskcap ", "riskcap ", "/tradecap ", "tradecap ",
     "/reversal ", "reversal ", "/gold_reversal ", "gold_reversal ",
     "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
     "/trail ", "/trade ", "/exec ",
@@ -7292,9 +7354,18 @@ def _format_uptime() -> str:
     return f"{hours}h {minutes}m {seconds}s"
 
 
+def _effective_account_balance(fin: Dict[str, Any]) -> Tuple[float, str]:
+    """Return effective capital base (adding broker credit when balance < 30 and credit > 0) and currency."""
+    bal = float(fin.get("balance", 0.0) or 0.0)
+    cred = float(fin.get("credit", 0.0) or 0.0)
+    eff_bal = bal if (bal >= 30.0 or cred <= 0.0) else round(bal + cred, 2)
+    curr = str(fin.get("currency", "GBP") or "GBP")
+    return eff_bal, curr
+
+
 async def handle_saved_messages_command(event: Any) -> None:
     """Remote monitoring commands sent to Saved Messages ('me')."""
-    global _awaiting_dailywin_input, _awaiting_dailyloss_input, _daily_50pct_alert_date, _daily_loss_locked, TRADING_HALTED
+    global _awaiting_dailywin_input, _awaiting_dailyloss_input, _daily_50pct_alert_date, _daily_float_cap_alert_date, _daily_loss_locked, TRADING_HALTED
     msg = event.message
     if not msg or not msg.message:
         return
@@ -7441,48 +7512,56 @@ async def handle_saved_messages_command(event: Any) -> None:
             )
             return
 
-    # LIVE CONTROL: /floatcap [pct] — change the floating-loss force-close hard cap
-    if text in ("/floatcap", "floatcap") or any(text.startswith(p) for p in ("/floatcap ", "floatcap ")):
-        _cfg_mod = sys.modules.get("config")
-        parts = text.split()
-        if len(parts) >= 2:
-            try:
-                new_pct = float(parts[1].strip().rstrip("%"))
-                if not (1.0 <= new_pct <= 100.0):
-                    raise ValueError("out of range")
-                if _cfg_mod:
-                    setattr(_cfg_mod, "FLOAT_LOSS_FORCE_CLOSE_PCT", new_pct)
-                fin = await _mt5_call(executor.get_account_financials)
-                bal = fin.get("balance", 0.0)
-                curr = fin.get("currency", "GBP")
-                cap_amt = round(bal * new_pct / 100.0, 2)
-                confirm_msg = (
-                    f"🔴 **Floating Loss Hard Cap Updated → `{new_pct:.0f}%`**\n"
-                    f"• The bot will now force-close ALL open trades if floating loss breaches `-{cap_amt:.2f} {curr}` "
-                    f"(`{new_pct:.0f}%` of `{bal:.2f} {curr}` balance).\n"
-                    f"• This fires before the 90% emergency cutoff to block broker margin stop-outs.\n"
-                    f"• Change again anytime: `/floatcap <pct>` (e.g. `/floatcap 50`)"
-                )
-                logger.info(f"[/floatcap] FLOAT_LOSS_FORCE_CLOSE_PCT updated to {new_pct:.1f}%")
-                await event.reply(confirm_msg)
-                await notify_saved_messages(confirm_msg)
-            except (ValueError, IndexError):
-                await event.reply(
-                    "⚠️ **Invalid value.** Usage: `/floatcap <1-100>`\n"
-                    "Example: `/floatcap 60` → force-close all trades when floating loss hits -60% of balance."
-                )
-        else:
-            _cfg_mod2 = sys.modules.get("config")
-            cur_pct = float(getattr(_cfg_mod2, "FLOAT_LOSS_FORCE_CLOSE_PCT", FLOAT_LOSS_FORCE_CLOSE_PCT))
-            fin = await _mt5_call(executor.get_account_financials)
-            bal = fin.get("balance", 0.0)
-            curr = fin.get("currency", "GBP")
-            cap_amt = round(bal * cur_pct / 100.0, 2)
-            await event.reply(
-                f"🔴 **Floating Loss Hard Cap:** `{cur_pct:.0f}%` (≈ `-{cap_amt:.2f} {curr}`)\n"
-                f"• The bot force-closes ALL open trades if floating loss hits this level.\n"
-                f"• Change: `/floatcap <pct>` (e.g. `/floatcap 50` or `/floatcap 70`)"
+    # LIVE CONTROL: /floatcap [pct|off] — toggle/configure floating-loss force-close hard cap
+    if text in ("/floatcap", "floatcap") or text.startswith(("/floatcap ", "floatcap ")):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        fin = await _mt5_call(executor.get_account_financials)
+        eff_bal, curr = _effective_account_balance(fin)
+        changed, reply_msg = apply_float_cap_command(_cfg_mod, arg, eff_bal, curr)
+        if changed:
+            _daily_float_cap_alert_date = None
+            logger.info(
+                f"[/floatcap] FLOAT_LOSS_FORCE_CLOSE_PCT updated to "
+                f"{getattr(_cfg_mod, 'FLOAT_LOSS_FORCE_CLOSE_PCT', 0.0)}%"
             )
+        await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /losslimit [off|<pause%> [cutoff%]] — toggle/configure daily drawdown guard
+    if text in ("/losslimit", "losslimit", "/drawdown", "drawdown", "/ddcap", "ddcap") or text.startswith(
+        ("/losslimit ", "losslimit ", "/drawdown ", "drawdown ", "/ddcap ", "ddcap ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split()
+        fin = await _mt5_call(executor.get_account_financials)
+        eff_bal, curr = _effective_account_balance(fin)
+        changed, reply_msg = apply_loss_limit_command(_cfg_mod, parts[1:], eff_bal, curr)
+        if changed:
+            _daily_50pct_alert_date = None
+            logger.info(
+                f"[/losslimit] DAILY_LOSS_PAUSE_PCT={getattr(_cfg_mod, 'DAILY_LOSS_PAUSE_PCT', 0.0)}%, "
+                f"EMERGENCY_CUTOFF_LOSS_PCT={getattr(_cfg_mod, 'EMERGENCY_CUTOFF_LOSS_PCT', 0.0)}%"
+            )
+        await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /lotcap [on|off] — toggle high-risk lot cap enforcement
+    if text in ("/lotcap", "lotcap", "/riskcap", "riskcap", "/tradecap", "tradecap") or text.startswith(
+        ("/lotcap ", "lotcap ", "/riskcap ", "riskcap ", "/tradecap ", "tradecap ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        risk_st = await _mt5_call(executor.get_risk_exposure_status)
+        changed, reply_msg = apply_lot_cap_command(_cfg_mod, arg, risk_st)
+        if changed:
+            logger.info(
+                f"[/lotcap] ENFORCE_HIGH_RISK_LOT_CAP updated to "
+                f"{bool(getattr(_cfg_mod, 'ENFORCE_HIGH_RISK_LOT_CAP', False))}"
+            )
+        await event.reply(reply_msg)
         return
 
     # LIVE CONTROL: /reversal [wide|tight|<giveback_pct> [floor] [ticks]]
@@ -7597,13 +7676,20 @@ async def handle_saved_messages_command(event: Any) -> None:
         high_l = risk_st["high_risk_lots"]
         mid_l = risk_st["mid_risk_lots"]
         low_l = risk_st["low_risk_lots"]
+        _cfg_mod = sys.modules.get("config") or config
+        lot_cap_on = bool(getattr(_cfg_mod, "ENFORCE_HIGH_RISK_LOT_CAP", False))
+        lots_guide_line = (
+            f"• **Max Lots Guide:** `{high_l:.2f} Max` (High: `{high_l:.2f}` | Mid: `{mid_l:.2f}` | Low: `{low_l:.2f}`)\n"
+            if lot_cap_on
+            else f"• **Lot Cap:** `Unlimited (OFF)` (Guide — Low: `{low_l:.2f}` | Mid: `{mid_l:.2f}` | High: `{high_l:.2f}`)\n"
+        )
 
         msg = (
             f"🟢 **Trading Resumed & Daily Drawdown Reset**\n"
             f"• Previous daily loss has passed and is archived as realized.\n"
             f"• **Active Capital Baseline:** `{bal:.2f} {curr}`\n"
             f"• **Drawdown Status:** `0.0%` (Unpaused — ready for new signals)\n"
-            f"• **Max Lots Guide:** `{high_l:.2f} Max` (High: `{high_l:.2f}` | Mid: `{mid_l:.2f}` | Low: `{low_l:.2f}`)\n"
+            f"{lots_guide_line}"
             f"• 🚀 **The bot is actively listening and will action new trades immediately!**"
         )
         logger.info(f"[/resume] Daily loss baseline updated to {bal:.2f} {curr}. Trading resumed.")
@@ -8024,6 +8110,11 @@ async def handle_saved_messages_command(event: Any) -> None:
                 )
             active_block = "\n" + "\n".join(lines)
 
+        risk_st_h = await _mt5_call(executor.get_risk_exposure_status)
+        dd_st_h = await _mt5_call(executor.get_daily_drawdown_status)
+        _cfg_mod_h = sys.modules.get("config") or config
+        limits_h = format_limits_status_lines(_cfg_mod_h, dd_st_h, risk_st_h)
+
         await event.reply(
             f"🩺 **XAUUSD Copier v3.0 Health Telemetry**\n"
             f"• Uptime: `{_format_uptime()}`\n"
@@ -8035,6 +8126,9 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"Reconnects: `{_telegram_reconnect_count}`\n"
             f"• Deleted-Signal Guard: `{'🟢 ON' if CLOSE_ON_SIGNAL_DELETED else '⚪ OFF'}` "
             f"(Sweep: `{DELETED_SIGNAL_POLL_INTERVAL_SECONDS}s`)\n"
+            f"• Active Lots (`/lotcap`): {limits_h['active_lots_label']}\n"
+            f"{limits_h['drawdown_guard_line']}\n"
+            f"{limits_h['float_cap_line']}\n"
             f"• Runner FSM Mode: `{RUNNER_PROXIMITY_MODE}` "
             f"(Buf: `{RUNNER_PROXIMITY_BUFFER_PIPS}` pips / `{RUNNER_PROXIMITY_BUFFER_PCT}%`, "
             f"MidrangeClamp: `{RUNNER_MAX_MIDRANGE_RATIO}`, "
@@ -8501,25 +8595,19 @@ async def handle_saved_messages_command(event: Any) -> None:
         else:
             dl_state_str = f"⚪ OFF (Realized Today: `{dl_realized_str}`){lock_str}"
 
-        dd_state_str = (
-            "🚨 90% CUT-OFF" if dd_st["emergency_cutoff_triggered"]
-            else "🛑 50% PAUSED (Holding Open Trades)" if dd_st["pause_new_signals"]
-            else "🟢 OK"
-        )
+        _cfg_mod = sys.modules.get("config") or config
+        limits_lines = format_limits_status_lines(_cfg_mod, dd_st, risk_st)
         srv_date = await _trading_day_str_async()
         ledger_stats = trade_ledger.get_stats(server_date=srv_date)
         lots_vec_str = "/".join(f"{b:.2f}" for b in BASE_LAYER_LOTS)
 
         risk_str = (
             f"\n• 4-Layer Split: `[{lots_vec_str}]` x `{RISK_LOT_MULTIPLIER}` (`{MAX_ORDERS_PER_SIGNAL}` orders/signal)"
-            f"\n• Active Lots: `{risk_st['open_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` | Pending: `{risk_st['pending_lots']:.2f}` "
-            f"(Low: `{risk_st['low_risk_lots']:.2f}` | Mid: `{risk_st['mid_risk_lots']:.2f}` | "
-            f"High Cap: `{risk_st['high_risk_lots']:.2f}`)"
+            f"\n• Active Lots (`/lotcap`): {limits_lines['active_lots_label']}"
             f"\n• Daily Win Limit (`dailywin`): {dw_state_str}"
             f"\n• Daily Loss Limit (`dailyloss`): {dl_state_str}"
-            f"\n• Daily Drawdown Guard: `{dd_state_str}` "
-            f"(Loss: `-{dd_st['total_daily_loss']:.2f} {dd_st['currency']}` / `{dd_st['loss_pct']:.1f}%` | "
-            f"50% Pause: `-{dd_st['pause_limit_amount']:.2f}` | 90% Cut-Off: `-{dd_st['emergency_cutoff_amount']:.2f}`)"
+            f"\n{limits_lines['drawdown_guard_line']}"
+            f"\n{limits_lines['float_cap_line']}"
             f"\n• Trade Ledger (`{TRADES_LEDGER_PATH.name}`): `{ledger_stats['total_trades']}` closed | "
             f"Win Rate: `{ledger_stats['win_rate_pct']:.1f}%` | "
             f"Realized: `{format_profit(ledger_stats['total_realized_pnl'], curr)}` "
@@ -8538,7 +8626,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"\n• Runner Exit Architecture: `{staged_badge}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return
@@ -8777,7 +8865,7 @@ async def main() -> None:
                 isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_s or [])
             )
             # Always baseline realized daily loss on startup against current account balance so
-            # previously realized losses from earlier runs never re-trigger 50% pause or 90% cutoff on restart.
+            # previously realized losses from earlier runs never re-trigger configured drawdown guards on restart.
             dd_init = await _mt5_call(executor.get_daily_drawdown_status)
             if dd_init.get("realized_today", 0.0) < 0.0 or dd_init.get("pause_new_signals"):
                 upd = await _mt5_call(executor.update_daily_loss_baseline)
@@ -8789,6 +8877,23 @@ async def main() -> None:
                 )
             await _startup_hydrate_and_backfill_ledger()
             await _update_live_terminal_status_async(force_print=True)
+
+        _boot_limits = read_risk_limits(sys.modules.get("config") or config)
+        _lot_lbl = "ON" if _boot_limits.lot_cap_enabled else "Unlimited (OFF)"
+        _dd_lbl = (
+            f"Pause {_fmt_pct(_boot_limits.daily_loss_pause_pct)}% / Cut-Off {_fmt_pct(_boot_limits.emergency_cutoff_pct)}%"
+            if (_boot_limits.daily_loss_pause_pct > 0.0 or _boot_limits.emergency_cutoff_pct > 0.0)
+            else "Unlimited (OFF)"
+        )
+        _fc_lbl = (
+            f"{_fmt_pct(_boot_limits.float_loss_cap_pct)}%"
+            if _boot_limits.float_loss_cap_pct > 0.0
+            else "Unlimited (OFF)"
+        )
+        logger.info(
+            f"🛡️ Risk Limits: Lot Cap={_lot_lbl} | Drawdown Guard={_dd_lbl} | Float Cap={_fc_lbl} "
+            f"(Manual Saved Messages controls: /lotcap, /losslimit, /floatcap, dailyloss, dailywin)"
+        )
 
         session_file = str(BASE_DIR / TELEGRAM_SESSION_NAME)
         logger.info(f"Initializing Telegram Client (Session: {session_file})...")
