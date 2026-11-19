@@ -15,6 +15,7 @@ os.environ["LOG_FILE_PATH"] = str(_SIM_DIR / "sim_copier.log")
 os.environ["STATE_FILE_PATH"] = str(_SIM_DIR / "sim_signals_state.json")
 os.environ["TRADES_LEDGER_PATH"] = str(_SIM_DIR / "sim_trades_ledger.jsonl")
 os.environ["LOCK_FILE_PATH"] = str(_SIM_DIR / "sim_copier.lock")
+os.environ.setdefault("LIMIT_ENTRY_FRONT_RUN_OFFSET", "0.0")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

@@ -36,6 +36,7 @@ from config import (
     CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
     CANCEL_PENDING_ON_TP1,
     TP_FRONT_RUN_OFFSET,
+    LIMIT_ENTRY_FRONT_RUN_OFFSET,
     TP1_CLOSE_PROXIMITY_PIPS,
     DEFAULT_TP_STEP_PIPS,
     TP2_STEP_PIPS,
@@ -598,6 +599,7 @@ _MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
     "SINGLE_PRICE_CONSOLIDATE_ORDERS": SINGLE_PRICE_CONSOLIDATE_ORDERS,
     "PENDING_DUPLICATE_PRICE_TOLERANCE": PENDING_DUPLICATE_PRICE_TOLERANCE,
     "PENDING_DUPLICATE_ORDER_TOLERANCE": PENDING_DUPLICATE_ORDER_TOLERANCE,
+    "LIMIT_ENTRY_FRONT_RUN_OFFSET": LIMIT_ENTRY_FRONT_RUN_OFFSET,
 }
 
 
@@ -6609,15 +6611,42 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
     desired_pending_targets: Dict[str, float] = {}
     if parsed.zone:
         if is_legacy:
-            desired_pending_targets = {
+            raw_desired = {
                 "TOP": parsed.zone.top if direction == "BUY" else parsed.zone.bottom,
                 "MID": parsed.zone.mid,
                 "BOTTOM": parsed.zone.bottom if direction == "BUY" else parsed.zone.top,
             }
         else:
-            desired_pending_targets = dict(parsed.zone.get_tiers(direction))
+            raw_desired = dict(parsed.zone.get_tiers(direction))
+        fn_fr = getattr(executor, "_apply_limit_entry_front_run", None)
+        if callable(fn_fr) and not is_stop_order:
+            desired_pending_targets = {
+                lk: fn_fr(
+                    symbol=symbol,
+                    direction=direction,
+                    target_price=float(px_v),
+                    final_tp=new_tp,
+                    raw_tp1=raw_tp1,
+                    pip_size=pip_size,
+                    digits=2,
+                )
+                for lk, px_v in raw_desired.items()
+            }
+        else:
+            desired_pending_targets = raw_desired
     elif parsed.single_price is not None:
         sp_rounded = round(float(parsed.single_price), 2)
+        fn_fr = getattr(executor, "_apply_limit_entry_front_run", None)
+        if callable(fn_fr) and not is_stop_order and order_intent != "STOP":
+            sp_rounded = fn_fr(
+                symbol=symbol,
+                direction=direction,
+                target_price=sp_rounded,
+                final_tp=new_tp,
+                raw_tp1=raw_tp1,
+                pip_size=pip_size,
+                digits=2,
+            )
         desired_pending_targets = {lk: sp_rounded for lk in layers.keys()}
 
     retiered_tickets: set = set()
@@ -6817,7 +6846,23 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                     ),
                 ]
             else:
-                tiers = zone.get_tiers(direction)
+                raw_tiers = zone.get_tiers(direction)
+                fn_fr = getattr(executor, "_apply_limit_entry_front_run", None)
+                if callable(fn_fr) and not is_stop_order:
+                    tiers = {
+                        lk: fn_fr(
+                            symbol=symbol,
+                            direction=direction,
+                            target_price=float(px_v),
+                            final_tp=new_tp,
+                            raw_tp1=raw_tp1,
+                            pip_size=pip_size,
+                            digits=2,
+                        )
+                        for lk, px_v in raw_tiers.items()
+                    }
+                else:
+                    tiers = raw_tiers
                 rem_base_lots = [
                     0.0 if (f"L{i + 1}" in layers and layers[f"L{i + 1}"].get("ticket") is not None) else float(BASE_LAYER_LOTS[i])
                     for i in range(4)

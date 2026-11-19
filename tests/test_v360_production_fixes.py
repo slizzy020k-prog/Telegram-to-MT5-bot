@@ -364,3 +364,67 @@ async def test_fix_b4_gate5_wrong_side_tp_edit_sanity_msg_9919(tmp_path):
         assert all(tp is None or tp < 3728.0 for tp in sent_tps)
         s_9919 = main.state_mgr.get_signal(9919, chat_id=-1004369388188)
         assert s_9919["sl"] == pytest.approx(3736.0)
+
+
+@pytest.mark.asyncio
+async def test_fix_d_limit_entry_front_run_offset_050_msg_13191(tmp_path, monkeypatch):
+    """
+    Reproduce Msg 13191 ('BUY 3710-3700 SL 3685 TP 3713 TP 3720 ...'):
+    - Raw zone tiers are {L1: 3710.0, L2: 3706.67, L3: 3703.33, L4: 3700.0}.
+    - Live market dipped to bid=3710.44 / ask=3710.76 (44 points above 3710.00) and then rallied to TP1=3713.0.
+    - With LIMIT_ENTRY_FRONT_RUN_OFFSET=0.50 (+$0.50 on BUY LIMIT, -$0.50 on SELL LIMIT),
+      the 4 BUY LIMIT layers are placed +0.50 higher at {L1: 3710.5, L2: 3707.17, L3: 3703.83, L4: 3700.5},
+      and SELL LIMIT layers are placed -0.50 lower, so L1 @ 3710.50 activates cleanly instead of missing!
+    """
+    ex = _setup_test_env(tmp_path, "fix_d_13191")
+    monkeypatch.setattr(config, "LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50)
+    monkeypatch.setattr(ex_mod, "LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50)
+    monkeypatch.setattr(main, "LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50)
+
+    tick_now = SimpleNamespace(bid=3715.88, ask=3716.40, time=1700000400)
+    with patch.object(ex, "get_tick", return_value=tick_now), \
+         patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
+        # 1. BUY Zone 3710-3700 (Msg 13191) -> shifted +0.50 higher to [3710.50, 3707.17, 3703.83, 3700.50]
+        await main.handle_new_message(
+            FakeEvent(
+                13191,
+                "BUY 3710-3700\nSL 3685\nTP 3713\nTP 3720\nFP 3723\nTP 3730\nTP 3740",
+                chat_id=-1003712081715,
+            )
+        )
+        s_buy = main.state_mgr.get_signal(13191, chat_id=-1003712081715)
+        assert s_buy is not None
+        assert len(s_buy["pending_tickets"]) == 4
+        assert s_buy["layers"]["L1"]["target_price"] == pytest.approx(3710.50)
+        assert s_buy["layers"]["L2"]["target_price"] == pytest.approx(3707.17)
+        assert s_buy["layers"]["L3"]["target_price"] == pytest.approx(3703.83)
+        assert s_buy["layers"]["L4"]["target_price"] == pytest.approx(3700.50)
+
+        # 2. SELL Zone 3720-3730 -> shifted -0.50 lower to [3719.50, 3722.83, 3726.17, 3729.50]
+        await main.handle_new_message(
+            FakeEvent(
+                13192,
+                "SELL 3720-3730\nSL 3745\nTP 3715\nTP 3705",
+                chat_id=-1003712081715,
+            )
+        )
+        s_sell = main.state_mgr.get_signal(13192, chat_id=-1003712081715)
+        assert s_sell is not None
+        assert len(s_sell["pending_tickets"]) == 4
+        assert s_sell["layers"]["L1"]["target_price"] == pytest.approx(3719.50)
+        assert s_sell["layers"]["L2"]["target_price"] == pytest.approx(3722.83)
+        assert s_sell["layers"]["L3"]["target_price"] == pytest.approx(3726.17)
+        assert s_sell["layers"]["L4"]["target_price"] == pytest.approx(3729.50)
+
+        # 3. Single-price BUY LIMIT 3705 -> shifted +0.50 higher to 3705.50
+        await main.handle_new_message(
+            FakeEvent(
+                13195,
+                "BUY LIMIT 3705\nSL 3690\nTP 3715",
+                chat_id=-1003712081715,
+            )
+        )
+        s_single = main.state_mgr.get_signal(13195, chat_id=-1003712081715)
+        assert s_single is not None
+        assert s_single["layers"]["L1"]["target_price"] == pytest.approx(3705.50)
+

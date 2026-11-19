@@ -25,6 +25,7 @@ def _apply_isolated_env() -> None:
     os.environ["LOCK_FILE_PATH"] = str(_PYTEST_RUNTIME_DIR / "copier_test.lock")
     os.environ["PREVENT_SYSTEM_SLEEP"] = "false"
     os.environ["CONSOLE_TITLE_UPDATES"] = "false"
+    os.environ.setdefault("LIMIT_ENTRY_FRONT_RUN_OFFSET", "0.0")
 
 
 _apply_isolated_env()

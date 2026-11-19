@@ -144,6 +144,7 @@ from config import (
     TP4_STEP_PIPS,
     TP5_STEP_PIPS,
     TP_FRONT_RUN_OFFSET,
+    LIMIT_ENTRY_FRONT_RUN_OFFSET,
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
     TRAIL_TP2_ATR_MULT,
@@ -179,6 +180,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "CANCEL_PENDING_ON_TP1",
         "FALLBACK_SL_PIPS",
         "TP_FRONT_RUN_OFFSET",
+        "LIMIT_ENTRY_FRONT_RUN_OFFSET",
         "TP1_CLOSE_PROXIMITY_PIPS",
         "TP1_LOCK_BUFFER",
         "TP1_TOUCH_BANK_ENABLED",
@@ -2264,6 +2266,38 @@ class MT5Executor:
 
         return market_tickets, pending_tickets, layers_data
 
+    def _apply_limit_entry_front_run(
+        self,
+        symbol: str,
+        direction: str,
+        target_price: float,
+        final_tp: Optional[float],
+        raw_tp1: Optional[float],
+        pip_size: float,
+        digits: int,
+    ) -> float:
+        """
+        Shift pending LIMIT target_price toward market by LIMIT_ENTRY_FRONT_RUN_OFFSET
+        (+$0.50 on BUY LIMIT, -$0.50 on SELL LIMIT on Gold) so round-number bounces
+        (e.g. Msg 13191 dipping to 3710.44 bid above a 3710.00 BUY zone) still fill L1,
+        provided at least $1.00 (10 pips) of profit room remains to TP1/final_tp.
+        """
+        raw_off = float(_cfg("LIMIT_ENTRY_FRONT_RUN_OFFSET", LIMIT_ENTRY_FRONT_RUN_OFFSET))
+        if raw_off <= 0.0:
+            return round(float(target_price), digits)
+        scale = (pip_size / 0.10) if pip_size > 0 else 1.0
+        off = raw_off * scale
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        shifted = round(float(target_price) + (off if is_buy else -off), digits)
+        tp_bound = final_tp if (final_tp is not None and float(final_tp) > 0.0) else raw_tp1
+        if tp_bound is not None and float(tp_bound) > 0.0:
+            min_room = 10.0 * (pip_size if pip_size > 0 else 0.10)
+            if is_buy and shifted >= float(tp_bound) - min_room + 1e-9:
+                return round(float(target_price), digits)
+            if not is_buy and shifted <= float(tp_bound) + min_room - 1e-9:
+                return round(float(target_price), digits)
+        return shifted
+
     def execute_4layer_zone(
         self,
         symbol: str,
@@ -2301,7 +2335,18 @@ class MT5Executor:
             raw_tiers = compute_zone_4tiers(zone["top"], zone["bottom"], direction_norm, digits=digits)
         else:
             raw_tiers = compute_zone_4tiers(zone.top, zone.bottom, direction_norm, digits=digits)
-        tiers = {k: round(float(v), digits) for k, v in raw_tiers.items()}
+        tiers = {
+            k: self._apply_limit_entry_front_run(
+                symbol=resolved_sym,
+                direction=direction_norm,
+                target_price=float(v),
+                final_tp=final_tp,
+                raw_tp1=raw_tp1 or (tp_levels or {}).get("TP1"),
+                pip_size=pip_size,
+                digits=digits,
+            )
+            for k, v in raw_tiers.items()
+        }
 
         market_mask = [
             self._layer_will_execute_at_market(
@@ -2439,6 +2484,16 @@ class MT5Executor:
             eff_intent = "STOP"
 
         target_px = round(float(price), digits)
+        if eff_intent != "STOP" and not is_stop_order:
+            target_px = self._apply_limit_entry_front_run(
+                symbol=resolved_sym,
+                direction=direction_norm,
+                target_price=target_px,
+                final_tp=final_tp,
+                raw_tp1=raw_tp1 or (tp_levels or {}).get("TP1"),
+                pip_size=pip_size,
+                digits=digits,
+            )
         market_mask = [
             (l_name in active_names)
             and self._layer_will_execute_at_market(

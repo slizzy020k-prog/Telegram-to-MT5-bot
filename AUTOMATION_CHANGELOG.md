@@ -47,6 +47,7 @@ All primary FSM/ATR/Spread parameters were calibrated strictly within the bounde
 | `PENDING_DUPLICATE_PRICE_TOLERANCE` | N/A | `0.50` | New | Blocks duplicate pending limit/stop signals within `$0.50` of an existing pending order in the same direction. |
 | `PENDING_DUPLICATE_ORDER_TOLERANCE` | N/A | `0.25` | New | Low-level `_place_pending_order` safety guard blocking duplicate pending orders within `$0.25`. |
 | `MAX_TP_DISTANCE_DOLLARS` | N/A | `250.0` | New | Gate 5 sanity cap stripping fat-finger/wrong-side TP typos (`Msg 9919` `TP 4320`). |
+| `LIMIT_ENTRY_FRONT_RUN_OFFSET` | `0.00` (exact tier) | `0.50` | `+$0.50` | Shifts pending `BUY LIMIT` entry layers `+$0.50` higher (e.g. `3710.0 -> 3710.50`) and `SELL LIMIT` layers `-$0.50` lower so spread/round-number bounces (`Msg 13191` dipping to `3710.44` bid above `3710.00`) fill `L1` instead of missing activation. |
 
 ---
 

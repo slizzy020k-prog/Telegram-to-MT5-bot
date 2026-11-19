@@ -211,6 +211,11 @@ MAX_ORDERS_PER_SIGNAL: int = _env_int("MAX_ORDERS_PER_SIGNAL", 4, min_val=1, max
 # Front-run offset applied to TP1 (e.g. 0.50 points on XAUUSD: TP1 - 0.50 BUY / TP1 + 0.50 SELL)
 TP_FRONT_RUN_OFFSET: float = _env_float("TP_FRONT_RUN_OFFSET", 0.50, min_val=0.0, max_val=50.0)
 
+# Front-run offset applied to pending LIMIT entry layers (e.g. 0.50 points/$0.50 on XAUUSD:
+# BUY LIMITs placed +0.50 higher, SELL LIMITs placed -0.50 lower so spread/round-number
+# bounces like Msg 13191 dipping to 3710.44 bid above a 3710.00 BUY zone still fill L1)
+LIMIT_ENTRY_FRONT_RUN_OFFSET: float = _env_float("LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50, min_val=0.0, max_val=10.0)
+
 # Deterministic TP1 -> TP5 auto-derivation extension steps (in pips; 100 pips = $10.00 on XAUUSD)
 DEFAULT_TP_STEP_PIPS: float = _env_float(
     "DEFAULT_TP_STEP_PIPS", 100.0, min_val=1.0, max_val=2000.0, positive_only=True
