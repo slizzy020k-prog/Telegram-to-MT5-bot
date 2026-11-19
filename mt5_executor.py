@@ -4146,10 +4146,13 @@ class MT5Executor:
             curr_bal = float(fin.get("balance") or 0.0)
             realized_today = self.get_realized_today_pnl()
             floating_pnl = 0.0
+            magic = _cfg("MAGIC_NUMBER", MAGIC_NUMBER)
             try:
                 with self._mt5_lock:
                     positions = mt5.positions_get() or []
                 for p in positions:
+                    if _int_num(getattr(p, "magic", 0), 0) != magic:
+                        continue
                     floating_pnl += (
                         _num(getattr(p, "profit", 0.0))
                         + _num(getattr(p, "swap", 0.0))

@@ -1715,10 +1715,10 @@ async def check_and_enforce_daily_drawdown() -> str:
         has_open_mkt = bool(open_mkt) or any(
             isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_sigs or [])
         )
-        # If there are NO open market positions (even if unfilled pending limits exist),
-        # previous loss is realized and has passed. Automatically update baseline to current
+        # If there are NO open bot market positions (even if unfilled pending limits or manual non-bot positions exist),
+        # previous bot loss is realized and has passed. Automatically update baseline to current
         # balance and allow new trades to be actioned without touching pending limit orders.
-        if not has_open_mkt and float(dd.get("floating_loss") or 0.0) <= 0.0:
+        if not has_open_mkt:
             await _mt5_call(executor.update_daily_loss_baseline)
             _daily_50pct_alert_date = None
             logger.info("Previous daily loss has passed (0 open trades). Baseline updated to current balance — ready to action new trades.")
@@ -8770,7 +8770,7 @@ async def main() -> None:
                 isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_s or [])
             )
             dd_init = await _mt5_call(executor.get_daily_drawdown_status)
-            if not has_open_mkt_boot and float(dd_init.get("floating_loss") or 0.0) <= 0.0 and dd_init.get("pause_new_signals"):
+            if not has_open_mkt_boot and dd_init.get("pause_new_signals"):
                 upd = await _mt5_call(executor.update_daily_loss_baseline)
                 _daily_50pct_alert_date = None
                 logger.info(
