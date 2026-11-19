@@ -1612,21 +1612,22 @@ def _render_terminal_status(st: Dict[str, Any], force_print: bool = False) -> No
     pnl = round(st.get("profit", 0.0), 2)
     curr = st.get("currency", "GBP")
     sym_char = "£" if curr == "GBP" else "$" if curr == "USD" else ""
-    tot_lots = round(st.get("total_lots", 0.0), 2)
+    open_lots = round(st.get("open_lots", 0.0), 2)
+    pending_lots = round(st.get("pending_lots", 0.0), 2)
     low_l = st.get("low_risk_lots", 0.01)
     mid_l = st.get("mid_risk_lots", 0.01)
     high_l = round(st.get("high_risk_lots", 0.01), 2)
 
-    snap = (bal, cred, tot_lots)
+    snap = (bal, cred, open_lots, pending_lots)
     if force_print or snap != _last_terminal_snapshot:
         _last_terminal_snapshot = snap
         logger.info(
             f"💳 [LIVE ACCOUNT & RISK GUIDE] Balance: {bal:.2f} {curr} | Credit: {cred:.2f} {curr} | "
-            f"Equity: {eq:.2f} {curr} | Active Lots: {tot_lots:.2f}/{high_l:.2f} Max "
+            f"Equity: {eq:.2f} {curr} | Active Lots: {open_lots:.2f}/{high_l:.2f} Max | Pending: {pending_lots:.2f} "
             f"(Low: {low_l:.2f} | Mid: {mid_l:.2f} | High Cap: {high_l:.2f})"
         )
 
-    hud_state = (bal, cred, eq, pnl, tot_lots, high_l)
+    hud_state = (bal, cred, eq, pnl, open_lots, pending_lots, high_l)
     if not force_print and hud_state == _last_hud_state:
         return
     _last_hud_state = hud_state
@@ -1634,7 +1635,7 @@ def _render_terminal_status(st: Dict[str, Any], force_print: bool = False) -> No
     title_str = (
         f"[XAUUSD COPIER v3.0] Bal: {sym_char}{bal:.2f} | Cred: {sym_char}{cred:.2f} | "
         f"Eq: {sym_char}{eq:.2f} | P&L: {'+' if pnl >= 0 else '-'}{sym_char}{abs(pnl):.2f} | "
-        f"Lots: {tot_lots:.2f}/{high_l:.2f}"
+        f"Lots: {open_lots:.2f}/{high_l:.2f} (Pend: {pending_lots:.2f})"
     )
     if os.name == "nt" and CONSOLE_TITLE_UPDATES:
         try:
@@ -2183,7 +2184,7 @@ async def _delayed_sell_now_task(
                 await notify_saved_messages(f"⚠️ **Delayed {direction.title()} Now Skipped [ID: {msg_id}]**: {reason}")
                 return
 
-            prev_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
+            prev_lots = (await _mt5_call(executor.get_total_active_lots))["open_lots"]
             staged_entry = bool(STAGED_MARKET_ENTRY)
             is_delayed_stub = bool(sl is None and not sig.get("tp_levels") and tp1_price is None) or staged_entry
             mk_tkts, pd_tkts, layers_data = await _mt5_call(
@@ -2212,7 +2213,7 @@ async def _delayed_sell_now_task(
                 )
                 return
 
-            new_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
+            new_lots = (await _mt5_call(executor.get_total_active_lots))["open_lots"]
             risk_alerts = await _mt5_call(executor.evaluate_risk_threshold_alerts, prev_lots, new_lots)
             alloc_warn = getattr(executor, "last_allocation_warning", None)
             extra_notes: List[str] = []
@@ -4752,7 +4753,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         zone_completed = False
         is_zone = False
         max_orders = MAX_ORDERS_PER_SIGNAL
-        prev_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
+        prev_lots = (await _mt5_call(executor.get_total_active_lots))["open_lots"]
         initial_price = None
 
         if parsed.is_zone and zone:
@@ -4919,7 +4920,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
             tp1_guard_armed=tp1_guard_armed,
         )
 
-        new_lots = (await _mt5_call(executor.get_total_active_lots))["total_lots"]
+        new_lots = (await _mt5_call(executor.get_total_active_lots))["open_lots"]
         risk_alerts = await _mt5_call(executor.evaluate_risk_threshold_alerts, prev_lots, new_lots)
         alloc_warn = getattr(executor, "last_allocation_warning", None)
         extra_notes: List[str] = []
@@ -5673,11 +5674,29 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                     0.0 if (f"L{i + 1}" in layers and layers[f"L{i + 1}"].get("ticket") is not None) else float(BASE_LAYER_LOTS[i])
                     for i in range(4)
                 ]
-                alloc_lots, _ = await _mt5_call(executor.allocate_4layer_lots, symbol, rem_base_lots)
                 l1_is_open_market = bool(
                     isinstance(layers.get("L1"), dict)
                     and layers["L1"].get("status") == "OPEN"
                     and layers["L1"].get("order_type") == "MARKET"
+                )
+                edit_intents = [
+                    "LIMIT" if (i > 0 and l1_is_open_market and not is_stop_order) else "AUTO"
+                    for i in range(4)
+                ]
+                edit_market_mask = [
+                    (rem_base_lots[i] > 0.0)
+                    and executor._layer_will_execute_at_market(
+                        symbol=symbol,
+                        direction=direction,
+                        target_price=tiers[f"L{i + 1}"],
+                        tick=tick,
+                        order_intent=edit_intents[i],
+                        allow_market_buffer=(i == 0),
+                    )
+                    for i in range(4)
+                ]
+                alloc_lots, _ = await _mt5_call(
+                    executor.allocate_4layer_lots, symbol, rem_base_lots, None, edit_market_mask
                 )
                 layer_specs = [
                     (
@@ -5686,7 +5705,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                         alloc_lots[i],
                         new_tp,
                         f"TG L{i + 1} (Edit",
-                        "LIMIT" if (i > 0 and l1_is_open_market and not is_stop_order) else "AUTO",
+                        edit_intents[i],
                     )
                     for i in range(4)
                 ]
@@ -7230,7 +7249,7 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         risk_str = (
             f"\n• 4-Layer Split: `[{lots_vec_str}]` x `{RISK_LOT_MULTIPLIER}` (`{MAX_ORDERS_PER_SIGNAL}` orders/signal)"
-            f"\n• Active Lots: `{risk_st['total_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` "
+            f"\n• Active Lots: `{risk_st['open_lots']:.2f} / {risk_st['high_risk_lots']:.2f} Max` | Pending: `{risk_st['pending_lots']:.2f}` "
             f"(Low: `{risk_st['low_risk_lots']:.2f}` | Mid: `{risk_st['mid_risk_lots']:.2f}` | "
             f"High Cap: `{risk_st['high_risk_lots']:.2f}`)"
             f"\n• Daily Win Limit (`dailywin`): {dw_state_str}"

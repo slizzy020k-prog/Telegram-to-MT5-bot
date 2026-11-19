@@ -494,6 +494,7 @@ class MT5Executor:
         self.last_allocation_warning: Optional[str] = None
         self._dry_run_capital: Optional[float] = None
         self._dry_run_ticket_lots: Dict[int, float] = {}
+        self._dry_run_pending_ticket_lots: Dict[int, float] = {}
         self._dry_run_daily_realized_pnl: float = 0.0
         self._dry_run_floating_pnl: float = 0.0
         self._dry_run_last_m1_candle: Optional[Dict[str, float]] = None
@@ -1109,6 +1110,7 @@ class MT5Executor:
         direction: str,
         lot: float,
         caller_label: str,
+        enforce_risk_cap: bool = True,
     ) -> Optional[Tuple[str, str, Any, int, float, float]]:
         """Validate direction/lot/connection/symbol and return (direction_norm, resolved_sym, sym_info, digits, pip_size, normalized_lot)."""
         self.last_error = None
@@ -1138,11 +1140,14 @@ class MT5Executor:
         pip_size = self.get_pip_size(resolved_sym)
 
         norm_lot = normalize_lot_to_symbol(float(lot), sym_info)
-        allowed_lot, block_reason = self.check_and_cap_order_lot(norm_lot, symbol=resolved_sym)
-        if allowed_lot <= 0.0:
-            self.last_error = block_reason or "High Risk Lot Cap reached"
-            logger.warning(f"{caller_label} {direction_norm} blocked by Risk Guide Cap: {self.last_error}")
-            return None
+        if enforce_risk_cap:
+            allowed_lot, block_reason = self.check_and_cap_order_lot(norm_lot, symbol=resolved_sym)
+            if allowed_lot <= 0.0:
+                self.last_error = block_reason or "High Risk Lot Cap reached"
+                logger.warning(f"{caller_label} {direction_norm} blocked by Risk Guide Cap: {self.last_error}")
+                return None
+        else:
+            allowed_lot = norm_lot
 
         final_lot = normalize_lot_to_symbol(allowed_lot, sym_info)
         if final_lot <= 0.0:
@@ -1246,7 +1251,9 @@ class MT5Executor:
             logger.error(f"{caller_label} rejected invalid price: {price!r}")
             return None
 
-        ctx = self._prepare_symbol_order_context(symbol, direction, lot, caller_label)
+        ctx = self._prepare_symbol_order_context(
+            symbol, direction, lot, caller_label, enforce_risk_cap=False
+        )
         if ctx is None:
             return None
         direction_norm, resolved_sym, _, digits, pip_size, final_lot = ctx
@@ -1296,7 +1303,7 @@ class MT5Executor:
                 logger.error(f"{kind_upper.title()} {direction_norm} order returned invalid ticket: {ticket}")
                 return None
             if self.dry_run:
-                self._dry_run_ticket_lots[ticket] = final_lot
+                self._dry_run_pending_ticket_lots[ticket] = final_lot
             logger.info(
                 f"Placed {kind_upper.title()} {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"TargetPrice={target_price}, Lot={final_lot}, SL={final_sl}, TP={final_tp}"
@@ -1438,6 +1445,37 @@ class MT5Executor:
             pending_kind="LIMIT",
         )
 
+    def _layer_will_execute_at_market(
+        self,
+        symbol: str,
+        direction: str,
+        target_price: Optional[float],
+        tick: Any,
+        order_intent: str = "AUTO",
+        allow_market_buffer: bool = True,
+    ) -> bool:
+        """Return True when the given layer will execute immediately at market rather than as a pending order."""
+        intent = (order_intent or "AUTO").strip().upper()
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+
+        if intent == "MARKET" or target_price is None:
+            return True
+        if tick is None:
+            return False
+
+        if intent == "STOP":
+            return (tick.ask >= target_price) if is_buy else (tick.bid <= target_price)
+
+        # AUTO / LIMIT routing
+        if intent == "AUTO" and allow_market_buffer:
+            pip_size = self.get_pip_size(symbol)
+            auto_market_buffer = float(_cfg("AUTO_MARKET_SLIPPAGE_PIPS", 15.0)) * pip_size
+            if is_buy:
+                return tick.ask <= target_price + auto_market_buffer
+            return tick.bid >= target_price - auto_market_buffer
+
+        return (tick.ask <= target_price) if is_buy else (tick.bid >= target_price)
+
     def _execute_layer_price(
         self,
         symbol: str,
@@ -1458,48 +1496,25 @@ class MT5Executor:
         and current bid/ask vs target_price.
         """
         intent = (order_intent or "AUTO").strip().upper()
-        is_buy = (direction or "BUY").strip().upper() == "BUY"
-
-        if intent == "MARKET" or target_price is None:
+        if self._layer_will_execute_at_market(
+            symbol=symbol,
+            direction=direction,
+            target_price=target_price,
+            tick=tick,
+            order_intent=intent,
+            allow_market_buffer=allow_market_buffer,
+        ):
             t = self.execute_market_order(
                 symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
             )
             return (t, "MARKET") if t else (None, "FAILED")
 
-        if intent == "STOP":
-            should_market = (tick.ask >= target_price) if is_buy else (tick.bid <= target_price)
-            if should_market:
-                t = self.execute_market_order(
-                    symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
-                )
-                return (t, "MARKET") if t else (None, "FAILED")
-            return self._place_pending_with_stops_fallback(
-                symbol=symbol,
-                direction=direction,
-                target_price=target_price,
-                lot=lot,
-                sl=sl,
-                tp=tp,
-                pending_comment=stop_comment or limit_comment.replace("Limit", "Stop"),
-                market_comment=market_comment,
-                pending_kind="STOP",
-            )
-
-        # AUTO / LIMIT routing
-        if intent == "AUTO" and allow_market_buffer:
-            pip_size = self.get_pip_size(symbol)
-            auto_market_buffer = float(_cfg("AUTO_MARKET_SLIPPAGE_PIPS", 15.0)) * pip_size
-            if is_buy:
-                should_market = (tick.ask <= target_price + auto_market_buffer)
-            else:
-                should_market = (tick.bid >= target_price - auto_market_buffer)
-        else:
-            should_market = (tick.ask <= target_price) if is_buy else (tick.bid >= target_price)
-        if should_market:
-            t = self.execute_market_order(
-                symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
-            )
-            return (t, "MARKET") if t else (None, "FAILED")
+        pending_kind = "STOP" if intent == "STOP" else "LIMIT"
+        pending_comment = (
+            (stop_comment or limit_comment.replace("Limit", "Stop"))
+            if pending_kind == "STOP"
+            else limit_comment
+        )
         return self._place_pending_with_stops_fallback(
             symbol=symbol,
             direction=direction,
@@ -1507,9 +1522,9 @@ class MT5Executor:
             lot=lot,
             sl=sl,
             tp=tp,
-            pending_comment=limit_comment,
+            pending_comment=pending_comment,
             market_comment=market_comment,
-            pending_kind="LIMIT",
+            pending_kind=pending_kind,
         )
 
     def allocate_4layer_lots(
@@ -1517,10 +1532,14 @@ class MT5Executor:
         symbol: str,
         base_lots: Optional[Sequence[float]] = None,
         multiplier: Optional[float] = None,
+        market_mask: Optional[Sequence[bool]] = None,
     ) -> Tuple[List[float], Optional[str]]:
         """
-        Atomically compute 4-layer lot sizes [L1, L2, L3, L4] scaled by multiplier,
-        normalized to symbol volume constraints, and fitted within available_lots cap.
+        Atomically compute 4-layer lot sizes [L1, L2, L3, L4] scaled by multiplier and
+        normalized to symbol volume constraints.
+
+        Only layers marked True in ``market_mask`` (default all 4) compete for the active open
+        position ``available_lots`` cap; pending limit/stop layers (False) retain full scaled lots.
         """
         sym_info = self.get_symbol_info(symbol)
         auto_adj = bool(_cfg("AUTO_ADJUST_LOTS_TO_BALANCE", AUTO_ADJUST_LOTS_TO_BALANCE))
@@ -1555,31 +1574,52 @@ class MT5Executor:
             self.last_allocation_warning = None
             return scaled, None
 
+        if market_mask is None:
+            is_market = [True, True, True, True]
+        else:
+            is_market = [bool(x) for x in list(market_mask)[:4]]
+            while len(is_market) < 4:
+                is_market.append(True)
+
+        market_requested = round(sum(scaled[i] for i in range(4) if is_market[i]), 6)
+        if market_requested <= 0.0:
+            self.last_allocation_warning = None
+            return scaled, None
+
         vol_min, vol_max, vol_step, dec = _extract_symbol_volume_limits(sym_info)
         status = self.get_risk_exposure_status()
         avail = float(status.get("available_lots", 0.0))
         high_cap = float(status.get("high_risk_lots", 0.0))
-        total_lots = float(status.get("total_lots", 0.0))
+        open_lots = float(status.get("open_lots", 0.0))
         cap = float(status.get("capital", 0.0))
         curr = status.get("currency", "GBP")
 
-        total_scaled = round(sum(scaled), 6)
-        if total_scaled <= avail + 1e-9:
+        if market_requested <= avail + 1e-9:
             self.last_allocation_warning = None
             return scaled, None
 
         if avail < vol_min - 1e-9:
-            warn = (
-                f"High Risk Lot Cap Reached ({total_lots:.2f}/{high_cap:.2f} lots "
+            alloc = [0.0 if is_market[i] else scaled[i] for i in range(4)]
+            base_msg = (
+                f"High Risk Lot Cap Reached ({open_lots:.2f}/{high_cap:.2f} active lots "
                 f"for {cap:.2f} {curr} account)"
             )
+            warn = (
+                f"{base_msg} — market layer(s) skipped; pending limit/stop layer(s) retained."
+                if any(alloc)
+                else base_msg
+            )
             self.last_allocation_warning = warn
-            return [0.0, 0.0, 0.0, 0.0], warn
+            return alloc, warn
 
-        ratio = avail / total_scaled if total_scaled > 0 else 0.0
+        ratio = avail / market_requested if market_requested > 0 else 0.0
         eps = max(1e-12, vol_step * 1e-7)
         alloc: List[float] = []
-        for s in scaled:
+        for i in range(4):
+            if not is_market[i]:
+                alloc.append(scaled[i])
+                continue
+            s = scaled[i]
             raw_p = s * ratio
             floored = round(math.floor((raw_p + eps) / vol_step) * vol_step, dec)
             if floored < vol_min - 1e-9:
@@ -1587,28 +1627,35 @@ class MT5Executor:
             else:
                 alloc.append(round(min(floored, s, vol_max), dec))
 
-        rem = round(avail - sum(alloc), 6)
+        alloc_market = round(sum(alloc[i] for i in range(4) if is_market[i]), 6)
+        rem = round(avail - alloc_market, 6)
 
-        # Pass 1: activate zeroed layers in L1 -> L2 -> L3 -> L4 order when budget allows vol_min
+        # Pass 1: activate zeroed market layers in L1 -> L2 -> L3 -> L4 order when budget allows vol_min
         min_norm = normalize_lot_to_symbol(vol_min, sym_info)
         for i in range(4):
-            if alloc[i] == 0.0 and rem >= min_norm - 1e-9 and min_norm <= scaled[i] + 1e-9:
+            if is_market[i] and alloc[i] == 0.0 and rem >= min_norm - 1e-9 and min_norm <= scaled[i] + 1e-9:
                 alloc[i] = min_norm
                 rem = round(rem - min_norm, 6)
 
-        # Pass 2: top up remaining step budget in L4 -> L3 -> L2 -> L1 order (favoring active runner)
+        # Pass 2: top up remaining step budget in L4 -> L3 -> L2 -> L1 order across market layers
         while rem >= vol_step - 1e-9:
             progressed = False
             for i in (3, 2, 1, 0):
-                if alloc[i] > 0.0 and rem >= vol_step - 1e-9 and (alloc[i] + vol_step) <= min(scaled[i], vol_max) + 1e-9:
+                if (
+                    is_market[i]
+                    and alloc[i] > 0.0
+                    and rem >= vol_step - 1e-9
+                    and (alloc[i] + vol_step) <= min(scaled[i], vol_max) + 1e-9
+                ):
                     alloc[i] = round(alloc[i] + vol_step, dec)
                     rem = round(rem - vol_step, 6)
                     progressed = True
             if not progressed:
                 break
 
+        new_alloc_market = sum(alloc[i] for i in range(4) if is_market[i])
         warn = (
-            f"High-Risk Cap applied: allocated {sum(alloc):.2f}/{total_scaled:.2f} lots "
+            f"High-Risk Cap applied: allocated {new_alloc_market:.2f}/{market_requested:.2f} active lots "
             f"(avail={avail:.2f})"
         )
         self.last_allocation_warning = warn
@@ -1805,11 +1852,6 @@ class MT5Executor:
             return [], [], {}
         direction_norm, resolved_sym, tick, _, digits, pip_size = prereq
 
-        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=base_lots, multiplier=multiplier)
-        if sum(alloc_lots) <= 0.0:
-            self.last_error = warn or "High Risk Lot Cap reached"
-            return [], [], {}
-
         if hasattr(zone, "get_tiers"):
             raw_tiers = zone.get_tiers(direction_norm)
         elif isinstance(zone, dict):
@@ -1817,6 +1859,24 @@ class MT5Executor:
         else:
             raw_tiers = compute_zone_4tiers(zone.top, zone.bottom, direction_norm, digits=digits)
         tiers = {k: round(float(v), digits) for k, v in raw_tiers.items()}
+
+        market_mask = [
+            self._layer_will_execute_at_market(
+                symbol=resolved_sym,
+                direction=direction_norm,
+                target_price=tiers[l_name],
+                tick=tick,
+                order_intent="AUTO",
+                allow_market_buffer=(l_name in ("L1", "TOP")),
+            )
+            for l_name in LAYER_NAMES
+        ]
+        alloc_lots, warn = self.allocate_4layer_lots(
+            resolved_sym, base_lots=base_lots, multiplier=multiplier, market_mask=market_mask
+        )
+        if sum(alloc_lots) <= 0.0:
+            self.last_error = warn or "High Risk Lot Cap reached"
+            return [], [], {}
 
         layer_tps, _ = self._resolve_4layer_tps(
             direction=direction_norm,
@@ -1917,16 +1977,29 @@ class MT5Executor:
             max_layers=max_layers,
             layers_subset=layers_subset,
         )
-        alloc_lots, warn = self.allocate_4layer_lots(resolved_sym, base_lots=eff_base_lots, multiplier=multiplier)
-        if sum(alloc_lots) <= 0.0:
-            self.last_error = warn or "High Risk Lot Cap reached"
-            return [], [], {}
-
         eff_intent = (order_intent or "AUTO").strip().upper()
         if is_stop_order and eff_intent == "AUTO":
             eff_intent = "STOP"
 
         target_px = round(float(price), digits)
+        market_mask = [
+            (l_name in active_names)
+            and self._layer_will_execute_at_market(
+                symbol=resolved_sym,
+                direction=direction_norm,
+                target_price=target_px,
+                tick=tick,
+                order_intent=eff_intent,
+                allow_market_buffer=(l_name in ("L1", "TOP")),
+            )
+            for l_name in LAYER_NAMES
+        ]
+        alloc_lots, warn = self.allocate_4layer_lots(
+            resolved_sym, base_lots=eff_base_lots, multiplier=multiplier, market_mask=market_mask
+        )
+        if sum(alloc_lots) <= 0.0:
+            self.last_error = warn or "High Risk Lot Cap reached"
+            return [], [], {}
         layer_tps, _ = self._resolve_4layer_tps(
             direction=direction_norm,
             pip_size=pip_size,
@@ -2415,6 +2488,7 @@ class MT5Executor:
         if not ticket:
             return False
         if self.dry_run:
+            self._dry_run_pending_ticket_lots.pop(ticket, None)
             self._dry_run_ticket_lots.pop(ticket, None)
             logger.info(f"[DRY-RUN] Cancelled Pending Order #{ticket}")
             return True
@@ -2665,8 +2739,13 @@ class MT5Executor:
     def get_total_active_lots(self) -> Dict[str, float]:
         """Return current bot open market lots, pending limit/stop lots, and total committed lots."""
         if self.dry_run or not self._connected:
-            total = round(sum(self._dry_run_ticket_lots.values()), 2)
-            return {"open_lots": total, "pending_lots": 0.0, "total_lots": total}
+            open_lots = round(sum(self._dry_run_ticket_lots.values()), 2)
+            pending_lots = round(sum(self._dry_run_pending_ticket_lots.values()), 2)
+            return {
+                "open_lots": open_lots,
+                "pending_lots": pending_lots,
+                "total_lots": round(open_lots + pending_lots, 2),
+            }
 
         magic = _cfg("MAGIC_NUMBER", MAGIC_NUMBER)
         try:
@@ -2722,16 +2801,16 @@ class MT5Executor:
 
         thresholds = calculate_risk_guide_thresholds(cap)
         lots = self.get_total_active_lots()
-        total_lots = lots["total_lots"]
+        open_lots = lots["open_lots"]
         low_l = thresholds["low_risk_lots"]
         mid_l = thresholds["mid_risk_lots"]
         high_l = thresholds["high_risk_lots"]
 
-        if total_lots >= high_l - 1e-9:
+        if open_lots >= high_l - 1e-9:
             tier = "HIGH_CAP_REACHED"
-        elif total_lots > mid_l + 1e-9:
+        elif open_lots > mid_l + 1e-9:
             tier = "ABOVE_MID_RISK"
-        elif total_lots > low_l + 1e-9:
+        elif open_lots > low_l + 1e-9:
             tier = "ABOVE_LOW_RISK"
         else:
             tier = "LOW_RISK_SAFE"
@@ -2741,7 +2820,7 @@ class MT5Executor:
             **thresholds,
             **lots,
             "risk_tier": tier,
-            "available_lots": max(0.0, round(high_l - total_lots, 2)),
+            "available_lots": max(0.0, round(high_l - open_lots, 2)),
         }
 
     def check_and_cap_order_lot(
@@ -2750,8 +2829,9 @@ class MT5Executor:
         symbol: Optional[str] = None,
     ) -> Tuple[float, Optional[str]]:
         """
-        Enforces the Professional Risk Guide High-Risk Cap:
-        Never allows total active + pending lots to exceed high_risk_lots.
+        Enforces the Professional Risk Guide High-Risk Cap for active open market positions:
+        Never allows open active buy/sell lots to exceed high_risk_lots.
+        Pending limit/stop orders are uncapped at placement time.
         """
         if requested_lot is None or float(requested_lot) <= 0.0:
             return 0.0, f"Invalid lot size: {requested_lot}"
@@ -2769,13 +2849,13 @@ class MT5Executor:
         status = self.get_risk_exposure_status()
         avail = status["available_lots"]
         high_cap = status["high_risk_lots"]
-        total_lots = status["total_lots"]
+        open_lots = status["open_lots"]
         cap = status["capital"]
         curr = status.get("currency", "GBP")
 
         if avail < vol_min - 1e-9:
             reason = (
-                f"High Risk Lot Cap Reached ({total_lots:.2f}/{high_cap:.2f} lots "
+                f"High Risk Lot Cap Reached ({open_lots:.2f}/{high_cap:.2f} active lots "
                 f"for {cap:.2f} {curr} account)"
             )
             return 0.0, reason
@@ -2785,7 +2865,7 @@ class MT5Executor:
         allowed = round(math.floor((allowed_raw + eps) / vol_step) * vol_step, dec)
         if allowed < vol_min:
             reason = (
-                f"High Risk Lot Cap Reached ({total_lots:.2f}/{high_cap:.2f} lots "
+                f"High Risk Lot Cap Reached ({open_lots:.2f}/{high_cap:.2f} active lots "
                 f"for {cap:.2f} {curr} account)"
             )
             return 0.0, reason
@@ -3146,7 +3226,7 @@ class MT5Executor:
             for t in list(tracked_market_tickets or list(self._dry_run_ticket_lots.keys())):
                 if self.close_market_position(t):
                     closed_tickets.append(t)
-            for pt in list(tracked_pending_tickets or []):
+            for pt in list(tracked_pending_tickets or list(self._dry_run_pending_ticket_lots.keys())):
                 if self.cancel_pending_order(pt):
                     cancelled_orders.append(pt)
             if closed_tickets:

@@ -138,13 +138,26 @@ def test_allocate_4layer_lots_atomic_budget_cap():
     assert lots_cap4 == [0.01, 0.01, 0.01, 0.01]
     assert warn_cap4 is not None and "High-Risk Cap applied" in warn_cap4
 
-    # 0.03 remaining -> proportional allocation keeps L4 runner (0.02*0.6=0.012->0.01) + L1, L2; L3 skipped cleanly
+    # 0.03 active open remaining -> execute_4layer_market keeps L1, L2, L4 (0.03 total) while L3 is skipped;
+    # meanwhile pending limit zone layers keep full pending lots uncapped.
     ex._dry_run_ticket_lots = {1: 0.07}
     lots_cap3, warn_cap3 = ex.allocate_4layer_lots("XAUUSD.s")
     assert lots_cap3 == [0.01, 0.01, 0.0, 0.01]
     assert warn_cap3 is not None
 
-    mk, pd, layers = ex.execute_4layer_zone(
+    mk_m, pd_m, layers_m = ex.execute_4layer_market(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        sl=3875.0,
+        final_tp=3899.5,
+        raw_tp1=3900.0,
+    )
+    assert len(mk_m) == 3 and pd_m == []
+    assert set(layers_m.keys()) == {"L1", "L2", "L4"}
+    assert round(sum(v["lot"] for v in layers_m.values()), 2) == 0.03
+
+    ex._dry_run_ticket_lots = {1: 0.07}
+    mk_z, pd_z, layers_z = ex.execute_4layer_zone(
         symbol="XAUUSD.s",
         direction="BUY",
         zone=ZoneInfo(3895.0, 3891.0, 3887.0, "BUY"),
@@ -152,9 +165,9 @@ def test_allocate_4layer_lots_atomic_budget_cap():
         final_tp=3899.5,
         raw_tp1=3900.0,
     )
-    assert len(mk) + len(pd) == 3
-    assert set(layers.keys()) == {"L1", "L2", "L4"}
-    assert round(sum(v["lot"] for v in layers.values()), 2) == 0.03
+    assert len(mk_z) == 1 and len(pd_z) == 3
+    assert set(layers_z.keys()) == {"L1", "L2", "L3", "L4"}
+    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.05
 
     # 0.00 remaining -> all zeroed, 0 orders placed
     ex._dry_run_ticket_lots = {1: 0.10}

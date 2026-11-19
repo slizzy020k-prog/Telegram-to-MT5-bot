@@ -171,8 +171,10 @@ async def test_1_active_4layer_deleted_and_multi_signal_isolation(tmp_path):
         sig_501_after = main.state_mgr.get_signal(501, chat_id=-1001234567890)
         assert sig_501_after["status"] in ("ACTIVE", "OPEN", "PARTIAL_FILLED")
         assert set(sig_501_after["market_tickets"]) | set(sig_501_after["pending_tickets"]) == tickets_501
-        for t in tickets_501:
+        for t in sig_501_after["market_tickets"]:
             assert t in main.executor._dry_run_ticket_lots
+        for t in sig_501_after["pending_tickets"]:
+            assert t in main.executor._dry_run_pending_ticket_lots
 
         # Now test bare original_update.channel_id=1234567890 normalization deleting #501
         bare_upd = SimpleNamespace(channel_id=1234567890, messages=[501])

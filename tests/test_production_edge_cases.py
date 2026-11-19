@@ -509,8 +509,8 @@ def test_get_position_close_info_dry_run():
 
 
 @pytest.mark.asyncio
-async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path):
-    """Verify exact professional risk guide table, threshold crossing alerts, and High Risk hard lot cap."""
+async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeypatch):
+    """Verify exact professional risk guide table, threshold crossing alerts, and active-only High Risk hard lot cap."""
     from mt5_executor import calculate_risk_guide_thresholds
     from tests.test_copier_scenarios import MockTelethonEvent
 
@@ -524,54 +524,62 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path):
     # Custom account amount (£120 -> High Risk = 0.12 = 3 concurrent 0.04-lot signals)
     assert calculate_risk_guide_thresholds(120) == {"capital": 120.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.06, "high_risk_lots": 0.12}
 
-    # 2. Enforce High Risk Lot Cap on a £50 account (High Risk = 0.05 lots)
-    main.state_mgr = StateManager(tmp_path / "risk_cap_state.json")
-    main.executor = MT5Executor(dry_run=True)
-    main.executor.connect()
-    main.executor._dry_run_capital = 50.0
+    # 2. Enforce High Risk Lot Cap for active open buys/sells on a £50 account (High Risk = 0.05 lots)
+    monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)
+    monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state.json"))
+    ex50 = MT5Executor(dry_run=True)
+    ex50.connect()
+    ex50._dry_run_capital = 50.0
+    monkeypatch.setattr(main, "executor", ex50)
 
     alerts = []
-    orig_notify = main.notify_saved_messages
 
     async def cap_notify(txt):
         alerts.append(txt)
 
-    main.notify_saved_messages = cap_notify
-    try:
-        # Signal 1 on £50: 4-layer zone (0.01+0.01+0.01+0.02 = 0.05 lots) -> passes Low, Mid & hits 0.05 High Cap!
-        evt1 = MockTelethonEvent(msg_id=9961, text="Buy 3895-3887\nTP 3905\nSL 3875")
-        await main.handle_new_message(evt1)
-        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
-        assert any("Passed LOW RISK" in a and "Passed MID RISK" in a and "MAX HIGH RISK CAP REACHED" in a for a in alerts)
+    monkeypatch.setattr(main, "notify_saved_messages", cap_notify)
 
-        # Signal 2 on £50: 0.00 lots available -> blocked completely by High Risk Cap
-        evt2 = MockTelethonEvent(msg_id=9962, text="Buy 3895-3887\nTP 3905\nSL 3875")
-        await main.handle_new_message(evt2)
-        assert main.state_mgr.get_signal(9962) is None
-        assert any("High Risk Lot Cap Reached" in a for a in alerts)
+    # Signal 1 on £50: 4-layer Market Now (0.01+0.01+0.01+0.02 = 0.05 open lots) -> passes Low, Mid & hits 0.05 High Cap!
+    evt1 = MockTelethonEvent(msg_id=9961, text="Buy now\nTP 3905\nSL 3875")
+    await main.handle_new_message(evt1)
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
+    assert any("Passed LOW RISK" in a and "Passed MID RISK" in a and "MAX HIGH RISK CAP REACHED" in a for a in alerts)
 
-        # 3. Atomic partial cap on a £80 account (High Risk = 0.08 lots): 0.05 + capped 0.03 -> 0.08, then blocked!
-        alerts.clear()
-        main.state_mgr = StateManager(tmp_path / "risk_cap_state_80.json")
-        main.executor = MT5Executor(dry_run=True)
-        main.executor.connect()
-        main.executor._dry_run_capital = 80.0
+    # Signal 2 on £50: 0.00 active lots available -> Market Now blocked by High Risk Cap
+    evt2 = MockTelethonEvent(msg_id=9962, text="Buy now\nTP 3905\nSL 3875")
+    await main.handle_new_message(evt2)
+    assert main.state_mgr.get_signal(9962) is None
+    assert any("High Risk Lot Cap Reached" in a for a in alerts)
 
-        await main.handle_new_message(MockTelethonEvent(msg_id=9964, text="Buy 3895-3887\nTP 3905\nSL 3875"))
-        assert main.executor.get_total_active_lots()["total_lots"] == 0.05
+    # Pending limit zone below market still allowed even at 0.05/0.05 active open cap
+    evt_pend = MockTelethonEvent(msg_id=9963, text="Buy 3885-3877\nTP 3895\nSL 3865")
+    await main.handle_new_message(evt_pend)
+    sig_pend = main.state_mgr.get_signal(9963)
+    assert sig_pend is not None and len(sig_pend["pending_tickets"]) == 4
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
 
-        await main.handle_new_message(MockTelethonEvent(msg_id=9965, text="Buy 3895-3887\nTP 3905\nSL 3875"))
-        assert main.executor.get_total_active_lots()["total_lots"] == 0.08
-        sig_partial = main.state_mgr.get_signal(9965)
-        assert sig_partial is not None
-        assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) == 3
-        assert round(sum(l["lot"] for l in sig_partial["layers"].values()), 2) == 0.03
-        assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
+    # 3. Atomic partial cap on a £80 account (High Risk = 0.08 lots): 0.05 + capped 0.03 -> 0.08 active open, then blocked!
+    alerts.clear()
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state_80.json"))
+    ex80 = MT5Executor(dry_run=True)
+    ex80.connect()
+    ex80._dry_run_capital = 80.0
+    monkeypatch.setattr(main, "executor", ex80)
 
-        await main.handle_new_message(MockTelethonEvent(msg_id=9966, text="Buy 3895-3887\nTP 3905\nSL 3875"))
-        assert main.state_mgr.get_signal(9966) is None
-    finally:
-        main.notify_saved_messages = orig_notify
+    await main.handle_new_message(MockTelethonEvent(msg_id=9964, text="Buy now\nTP 3905\nSL 3875"))
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
+
+    await main.handle_new_message(MockTelethonEvent(msg_id=9965, text="Buy now\nTP 3905\nSL 3875"))
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.08
+    sig_partial = main.state_mgr.get_signal(9965)
+    assert sig_partial is not None
+    assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) == 3
+    assert round(sum(l["lot"] for l in sig_partial["layers"].values()), 2) == 0.03
+    assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
+
+    await main.handle_new_message(MockTelethonEvent(msg_id=9966, text="Buy now\nTP 3905\nSL 3875"))
+    assert main.state_mgr.get_signal(9966) is None
 
 
 @pytest.mark.asyncio
