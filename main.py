@@ -8776,14 +8776,16 @@ async def main() -> None:
             has_open_mkt_boot = bool(open_pos) or any(
                 isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_s or [])
             )
+            # Always baseline realized daily loss on startup against current account balance so
+            # previously realized losses from earlier runs never re-trigger 50% pause or 90% cutoff on restart.
             dd_init = await _mt5_call(executor.get_daily_drawdown_status)
-            if not has_open_mkt_boot and dd_init.get("pause_new_signals"):
+            if dd_init.get("realized_today", 0.0) < 0.0 or dd_init.get("pause_new_signals"):
                 upd = await _mt5_call(executor.update_daily_loss_baseline)
                 _daily_50pct_alert_date = None
                 logger.info(
-                    f"Previous daily loss (-{dd_init['total_daily_loss']:.2f} {dd_init['currency']}) "
-                    f"has passed (0 open positions). Daily loss baseline updated to current balance "
-                    f"{upd['current_balance']:.2f} {dd_init['currency']}. Ready to action new trades."
+                    f"Startup daily loss baseline synced to current balance "
+                    f"{upd['current_balance']:.2f} {dd_init['currency']} "
+                    f"(archived prior realized={upd['baseline_realized']:.2f} {dd_init['currency']})."
                 )
             await _startup_hydrate_and_backfill_ledger()
             await _update_live_terminal_status_async(force_print=True)
