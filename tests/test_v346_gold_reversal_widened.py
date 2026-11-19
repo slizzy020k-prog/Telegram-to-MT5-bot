@@ -123,8 +123,11 @@ def test_tight_leg_arms_at_80pct_and_requires_half_leg_giveback():
     assert res_dip1["armed"] is True
     assert res_dip1["triggered"] is False
 
-    # Dip $1.80 to 3730.75 ($1.80 >= $1.50 floor and 1.80/2.55 = 70.6% >= 30%) -> TRIGGERS!
+    # Dip $1.80 to 3730.75 ($1.80 >= $1.50 floor and 1.80/2.55 = 70.6% >= 30%) -> 2 confirming ticks!
     t_dip2 = _tick(3730.75)
+    res_dip2_tick1 = executor.evaluate_gold_reversal_guard(sig, t_dip2)
+    assert res_dip2_tick1["armed"] is True
+    assert res_dip2_tick1["triggered"] is False
     res_dip2 = executor.evaluate_gold_reversal_guard(sig, t_dip2)
     assert res_dip2["armed"] is True
     assert res_dip2["triggered"] is True

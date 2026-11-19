@@ -314,6 +314,7 @@ async def test_single_price_pending_retiered_into_4layer_zone_after_4_minutes_an
         # - L3 (3862.67) and L4 (3864.00): cancelled cleanly and re-placed at their new zone limit tiers!
         orig_cancel = main.executor.cancel_pending_order
         orig_mod_pend = main.executor.modify_pending_order_sltp
+        orig_mod_pend_price = main.executor.modify_pending_order_price_sltp
 
         def _cancel_with_l2_fill_race(ticket):
             if ticket == orig_l2_ticket:
@@ -324,6 +325,11 @@ async def test_single_price_pending_retiered_into_4layer_zone_after_4_minutes_an
             if ticket == orig_l1_ticket:
                 return False
             return orig_mod_pend(ticket=ticket, sl=sl, tp=tp)
+
+        def _mod_pend_price_with_l2_fill_race(ticket, price, sl=None, tp=None):
+            if ticket == orig_l2_ticket:
+                return False
+            return orig_mod_pend_price(ticket, price, sl=sl, tp=tp)
 
         tick_4m_later = SimpleNamespace(bid=3860.80, ask=3861.00, time=1700000240)
         edit_zone_text = (
@@ -341,7 +347,11 @@ async def test_single_price_pending_retiered_into_4layer_zone_after_4_minutes_an
 
         with patch.object(main.executor, "get_tick", return_value=tick_4m_later), patch.object(
             main.executor, "cancel_pending_order", side_effect=_cancel_with_l2_fill_race
-        ), patch.object(main.executor, "modify_pending_order_sltp", side_effect=_mod_pend_with_l1_filled):
+        ), patch.object(
+            main.executor, "modify_pending_order_sltp", side_effect=_mod_pend_with_l1_filled
+        ), patch.object(
+            main.executor, "modify_pending_order_price_sltp", side_effect=_mod_pend_price_with_l2_fill_race
+        ):
             await main.handle_message_edited(evt_edit)
 
         sig1 = main.state_mgr.get_signal(9742, chat_id=-1004369388188)

@@ -274,8 +274,10 @@ async def test_3_near_miss_reversal_at_90pct_tp1_banks_profit_and_respects_m1_at
             await main._process_pre_tp1_or_backstop_tick("7301", main.state_mgr.get_signal(7301))
         assert main.state_mgr.get_signal(7301)["status"] == "ACTIVE"
 
-        # Drop 31.1% ($2.80 to 3896.20 >= 30% AND >= $1.50) -> BANKS IMMEDIATELY!
+        # Drop 31.1% ($2.80 to 3896.20 >= 30% AND >= $1.50) -> 2 confirming ticks bank exit!
         with patch.object(main.executor, "get_tick", return_value=_tick(3896.20)):
+            await main._process_pre_tp1_or_backstop_tick("7301", main.state_mgr.get_signal(7301))
+            assert main.state_mgr.get_signal(7301)["status"] == "ACTIVE"
             await main._process_pre_tp1_or_backstop_tick("7301", main.state_mgr.get_signal(7301))
         s_closed = main.state_mgr.get_signal(7301)
         assert s_closed["status"] == "CLOSED"
@@ -299,7 +301,9 @@ async def test_3_near_miss_reversal_at_90pct_tp1_banks_profit_and_respects_m1_at
     # $1.80 drop is 33.3% (>=30%) and >=$1.50, BUT < $2.10 ATR floor -> holds!
     res_hold = main.executor.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.60))
     assert res_hold["triggered"] is False
-    # $2.20 drop (>= $2.10 ATR floor and >= 30%) -> triggers!
+    # $2.20 drop (>= $2.10 ATR floor and >= 30%) -> 2 confirming ticks trigger!
+    res_trig_t1 = main.executor.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.20))
+    assert res_trig_t1["triggered"] is False
     res_trig = main.executor.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.20))
     assert res_trig["triggered"] is True
 

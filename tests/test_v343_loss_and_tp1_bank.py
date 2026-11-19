@@ -123,7 +123,11 @@ async def test_bank_single_layer_at_tp1(tmp_path, monkeypatch):
     assert sig["last_banked_tickets"] == [4101]
 
 
-def test_tight_scalp_reversal_guard_arming():
+def test_tight_scalp_reversal_guard_arming(monkeypatch):
+    import mt5_executor as _mt5_mod
+    monkeypatch.setattr(config, "STAGE0_PROFIT_LOCK_ENABLED", False)
+    if hasattr(_mt5_mod, "STAGE0_PROFIT_LOCK_ENABLED"):
+        monkeypatch.setattr(_mt5_mod, "STAGE0_PROFIT_LOCK_ENABLED", False)
     """
     Verify Gold Scalp Arming Calibration on short TP1 leg (<= $4.00):
     Signal: Entry 3842.0, TP1 3844.5 ($2.50 leg).
@@ -155,12 +159,15 @@ def test_tight_scalp_reversal_guard_arming():
     assert sig.get("reversal_guard_armed") is True
     assert sig.get("peak_profit") == pytest.approx(2.06)
 
-    # Reversal to 3842.80: giveback = $1.26 >= floor ($1.125) and >= 30% giveback -> TRIGGERS!
-    t_pullback = _tick(3842.80)
+    # Reversal to 3842.50: giveback = $1.56 >= floor ($1.50) and >= 30% giveback -> 2 confirming ticks!
+    t_pullback = _tick(3842.50)
+    res_tick1 = executor.evaluate_gold_reversal_guard(sig, t_pullback)
+    assert res_tick1["armed"] is True
+    assert res_tick1["triggered"] is False
     res_trigger = executor.evaluate_gold_reversal_guard(sig, t_pullback)
     assert res_trigger["armed"] is True
     assert res_trigger["triggered"] is True
-    assert res_trigger["pullback_dollars"] == pytest.approx(1.26)
+    assert res_trigger["pullback_dollars"] == pytest.approx(1.56)
 
 
 @pytest.mark.asyncio

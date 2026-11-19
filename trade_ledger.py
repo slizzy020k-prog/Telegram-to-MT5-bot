@@ -144,7 +144,16 @@ def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> st
 def _resolve_ref_entry(signal_data: Dict[str, Any], is_buy: bool) -> Optional[float]:
     """Resolve best available reference entry price for MFE computation."""
     layers = signal_data.get("layers")
-    runner_layer = signal_data.get("runner_layer")
+    r_layers = list(
+        signal_data.get("runner_layers")
+        or signal_data.get("last_runner_layers")
+        or []
+    )
+    runner_layer = (
+        signal_data.get("runner_layer")
+        or signal_data.get("last_runner_layer")
+        or (r_layers[-1] if r_layers else None)
+    )
     if runner_layer and isinstance(layers, dict):
         r_obj = layers.get(runner_layer)
         if isinstance(r_obj, dict):
@@ -333,6 +342,34 @@ def build_trade_record(
     raw_tier = signal_data.get("trail_tier_used")
     trail_tier_used: Optional[Dict[str, Any]] = dict(raw_tier) if isinstance(raw_tier, dict) else None
 
+    resolved_r_layers = [
+        str(x)
+        for x in (
+            signal_data.get("runner_layers")
+            or signal_data.get("last_runner_layers")
+            or ([signal_data["runner_layer"]] if signal_data.get("runner_layer") else [])
+            or ([signal_data["last_runner_layer"]] if signal_data.get("last_runner_layer") else [])
+        )
+        if x
+    ]
+    if not resolved_r_layers:
+        r_tkts = [
+            _safe_int(t)
+            for t in (signal_data.get("last_runner_tickets") or ([signal_data.get("last_runner_ticket")] if signal_data.get("last_runner_ticket") else []))
+            if _safe_int(t) is not None
+        ]
+        if r_tkts and isinstance(layers, dict):
+            for lk, lv in layers.items():
+                if isinstance(lv, dict) and _safe_int(lv.get("ticket")) in r_tkts:
+                    resolved_r_layers.append(str(lk))
+        elif layers_filled:
+            resolved_r_layers = [str(layers_filled[-1])]
+    resolved_r_layer = (
+        signal_data.get("runner_layer")
+        or signal_data.get("last_runner_layer")
+        or (resolved_r_layers[-1] if resolved_r_layers else None)
+    )
+
     record: Dict[str, Any] = {
         "schema_version": 3,
         "closed_at": datetime.now(timezone.utc).isoformat(),
@@ -348,11 +385,8 @@ def build_trade_record(
         "tickets": tickets,
         "layers_filled": layers_filled,
         "highest_milestone_cleared": highest_cleared,
-        "runner_layer": signal_data.get("runner_layer"),
-        "runner_layers": list(
-            signal_data.get("runner_layers")
-            or ([signal_data["runner_layer"]] if signal_data.get("runner_layer") else [])
-        ),
+        "runner_layer": resolved_r_layer,
+        "runner_layers": resolved_r_layers,
         "exit_reason": resolved_exit_reason,
         "exit_reason_code": resolved_exit_code,
         "exit_reason_detail": resolved_exit_detail,

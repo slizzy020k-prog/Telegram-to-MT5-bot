@@ -863,6 +863,8 @@ def gate_3_classify_trade_management(
             return mgmt_obj
 
         # 7b. Adjust SL / TP1..TP5 ("SL 3885", "Move SL to 3885", "TP2 3918 TP3 3930", "Adjust TP2 3918 TP3 3928")
+        if not effective_is_reply and _infer_geometric_signal(text, is_reply=False) is not None:
+            return None
         raw_adj_sl = _extract_sl(text)
         adj_sl = round(raw_adj_sl, 2) if (raw_adj_sl is not None and raw_adj_sl >= 500.0) else None
         raw_labeled, raw_unlabeled = extract_labeled_tps(text)
@@ -1007,6 +1009,248 @@ def _strip_entry_text(text: str) -> str:
     return " \n ".join(clean_lines)
 
 
+_NON_GOLD_GEO_TICKER_RE = re.compile(
+    r"\b(?:ETHUSD|BTCUSD|SOLUSD|XRPUSD|LTCUSD|BNBUSD|ADAUSD|DOGEUSD|"
+    r"SPX500|SP500|US500|NAS100|USTEC|NDX|US30|DJ30|UK100|FTSE|GER40|DE40|DAX|"
+    r"XAGUSD|XPTUSD|XPDUSD|WTI|BRENT|USOIL|UKOIL|"
+    r"EURUSD|GBPUSD|USDJPY|USDCHF|USDCAD|AUDUSD|NZDUSD|EURJPY|GBPJPY|EURGBP)\b",
+    re.IGNORECASE,
+)
+
+_GEO_HEADER_ALLOWLIST = {
+    "xau", "xauusd", "gold", "limit", "limits", "stop", "stops",
+    "entry", "entries", "zone", "area", "price", "to", "at", "around",
+    "near", "now", "signal", "setup", "order", "orders", "high", "mid",
+    "low", "risk", "scalp", "swing", "vip",
+}
+
+
+def _try_repair_zone_typo(
+    raw_p1: str,
+    raw_p2: str,
+    raw_sl: Optional[float],
+    raw_tp1: Optional[float],
+    direction: Optional[str] = None,
+) -> Optional[Tuple[float, float, str]]:
+    """
+    Repair a single-digit thousands typo in an entry zone (e.g. '3750-4730' -> 3750.0-3730.0)
+    strictly anchored by BOTH explicit SL and explicit TP1 geometry.
+    Returns (top_price, bottom_price, note) iff exactly 1 valid candidate exists.
+    """
+    if raw_sl is None or raw_tp1 is None:
+        return None
+    if not (1000.0 <= float(raw_sl) < 10000.0 and 1000.0 <= float(raw_tp1) < 10000.0):
+        return None
+    if abs(float(raw_sl) - float(raw_tp1)) < 1e-6:
+        return None
+
+    eff_dir = (direction or "").strip().upper()
+    if eff_dir not in ("BUY", "SELL"):
+        eff_dir = "BUY" if float(raw_sl) < float(raw_tp1) else "SELL"
+
+    int1 = raw_p1.split(".", 1)[0]
+    int2 = raw_p2.split(".", 1)[0]
+    if len(int1) != 4 or len(int2) != 4 or int1[0] == int2[0]:
+        return None
+
+    try:
+        p1 = float(raw_p1)
+        p2 = float(raw_p2)
+        cand_a = (p1, float(int1[0] + raw_p2[1:]))
+        cand_b = (float(int2[0] + raw_p1[1:]), p2)
+    except (TypeError, ValueError):
+        return None
+
+    max_sl_dist = float(MAX_SL_PIPS) * 0.10
+    valid: List[Tuple[float, float, str]] = []
+    for a, b in (cand_a, cand_b):
+        if not (1000.0 <= a < 10000.0 and 1000.0 <= b < 10000.0):
+            continue
+        top_p = round(max(a, b), 2)
+        bot_p = round(min(a, b), 2)
+        span = top_p - bot_p
+        if span <= 0.0 or span > 50.0:
+            continue
+        sl_f = float(raw_sl)
+        tp1_f = float(raw_tp1)
+        if eff_dir == "BUY":
+            if sl_f < bot_p <= top_p < tp1_f and (bot_p - sl_f) <= max_sl_dist and (tp1_f - top_p) <= 250.0:
+                valid.append((top_p, bot_p, f"{raw_p1}-{raw_p2} -> {top_p}-{bot_p}"))
+        else:
+            if tp1_f < bot_p <= top_p < sl_f and (sl_f - top_p) <= max_sl_dist and (bot_p - tp1_f) <= 250.0:
+                valid.append((top_p, bot_p, f"{raw_p1}-{raw_p2} -> {top_p}-{bot_p}"))
+
+    if len(valid) == 1:
+        return valid[0]
+    return None
+
+
+def _extract_zone_and_single_entry(
+    zone_search_text: str,
+    direction: str,
+    raw_sl: Optional[float] = None,
+    explicit_tps: Optional[Sequence[float]] = None,
+) -> Tuple[Optional[Dict[str, float]], Optional[Dict[str, float]], Optional[float], bool, List[float], Optional[str]]:
+    """
+    Shared extractor for entry zones, single-digit typo-repaired zones, multi-line levels,
+    and single-price entries. Returns (entry_tiers, zone_tiers, single_price, is_zone, distinct_levels, repair_note).
+    """
+    entry_tiers = None
+    zone_tiers = None
+    single_price = None
+    is_zone = False
+    repair_note: Optional[str] = None
+    raw_tp1 = float(explicit_tps[0]) if explicit_tps else None
+
+    failed_pairs: List[Tuple[str, str, float, float]] = []
+    for zm in ZONE_PATTERN.finditer(zone_search_text):
+        r1, r2 = zm.group(1), zm.group(2)
+        p1, p2 = float(r1), float(r2)
+        if 500.0 <= p1 < 100000.0 and 500.0 <= p2 < 100000.0 and abs(p1 - p2) <= 250.0:
+            top_price = round(max(p1, p2), 2)
+            bottom_price = round(min(p1, p2), 2)
+            mid_price = round((top_price + bottom_price) / 2.0, 2)
+            entry_tiers = {"top": top_price, "mid": mid_price, "bottom": bottom_price}
+            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
+            is_zone = True
+            break
+        failed_pairs.append((r1, r2, p1, p2))
+
+    if not is_zone and failed_pairs:
+        for r1, r2, p1, p2 in failed_pairs:
+            if abs(p1 - p2) > 250.0:
+                repaired = _try_repair_zone_typo(r1, r2, raw_sl, raw_tp1, direction=direction)
+                if repaired is not None:
+                    top_price, bottom_price, repair_note = repaired
+                    mid_price = round((top_price + bottom_price) / 2.0, 2)
+                    entry_tiers = {"top": top_price, "mid": mid_price, "bottom": bottom_price}
+                    zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
+                    is_zone = True
+                    logger.warning(
+                        f"[ZONE TYPO REPAIR] {repair_note} ({direction}, SL={raw_sl}, TP1={raw_tp1})"
+                    )
+                    break
+
+    distinct_levels: List[float] = []
+    if not is_zone:
+        for num_m in re.finditer(
+            r"(?<![.\d])(\d{3,6}(?:\.\d+)?)(?![.\d])(?!\s*(?:pips?|%|lots?|x)\b)",
+            zone_search_text,
+            re.IGNORECASE,
+        ):
+            val = round(float(num_m.group(1)), 2)
+            if 500.0 <= val < 100000.0 and val not in distinct_levels:
+                distinct_levels.append(val)
+        if len(distinct_levels) >= 2 and (max(distinct_levels) - min(distinct_levels)) <= 100.0:
+            top_price = max(distinct_levels)
+            bottom_price = min(distinct_levels)
+            mid_price = round((top_price + bottom_price) / 2.0, 2)
+            entry_tiers = {"top": top_price, "mid": mid_price, "bottom": bottom_price}
+            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
+            is_zone = True
+
+    if not is_zone:
+        single_match = SINGLE_PRICE_PATTERN.search(zone_search_text)
+        if single_match:
+            price = float(single_match.group(1))
+            if 500.0 <= price < 100000.0:
+                single_price = round(price, 2)
+                is_zone = False
+        if single_price is None and len(distinct_levels) == 1 and (raw_sl is not None or raw_tp1 is not None):
+            single_price = distinct_levels[0]
+            is_zone = False
+
+    return entry_tiers, zone_tiers, single_price, is_zone, distinct_levels, repair_note
+
+
+def _infer_geometric_signal(text: str, is_reply: bool = False) -> Optional[str]:
+    """
+    When explicit BUY/SELL keywords are omitted (e.g. '3750-3730\\nSL 3725\\nTP 3753...'),
+    safely infer direction strictly from unambiguous Gold SL/Entry/TP geometry.
+    Returns 'BUY', 'SELL', or None.
+    """
+    if is_reply or "?" in text or DIRECTION_PATTERN.search(text):
+        return None
+    if _NON_GOLD_GEO_TICKER_RE.search(text):
+        return None
+    if _PROSE_CHATTER_PATTERN.search(text):
+        return None
+    lower = text.lower()
+    for pat in VICTORY_RECAP_BLOCKERS:
+        if re.search(pat, lower):
+            return None
+
+    zone_search_text = _strip_entry_text(text).strip()
+    if not zone_search_text:
+        return None
+
+    # Clean header allowlist: strip emojis, connectors, and punctuation before checking tokens
+    hdr_norm = re.sub(r"\bxau\s*/?\s*usd(?:\.[a-z0-9]+)?\b", " xauusd ", zone_search_text, flags=re.IGNORECASE)
+    hdr_norm = re.sub(r"[^\x00-\x7F]+", " ", hdr_norm)
+    hdr_norm = re.sub(r"[-–—/:@,|•()\[\]*_~`!]+", " ", hdr_norm)
+    hdr_tokens = [tok.lower() for tok in hdr_norm.split() if tok]
+    if not hdr_tokens or len(hdr_tokens) > 6:
+        return None
+    for tok in hdr_tokens:
+        if re.fullmatch(r"\d+(?:\.\d+)?", tok):
+            continue
+        if tok not in _GEO_HEADER_ALLOWLIST:
+            return None
+
+    raw_sl = _extract_sl(text)
+    explicit_tps = [v for v in extract_tps(text) if 500.0 <= v < 100000.0]
+    if raw_sl is None or not explicit_tps:
+        return None
+    raw_tp1 = float(explicit_tps[0])
+    sl_f = float(raw_sl)
+    if not (1000.0 <= sl_f < 10000.0 and 1000.0 <= raw_tp1 < 10000.0) or abs(sl_f - raw_tp1) < 1e-6:
+        return None
+
+    inferred_dir = "BUY" if sl_f < raw_tp1 else "SELL"
+    entry_tiers, _, single_price, is_zone, distinct_levels, _ = _extract_zone_and_single_entry(
+        zone_search_text, inferred_dir, raw_sl=sl_f, explicit_tps=explicit_tps
+    )
+
+    if is_zone and entry_tiers:
+        entry_top = float(entry_tiers["top"])
+        entry_bot = float(entry_tiers["bottom"])
+        if (entry_top - entry_bot) > 100.0:
+            return None
+    elif single_price is not None:
+        entry_top = float(single_price)
+        entry_bot = float(single_price)
+    elif len(distinct_levels) == 1:
+        entry_top = float(distinct_levels[0])
+        entry_bot = float(distinct_levels[0])
+    else:
+        return None
+
+    if not (1000.0 <= entry_bot <= entry_top < 10000.0):
+        return None
+
+    max_sl_dist = float(MAX_SL_PIPS) * 0.10
+    if inferred_dir == "BUY":
+        if (
+            sl_f < entry_bot
+            and entry_top < raw_tp1
+            and (entry_bot - sl_f) <= max_sl_dist
+            and (raw_tp1 - entry_top) <= 250.0
+            and all(float(tp) > entry_top for tp in explicit_tps)
+        ):
+            return "BUY"
+    else:
+        if (
+            raw_tp1 < entry_bot
+            and entry_top < sl_f
+            and (sl_f - entry_top) <= max_sl_dist
+            and (entry_bot - raw_tp1) <= 250.0
+            and all(float(tp) < entry_bot for tp in explicit_tps)
+        ):
+            return "SELL"
+
+    return None
+
+
 def gate_4_extract_signal(
     text: str,
     message_id: int = 0,
@@ -1015,18 +1259,22 @@ def gate_4_extract_signal(
 ) -> Optional[SignalAction]:
     """
     Gate 4: New Signal Extraction (v3.0 4-Layer + TP1-TP5 + STOP/LIMIT).
-    Defaults to DEFAULT_SYMBOL (XAUUSD) for any valid directional trigger verb.
-    Extracts zones (with 4-tier L1..L4 mapping), single-price LIMIT/STOP,
-    market-now entries, SL, explicit TPs, and deterministic TP1..TP5 targets.
+    Defaults to DEFAULT_SYMBOL (XAUUSD) for any valid directional trigger verb
+    or unambiguous geometric Gold entry/SL/TP layout.
     """
-    # 1. Direction Verb Detection
+    # 1. Direction Verb Detection (or Unambiguous Geometric Direction Inference)
     dir_match = DIRECTION_PATTERN.search(text)
-    if not dir_match:
-        logger.info(f"[PARSER IGNORED] No valid directional verb detected | text={text!r}")
-        return None
-
-    matched_verb = dir_match.group(1).upper()
-    direction = "BUY" if any(kw in matched_verb for kw in ("BUY", "LONG")) else "SELL"
+    inferred_direction = None
+    if dir_match:
+        matched_verb = dir_match.group(1).upper()
+        direction = "BUY" if any(kw in matched_verb for kw in ("BUY", "LONG")) else "SELL"
+    else:
+        inferred_direction = _infer_geometric_signal(text, is_reply=is_reply)
+        if not inferred_direction:
+            logger.info(f"[PARSER IGNORED] No valid directional verb detected | text={text!r}")
+            return None
+        direction = inferred_direction
+        logger.info(f"[PARSER GEOMETRIC] Inferred direction={direction} from unambiguous Gold entry/SL/TP geometry")
 
     # 2. Symbol resolution - defaults straight to XAUUSD
     symbol = DEFAULT_SYMBOL
@@ -1058,82 +1306,27 @@ def gate_4_extract_signal(
     is_stop_order = bool(_STOP_ORDER_PATTERN.search(zone_search_text))
     is_limit_order = False if is_stop_order else bool(_LIMIT_ORDER_PATTERN.search(zone_search_text))
 
-    zone_match = ZONE_PATTERN.search(zone_search_text)
-    entry_tiers = None
-    zone_tiers = None
-    single_price = None
-    is_zone = False
     is_instant_now = False
     max_orders = MAX_ORDERS_PER_SIGNAL
+    entry_tiers, zone_tiers, single_price, is_zone, _, repair_note = _extract_zone_and_single_entry(
+        zone_search_text, direction, raw_sl=raw_sl, explicit_tps=explicit_tps
+    )
 
-    if zone_match:
-        p1 = float(zone_match.group(1))
-        p2 = float(zone_match.group(2))
-        # Guard: Require valid Gold prices (500 <= p < 100000) and reasonable zone span (<= 250 points)
-        if 500.0 <= p1 < 100000.0 and 500.0 <= p2 < 100000.0 and abs(p1 - p2) <= 250.0:
-            top_price = round(max(p1, p2), 2)
-            bottom_price = round(min(p1, p2), 2)
-            mid_price = round((top_price + bottom_price) / 2.0, 2)
-            entry_tiers = {
-                "top": top_price,
-                "mid": mid_price,
-                "bottom": bottom_price,
-            }
-            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
-            is_zone = True
+    if not is_zone and single_price is None:
+        if is_limit_order or is_stop_order:
+            # Explicit "buy limit" / "sell stop" etc. WITHOUT any valid Gold price is incomplete/chatter -> never execute as Market Now!
+            logger.info(
+                f"[PARSER IGNORED] LIMIT/STOP keyword detected without an entry price or zone (>=500) | text={text!r}"
+            )
+            return None
+        if _MARKET_NOW_PATTERN.search(zone_search_text):
+            # Explicit market entry ("Buy now", "Sell xauusd now", "Buy at market")
+            is_instant_now = True
         else:
-            zone_match = None
-
-    # Multi-line / comma / '&' / repeated-limit entry extraction (e.g. "Buy limits:\n3840\n3830")
-    distinct_levels: List[float] = []
-    if not is_zone:
-        for num_m in re.finditer(
-            r"(?<![.\d])(\d{3,6}(?:\.\d+)?)(?![.\d])(?!\s*(?:pips?|%|lots?|x)\b)",
-            zone_search_text,
-            re.IGNORECASE,
-        ):
-            val = round(float(num_m.group(1)), 2)
-            if 500.0 <= val < 100000.0 and val not in distinct_levels:
-                distinct_levels.append(val)
-        if len(distinct_levels) >= 2 and (max(distinct_levels) - min(distinct_levels)) <= 100.0:
-            top_price = max(distinct_levels)
-            bottom_price = min(distinct_levels)
-            mid_price = round((top_price + bottom_price) / 2.0, 2)
-            entry_tiers = {
-                "top": top_price,
-                "mid": mid_price,
-                "bottom": bottom_price,
-            }
-            zone_tiers = compute_zone_4tiers(top_price, bottom_price, direction)
-            is_zone = True
-
-    if not is_zone:
-        # Check for single-price entry limit, stop, or stub (e.g. "Sell limit 3920", "Buy stop 3900", "BUY XAUUSD 3853")
-        single_match = SINGLE_PRICE_PATTERN.search(zone_search_text)
-        if single_match:
-            price = float(single_match.group(1))
-            if 500.0 <= price < 100000.0:
-                single_price = round(price, 2)
-                is_zone = False
-        if single_price is None and len(distinct_levels) == 1 and has_valid_targets:
-            single_price = distinct_levels[0]
-            is_zone = False
-
-        if single_price is None:
-            if is_limit_order or is_stop_order:
-                # Explicit "buy limit" / "sell stop" etc. WITHOUT any valid Gold price is incomplete/chatter -> never execute as Market Now!
-                logger.info(
-                    f"[PARSER IGNORED] LIMIT/STOP keyword detected without an entry price or zone (>=500) | text={text!r}"
-                )
-                return None
-            if _MARKET_NOW_PATTERN.search(zone_search_text):
-                # Explicit market entry ("Buy now", "Sell xauusd now", "Buy at market")
-                is_instant_now = True
-            else:
-                logger.info(
-                    f"[PARSER IGNORED] Bare directional word without valid Gold price/zone (>=500) or explicit 'now' keyword | text={text!r}"
-                )
-                return None
+            logger.info(
+                f"[PARSER IGNORED] Bare directional word without valid Gold price/zone (>=500) or explicit 'now' keyword | text={text!r}"
+            )
+            return None
 
     # Guard: Unstructured prose / question without SL and without TP
     if not has_valid_targets:
@@ -1206,6 +1399,8 @@ def gate_4_extract_signal(
         "final_tp": final_tp,
         "tp_stage": "TP1",
         "proximity_close_price": proximity_close_price,
+        "direction_inferred": bool(inferred_direction),
+        "zone_typo_repaired": bool(repair_note),
         "raw_text": text,
     })
 
@@ -1327,6 +1522,28 @@ def gate_5_validate_price_sanity(
 # MAIN PIPELINE ENTRY POINT
 # ---------------------------------------------------------------------------
 
+def finalize_signal_sanity(
+    signal_action: SignalAction,
+    live_price: Optional[float] = None,
+    log_output: bool = True,
+) -> SignalAction:
+    """Run Gate 5 price sanity validation on an extracted NEW_SIGNAL and emit Pipeline Output log once."""
+    validated_action = gate_5_validate_price_sanity(
+        signal_action,
+        live_price=live_price,
+    )
+    if log_output:
+        logger.info(
+            f"Pipeline Output: {validated_action['event_type']} | {validated_action['direction']} "
+            f"{validated_action['symbol']} ({validated_action['order_intent']}) | "
+            f"Tiers={validated_action['zone_tiers'] or validated_action['entry_tiers']} | "
+            f"SL={validated_action['sl']} (valid={validated_action['sl_valid']}) | "
+            f"TPs={validated_action['tp_levels']} | FinalTP={validated_action['final_tp']} | "
+            f"ProximityClose={validated_action['proximity_close_price']}"
+        )
+    return validated_action
+
+
 def parse_message(
     text: Optional[str],
     message_id: int = 0,
@@ -1335,6 +1552,8 @@ def parse_message(
     reply_to_msg_id: Optional[int] = None,
     is_forward: bool = False,
     live_price: Optional[float] = None,
+    validate_sanity: bool = True,
+    log_output: bool = True,
 ) -> Optional[SignalAction]:
     """
     Main 6-Gate Sequential Pipeline conforming to PARSER_SPEC.md and ARCHITECTURE_v3.md.
@@ -1386,22 +1605,11 @@ def parse_message(
     if not signal_action:
         return None
 
+    if not validate_sanity:
+        return signal_action
+
     # Gate 5: Price Sanity Validation
-    validated_action = gate_5_validate_price_sanity(
-        signal_action,
-        live_price=live_price,
-    )
-
-    logger.info(
-        f"Pipeline Output: {validated_action['event_type']} | {validated_action['direction']} "
-        f"{validated_action['symbol']} ({validated_action['order_intent']}) | "
-        f"Tiers={validated_action['zone_tiers'] or validated_action['entry_tiers']} | "
-        f"SL={validated_action['sl']} (valid={validated_action['sl_valid']}) | "
-        f"TPs={validated_action['tp_levels']} | FinalTP={validated_action['final_tp']} | "
-        f"ProximityClose={validated_action['proximity_close_price']}"
-    )
-
-    return validated_action
+    return finalize_signal_sanity(signal_action, live_price=live_price, log_output=log_output)
 
 
 # Compatibility aliases

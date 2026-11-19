@@ -59,12 +59,25 @@ def _default_layer_lots() -> Dict[str, float]:
 
 
 def _sync_mt5_order_tickets(rec: Dict[str, Any]) -> List[int]:
-    """Keep combined unique mt5_order_tickets synced with market_tickets + pending_tickets."""
+    """Keep combined unique mt5_order_tickets synced and maintain append-only all_placed_tickets."""
     combined: List[int] = []
     for t in list(rec.get("market_tickets") or []) + list(rec.get("pending_tickets") or []):
         if t is not None and t not in combined:
             combined.append(t)
     rec["mt5_order_tickets"] = combined
+
+    all_placed: List[int] = []
+    for t in list(rec.get("all_placed_tickets") or []) + combined:
+        if t is not None and t not in all_placed:
+            all_placed.append(t)
+    layers = rec.get("layers")
+    if isinstance(layers, dict):
+        for l_data in layers.values():
+            if isinstance(l_data, dict):
+                lt = l_data.get("ticket")
+                if lt is not None and lt not in all_placed:
+                    all_placed.append(lt)
+    rec["all_placed_tickets"] = all_placed
     return combined
 
 
@@ -552,6 +565,7 @@ class StateManager:
                     layer["lot"] = lot
                 if tp_stage is not None:
                     layer["tp_stage"] = tp_stage
+                _sync_mt5_order_tickets(rec)
                 self._save_state_locked()
 
     def add_market_ticket(

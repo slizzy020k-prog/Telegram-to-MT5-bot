@@ -235,7 +235,12 @@ GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.9
 MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
     "MIN_GOLD_PULLBACK_DOLLARS", 1.50, min_val=0.10, max_val=50.0, positive_only=True
 )
-REVERSAL_CONFIRM_TICKS: int = _env_int("REVERSAL_CONFIRM_TICKS", 1, min_val=1, max_val=10)
+REVERSAL_CONFIRM_TICKS: int = _env_int("REVERSAL_CONFIRM_TICKS", 2, min_val=1, max_val=10)
+STAGE0_PROFIT_LOCK_ENABLED: bool = _env_bool("STAGE0_PROFIT_LOCK_ENABLED", True)
+STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS: float = _env_float(
+    "STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS", 1.20, min_val=0.20, max_val=50.0, positive_only=True
+)
+CANCEL_PENDING_ON_STAGE0_LOCK_EXIT: bool = _env_bool("CANCEL_PENDING_ON_STAGE0_LOCK_EXIT", True)
 ATR_NOISE_FLOOR_MULT: float = _env_float("ATR_NOISE_FLOOR_MULT", 0.35, min_val=0.0, max_val=5.0)
 M1_ATR_PERIOD: int = _env_int("M1_ATR_PERIOD", 14, min_val=2, max_val=200)
 MAX_GIVEBACK_DOLLARS: float = _env_float("MAX_GIVEBACK_DOLLARS", 4.50, min_val=0.0, max_val=200.0)
@@ -290,6 +295,9 @@ BE_LAYERS: List[str] = [
     if str(item).strip()
 ] or list(_default_be_layers)
 BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 5.0, min_val=0.0, max_val=50.0)
+STAGE0_PROFIT_LOCK_OFFSET_PIPS: float = _env_float(
+    "STAGE0_PROFIT_LOCK_OFFSET_PIPS", BE_OFFSET_PIPS, min_val=0.0, max_val=100.0
+)
 
 # Legacy runner / pre-TP1 shortfall thresholds (calibrated v3.1 anti-choke defaults)
 TP1_LOCK_BUFFER: float = _env_float("TP1_LOCK_BUFFER", 0.50, min_val=0.0, max_val=50.0)
@@ -470,6 +478,9 @@ TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.5, min_val=0.1, m
 TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.50, min_val=0.10, max_val=100.0)
 TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.50, min_val=0.10, max_val=100.0)
 TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.25, min_val=0.01, max_val=20.0)
+STAGE1_ATR_ACTIVATION_PCT: float = _env_float(
+    "STAGE1_ATR_ACTIVATION_PCT", 0.45, min_val=0.0, max_val=1.0
+)
 
 # Stage 2 (TP2 cleared)
 TRAIL_TP2_ATR_MULT: float = _env_float("TRAIL_TP2_ATR_MULT", 2.0, min_val=0.1, max_val=20.0)

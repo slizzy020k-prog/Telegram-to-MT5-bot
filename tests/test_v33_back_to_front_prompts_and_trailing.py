@@ -322,7 +322,7 @@ async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp
             assert sig_buy["tp_stage"] == "TP2"
             assert sig_buy["layers"]["L4"]["tp"] == pytest.approx(3910.0)
             floor_tp1 = sig_buy["runner_sl_floor"]
-            assert floor_tp1 >= 3897.5
+            assert floor_tp1 == pytest.approx(3895.5)
 
             # Step 2: Edit original message #301 during RUNNER_ACTIVE with looser SL (3870) + new TP2 3912 TP3 3924
             # Verify ratchet_sl_only=True blocks loosening SL back to 3870 while updating TP2 & TP3!

@@ -364,7 +364,7 @@ async def run_simulation() -> None:
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["status"] == "RUNNER_ACTIVE" and sig_p["tp_stage"] == "TP2"
     assert sig_p["fsm_floor"] == round(3895.0 + config.BE_OFFSET_PIPS * 0.10, 2)
-    assert sig_p["trail_stop"] == 3897.2
+    assert sig_p["trail_stop"] == sig_p["fsm_floor"]
     assert sig_p["runner_sl_floor"] == sig_p["trail_stop"]
 
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3914.40, 3914.60)):

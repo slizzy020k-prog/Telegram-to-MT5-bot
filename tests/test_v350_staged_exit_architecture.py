@@ -58,6 +58,7 @@ def _pin_v350_staged_defaults(monkeypatch):
         "ATR_NOISE_FLOOR_MULT": 0.35,
         "HARD_GIVEBACK_CEILING_DOLLARS": 3.50,
         "MAX_GIVEBACK_DOLLARS": 4.50,
+        "REVERSAL_CONFIRM_TICKS": 2,
         "TP1_TRAIL_ENABLED": True,
         "TP1_TRAIL_ATR_MULT": 1.5,
         "TP1_TRAIL_MIN_DOLLARS": 2.50,
@@ -82,6 +83,8 @@ def _pin_v350_staged_defaults(monkeypatch):
     }
     for key, val in defaults.items():
         monkeypatch.setattr(config, key, val, raising=False)
+        if hasattr(ex_mod, key):
+            monkeypatch.setattr(ex_mod, key, val, raising=False)
         if hasattr(main, key):
             monkeypatch.setattr(main, key, val, raising=False)
 
@@ -208,8 +211,10 @@ async def test_stage0_gold_guard_triggers_before_tp1(tmp_path):
         assert s_arm["reversal_guard_armed"] is True
         assert s_arm["status"] == "ACTIVE"
 
-        # Pullback 31.8% ($2.80 >= 30% and >= $1.50): closes ALL 4 layers at Stage 0
+        # Pullback 31.8% ($2.80 >= 30% and >= $1.50): 2 confirming ticks close ALL 4 layers at Stage 0
         with patch.object(ex, "get_tick", return_value=_tick(3896.00)):
+            await main._process_pre_tp1_or_backstop_tick("9001", main.state_mgr.get_signal(9001))
+            assert main.state_mgr.get_signal(9001)["status"] == "ACTIVE"
             await main._process_pre_tp1_or_backstop_tick("9001", main.state_mgr.get_signal(9001))
 
     s_closed = main.state_mgr.get_signal(9001)
@@ -230,7 +235,8 @@ async def test_stage0_gold_guard_triggers_before_tp1(tmp_path):
     res_arm = ex.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3899.40))
     assert res_arm["armed"] is True and res_arm["noise_floor_dollars"] == pytest.approx(2.10)
     assert ex.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.60))["triggered"] is False  # $1.80 < $2.10
-    assert ex.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.20))["triggered"] is True   # $2.20 >= $2.10
+    assert ex.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.20))["triggered"] is False  # tick 1/2
+    assert ex.evaluate_gold_reversal_guard(sig_atr, tick=_tick(3897.20))["triggered"] is True   # $2.20 >= $2.10 (2 ticks)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +435,8 @@ def test_multi_tp_gap_candle_sequential_transition():
     with patch.object(ex, "get_tick", return_value=_tick(3900.10)):
         ex.handle_tp1_scaling_and_select_runner(sig)
     assert ex.get_runner_fsm_stage(sig) == 1
-    assert sig["runner_cleared_milestones"] == []
+    assert sig["runner_cleared_milestones"] == ["TP1"]
+    assert sig["runner_milestone_idx"] == 2
 
     mod_calls: List[tuple] = []
     orig_mod = ex.modify_position_sltp
@@ -580,14 +587,13 @@ def test_stage1_trigger_is_tp1_scaling_event():
     assert rt == 1004
     assert sig["status"] == "RUNNER_ACTIVE"
     assert sig["tp1_reached"] is True
-    assert sig["runner_cleared_milestones"] == []
+    assert sig["runner_cleared_milestones"] == ["TP1"]
+    assert sig["runner_milestone_idx"] == 2
     assert ex.get_runner_fsm_stage(sig) == 1
     assert sig["fsm_floor"] == pytest.approx(3890.50)  # entry + 5p ($0.50)
-    assert sig["trail_tier_used"]["stage"] == 1
-    assert sig["trail_dist"] == pytest.approx(2.70)
-    assert sig["atr_stop"] == pytest.approx(3896.50)
-    assert sig["trail_stop"] == pytest.approx(3896.50)
-    assert sig["broker_sl"] == pytest.approx(3896.50)
+    assert sig["stage1_atr_armed"] is False
+    assert sig["trail_stop"] == pytest.approx(3890.50)
+    assert sig["broker_sl"] == pytest.approx(3890.50)
     assert sig["layers"]["L4"]["tp"] == pytest.approx(3910.0)
 
 
@@ -647,7 +653,7 @@ def test_legacy_post_tp1_exits_disabled(monkeypatch):
 
     with patch.object(ex, "get_tick", return_value=_tick(3900.00)):
         ex.handle_tp1_scaling_and_select_runner(sig)
-    assert sig["trail_stop"] == pytest.approx(3897.00)
+    assert sig["trail_stop"] == pytest.approx(3890.50)
 
     # 1) Old TP1-touch fallback bank (< TP1 - $1.20 = 3898.80) must NOT fire!
     with patch.object(ex, "get_tick", return_value=_tick(3898.50)):
@@ -780,8 +786,8 @@ def test_broker_sl_throttle_and_floor_push_on_stage_change():
     with patch.object(ex, "modify_position_sltp", side_effect=_spy_mod):
         with patch.object(ex, "get_tick", return_value=_tick(3900.20)):
             ex.handle_tp1_scaling_and_select_runner(sig)
-        # Initial Stage 1 SL = 3900.20 - 2.50 = 3897.70
-        assert sl_pushes[-1][1] == pytest.approx(3897.70)
+        # Initial Stage 1 holds fsm_floor (3890.50) until >= 45% progress on TP1->TP2
+        assert sl_pushes[-1][1] == pytest.approx(3890.50)
 
         # Rally to 3909.00 -> trail_stop = 3906.50, pushed to broker
         with patch.object(ex, "get_tick", return_value=_tick(3909.00)):
@@ -879,7 +885,7 @@ def test_sell_side_mirror():
     assert ex.get_runner_fsm_stage(sig) == 1
     assert sig["fsm_floor"] == pytest.approx(3909.50)  # 3910.0 - $0.50
     assert sig["trail_peak"] == pytest.approx(3900.00)
-    assert sig["trail_stop"] == pytest.approx(3903.00)  # min(3909.50, 3900.00 + 3.00)
+    assert sig["trail_stop"] == pytest.approx(3909.50)  # holds fsm_floor until >= 45% on TP1->TP2
 
     # Sequential clean breaks down through TP1 -> TP2 -> TP3 -> TP4 -> TP5 ceiling
     for ask_px, exp_stage, exp_floor in (

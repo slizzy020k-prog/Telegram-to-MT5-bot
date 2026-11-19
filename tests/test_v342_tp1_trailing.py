@@ -116,7 +116,11 @@ def _seed_4layer_signal(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_ab_buy_and_sell_tp1_trailing_stop_wiggle_holds_rally_ratchets_and_pullback_banks(tmp_path):
+async def test_ab_buy_and_sell_tp1_trailing_stop_wiggle_holds_rally_ratchets_and_pullback_banks(tmp_path, monkeypatch):
+    import mt5_executor as _mt5_mod
+    monkeypatch.setattr(config, "STAGE1_ATR_ACTIVATION_PCT", 0.0)
+    if hasattr(_mt5_mod, "STAGE1_ATR_ACTIVATION_PCT"):
+        monkeypatch.setattr(_mt5_mod, "STAGE1_ATR_ACTIVATION_PCT", 0.0)
     _reset_runtime(tmp_path, "scen_ab")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()

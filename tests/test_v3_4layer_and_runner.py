@@ -669,7 +669,7 @@ def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch)
     mod_tps = []
     with patch.object(ex, "get_tick", return_value=_make_tick(3900.10, 3900.30)):
         ex.handle_tp1_scaling_and_select_runner(sig)
-    assert sig["runner_milestone_idx"] == 1
+    assert sig["runner_milestone_idx"] == 2
     assert sig["layers"]["L4"]["tp"] == 3910.0  # stepped initially to TP2!
 
     with patch.object(ex, "modify_position_sltp", side_effect=lambda ticket, sl=None, tp=None: mod_tps.append((ticket, sl, tp)) or True):
@@ -705,7 +705,7 @@ def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch)
         assert sig["status"] == "CLOSED"
         assert sig["market_tickets"] == []
         assert sig["runner_cleared_milestones"] == ["TP1", "TP2", "TP3", "TP4"]
-    assert [tp for _, _, tp in mod_tps if tp is not None][:3] == [3910.0, 3920.0, 3930.0]
+    assert [tp for _, _, tp in mod_tps if tp is not None][:2] == [3920.0, 3930.0]
 
     # 2. SELL clean run with optional RUNNER_MAX_TP_STAGE=5 -> reaches TP5 (3840.0)
     monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 5)
@@ -928,6 +928,7 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
         assert main.state_mgr.get_signal(9302)["status"] == "ACTIVE"
 
         with patch.object(main.executor, "get_tick", return_value=_make_tick(3896.70, 3896.90)):
+            await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
             await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
 
         after = main.state_mgr.get_signal(9302)

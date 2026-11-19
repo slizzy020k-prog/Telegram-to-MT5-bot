@@ -33,6 +33,7 @@ from config import (
     BE_LAYERS,
     BE_OFFSET_PIPS,
     BE_AFTER_TP1,
+    CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
     CANCEL_PENDING_ON_TP1,
     TP_FRONT_RUN_OFFSET,
     TP1_CLOSE_PROXIMITY_PIPS,
@@ -102,10 +103,12 @@ from config import (
     IDLE_MT5_POLL_INTERVAL_SECONDS,
     TELEGRAM_KEEPALIVE_SECONDS,
     CONSOLE_TITLE_UPDATES,
+    STAGE0_PROFIT_LOCK_ENABLED,
     STAGED_EXIT_ENABLED,
 )
 from parser import (
     parse_message,
+    finalize_signal_sanity,
     SignalAction,
     ZoneInfo,
     is_tp1_hit_message,
@@ -420,7 +423,11 @@ async def _account_closed_tickets(
             accounted.append(ai)
 
     total_banked = float(sig.get("banked_profit") or 0.0)
-    infos: Dict[int, Dict[str, Any]] = dict(close_infos or {})
+    infos: Dict[int, Dict[str, Any]] = {}
+    for k_t, v_i in (close_infos or {}).items():
+        ki = _safe_ticket_int(k_t)
+        if ki is not None:
+            infos[ki] = v_i
     added_profit = 0.0
 
     unique_tickets: List[int] = []
@@ -429,9 +436,19 @@ async def _account_closed_tickets(
         if ti is not None and ti not in unique_tickets:
             unique_tickets.append(ti)
 
+    cached_map = getattr(executor, "_cached_pos_profits", None)
     for t in unique_tickets:
         if t not in infos:
-            infos[t] = await _mt5_call(executor.get_position_close_info, t)
+            info = await _mt5_call(executor.get_position_close_info, t)
+            if (
+                isinstance(info, dict)
+                and float(info.get("profit", 0.0) or 0.0) == 0.0
+                and str(info.get("reason") or "UNKNOWN").upper() == "UNKNOWN"
+                and isinstance(cached_map, dict)
+                and t in cached_map
+            ):
+                info = {"profit": round(float(cached_map[t]), 2), "reason": "UNKNOWN"}
+            infos[t] = info
         if t not in accounted:
             profit_val = float(infos[t].get("profit", 0.0) or 0.0)
             accounted.append(t)
@@ -463,6 +480,8 @@ def _has_executed_exposure(sig: Dict[str, Any]) -> bool:
 
 _MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
     "STAGED_EXIT_ENABLED": STAGED_EXIT_ENABLED,
+    "STAGE0_PROFIT_LOCK_ENABLED": STAGE0_PROFIT_LOCK_ENABLED,
+    "CANCEL_PENDING_ON_STAGE0_LOCK_EXIT": CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
 }
 
 
@@ -472,6 +491,14 @@ def _is_staged_exit_enabled() -> bool:
         return bool(STAGED_EXIT_ENABLED)
     _cfg_mod = sys.modules.get("config")
     return bool(getattr(_cfg_mod, "STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+
+
+def _is_cancel_pending_on_stage0_lock_exit() -> bool:
+    """Resolve CANCEL_PENDING_ON_STAGE0_LOCK_EXIT dynamically across config and main."""
+    if CANCEL_PENDING_ON_STAGE0_LOCK_EXIT != _MAIN_CFG_SNAPSHOT["CANCEL_PENDING_ON_STAGE0_LOCK_EXIT"]:
+        return bool(CANCEL_PENDING_ON_STAGE0_LOCK_EXIT)
+    _cfg_mod = sys.modules.get("config")
+    return bool(getattr(_cfg_mod, "CANCEL_PENDING_ON_STAGE0_LOCK_EXIT", CANCEL_PENDING_ON_STAGE0_LOCK_EXIT))
 
 
 def _is_num(val: Any) -> bool:
@@ -522,7 +549,11 @@ def _resolve_signal_ref_entry(sig: Dict[str, Any]) -> Optional[float]:
         return None
     is_buy = str(sig.get("direction") or "BUY").strip().upper() == "BUY"
     layers = sig.get("layers")
-    runner_layer = sig.get("runner_layer")
+    runner_layer = (
+        sig.get("runner_layer")
+        or sig.get("last_runner_layer")
+        or ((sig.get("last_runner_layers") or [None])[-1])
+    )
     if runner_layer and isinstance(layers, dict):
         r_obj = layers.get(runner_layer)
         if isinstance(r_obj, dict):
@@ -829,12 +860,27 @@ async def _execute_tp1_scaling_handoff(
         )
         return runner_t, tp1_added_profit, alert
 
-    runner_layers = list(sig.get("runner_layers") or ([sig["runner_layer"]] if sig.get("runner_layer") else []))
+    runner_layers = list(
+        sig.get("runner_layers")
+        or ([sig["runner_layer"]] if sig.get("runner_layer") else [])
+        or sig.get("last_runner_layers")
+        or ([sig["last_runner_layer"]] if sig.get("last_runner_layer") else [])
+    )
     runner_tickets = list(sig.get("runner_tickets") or ([sig["runner_ticket"]] if sig.get("runner_ticket") else []))
-    runner_name = ", ".join(str(x) for x in runner_layers) if len(runner_layers) > 1 else sig.get("runner_layer")
+    runner_name = (
+        ", ".join(str(x) for x in runner_layers)
+        if len(runner_layers) > 1
+        else (sig.get("runner_layer") or sig.get("last_runner_layer") or (runner_layers[-1] if runner_layers else None))
+    )
     soft_floor = sig.get("runner_sl_floor") if sig.get("runner_sl_floor") is not None else sig.get("soft_tp1_floor")
     milestone_name = sig.get("runner_milestone_name", "TP1")
     tp_stage = sig.get("tp_stage", "TP2")
+    fsm_stage = _get_signal_stage(sig)
+    next_target_disp = milestone_name if milestone_name != "TP1" else (tp_stage or "TP2")
+    if _is_staged_exit_enabled() and sig.get("tp1_reached"):
+        floor_stage_line = f"• 🛡️ **Floor / Trailed SL:** `{soft_floor}` | Stage {fsm_stage} (TP1 Cleared) | Next Target: `{next_target_disp}`\n"
+    else:
+        floor_stage_line = f"• 🛡️ **Floor / Trailed SL:** `{soft_floor}` | Stage: `{tp_stage}` | Next Milestone: `{milestone_name}`\n"
     surviving_mkt = list(sig.get("market_tickets") or [])
     tp_summary = _format_tp_summary(sig)
     pending_note = (
@@ -850,7 +896,7 @@ async def _execute_tp1_scaling_handoff(
         f"• Symbol: `{symbol}` ({direction}){hit_line}\n"
         f"• 💰 **Amount Made at TP1:** `{profit_str}` (Tickets: `{banked_tkts}`{be_note})\n"
         f"• 🚀 **Designated Runner:** Layer `{runner_name}` [Ticket #{runner_t}]{extra_runners_note} (Open Tickets: `{surviving_mkt}`)\n"
-        f"• 🛡️ **Floor / Trailed SL:** `{soft_floor}` | Stage: `{tp_stage}` | Next Milestone: `{milestone_name}`\n"
+        f"{floor_stage_line}"
         f"• 🎯 **Targets:** {tp_summary}\n"
         f"• {pending_note}\n\n"
         f"{fin['formatted']}"
@@ -1652,7 +1698,7 @@ def _render_terminal_status(st: Dict[str, Any], force_print: bool = False) -> No
         f"Cred: \033[96m{sym_char}{cred:.2f}\033[0m | "
         f"Eq: {pnl_color}{sym_char}{eq:.2f}\033[0m | "
         f"P&L: {pnl_color}{pnl_sign}{sym_char}{abs(pnl):.2f}\033[0m | "
-        f"Lots: \033[93m{tot_lots:.2f}/{high_l:.2f}\033[0m"
+        f"Lots: \033[93m{open_lots:.2f}/{high_l:.2f}\033[0m"
     )
     sys.stdout.write(f"\r\033[2K{_current_hud_line}")
     sys.stdout.flush()
@@ -1870,10 +1916,15 @@ def _reserve_task_key(msg_id: Any, chat_id: Optional[int | str] = None) -> Any:
 
 def _cancel_delayed_sell_now(msg_id: Any, chat_id: Optional[int | str] = None) -> bool:
     """Cancel an active delayed 'Sell now' / 'Buy now' timer if still waiting."""
+    try:
+        cur_task = asyncio.current_task()
+    except RuntimeError:
+        cur_task = None
+
     if isinstance(msg_id, tuple) and msg_id in _pending_sell_now_tasks:
         task = _pending_sell_now_tasks.pop(msg_id, None)
         _pending_task_chats.pop(msg_id, None)
-        if task and not task.done():
+        if task and not task.done() and task is not cur_task:
             task.cancel()
             return True
         return False
@@ -1895,7 +1946,7 @@ def _cancel_delayed_sell_now(msg_id: Any, chat_id: Optional[int | str] = None) -
     for k in candidate_keys:
         task = _pending_sell_now_tasks.pop(k, None)
         _pending_task_chats.pop(k, None)
-        if task and not task.done():
+        if task and not task.done() and task is not cur_task:
             task.cancel()
             cancelled = True
     return cancelled
@@ -1929,13 +1980,11 @@ async def _invalidate_signal_tp1_unlocked(
         t for t in (sig.get("mt5_order_tickets") or [])
         if t not in market_tickets and t not in pending_tickets
     ]
-    all_pending = pending_tickets + extra_pending
     layers = dict(sig.get("layers") or {})
-
-    cancelled: List[int] = []
-    for pt in all_pending:
-        if pt not in market_tickets and await _mt5_call(executor.cancel_pending_order, pt):
-            cancelled.append(pt)
+    sig["layers"] = layers
+    cancelled = await _mt5_call(executor.cancel_signal_pending_orders, sig)
+    layers = sig.get("layers") or layers
+    all_pending = list(dict.fromkeys(pending_tickets + extra_pending))
 
     for lk, l_data in layers.items():
         if isinstance(l_data, dict):
@@ -2284,6 +2333,11 @@ async def _probe_mt5_health() -> Tuple[bool, bool, Optional[float]]:
     """Measure MT5 connection + algo-trading state off-loop and return (connected, trade_allowed, latency_ms)."""
     global _mt5_last_ping_ms
     t0 = time.perf_counter()
+    if hasattr(executor, "get_health_status"):
+        connected, allowed = await _mt5_call(executor.get_health_status)
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        _mt5_last_ping_ms = latency_ms
+        return bool(connected), bool(allowed), latency_ms
     connected = bool(await _mt5_call(executor.is_connected))
     latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
     _mt5_last_ping_ms = latency_ms
@@ -2459,6 +2513,8 @@ async def _close_deleted_signal_unlocked(
             l_data["status"] = "CANCELLED"
 
     close_reason_str = f"Signal Deleted ({source_label})"
+    prev_rlayers = list(sig.get("runner_layers") or ([sig["runner_layer"]] if sig.get("runner_layer") else []))
+    prev_rlayer = sig.get("runner_layer") or (prev_rlayers[-1] if prev_rlayers else sig.get("last_runner_layer"))
     updates: Dict[str, Any] = {
         "status": "CLOSED",
         "deleted_from_chat": True,
@@ -2479,6 +2535,10 @@ async def _close_deleted_signal_unlocked(
         "accounted_tickets": sig.get("accounted_tickets", []),
         "banked_profit": sig.get("banked_profit", 0.0),
     }
+    if prev_rlayers:
+        updates["last_runner_layers"] = prev_rlayers
+    if prev_rlayer:
+        updates["last_runner_layer"] = prev_rlayer
     sig.update(updates)
     state_mgr.update_signal(msg_id, updates, chat_id=eff_chat)
 
@@ -2835,6 +2895,7 @@ async def run_reconnect_catchup(reason: str = "startup") -> Dict[str, int]:
                     reply_to_msg_id=reply_to_id,
                     is_forward=is_forward,
                     live_price=live_price,
+                    log_output=False,
                 )
 
                 if parsed is None:
@@ -2916,15 +2977,23 @@ async def _reconcile_live_mt5_signals(
 ) -> None:
     """
     Reconcile live MT5 positions & pending orders against active state records.
-    Unifies broker-closed `runner_ticket` accounting with banked_profit + TradeLedger.
+    Re-verifies inside the per-signal lock to avoid placement/edit TOCTOU races,
+    enforces IPC query health & 3s placement grace, self-heals cancelled orphans,
+    and unifies broker-closed `runner_ticket` accounting with banked_profit + TradeLedger.
     """
     live_positions = await _mt5_call(executor.get_live_positions, DEFAULT_SYMBOL)
+    if live_positions is None or not getattr(executor, "_last_live_pos_query_ok", True):
+        logger.warning("Skipping MT5 reconciliation cycle: live positions query failed.")
+        return
     live_orders = await _mt5_call(executor.get_live_orders, DEFAULT_SYMBOL)
+    if live_orders is None or not getattr(executor, "_last_live_ord_query_ok", True):
+        logger.warning("Skipping MT5 reconciliation cycle: live orders query failed.")
+        return
     live_pos_tickets = {
-        getattr(p, "ticket", None) for p in live_positions if getattr(p, "ticket", None) is not None
+        ti for p in live_positions if (ti := _safe_ticket_int(getattr(p, "ticket", None))) is not None
     }
     live_order_tickets = {
-        getattr(o, "ticket", None) for o in live_orders if getattr(o, "ticket", None) is not None
+        ti for o in live_orders if (ti := _safe_ticket_int(getattr(o, "ticket", None))) is not None
     }
 
     for msg_id, sig_snap in list(active_signals):
@@ -2937,11 +3006,52 @@ async def _reconcile_live_mt5_signals(
             mk_tickets = list(sig.get("market_tickets", []))
             pd_tickets = list(sig.get("pending_tickets", []))
             layers = dict(sig.get("layers") or {})
+            sig_pos_tickets = set(live_pos_tickets)
+            sig_ord_tickets = set(live_order_tickets)
+
+            cancelled_or_placed_live = False
+            if not sig.get("tp1_reached"):
+                for l_data in layers.values():
+                    if isinstance(l_data, dict) and str(l_data.get("status") or "").strip().upper() == "CANCELLED":
+                        lt = _safe_ticket_int(l_data.get("ticket"))
+                        if lt is not None and lt in sig_ord_tickets:
+                            cancelled_or_placed_live = True
+                            break
+                if not cancelled_or_placed_live:
+                    mk_pd_set = {_safe_ticket_int(x) for x in (mk_tickets + pd_tickets) if _safe_ticket_int(x) is not None}
+                    for t_ap in (sig.get("all_placed_tickets") or []):
+                        t_ap_i = _safe_ticket_int(t_ap)
+                        if t_ap_i is not None and t_ap_i not in mk_pd_set and t_ap_i in sig_ord_tickets:
+                            cancelled_or_placed_live = True
+                            break
+
+            known_live = sig_pos_tickets | sig_ord_tickets
+            any_missing = any(
+                ti not in known_live
+                for t in (mk_tickets + pd_tickets)
+                if (ti := _safe_ticket_int(t)) is not None
+            )
+            if any_missing or cancelled_or_placed_live:
+                re_pos = await _mt5_call(executor.get_live_positions, DEFAULT_SYMBOL)
+                if re_pos is None or not getattr(executor, "_last_live_pos_query_ok", True):
+                    continue
+                re_ord = await _mt5_call(executor.get_live_orders, DEFAULT_SYMBOL)
+                if re_ord is None or not getattr(executor, "_last_live_ord_query_ok", True):
+                    continue
+                sig_pos_tickets = {
+                    ti for p in re_pos if (ti := _safe_ticket_int(getattr(p, "ticket", None))) is not None
+                }
+                sig_ord_tickets = {
+                    ti for o in re_ord if (ti := _safe_ticket_int(getattr(o, "ticket", None))) is not None
+                }
+
             updated = False
+            grace_fn = getattr(executor, "is_ticket_in_reconcile_grace", None)
 
             new_pd_tickets: List[int] = []
             for t in pd_tickets:
-                if t in live_pos_tickets:
+                ti = _safe_ticket_int(t)
+                if ti is not None and ti in sig_pos_tickets:
                     if t not in mk_tickets:
                         mk_tickets.append(t)
                     for l_data in layers.values():
@@ -2949,7 +3059,9 @@ async def _reconcile_live_mt5_signals(
                             l_data["status"] = "FILLED"
                     updated = True
                     logger.info(f"Reconciled MT5 state: Pending order #{t} filled into active position for Msg ID {msg_id}")
-                elif t in live_order_tickets:
+                elif ti is not None and ti in sig_ord_tickets:
+                    new_pd_tickets.append(t)
+                elif ti is not None and callable(grace_fn) and grace_fn(ti, 3.0):
                     new_pd_tickets.append(t)
                 else:
                     updated = True
@@ -2961,7 +3073,10 @@ async def _reconcile_live_mt5_signals(
             new_mk_tickets: List[int] = []
             broker_closed: List[int] = []
             for t in mk_tickets:
-                if t in live_pos_tickets:
+                ti = _safe_ticket_int(t)
+                if ti is not None and ti in sig_pos_tickets:
+                    new_mk_tickets.append(t)
+                elif ti is not None and callable(grace_fn) and grace_fn(ti, 3.0):
                     new_mk_tickets.append(t)
                 else:
                     updated = True
@@ -2971,8 +3086,94 @@ async def _reconcile_live_mt5_signals(
                             l_data["status"] = "CLOSED"
                     logger.info(f"Reconciled MT5 state: Market position #{t} closed for Msg ID {msg_id}")
 
+            # Self-heal: re-attach live MT5 pending orders on pre-TP1 signals if state wrongly marked CANCELLED/dropped,
+            # or cancel orphaned live pending orders after TP1 scaling when CANCEL_PENDING_ON_TP1=True.
+            active_mk_set = {_safe_ticket_int(x) for x in new_mk_tickets if _safe_ticket_int(x) is not None}
+            active_pd_set = {_safe_ticket_int(x) for x in new_pd_tickets if _safe_ticket_int(x) is not None}
+            accounted_set = {_safe_ticket_int(x) for x in (sig.get("accounted_tickets") or []) if _safe_ticket_int(x) is not None}
+            closed_set_re = {_safe_ticket_int(x) for x in broker_closed if _safe_ticket_int(x) is not None}
+
+            s0_sweep_pending = bool(sig.get("stage0_profit_lock_active") and _is_cancel_pending_on_stage0_lock_exit())
+            if not sig.get("tp1_reached") and not s0_sweep_pending:
+                for l_data in layers.values():
+                    if not isinstance(l_data, dict):
+                        continue
+                    lt = _safe_ticket_int(l_data.get("ticket"))
+                    if (
+                        lt is not None
+                        and lt in sig_ord_tickets
+                        and lt not in active_mk_set
+                        and str(l_data.get("status") or "").strip().upper() == "CANCELLED"
+                    ):
+                        l_data["status"] = "PENDING"
+                        if lt not in active_pd_set:
+                            new_pd_tickets.append(lt)
+                            active_pd_set.add(lt)
+                        updated = True
+                        logger.info(f"Self-healed live pending order #{lt} back into Msg ID {msg_id}")
+                for t_ap in (sig.get("all_placed_tickets") or []):
+                    t_ap_i = _safe_ticket_int(t_ap)
+                    if (
+                        t_ap_i is not None
+                        and t_ap_i in sig_ord_tickets
+                        and t_ap_i not in active_mk_set
+                        and t_ap_i not in active_pd_set
+                        and t_ap_i not in accounted_set
+                        and t_ap_i not in closed_set_re
+                    ):
+                        new_pd_tickets.append(t_ap_i)
+                        active_pd_set.add(t_ap_i)
+                        for l_data in layers.values():
+                            if isinstance(l_data, dict) and _safe_ticket_int(l_data.get("ticket")) == t_ap_i:
+                                l_data["status"] = "PENDING"
+                        updated = True
+                        logger.info(f"Self-healed placed pending order #{t_ap_i} back into Msg ID {msg_id}")
+            elif CANCEL_PENDING_ON_TP1 or s0_sweep_pending:
+                orphan_ord_cands: List[int] = [
+                    ti for t_o in list(new_pd_tickets) + list(sig.get("all_placed_tickets") or [])
+                    if (ti := _safe_ticket_int(t_o)) is not None
+                    and ti in sig_ord_tickets
+                    and ti not in active_mk_set
+                ]
+                for ord_t in list(dict.fromkeys(orphan_ord_cands)):
+                    if await _mt5_call(executor.cancel_pending_order, ord_t):
+                        new_pd_tickets = [x for x in new_pd_tickets if _safe_ticket_int(x) != ord_t]
+                        for l_data in layers.values():
+                            if isinstance(l_data, dict) and _safe_ticket_int(l_data.get("ticket")) == ord_t:
+                                l_data["status"] = "CANCELLED"
+                        updated = True
+                        sweep_lbl = "post-Stage0-lock" if s0_sweep_pending else "post-TP1"
+                        logger.info(f"Swept orphaned {sweep_lbl} pending order #{ord_t} on Msg ID {msg_id}")
+
             if not updated:
                 continue
+
+            # Stage 0 Profit-Lock broker-SL termination: sweep remaining unfilled limits before status decision
+            s0_lock_cleared = False
+            if (
+                sig.get("stage0_profit_lock_active")
+                and not new_mk_tickets
+                and broker_closed
+                and _is_cancel_pending_on_stage0_lock_exit()
+                and (
+                    new_pd_tickets
+                    or any(
+                        (_safe_ticket_int(t_o) in sig_ord_tickets)
+                        for t_o in (sig.get("all_placed_tickets") or [])
+                        if _safe_ticket_int(t_o) is not None and _safe_ticket_int(t_o) not in closed_set_re
+                    )
+                )
+            ):
+                sig["pending_tickets"] = list(new_pd_tickets)
+                sig["layers"] = layers
+                await _mt5_call(executor.cancel_signal_pending_orders, sig)
+                new_pd_tickets = []
+                for l_data in layers.values():
+                    if isinstance(l_data, dict) and str(l_data.get("status") or "").strip().upper() == "PENDING":
+                        l_data["status"] = "CANCELLED"
+                sig["stage0_profit_lock_active"] = False
+                sig["stage0_zone_protected"] = False
+                s0_lock_cleared = True
 
             runner_tkts = [
                 t for t in (sig.get("runner_tickets") or ([sig["runner_ticket"]] if sig.get("runner_ticket") is not None else []))
@@ -3011,6 +3212,9 @@ async def _reconcile_live_mt5_signals(
                 "accounted_tickets": sig.get("accounted_tickets", []),
                 "banked_profit": sig.get("banked_profit", 0.0),
             }
+            if s0_lock_cleared:
+                updates["stage0_profit_lock_active"] = False
+                updates["stage0_zone_protected"] = False
             if closed_runner_tkts and rem_runner_tkts:
                 rem_r_layers = [
                     lk for lk, ld in layers.items()
@@ -3035,10 +3239,18 @@ async def _reconcile_live_mt5_signals(
                     "MANUAL": "MANUAL",
                 }
                 raw_r_reason = str(r_info.get("reason", "UNKNOWN")).upper()
+                prev_rlayers = list(sig.get("runner_layers") or ([sig["runner_layer"]] if sig.get("runner_layer") else []))
+                prev_rlayer = sig.get("runner_layer") or (prev_rlayers[-1] if prev_rlayers else sig.get("last_runner_layer"))
+                if prev_rlayers:
+                    updates["last_runner_layers"] = prev_rlayers
+                if prev_rlayer:
+                    updates["last_runner_layer"] = prev_rlayer
                 updates["last_runner_tickets"] = closed_runner_tkts
                 updates["last_runner_ticket"] = runner_t
                 updates["runner_tickets"] = []
                 updates["runner_ticket"] = None
+                updates["runner_layers"] = []
+                updates["runner_layer"] = None
                 updates["runner_proximity_armed"] = False
                 updates["runner_reversal_ticks"] = 0
                 updates["tp2_shortfall_armed"] = False
@@ -3062,7 +3274,7 @@ async def _reconcile_live_mt5_signals(
                         updates["exit_price"] = round(float(sl_px_r), 4)
 
             sig.update(updates)
-            if runner_closed_now or new_status == "CLOSED":
+            if new_status == "CLOSED" or (runner_closed_now and not new_mk_tickets):
                 last_b_reason = (
                     str(close_infos[broker_closed[-1]].get("reason", "UNKNOWN")).upper()
                     if broker_closed
@@ -3145,10 +3357,16 @@ async def _reconcile_live_mt5_signals(
                 gb_b = sig.get("giveback_from_peak")
                 mfe_str_b = f"{pk_b} (+${pp_b:.2f}/oz)" if (_is_num(pk_b) and _is_num(pp_b)) else f"{pk_b}"
                 gb_str_b = f"${float(gb_b):.2f}" if _is_num(gb_b) else "N/A"
+                runner_layer_disp = (
+                    sig.get("runner_layer")
+                    or sig.get("last_runner_layer")
+                    or ((sig.get("last_runner_layers") or [None])[-1])
+                    or "RUNNER"
+                )
                 await notify_saved_messages(
                     f"🏁 **Runner Closed by Broker & Unified Summary [ID: {msg_id}]**\n"
                     f"• Symbol: `{sig.get('symbol')}` ({sig.get('direction')})\n"
-                    f"• Runner: `Layer {sig.get('runner_layer')}` [Ticket #{runner_t}] | Stage Reached: `Stage {stage_val_b}`\n"
+                    f"• Runner: `Layer {runner_layer_disp}` [Ticket #{runner_t}] | Stage Reached: `Stage {stage_val_b}`\n"
                     f"• Exit: {reason_map.get(r_info.get('reason', 'UNKNOWN'), r_info.get('reason'))} (`{code_val_b}`)\n"
                     f"• Peak / MFE: `{mfe_str_b}` | Giveback from Peak: `{gb_str_b}`\n"
                     f"• Milestones Cleared: `{cleared_str}`{rem_note}\n"
@@ -3179,6 +3397,10 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
 
     still_active = await _mt5_call(executor.manage_designated_runner, sig)
 
+    sub_closed_tkts = list(sig.pop("last_closed_sub_runner_tickets", []) or [])
+    if sub_closed_tkts:
+        await _account_closed_tickets(sig, sub_closed_tkts)
+
     backstop_tkts = list(sig.get("last_backstop_closed_tickets") or [])
     if backstop_tkts:
         added_bs, _ = await _account_closed_tickets(sig, backstop_tkts)
@@ -3194,11 +3416,16 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
 
     if not still_active:
         last_runner_tkts = [
-            t for t in (sig.get("last_runner_tickets") or ([sig["last_runner_ticket"]] if sig.get("last_runner_ticket") else []))
-            if t is not None
+            ti for t in (sig.get("last_runner_tickets") or ([sig["last_runner_ticket"]] if sig.get("last_runner_ticket") else []))
+            if (ti := _safe_ticket_int(t)) is not None
         ]
-        last_runner_t = sig.get("last_runner_ticket") or (last_runner_tkts[-1] if last_runner_tkts else None)
-        runner_layer = sig.get("runner_layer", "RUNNER")
+        last_runner_t = _safe_ticket_int(sig.get("last_runner_ticket")) or (last_runner_tkts[-1] if last_runner_tkts else None)
+        runner_layer = (
+            sig.get("runner_layer")
+            or sig.get("last_runner_layer")
+            or ((sig.get("last_runner_layers") or [None])[-1])
+            or "RUNNER"
+        )
         tp5_hit = bool(sig.get("tp5_reached", False))
         tp4_hit = bool(sig.get("tp4_reached", False))
         tp2_hit = bool(sig.get("tp2_reached", False))
@@ -3270,9 +3497,11 @@ async def _process_runner_active_tick(msg_id: str, sig: Dict[str, Any]) -> None:
     important_keys = (
         "status", "market_tickets", "pending_tickets", "layers",
         "runner_ticket", "runner_tickets", "runner_layer", "runner_layers",
+        "last_runner_layer", "last_runner_layers",
         "runner_milestone_idx", "runner_milestone_name", "tp_stage",
         "runner_cleared_milestones", "runner_proximity_armed", "runner_reversal_ticks", "tp2_shortfall_armed",
         "reversal_guard_armed", "peak_profit", "reversal_guard_peak_profit",
+        "stage1_atr_armed", "chart_peak", "stage0_profit_lock_active", "stage0_profit_lock_sl", "stage0_zone_protected",
         "runner_sl_floor", "soft_tp1_floor", "broker_sl",
         "fsm_floor", "atr_stop", "trail_stop", "trail_peak", "trail_dist",
         "trail_tier_used", "active_stop_source",
@@ -3308,6 +3537,12 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
     curr_price = tick.bid if direction == "BUY" else tick.ask
     if not isinstance(curr_price, (int, float)) or isinstance(curr_price, bool):
         return
+    raw_chart = getattr(tick, "bid", None)
+    chart_price = (
+        float(raw_chart)
+        if isinstance(raw_chart, (int, float)) and not isinstance(raw_chart, bool) and raw_chart > 0
+        else float(curr_price)
+    )
 
     # Post-runner L2/L3 backstop when runner already exited early
     if sig.get("tp1_reached", False):
@@ -3415,7 +3650,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
     if not raw_tp1:
         return
 
-    tp1_hit = (curr_price >= raw_tp1) if direction == "BUY" else (curr_price <= raw_tp1)
+    tp1_hit = (chart_price >= raw_tp1) if direction == "BUY" else (chart_price <= raw_tp1)
 
     # Trigger 2: If 0 market positions filled and pending limits/stops remain, invalidate ONLY after
     # price has actually entered the entry zone/price (`has_entered_zone=True`) and then reaches raw_tp1
@@ -3493,16 +3728,16 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
     # v3.1 Proactive Runner TP Lift & Dynamic Deepest-Layer Sync before TP1
     if not sig.get("tp1_reached") and hasattr(executor, "prepare_deepest_runners_for_tp_breakout"):
         sig_before_prep = copy.deepcopy(sig)
-        await _mt5_call(executor.prepare_deepest_runners_for_tp_breakout, sig, curr_price)
+        await _mt5_call(executor.prepare_deepest_runners_for_tp_breakout, sig, curr_price, chart_price)
         if sig != sig_before_prep:
             state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
 
     if tp1_hit:
         logger.info(
-            f"🎯 TP1 REACHED on Msg ID {msg_id}! Live Price={curr_price}, Raw TP1={raw_tp1}"
+            f"🎯 TP1 REACHED on Msg ID {msg_id}! ChartPrice={chart_price}, ExecPrice={curr_price}, Raw TP1={raw_tp1}"
         )
         _, _, alert = await _execute_tp1_scaling_handoff(
-            msg_id, sig, chat_id=sig_chat, source_label="Watcher", curr_price=curr_price
+            msg_id, sig, chat_id=sig_chat, source_label="Watcher", curr_price=chart_price
         )
         await notify_saved_messages(alert)
         return
@@ -3563,6 +3798,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 dd_pct = float(rg_res.get("drawdown_from_peak") or 0.0) * 100.0
                 pb_dlr = float(rg_res.get("pullback_dollars") or 0.0)
                 nf_dlr = float(rg_res.get("noise_floor_dollars") or MIN_GOLD_PULLBACK_DOLLARS)
+                s0_lock_hit = bool(rg_res.get("stage0_lock_triggered"))
                 logger.warning(
                     f"⚠️ GOLD REVERSAL GUARD TRIGGERED near TP1 on Msg ID {msg_id}! "
                     f"Peak={pk_px}, Live={curr_price}, Giveback={dd_pct:.1f}% (${pb_dlr:.2f} >= ${nf_dlr:.2f}), TP1={raw_tp1}"
@@ -3570,26 +3806,50 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 closed_tickets = list(sig.get("market_tickets", []))
                 for t in closed_tickets:
                     await _mt5_call(executor.close_market_position, t)
-                for pt in sig.get("pending_tickets", []):
-                    await _mt5_call(executor.cancel_pending_order, pt)
+                await _mt5_call(executor.cancel_signal_pending_orders, sig)
 
-                for lk in layers_map:
-                    if isinstance(layers_map[lk], dict):
-                        layers_map[lk]["status"] = "CLOSED"
+                closed_set_rg = {_safe_ticket_int(t) for t in closed_tickets if _safe_ticket_int(t) is not None}
+                for lk, lv in layers_map.items():
+                    if isinstance(lv, dict):
+                        lt = _safe_ticket_int(lv.get("ticket"))
+                        st_lv = str(lv.get("status") or "").strip().upper()
+                        if lt in closed_set_rg or st_lv in ("OPEN", "FILLED", "RUNNER", "CLOSED", "BANKED"):
+                            lv["status"] = "CLOSED"
+                        else:
+                            lv["status"] = "CANCELLED"
 
                 added_profit, _ = await _account_closed_tickets(sig, closed_tickets)
                 pk_px_f = round(float(pk_px), 4) if _is_num(pk_px) else round(float(curr_price), 4)
                 pk_prof_f = round(max(0.0, float(rg_res.get("peak_profit") or 0.0)), 4)
+                prev_rlayers_rg = list(sig.get("runner_layers") or ([sig["runner_layer"]] if sig.get("runner_layer") else []) or runner_layers)
+                prev_rlayer_rg = sig.get("runner_layer") or (prev_rlayers_rg[-1] if prev_rlayers_rg else sig.get("last_runner_layer"))
+                if prev_rlayers_rg:
+                    sig["last_runner_layers"] = prev_rlayers_rg
+                if prev_rlayer_rg:
+                    sig["last_runner_layer"] = prev_rlayer_rg
+                if closed_tickets:
+                    sig["last_runner_tickets"] = list(closed_tickets)
+                    sig["last_runner_ticket"] = closed_tickets[-1]
                 sig["status"] = "CLOSED"
                 sig["market_tickets"] = []
                 sig["pending_tickets"] = []
                 sig["runner_tickets"] = []
                 sig["runner_ticket"] = None
+                sig["runner_layers"] = []
+                sig["runner_layer"] = None
+                sig["stage0_profit_lock_active"] = False
+                sig["stage0_zone_protected"] = False
                 sig["layers"] = layers_map
-                sig["runner_close_reason"] = (
-                    f"Gold Reversal Guard (TP1, Peak: {pk_px}, Giveback: {dd_pct:.1f}% / ${pb_dlr:.2f})"
-                )
-                sig["exit_reason_code"] = "GOLD_GUARD"
+                if s0_lock_hit:
+                    sig["runner_close_reason"] = f"Stage 0 Profit-Lock SL Hit ({rg_res.get('stage0_profit_lock_sl')})"
+                    sig["exit_reason_code"] = "STAGE0_PROFIT_LOCK"
+                    ledger_exit_reason = "Stage 0 Profit-Lock SL Hit"
+                else:
+                    sig["runner_close_reason"] = (
+                        f"Gold Reversal Guard (TP1, Peak: {pk_px}, Giveback: {dd_pct:.1f}% / ${pb_dlr:.2f})"
+                    )
+                    sig["exit_reason_code"] = "GOLD_GUARD"
+                    ledger_exit_reason = "Gold Reversal Guard (TP1 Near-Miss)"
                 sig["exit_stage"] = 0
                 sig["exit_price"] = round(float(curr_price), 4)
                 sig["max_favorable_excursion"] = {
@@ -3608,10 +3868,10 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 msg_id,
                 sig,
                 float(sig.get("banked_profit") or added_profit),
-                exit_reason="Gold Reversal Guard (TP1 Near-Miss)",
+                exit_reason=ledger_exit_reason,
             )
             await _record_signal_to_ledger(
-                msg_id, sig, exit_reason="Gold Reversal Guard (TP1 Near-Miss)", currency=curr
+                msg_id, sig, exit_reason=ledger_exit_reason, currency=curr
             )
             profit_str = format_profit(added_profit, curr)
             await notify_saved_messages(
@@ -3735,8 +3995,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                 await _mt5_call(executor.close_market_position, t)
 
             if CANCEL_PENDING_ON_TP1 or not (gold_guard_on and runner_tickets_pre):
-                for pt in list(sig.get("pending_tickets", [])):
-                    await _mt5_call(executor.cancel_pending_order, pt)
+                await _mt5_call(executor.cancel_signal_pending_orders, sig)
                 sig["pending_tickets"] = []
                 for lv in layers_map.values():
                     if isinstance(lv, dict) and lv.get("status") == "PENDING":
@@ -4466,32 +4725,55 @@ async def _handle_trade_management_action(
         total_profit = float(target_signal.get("banked_profit") or added_p)
         profit_str = format_profit(total_profit, curr)
 
+        closed_set_fc = {_safe_ticket_int(t) for t in closed_tkts if _safe_ticket_int(t) is not None}
         for l_data in layers.values():
             if isinstance(l_data, dict):
-                l_data["status"] = "CLOSED"
+                lt = _safe_ticket_int(l_data.get("ticket"))
+                st_l = str(l_data.get("status") or "").strip().upper()
+                if lt in closed_set_fc or st_l in ("OPEN", "FILLED", "RUNNER", "CLOSED", "BANKED") or st_l.startswith("CLOSED"):
+                    l_data["status"] = "CLOSED"
+                else:
+                    l_data["status"] = "CANCELLED"
         _ensure_signal_exit_telemetry(target_signal, exit_reason_code="MANUAL", overwrite_code=True)
+        prev_rlayers_fc = list(target_signal.get("runner_layers") or ([target_signal["runner_layer"]] if target_signal.get("runner_layer") else []))
+        prev_rlayer_fc = target_signal.get("runner_layer") or (prev_rlayers_fc[-1] if prev_rlayers_fc else target_signal.get("last_runner_layer"))
+        if prev_rlayers_fc:
+            target_signal["last_runner_layers"] = prev_rlayers_fc
+        if prev_rlayer_fc:
+            target_signal["last_runner_layer"] = prev_rlayer_fc
         target_signal["market_tickets"] = []
         target_signal["pending_tickets"] = []
+        target_signal["runner_tickets"] = []
         target_signal["runner_ticket"] = None
+        target_signal["runner_layers"] = []
+        target_signal["runner_layer"] = None
         target_signal["layers"] = layers
         target_signal["status"] = "CLOSED"
+        fc_updates: Dict[str, Any] = {
+            "market_tickets": [],
+            "pending_tickets": [],
+            "runner_tickets": [],
+            "runner_ticket": None,
+            "runner_layers": [],
+            "runner_layer": None,
+            "layers": layers,
+            "status": "CLOSED",
+            "accounted_tickets": target_signal.get("accounted_tickets", []),
+            "banked_profit": target_signal.get("banked_profit", 0.0),
+            "exit_reason_code": target_signal.get("exit_reason_code"),
+            "exit_stage": target_signal.get("exit_stage"),
+            "exit_price": target_signal.get("exit_price"),
+            "max_favorable_excursion": target_signal.get("max_favorable_excursion"),
+            "giveback_from_peak": target_signal.get("giveback_from_peak"),
+            "trail_tier_used": target_signal.get("trail_tier_used"),
+        }
+        if prev_rlayers_fc:
+            fc_updates["last_runner_layers"] = prev_rlayers_fc
+        if prev_rlayer_fc:
+            fc_updates["last_runner_layer"] = prev_rlayer_fc
         state_mgr.update_signal(
             target_msg_id,
-            {
-                "market_tickets": [],
-                "pending_tickets": [],
-                "runner_ticket": None,
-                "layers": layers,
-                "status": "CLOSED",
-                "accounted_tickets": target_signal.get("accounted_tickets", []),
-                "banked_profit": target_signal.get("banked_profit", 0.0),
-                "exit_reason_code": target_signal.get("exit_reason_code"),
-                "exit_stage": target_signal.get("exit_stage"),
-                "exit_price": target_signal.get("exit_price"),
-                "max_favorable_excursion": target_signal.get("max_favorable_excursion"),
-                "giveback_from_peak": target_signal.get("giveback_from_peak"),
-                "trail_tier_used": target_signal.get("trail_tier_used"),
-            },
+            fc_updates,
             chat_id=target_chat_id,
         )
         _emit_exit_telemetry_log(target_msg_id, target_signal, total_profit, exit_reason="Full Close Command")
@@ -4549,13 +4831,13 @@ async def _handle_trade_management_action(
         await notify_saved_messages(alert)
 
 
-async def _handle_new_message_unlocked(event: Any) -> None:
+async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[str], bool]]:
     """Unlocked core implementation of handle_new_message (caller holds signal lock for (chat_id, msg_id))."""
     if session_trading_blocked():
-        return
+        return None
     msg = event.message
     if not msg:
-        return
+        return None
 
     msg_id = msg.id
     raw_text = msg.message or ""
@@ -4616,8 +4898,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
             target_chat_id = cand_sig.get("chat_id", chat_id)
 
     is_forward = getattr(msg, "forward", None) is not None
-    # Fast path: run pure-CPU Gates 1-3 first without blocking on an MT5 `get_tick` IPC call.
-    # Only fetch `get_tick` when Gate 4 extracts a NEW_SIGNAL that needs Gate 5 live-price validation.
+    # Single-pass parse: run pure-CPU Gates 1-4 once (skipping Gate 5 & Pipeline Output log until live_price is known).
     parsed = parse_message(
         raw_text,
         message_id=msg_id,
@@ -4625,26 +4906,21 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         reply_to_msg_id=reply_to_id,
         is_forward=is_forward,
         live_price=None,
+        validate_sanity=False,
+        log_output=False,
     )
 
     if parsed is None:
         logger.info(f"Message ID {msg_id} filtered out (noise, recap, or ignored symbol).")
-        return
+        return None
 
     if parsed.event_type == "NEW_SIGNAL" or parsed.is_entry:
-        tick = await _mt5_call(executor.get_tick, DEFAULT_SYMBOL)
+        sig_sym = getattr(parsed, "symbol", None) or DEFAULT_SYMBOL
+        tick = await _mt5_call(executor.get_tick, sig_sym)
         live_price = getattr(tick, "bid", None) if tick else None
-        if live_price is not None:
-            parsed = parse_message(
-                raw_text,
-                message_id=msg_id,
-                is_reply=is_reply_evt,
-                reply_to_msg_id=reply_to_id,
-                is_forward=is_forward,
-                live_price=live_price,
-            )
-            if parsed is None:
-                return
+        parsed = finalize_signal_sanity(parsed, live_price=live_price, log_output=True)
+        if parsed is None:
+            return None
 
     # 1. Trade Management Commands
     if parsed.event_type == "TRADE_MANAGEMENT" or parsed.is_management:
@@ -4739,8 +5015,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         )
         if not passed:
             logger.warning(f"Pre-flight safety check failed for Msg ID {msg_id}: {reason}")
-            await notify_saved_messages(f"⚠️ **Order Blocked by Pre-Flight**: {reason}")
-            return
+            return f"⚠️ **Order Blocked by Pre-Flight**: {reason}", False
 
         logger.info(
             f"Pre-flight OK. Executing 4-Layer New Signal: Direction={direction}, Symbol={symbol}, "
@@ -4863,25 +5138,25 @@ async def _handle_new_message_unlocked(event: Any) -> None:
                 if direction == "SELL"
                 else f"price <= `{initial_price}` (lower than recorded point)"
             )
-            await notify_saved_messages(
+            delay_alert = (
                 f"⏳ **{direction.title()} Now Held ({int(SELL_NOW_DELAY_SECONDS)}s Timer) [ID: {msg_id}]**\n"
                 f"• Symbol: `{symbol}` ({direction})\n"
                 f"• 📍 **Initial Market Snapshot:** `{initial_price}`\n"
                 f"• Waiting {int(SELL_NOW_DELAY_SECONDS)}s for zone/limit edit or TP1 check; if no zone arrives, "
                 f"will validate {cond_str} before executing 4-layer market ({BASE_LAYER_LOTS})."
             )
-            return
+            return delay_alert, False
 
         if not market_tickets and not pending_tickets:
             err_reason = getattr(executor, "last_error", None) or "Broker rejected order(s)"
             logger.error(f"Signal ID {msg_id} produced 0 orders ({err_reason}); skipping state creation.")
-            await notify_saved_messages(
+            reject_alert = (
                 f"❌ **Order Rejected by MT5 [ID: {msg_id}]**\n"
                 f"• Direction: `{direction}` {symbol}\n"
                 f"• Reason: `{err_reason}`\n"
                 f"• No positions or pending orders were opened."
             )
-            return
+            return reject_alert, False
 
         arm_tick = await _mt5_call(executor.get_tick, symbol)
         tp1_guard_armed = _compute_initial_tp1_guard_armed(
@@ -4933,7 +5208,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
         is_staged_entry = (not is_zone and parsed.single_price is None and len(market_tickets) == 1 and not pending_tickets)
         staged_note = "\n• ⏳ **L2/L3/L4 waiting** — edit the signal with zone/limit prices to place them." if is_staged_entry else ""
 
-        await notify_saved_messages(
+        exec_alert = (
             f"🚀 **New {'L1 Staged' if is_staged_entry else '4-Layer'} Signal Executed ({order_intent}) [ID: {msg_id}]**\n"
             f"• Direction: `{direction}` {symbol}\n"
             f"• Orders: Market={market_tickets}, Pending={pending_tickets}\n"
@@ -4942,7 +5217,7 @@ async def _handle_new_message_unlocked(event: Any) -> None:
             f"{staged_note}"
             f"{risk_block}"
         )
-        await _update_live_terminal_status_async()
+        return exec_alert, True
 
 
 async def handle_new_message(event: Any) -> None:
@@ -4953,8 +5228,15 @@ async def handle_new_message(event: Any) -> None:
     if not msg:
         return
     chat_id = _safe_chat_id(event)
+    pending_notify: Optional[Tuple[Optional[str], bool]] = None
     async with _get_signal_lock(chat_id, msg.id):
-        await _handle_new_message_unlocked(event)
+        pending_notify = await _handle_new_message_unlocked(event)
+    if pending_notify:
+        alert_text, refresh_hud = pending_notify
+        if alert_text:
+            await notify_saved_messages(alert_text)
+        if refresh_hud:
+            await _update_live_terminal_status_async()
 
 
 def _place_edit_layer_order(
@@ -4998,13 +5280,13 @@ def _place_edit_layer_order(
     )
 
 
-async def _handle_message_edited_unlocked(event: Any) -> None:
+async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional[str], bool]]:
     """Unlocked core implementation of handle_message_edited (caller holds signal lock)."""
     if session_trading_blocked():
-        return
+        return None
     msg = event.message
     if not msg:
-        return
+        return None
 
     msg_id = msg.id
     raw_text = msg.message or ""
@@ -5078,9 +5360,9 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             return
 
         logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] (not in state; treating as new) ---")
-        await _handle_new_message_unlocked(event)
+        res_new = await _handle_new_message_unlocked(event)
         _recent_message_texts[state_scope_key] = norm_text
-        return
+        return res_new
 
     logger.info(f"--- Message Edited [ID: {msg_id}] in Chat [{chat_id}] ---\nNew Text: {raw_text}")
 
@@ -5099,14 +5381,13 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         if curr_status in ("PENDING", "PENDING_DELAY") or not mk_tkts_now:
             await _invalidate_signal_tp1_unlocked(msg_id, reason="Edit", chat_id=chat_id)
             state_mgr.update_signal(msg_id, {"raw_text": raw_text}, chat_id=chat_id)
-            return
+            return None
         elif not existing_signal.get("tp1_reached") and curr_status != "RUNNER_ACTIVE":
             existing_signal["raw_text"] = raw_text
             _, _, alert = await _execute_tp1_scaling_handoff(
                 msg_id, existing_signal, chat_id=chat_id, source_label="Edited Signal"
             )
-            await notify_saved_messages(alert)
-            return
+            return alert, False
     elif edit_hit in (2, 3) and existing_signal.get("market_tickets"):
         existing_signal["raw_text"] = raw_text
         hit_action = SignalAction(
@@ -5119,8 +5400,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         alert = await _apply_adjust_or_trail_unlocked(
             msg_id, chat_id, existing_signal, hit_action, source_label="Edited Signal"
         )
-        await notify_saved_messages(alert)
-        return
+        return alert, False
 
     is_forward = getattr(msg, "forward", None) is not None
     tick = await _mt5_call(executor.get_tick, symbol)
@@ -5142,30 +5422,37 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
         is_edit=True,
         is_forward=is_forward,
         live_price=live_price if live_price is not None else entry_ref_price,
+        validate_sanity=False,
+        log_output=False,
     )
     if parsed is None:
-        return
-    if (
-        parsed.event_type != "TRADE_MANAGEMENT"
-        and not parsed.sl_valid
-        and entry_ref_price is not None
-        and entry_ref_price != live_price
-        and curr_status != "RUNNER_ACTIVE"
-    ):
-        alt_parsed = parse_message(
-            raw_text,
-            message_id=msg_id,
-            is_edit=True,
-            is_forward=is_forward,
-            live_price=entry_ref_price,
+        return None
+    if parsed.event_type == "NEW_SIGNAL" or parsed.is_entry:
+        eff_live = live_price if live_price is not None else entry_ref_price
+        alt_probe = copy.deepcopy(parsed)
+        parsed = finalize_signal_sanity(parsed, live_price=eff_live, log_output=False)
+        if (
+            not parsed.sl_valid
+            and entry_ref_price is not None
+            and entry_ref_price != live_price
+            and curr_status != "RUNNER_ACTIVE"
+        ):
+            alt_parsed = finalize_signal_sanity(alt_probe, live_price=entry_ref_price, log_output=False)
+            if alt_parsed is not None and alt_parsed.sl_valid and alt_parsed.sl is not None:
+                if live_price is None or (
+                    (str(direction).upper() == "BUY" and float(alt_parsed.sl) < float(live_price))
+                    or (str(direction).upper() == "SELL" and float(alt_parsed.sl) > float(live_price))
+                ):
+                    parsed["sl"] = alt_parsed.sl
+                    parsed["sl_valid"] = True
+        logger.info(
+            f"Pipeline Output: {parsed['event_type']} | {parsed['direction']} "
+            f"{parsed['symbol']} ({parsed['order_intent']}) | "
+            f"Tiers={parsed['zone_tiers'] or parsed['entry_tiers']} | "
+            f"SL={parsed['sl']} (valid={parsed['sl_valid']}) | "
+            f"TPs={parsed['tp_levels']} | FinalTP={parsed['final_tp']} | "
+            f"ProximityClose={parsed['proximity_close_price']}"
         )
-        if alt_parsed is not None and alt_parsed.sl_valid and alt_parsed.sl is not None:
-            if live_price is None or (
-                (str(direction).upper() == "BUY" and float(alt_parsed.sl) < float(live_price))
-                or (str(direction).upper() == "SELL" and float(alt_parsed.sl) > float(live_price))
-            ):
-                parsed["sl"] = alt_parsed.sl
-                parsed["sl_valid"] = True
 
     if parsed.event_type == "TRADE_MANAGEMENT":
         existing_signal["raw_text"] = raw_text
@@ -5262,8 +5549,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                 _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
                 state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 logger.warning(f"Edited delayed signal [ID: {msg_id}] blocked by pre-flight: {reason}")
-                await notify_saved_messages(f"⚠️ **Edited Delayed Entry Skipped [ID: {msg_id}]**: {reason}")
-                return
+                return f"⚠️ **Edited Delayed Entry Skipped [ID: {msg_id}]**: {reason}", False
 
         if parsed.is_zone and parsed.zone:
             _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
@@ -5285,8 +5571,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             if not mk_tkts and not pd_tkts:
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order(s)"
                 state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
-                await notify_saved_messages(f"❌ **Edited Zone Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`")
-                return
+                return f"❌ **Edited Zone Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`", False
             arm_tick = await _mt5_call(executor.get_tick, symbol)
             state_mgr.update_signal(
                 msg_id,
@@ -5318,12 +5603,12 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                 },
                 chat_id=chat_id,
             )
-            await notify_saved_messages(
+            return (
                 f"✏️ **Delayed {direction.title()} Now → 4-Layer Zone Executed [ID: {msg_id}]**\n"
                 f"• Market: {mk_tkts} | Pending Limits: {pd_tkts}\n"
-                f"• SL: `{new_sl}` | Broker TP1: `{new_tp}`"
+                f"• SL: `{new_sl}` | Broker TP1: `{new_tp}`",
+                False,
             )
-            return
         elif parsed.single_price is not None:
             _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
             mk_tkts, pd_tkts, l_data = await _mt5_call(
@@ -5345,8 +5630,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             if not mk_tkts and not pd_tkts:
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order"
                 state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
-                await notify_saved_messages(f"❌ **Edited Order Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`")
-                return
+                return f"❌ **Edited Order Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`", False
             arm_tick = await _mt5_call(executor.get_tick, symbol)
             state_mgr.update_signal(
                 msg_id,
@@ -5378,11 +5662,11 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                 },
                 chat_id=chat_id,
             )
-            await notify_saved_messages(
+            return (
                 f"✏️ **Delayed {direction.title()} Now → 4-Layer {order_intent} Executed [ID: {msg_id}]**\n"
-                f"• Market: {mk_tkts} | Pending: {pd_tkts} @ `{parsed.single_price}`"
+                f"• Market: {mk_tkts} | Pending: {pd_tkts} @ `{parsed.single_price}`",
+                False,
             )
-            return
         else:
             state_mgr.update_signal(
                 msg_id,
@@ -5402,7 +5686,7 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
                 },
                 chat_id=chat_id,
             )
-            return
+            return None
 
     market_tickets = list(existing_signal.get("market_tickets", []))
     pending_tickets = list(existing_signal.get("pending_tickets", []))
@@ -5479,12 +5763,12 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             or (existing_signal.get("tp_levels") or {}).get(f"TP{eff_max_edit}")
             or v3_runner_tp
         )
-        await notify_saved_messages(
+        return (
             f"✏️ **Runner Target Updated via Edit [ID: {msg_id}]**\n"
             f"• Runner TP Ceiling: `{target_runner_tp}` | Floor / SL: `{res_adj.get('sl')}`\n"
-            f"• Targets: {_format_tp_summary(existing_signal)}"
+            f"• Targets: {_format_tp_summary(existing_signal)}",
+            False,
         )
-        return
 
     tp1_changed_pre_tp1 = (
         not existing_signal.get("tp1_reached")
@@ -5523,6 +5807,24 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
             l_tp_target = (
                 new_tp if not is_legacy else (new_tp if l_name in ("L1", "TOP") else legacy_runner_tp)
             )
+            eff_intent = "AUTO" if parsed.zone else order_intent
+            will_mkt = await _mt5_call(
+                executor._layer_will_execute_at_market,
+                symbol=symbol,
+                direction=direction,
+                target_price=desired_px,
+                tick=tick,
+                order_intent=eff_intent,
+                allow_market_buffer=(l_name in ("L1", "TOP")),
+            )
+            in_place_fn = getattr(executor, "modify_pending_order_price_sltp", None)
+            if not will_mkt and callable(in_place_fn) and await _mt5_call(in_place_fn, t, desired_px, new_sl, l_tp_target):
+                retiered_tickets.add(t)
+                l_data["target_price"] = desired_px
+                if l_tp_target is not None:
+                    l_data["tp"] = l_tp_target
+                    l_data["tp_stage"] = "TP1"
+                continue
             cancelled_ok = await _mt5_call(executor.cancel_pending_order, t)
             if cancelled_ok:
                 if t in pending_tickets:
@@ -5802,10 +6104,11 @@ async def _handle_message_edited_unlocked(event: Any) -> None:
 
     state_mgr.update_signal(msg_id, signal_updates, chat_id=chat_id)
 
-    await notify_saved_messages(
+    return (
         f"✏️ **Signal Updated via Edit [ID: {msg_id}]**\n"
         f"• SL: `{new_sl}` | Broker TP1: `{new_tp}`\n"
-        f"• Total Orders: {len(market_tickets) + len(pending_tickets)}/{MAX_ORDERS_PER_SIGNAL}"
+        f"• Total Orders: {len(market_tickets) + len(pending_tickets)}/{MAX_ORDERS_PER_SIGNAL}",
+        False,
     )
 
 
@@ -5817,8 +6120,15 @@ async def handle_message_edited(event: Any) -> None:
     if not msg:
         return
     chat_id = _safe_chat_id(event)
+    pending_notify: Optional[Tuple[Optional[str], bool]] = None
     async with _get_signal_lock(chat_id, msg.id):
-        await _handle_message_edited_unlocked(event)
+        pending_notify = await _handle_message_edited_unlocked(event)
+    if pending_notify:
+        alert_text, refresh_hud = pending_notify
+        if alert_text:
+            await notify_saved_messages(alert_text)
+        if refresh_hud:
+            await _update_live_terminal_status_async()
 
 
 # ---------------------------------------------------------------------------
@@ -6419,19 +6729,30 @@ async def handle_saved_messages_command(event: Any) -> None:
                 for rt in all_open_tkts:
                     if rt and await _mt5_call(executor.close_market_position, rt):
                         closed_tkts.append(rt)
-                for pt in list(fresh_sig.get("pending_tickets") or []):
-                    await _mt5_call(executor.cancel_pending_order, pt)
+                await _mt5_call(executor.cancel_signal_pending_orders, fresh_sig)
                 layers_b = fresh_sig.get("layers") if isinstance(fresh_sig.get("layers"), dict) else {}
+                closed_set_b = set(all_open_tkts)
                 for lv in layers_b.values():
-                    if isinstance(lv, dict) and lv.get("ticket") in set(closed_tkts):
-                        lv["status"] = "CLOSED"
-                added_prof, _ = await _account_closed_tickets(fresh_sig, closed_tkts)
+                    if isinstance(lv, dict):
+                        if lv.get("ticket") in closed_set_b:
+                            lv["status"] = "CLOSED"
+                        elif str(lv.get("status") or "").strip().upper() == "PENDING":
+                            lv["status"] = "CANCELLED"
+                added_prof, _ = await _account_closed_tickets(fresh_sig, all_open_tkts)
                 _ensure_signal_exit_telemetry(fresh_sig, exit_reason_code="MANUAL", overwrite_code=True)
+                prev_rlayers_b = list(fresh_sig.get("runner_layers") or ([fresh_sig["runner_layer"]] if fresh_sig.get("runner_layer") else []))
+                prev_rlayer_b = fresh_sig.get("runner_layer") or (prev_rlayers_b[-1] if prev_rlayers_b else fresh_sig.get("last_runner_layer"))
+                if prev_rlayers_b:
+                    fresh_sig["last_runner_layers"] = prev_rlayers_b
+                if prev_rlayer_b:
+                    fresh_sig["last_runner_layer"] = prev_rlayer_b
                 fresh_sig["status"] = "CLOSED"
                 fresh_sig["market_tickets"] = []
                 fresh_sig["pending_tickets"] = []
                 fresh_sig["runner_tickets"] = []
                 fresh_sig["runner_ticket"] = None
+                fresh_sig["runner_layers"] = []
+                fresh_sig["runner_layer"] = None
                 fresh_sig["layers"] = layers_b
                 fresh_sig["runner_close_reason"] = "Manual /bank on Runner"
                 state_mgr.update_signal(msg_id, fresh_sig, chat_id=sig_chat)
@@ -6775,9 +7096,10 @@ async def handle_saved_messages_command(event: Any) -> None:
                 cleared = s.get("runner_cleared_milestones") or []
                 armed = "ARMED" if s.get("runner_proximity_armed") else "STANDBY"
                 rev_ticks = int(s.get("runner_reversal_ticks") or s.get("shortfall_reversal_ticks") or 0)
+                fsm_s = _get_signal_stage(s)
                 lines.append(
                     f"  - `{mid}` ({s.get('direction')} {s.get('symbol')}) | `{s.get('status')}` | "
-                    f"Layers: `{_format_layers_summary(s)}` | Stage: `{tp_stage}` | Milestone: `{milestone}` "
+                    f"Layers: `{_format_layers_summary(s)}` | FSM: `Stage {fsm_s}` | Stage: `{tp_stage}` | Milestone: `{milestone}` "
                     f"(Cleared: `{cleared}`, Guard: `{armed}`, RevTicks: `{rev_ticks}/{RUNNER_REVERSAL_CONFIRM_TICKS}`)"
                 )
             active_block = "\n" + "\n".join(lines)

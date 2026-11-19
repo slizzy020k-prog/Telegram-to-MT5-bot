@@ -23,6 +23,7 @@ from config import (
     BE_AFTER_TP1,
     BE_LAYERS,
     BE_OFFSET_PIPS,
+    CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
     CANCEL_PENDING_ON_TP1,
     DAILY_LOSS_PAUSE_PCT,
     DAILY_PNL_CACHE_TTL_SECONDS,
@@ -68,6 +69,10 @@ from config import (
     SHORTFALL_ARM_PIPS,
     SHORTFALL_CONFIRM_TICKS,
     SHORTFALL_PULLBACK_PIPS,
+    STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS,
+    STAGE0_PROFIT_LOCK_ENABLED,
+    STAGE0_PROFIT_LOCK_OFFSET_PIPS,
+    STAGE1_ATR_ACTIVATION_PCT,
     STAGED_EXIT_ENABLED,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
@@ -500,6 +505,15 @@ class MT5Executor:
         self._dry_run_last_m1_candle: Optional[Dict[str, float]] = None
         self._dry_run_m1_atr: Optional[float] = None
         self._cached_pos_profits: Dict[int, float] = {}
+        self._bot_closed_tickets: Set[int] = set()
+        self._ticket_placed_monotonic: Dict[int, float] = {}
+        self._last_live_query_ok: bool = True
+        self._last_live_pos_query_ok: bool = True
+        self._last_live_ord_query_ok: bool = True
+        self._atr_cache: Dict[Tuple[str, int], Tuple[float, float]] = {}
+        self._server_offset_cache: Optional[int] = None
+        self._server_offset_cache_ts: float = 0.0
+        self._last_preflight_ctx: Optional[Dict[str, Any]] = None
         self._realized_pnl_cache: Optional[Tuple[float, float, str]] = None
         self._closing_lock = threading.Lock()
         self._closing_tickets: Set[int] = set()
@@ -508,11 +522,37 @@ class MT5Executor:
         self._daily_drawdown_ref_balance: Optional[float] = None
         self._daily_drawdown_baseline_date: Optional[str] = None
 
+    def _record_ticket_placed(self, ticket: int) -> None:
+        """Record monotonic placement timestamp for MT5 IPC visibility grace windows."""
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0:
+            return
+        now_m = time.monotonic()
+        self._ticket_placed_monotonic[t_int] = now_m
+        if len(self._ticket_placed_monotonic) > 512:
+            cutoff = now_m - 300.0
+            self._ticket_placed_monotonic = {
+                k: ts for k, ts in self._ticket_placed_monotonic.items() if ts >= cutoff
+            }
+
+    def is_ticket_in_reconcile_grace(self, ticket: Any, grace_seconds: float = 3.0) -> bool:
+        """Return True when a ticket was placed less than `grace_seconds` ago."""
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0:
+            return False
+        ts = getattr(self, "_ticket_placed_monotonic", {}).get(t_int)
+        if ts is None:
+            return False
+        return (time.monotonic() - ts) < max(0.0, float(grace_seconds))
+
     def connect(self) -> bool:
         """Initialize connection to MetaTrader 5 terminal."""
         if self.dry_run:
             logger.info("MT5Executor running in DRY-RUN mode.")
             self._connected = True
+            self._atr_cache.clear()
+            self._server_offset_cache_ts = 0.0
+            self._last_preflight_ctx = None
             return True
 
         with self._mt5_lock:
@@ -544,6 +584,12 @@ class MT5Executor:
                     logger.info(f"Connected to MT5 terminal: {term_info}")
 
             self._connected = True
+            self._atr_cache.clear()
+            self._server_offset_cache_ts = 0.0
+            self._last_preflight_ctx = None
+            self._last_live_query_ok = True
+            self._last_live_pos_query_ok = True
+            self._last_live_ord_query_ok = True
             return True
 
     def shutdown(self) -> None:
@@ -553,6 +599,12 @@ class MT5Executor:
                 mt5.shutdown()
                 self._connected = False
                 self._realized_pnl_cache = None
+                self._atr_cache.clear()
+                self._server_offset_cache_ts = 0.0
+                self._last_preflight_ctx = None
+                self._last_live_query_ok = False
+                self._last_live_pos_query_ok = False
+                self._last_live_ord_query_ok = False
                 logger.info("MT5 connection shut down.")
 
     def is_connected(self) -> bool:
@@ -580,6 +632,21 @@ class MT5Executor:
             return term is not None and bool(getattr(term, "trade_allowed", False))
         except Exception:
             return False
+
+    def get_health_status(self) -> Tuple[bool, bool]:
+        """Return (connected, trade_allowed) using a single mt5.terminal_info() IPC call."""
+        if self.dry_run:
+            return True, True
+        if not self._connected:
+            return False, False
+        try:
+            with self._mt5_lock:
+                term = mt5.terminal_info()
+            if term is None:
+                return False, False
+            return bool(getattr(term, "connected", False)), bool(getattr(term, "trade_allowed", False))
+        except Exception:
+            return False, False
 
     def _ensure_connected(self) -> bool:
         """Ensure MT5 connection is live; reconnect if dropped."""
@@ -764,6 +831,14 @@ class MT5Executor:
         if not self._connected:
             return 0.0
 
+        sym_key = (symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)).strip().upper()
+        cache_key = (sym_key, eff_period)
+        atr_cache = getattr(self, "_atr_cache", None)
+        if atr_cache is not None:
+            cached = atr_cache.get(cache_key)
+            if cached is not None and (time.monotonic() - cached[0]) < 60.0:
+                return cached[1]
+
         try:
             timeframe_m1 = _mt5_const("TIMEFRAME_M1", 1)
             with self._mt5_lock:
@@ -804,7 +879,10 @@ class MT5Executor:
 
             if not trs:
                 return 0.0
-            return round(sum(trs) / len(trs), 4)
+            atr_val = round(sum(trs) / len(trs), 4)
+            if atr_val > 0.0 and atr_cache is not None:
+                atr_cache[cache_key] = (time.monotonic(), atr_val)
+            return atr_val
         except Exception as e:
             logger.debug(f"Could not compute M1 ATR({eff_period}) for {symbol}: {e}")
             return 0.0
@@ -888,6 +966,7 @@ class MT5Executor:
            - Immediate market / active entries: not within proximity buffer of TP1 or < MIN_SL_BUFFER_PIPS from SL.
            - Pending LIMIT or STOP setups away from live market validate safely without blocking on trigger side.
         """
+        self._last_preflight_ctx = None
         direction_norm = (direction or "BUY").strip().upper()
         if direction_norm not in ("BUY", "SELL"):
             return False, f"Invalid trade direction: {direction}"
@@ -935,8 +1014,22 @@ class MT5Executor:
             return False, f"Invalid/empty tick quote for {resolved} (ask={ask}, bid={bid})"
 
         point = _num(getattr(info, "point", 0.01), 0.01) or 0.01
+        digits = _int_num(getattr(info, "digits", 2), 2)
+        pip_size = self.get_pip_size(resolved)
         spread_points = round((ask - bid) / point, 1)
         logger.info(f"Pre-flight check: Current spread on {resolved} is {spread_points} points.")
+
+        def _stash_ctx() -> None:
+            self._last_preflight_ctx = {
+                "symbol": resolved,
+                "raw_symbol": symbol,
+                "direction": direction_norm,
+                "sym_info": info,
+                "tick": tick,
+                "digits": digits,
+                "pip_size": pip_size,
+                "ts": time.monotonic(),
+            }
 
         intent = (order_intent or "AUTO").strip().upper()
         if is_stop_order and intent == "AUTO":
@@ -950,6 +1043,7 @@ class MT5Executor:
                     f"Pre-flight OK for pending {direction_norm} STOP @ {stop_px} "
                     f"(live bid={bid}, ask={ask}, TP1={raw_tp1}, SL={sl})."
                 )
+                _stash_ctx()
                 return True, "Pre-flight checks passed"
 
         is_pending_limit = False
@@ -971,9 +1065,9 @@ class MT5Executor:
                 f"Pre-flight OK for pending {direction_norm} LIMIT @ {limit_ref} "
                 f"(live bid={bid}, ask={ask}, TP1={raw_tp1}, SL={sl})."
             )
+            _stash_ctx()
             return True, "Pre-flight checks passed"
 
-        pip_size = self.get_pip_size(resolved)
         tp1_prox_pips = _cfg("TP1_CLOSE_PROXIMITY_PIPS", TP1_CLOSE_PROXIMITY_PIPS)
         min_sl_pips = _cfg("MIN_SL_BUFFER_PIPS", MIN_SL_BUFFER_PIPS)
         tp1_buf = tp1_prox_pips * pip_size
@@ -990,6 +1084,7 @@ class MT5Executor:
             if sl is not None and bid >= (sl - sl_buf):
                 return False, f"Price {bid} is too close to SL ({sl}) (< {min_sl_pips} pips)"
 
+        _stash_ctx()
         return True, "Pre-flight checks passed"
 
     def get_filling_modes(self, symbol: str) -> List[int]:
@@ -1164,9 +1259,12 @@ class MT5Executor:
         sl: Optional[float] = None,
         tp: Optional[float] = None,
         comment: str = "TG Layer Market",
+        enforce_risk_cap: bool = True,
     ) -> Optional[int]:
         """Execute an immediate Market Buy or Sell order."""
-        ctx = self._prepare_symbol_order_context(symbol, direction, lot, "execute_market_order")
+        ctx = self._prepare_symbol_order_context(
+            symbol, direction, lot, "execute_market_order", enforce_risk_cap=enforce_risk_cap
+        )
         if ctx is None:
             return None
         direction_norm, resolved_sym, _, digits, pip_size, final_lot = ctx
@@ -1225,6 +1323,7 @@ class MT5Executor:
                 return None
             if self.dry_run:
                 self._dry_run_ticket_lots[ticket] = final_lot
+            self._record_ticket_placed(ticket)
             logger.info(
                 f"Opened Market {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"Lot={final_lot}, Price={entry_price}, SL={final_sl}, TP={final_tp}"
@@ -1304,6 +1403,7 @@ class MT5Executor:
                 return None
             if self.dry_run:
                 self._dry_run_pending_ticket_lots[ticket] = final_lot
+            self._record_ticket_placed(ticket)
             logger.info(
                 f"Placed {kind_upper.title()} {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"TargetPrice={target_price}, Lot={final_lot}, SL={final_sl}, TP={final_tp}"
@@ -1366,6 +1466,7 @@ class MT5Executor:
         pending_comment: str,
         market_comment: str,
         pending_kind: str = "LIMIT",
+        enforce_risk_cap: bool = True,
     ) -> Tuple[Optional[int], str]:
         """
         Place a pending LIMIT or STOP order; if broker rejects because live price is touching
@@ -1415,7 +1516,13 @@ class MT5Executor:
                     f"({ask if is_buy else bid}); falling back to Market entry."
                 )
                 mt = self.execute_market_order(
-                    symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
+                    symbol=symbol,
+                    direction=direction,
+                    lot=lot,
+                    sl=sl,
+                    tp=tp,
+                    comment=market_comment,
+                    enforce_risk_cap=enforce_risk_cap,
                 )
                 if mt:
                     return mt, "MARKET"
@@ -1490,6 +1597,7 @@ class MT5Executor:
         order_intent: str = "AUTO",
         stop_comment: Optional[str] = None,
         allow_market_buffer: bool = True,
+        enforce_risk_cap: bool = True,
     ) -> Tuple[Optional[int], str]:
         """
         Route a single layer to MARKET, LIMIT, or STOP based on explicit order_intent
@@ -1505,7 +1613,13 @@ class MT5Executor:
             allow_market_buffer=allow_market_buffer,
         ):
             t = self.execute_market_order(
-                symbol=symbol, direction=direction, lot=lot, sl=sl, tp=tp, comment=market_comment,
+                symbol=symbol,
+                direction=direction,
+                lot=lot,
+                sl=sl,
+                tp=tp,
+                comment=market_comment,
+                enforce_risk_cap=enforce_risk_cap,
             )
             return (t, "MARKET") if t else (None, "FAILED")
 
@@ -1525,6 +1639,7 @@ class MT5Executor:
             pending_comment=pending_comment,
             market_comment=market_comment,
             pending_kind=pending_kind,
+            enforce_risk_cap=enforce_risk_cap,
         )
 
     def allocate_4layer_lots(
@@ -1743,6 +1858,34 @@ class MT5Executor:
             self.last_error = f"Invalid {caller_label} direction ({direction})"
             return None
 
+        preflight_ctx = getattr(self, "_last_preflight_ctx", None)
+        if not self.dry_run and self._connected and isinstance(preflight_ctx, dict):
+            age = time.monotonic() - _num(preflight_ctx.get("ts"), 0.0)
+            ctx_sym = preflight_ctx.get("symbol")
+            ctx_raw = preflight_ctx.get("raw_symbol")
+            ctx_tick = preflight_ctx.get("tick")
+            ctx_info = preflight_ctx.get("sym_info")
+            if (
+                age < 1.0
+                and preflight_ctx.get("direction") == direction_norm
+                and (symbol == ctx_raw or symbol == ctx_sym or self.resolve_symbol(symbol) == ctx_sym)
+                and ctx_tick is not None
+                and ctx_info is not None
+            ):
+                ask = getattr(ctx_tick, "ask", None)
+                bid = getattr(ctx_tick, "bid", None)
+                if isinstance(ask, (int, float)) and isinstance(bid, (int, float)) and ask > 0 and bid > 0:
+                    self._last_preflight_ctx = None
+                    return (
+                        direction_norm,
+                        str(ctx_sym),
+                        ctx_tick,
+                        ctx_info,
+                        _int_num(preflight_ctx.get("digits"), 2),
+                        float(preflight_ctx.get("pip_size") or self.get_pip_size(str(ctx_sym))),
+                    )
+        self._last_preflight_ctx = None
+
         if not self._ensure_connected():
             self.last_error = "MT5 terminal is not connected"
             return None
@@ -1779,6 +1922,7 @@ class MT5Executor:
         tick: Any,
         order_intent: str = "AUTO",
         entry_label: str = "4Layer",
+        enforce_risk_cap: bool = True,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """Shared execution loop for L1..L4 layers across Zone, Single-Price, and Market entries."""
         market_tickets: List[int] = []
@@ -1803,6 +1947,7 @@ class MT5Executor:
                 order_intent=order_intent,
                 stop_comment=f"TG {l_name} (Stop)",
                 allow_market_buffer=allow_mkt_buf,
+                enforce_risk_cap=enforce_risk_cap,
             )
             if t:
                 if o_type == "MARKET":
@@ -1908,6 +2053,7 @@ class MT5Executor:
             tick=tick,
             order_intent="AUTO",
             entry_label="Zone",
+            enforce_risk_cap=False,
         )
 
     def _resolve_active_layer_subset(
@@ -2031,6 +2177,7 @@ class MT5Executor:
             tick=tick,
             order_intent=eff_intent,
             entry_label=f"Single-{eff_intent}",
+            enforce_risk_cap=False,
         )
 
     def execute_4layer_market(
@@ -2104,6 +2251,7 @@ class MT5Executor:
             tick=tick,
             order_intent="MARKET",
             entry_label="Market",
+            enforce_risk_cap=False,
         )
 
     def execute_single_price_order(
@@ -2308,6 +2456,10 @@ class MT5Executor:
             new_sl = round(float(sl), digits) if sl is not None else cur_sl
             new_tp = round(float(tp), digits) if tp is not None else cur_tp
 
+            if abs(new_sl - cur_sl) <= 1e-6 and abs(new_tp - cur_tp) <= 1e-6:
+                logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No-op).")
+                return True
+
             request = {
                 "action": _mt5_const("TRADE_ACTION_SLTP", 6),
                 "position": ticket,
@@ -2406,6 +2558,11 @@ class MT5Executor:
             cur_tp = round(_num(getattr(order, "tp", 0.0), 0.0), digits)
             new_sl = round(float(sl), digits) if sl is not None else cur_sl
             new_tp = round(float(tp), digits) if tp is not None else cur_tp
+
+            if abs(new_sl - cur_sl) <= 1e-6 and abs(new_tp - cur_tp) <= 1e-6:
+                logger.debug(f"Pending Order #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No-op).")
+                return True
+
             ord_price = _num(getattr(order, "price_open", 0.0), 0.0)
             ord_time = _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0))
             ord_fill = _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2))
@@ -2483,6 +2640,110 @@ class MT5Executor:
             logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
             return False
 
+    def modify_pending_order_price_sltp(
+        self,
+        ticket: int,
+        price: float,
+        sl: Optional[float],
+        tp: Optional[float],
+    ) -> bool:
+        """
+        Modify price, SL, and TP of an unfilled pending order in-place via TRADE_ACTION_MODIFY.
+        Pre-validates live tick + order type + trade_stops_level, and NEVER falls back to cur_price.
+        """
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0 or price is None or float(price) <= 0.0:
+            return False
+        if self.dry_run:
+            logger.info(f"[DRY-RUN] Modified Pending Order #{t_int}: Price={price}, SL={sl}, TP={tp}")
+            return True
+
+        with self._mt5_lock:
+            if not self._ensure_connected():
+                logger.error(f"Cannot modify pending order #{t_int}: MT5 is not connected.")
+                return False
+
+            orders = mt5.orders_get(ticket=t_int)
+            if not orders:
+                logger.debug(f"Pending order #{t_int} not found for in-place price/SL/TP modify.")
+                return False
+            order = orders[0]
+
+            raw_sym = getattr(order, "symbol", None)
+            o_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+            sym_info = self.get_symbol_info(o_symbol)
+            digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+            point = _num(getattr(sym_info, "point", 0.01), 0.01) or 0.01
+            stops_lvl = _int_num(getattr(sym_info, "trade_stops_level", 0), 0) if sym_info else 0
+            min_dist = max(0.0, float(stops_lvl) * point)
+
+            cur_price = round(_num(getattr(order, "price_open", 0.0), 0.0), digits)
+            cur_sl = round(_num(getattr(order, "sl", 0.0), 0.0), digits)
+            cur_tp = round(_num(getattr(order, "tp", 0.0), 0.0), digits)
+            new_price = round(float(price), digits)
+            new_sl = round(float(sl), digits) if sl is not None else cur_sl
+            new_tp = round(float(tp), digits) if tp is not None else cur_tp
+
+            if abs(new_price - cur_price) <= 1e-6 and abs(new_sl - cur_sl) <= 1e-6 and abs(new_tp - cur_tp) <= 1e-6:
+                logger.debug(f"Pending Order #{t_int} already at Price={new_price}, SL={new_sl}, TP={new_tp} (No-op).")
+                return True
+
+            o_type = _int_num(getattr(order, "type", -1), -1)
+            buy_limit = _mt5_const("ORDER_TYPE_BUY_LIMIT", 2)
+            sell_limit = _mt5_const("ORDER_TYPE_SELL_LIMIT", 3)
+            buy_stop = _mt5_const("ORDER_TYPE_BUY_STOP", 4)
+            sell_stop = _mt5_const("ORDER_TYPE_SELL_STOP", 5)
+
+            tick = mt5.symbol_info_tick(o_symbol)
+            if tick is not None:
+                ask = getattr(tick, "ask", None)
+                bid = getattr(tick, "bid", None)
+                if o_type == buy_limit and isinstance(ask, (int, float)) and ask > 0 and new_price >= ask - min_dist:
+                    return False
+                if o_type == sell_limit and isinstance(bid, (int, float)) and bid > 0 and new_price <= bid + min_dist:
+                    return False
+                if o_type == buy_stop and isinstance(ask, (int, float)) and ask > 0 and new_price <= ask + min_dist:
+                    return False
+                if o_type == sell_stop and isinstance(bid, (int, float)) and bid > 0 and new_price >= bid - min_dist:
+                    return False
+
+            if o_type in (buy_limit, buy_stop):
+                if new_sl > 0.0 and new_sl >= new_price - min_dist:
+                    return False
+                if new_tp > 0.0 and new_tp <= new_price + min_dist:
+                    return False
+            elif o_type in (sell_limit, sell_stop):
+                if new_sl > 0.0 and new_sl <= new_price + min_dist:
+                    return False
+                if new_tp > 0.0 and new_tp >= new_price - min_dist:
+                    return False
+
+            ord_time = _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0))
+            ord_fill = _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2))
+
+            request = {
+                "action": _mt5_const("TRADE_ACTION_MODIFY", 7),
+                "order": t_int,
+                "price": new_price,
+                "sl": new_sl,
+                "tp": new_tp,
+                "type_time": ord_time,
+                "type_filling": ord_fill,
+            }
+            done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
+            no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+            result = mt5.order_send(request)
+            comment = getattr(result, "comment", "") if result else mt5.last_error()
+            if result and (result.retcode in (done_code, no_changes_code) or str(comment).strip().lower() == "no changes"):
+                logger.info(
+                    f"Modified Pending Order #{t_int} in-place: Price={new_price}, SL={new_sl}, TP={new_tp}"
+                )
+                return True
+
+            self.last_error = str(comment)
+            logger.info(f"In-place modify failed for Pending Order #{t_int} (Price={new_price}): {comment}")
+            return False
+
     def cancel_pending_order(self, ticket: int) -> bool:
         """Cancel an unfilled pending limit/stop order (thread-safe)."""
         if not ticket:
@@ -2542,7 +2803,8 @@ class MT5Executor:
             if self.dry_run:
                 self._dry_run_ticket_lots.pop(ticket, None)
                 logger.info(f"[DRY-RUN] Closed Market Position #{ticket}")
-                self._cached_pos_profits[ticket] = 1.25
+                self._cached_pos_profits[t_int] = 1.25
+                self._bot_closed_tickets.add(t_int)
                 self.invalidate_realized_pnl_cache()
                 return True
 
@@ -2556,7 +2818,7 @@ class MT5Executor:
                     logger.warning(f"Position #{ticket} not found to close (already closed).")
                     return False
                 p = pos[0]
-                self._cached_pos_profits[ticket] = round(
+                self._cached_pos_profits[t_int] = round(
                     _num(getattr(p, "profit", 0.0)) + _num(getattr(p, "swap", 0.0)),
                     2,
                 )
@@ -2592,6 +2854,9 @@ class MT5Executor:
 
                 success, _ = self.send_order_with_filling_fallback(request)
                 if success:
+                    self._bot_closed_tickets.add(t_int)
+                    if len(self._bot_closed_tickets) > 2000:
+                        self._bot_closed_tickets = set(list(self._bot_closed_tickets)[-500:])
                     self.invalidate_realized_pnl_cache()
                     logger.info(f"Closed Position #{ticket} ({p_symbol} {vol} lots at {close_price})")
                     return True
@@ -2602,16 +2867,9 @@ class MT5Executor:
 
     def _compute_close_info_from_deals(self, ticket: int, deals: Any) -> Dict[str, Any]:
         """Compute {"profit": float, "reason": str} from a single history_deals_get result."""
+        t_int = _int_num(ticket, 0)
         reason = "UNKNOWN"
         if deals:
-            net_profit = sum(
-                _num(getattr(d, "profit", 0.0))
-                + _num(getattr(d, "commission", 0.0))
-                + _num(getattr(d, "swap", 0.0))
-                + _num(getattr(d, "fee", 0.0))
-                for d in deals
-            )
-            profit = round(net_profit, 2)
             out_entries = {
                 _mt5_const("DEAL_ENTRY_OUT", 1),
                 _mt5_const("DEAL_ENTRY_INOUT", 2),
@@ -2619,6 +2877,14 @@ class MT5Executor:
             }
             exit_deals = [d for d in deals if _int_num(getattr(d, "entry", -1), -1) in out_entries]
             if exit_deals:
+                net_profit = sum(
+                    _num(getattr(d, "profit", 0.0))
+                    + _num(getattr(d, "commission", 0.0))
+                    + _num(getattr(d, "swap", 0.0))
+                    + _num(getattr(d, "fee", 0.0))
+                    for d in deals
+                )
+                profit = round(net_profit, 2)
                 d = exit_deals[-1]
                 d_reason = getattr(d, "reason", None)
                 if d_reason == _mt5_const("DEAL_REASON_SL", 4):
@@ -2627,37 +2893,63 @@ class MT5Executor:
                     reason = "TP"
                 else:
                     reason = "MANUAL/BOT"
-            return {"profit": profit, "reason": reason}
+                return {"profit": profit, "reason": reason}
 
+        fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
         return {
-            "profit": self._cached_pos_profits.get(ticket, 0.0),
-            "reason": reason,
+            "profit": self._cached_pos_profits.get(t_int, 0.0),
+            "reason": fallback_reason,
         }
 
     def get_position_close_info(self, ticket: Optional[int]) -> Dict[str, Any]:
         """
-        Return {"profit": float, "reason": str} for a closed position using a SINGLE
-        mt5.history_deals_get(position=ticket) call.
+        Return {"profit": float, "reason": str} for a closed position.
+        Uses a single mt5.history_deals_get(position=ticket) call on the happy path and retries
+        briefly (outside _mt5_lock) only if exit deals have not settled yet in MT5 history.
         reason is one of: "TP", "SL", "MANUAL/BOT", "UNKNOWN".
         """
-        if not ticket:
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0:
             return {"profit": 0.0, "reason": "UNKNOWN"}
 
         if self.dry_run or not self._connected:
             return {
-                "profit": self._cached_pos_profits.get(ticket, 1.25),
+                "profit": self._cached_pos_profits.get(t_int, 1.25),
                 "reason": "UNKNOWN",
             }
 
+        out_entries = {
+            _mt5_const("DEAL_ENTRY_OUT", 1),
+            _mt5_const("DEAL_ENTRY_INOUT", 2),
+            _mt5_const("DEAL_ENTRY_OUT_BY", 3),
+        }
+
         try:
             with self._mt5_lock:
-                deals = mt5.history_deals_get(position=ticket)
-            return self._compute_close_info_from_deals(ticket, deals)
+                deals = mt5.history_deals_get(position=t_int)
+            has_exit = bool(deals and any(_int_num(getattr(d, "entry", -1), -1) in out_entries for d in deals))
+            if not has_exit:
+                for delay in (0.15, 0.20):
+                    time.sleep(delay)
+                    with self._mt5_lock:
+                        deals = mt5.history_deals_get(position=t_int)
+                    has_exit = bool(
+                        deals and any(_int_num(getattr(d, "entry", -1), -1) in out_entries for d in deals)
+                    )
+                    if has_exit:
+                        break
+                if not has_exit:
+                    logger.warning(
+                        f"history_deals_get(position={t_int}) returned no exit deals after retries; "
+                        f"using cached profit fallback ({self._cached_pos_profits.get(t_int, 0.0):.2f})."
+                    )
+            return self._compute_close_info_from_deals(t_int, deals)
         except Exception as e:
-            logger.warning(f"Could not determine close info for #{ticket}: {e}")
+            logger.warning(f"Could not determine close info for #{t_int}: {e}")
+            fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
             return {
-                "profit": self._cached_pos_profits.get(ticket, 0.0),
-                "reason": "UNKNOWN",
+                "profit": self._cached_pos_profits.get(t_int, 0.0),
+                "reason": fallback_reason,
             }
 
     def get_position_closed_profit(self, ticket: Optional[int]) -> float:
@@ -2908,11 +3200,14 @@ class MT5Executor:
     def get_server_time_offset_seconds(self) -> int:
         """
         Broker server clock offset vs UTC (e.g. PU Prime = GMT+2 -> 7200s), derived from the
-        latest tick timestamp. Stale ticks fall back to the last good cached offset.
+        latest tick timestamp (cached for 300s). Stale ticks fall back to the last good cached offset.
         """
         cached = getattr(self, "_server_offset_cache", None)
+        cached_ts = _num(getattr(self, "_server_offset_cache_ts", 0.0), 0.0)
         if self.dry_run or not self._connected:
             return 0
+        if cached is not None and cached_ts > 0.0 and (time.monotonic() - cached_ts) < 300.0:
+            return cached
         try:
             with self._mt5_lock:
                 tick = mt5.symbol_info_tick(self.resolve_symbol(_cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)))
@@ -2922,6 +3217,7 @@ class MT5Executor:
                 rounded = int(round(diff / 1800.0) * 1800)
                 if -12 * 3600 <= rounded <= 14 * 3600 and abs(diff - rounded) <= 600:
                     self._server_offset_cache = rounded
+                    self._server_offset_cache_ts = time.monotonic()
                     return rounded
         except Exception as e:
             logger.debug(f"Could not derive server time offset: {e}")
@@ -3715,28 +4011,172 @@ class MT5Executor:
     def get_live_positions(self, symbol: Optional[str] = None) -> List[Any]:
         """Thread-safe reader returning all open MT5 positions (optionally filtered by symbol)."""
         if self.dry_run or not self._connected:
+            self._last_live_query_ok = False
+            self._last_live_pos_query_ok = False
             return []
         try:
             with self._mt5_lock:
                 resolved = self.resolve_symbol(symbol) if symbol else None
                 positions = mt5.positions_get(symbol=resolved) if resolved else mt5.positions_get()
-                return list(positions) if positions else []
+            if positions is None:
+                self._last_live_query_ok = False
+                self._last_live_pos_query_ok = False
+                return []
+            self._last_live_query_ok = True
+            self._last_live_pos_query_ok = True
+            pos_list = list(positions)
+            for p in pos_list:
+                pt = _int_num(getattr(p, "ticket", 0), 0)
+                if pt > 0:
+                    self._cached_pos_profits[pt] = round(
+                        _num(getattr(p, "profit", 0.0), 0.0) + _num(getattr(p, "swap", 0.0), 0.0),
+                        2,
+                    )
+            return pos_list
         except Exception as e:
             logger.debug(f"get_live_positions error: {e}")
+            self._last_live_query_ok = False
+            self._last_live_pos_query_ok = False
             return []
 
     def get_live_orders(self, symbol: Optional[str] = None) -> List[Any]:
         """Thread-safe reader returning all pending MT5 orders (optionally filtered by symbol)."""
         if self.dry_run or not self._connected:
+            self._last_live_query_ok = False
+            self._last_live_ord_query_ok = False
             return []
         try:
             with self._mt5_lock:
                 resolved = self.resolve_symbol(symbol) if symbol else None
                 orders = mt5.orders_get(symbol=resolved) if resolved else mt5.orders_get()
-                return list(orders) if orders else []
+            if orders is None:
+                self._last_live_query_ok = False
+                self._last_live_ord_query_ok = False
+                return []
+            self._last_live_query_ok = True
+            self._last_live_ord_query_ok = True
+            return list(orders)
         except Exception as e:
             logger.debug(f"get_live_orders error: {e}")
+            self._last_live_query_ok = False
+            self._last_live_ord_query_ok = False
             return []
+
+    def cancel_signal_pending_orders(
+        self,
+        signal_data: Dict[str, Any],
+        include_all_placed: bool = True,
+    ) -> List[int]:
+        """
+        Sweep all pending LIMIT/STOP orders belonging to `signal_data`, including any orphans in
+        `mt5_order_tickets`, `all_placed_tickets`, or `layers[*].ticket`.
+        """
+        if not isinstance(signal_data, dict):
+            return []
+
+        market_set: Set[int] = {
+            _int_num(x, 0)
+            for x in (
+                list(signal_data.get("market_tickets") or [])
+                + list(signal_data.get("runner_tickets") or [])
+                + ([signal_data.get("runner_ticket")] if signal_data.get("runner_ticket") else [])
+                + list(signal_data.get("accounted_tickets") or [])
+                + list(signal_data.get("closed_tickets") or [])
+            )
+            if _int_num(x, 0) > 0
+        }
+        layers = signal_data.get("layers")
+        if isinstance(layers, dict):
+            for l_info in layers.values():
+                if not isinstance(l_info, dict):
+                    continue
+                lt = _int_num(l_info.get("ticket"), 0)
+                st = str(l_info.get("status") or "").strip().upper()
+                if lt > 0 and st in ("OPEN", "FILLED", "RUNNER", "CLOSED"):
+                    market_set.add(lt)
+
+        live_ord_ids: Set[int] = set()
+        live_orders_checked = False
+        if not self.dry_run and self._connected:
+            try:
+                live_orders = self.get_live_orders()
+                if self._last_live_ord_query_ok:
+                    live_orders_checked = True
+                    live_ord_ids = {
+                        _int_num(getattr(o, "ticket", 0), 0)
+                        for o in live_orders
+                        if _int_num(getattr(o, "ticket", 0), 0) > 0
+                    }
+            except Exception:
+                live_ord_ids = set()
+                live_orders_checked = False
+
+        layer_status_by_ticket: Dict[int, str] = {}
+        if isinstance(layers, dict):
+            for l_info in layers.values():
+                if isinstance(l_info, dict):
+                    lt = _int_num(l_info.get("ticket"), 0)
+                    st = str(l_info.get("status") or "").strip().upper()
+                    if lt > 0 and st:
+                        layer_status_by_ticket[lt] = st
+
+        candidates: List[int] = []
+        seen: Set[int] = set()
+
+        def _add_candidate(val: Any) -> None:
+            t_int = _int_num(val, 0)
+            if t_int > 0 and t_int not in market_set and t_int not in seen:
+                seen.add(t_int)
+                candidates.append(t_int)
+
+        for pt in (signal_data.get("pending_tickets") or []):
+            _add_candidate(pt)
+        if isinstance(layers, dict):
+            for l_info in layers.values():
+                if not isinstance(l_info, dict):
+                    continue
+                lt = _int_num(l_info.get("ticket"), 0)
+                st = str(l_info.get("status") or "").strip().upper()
+                if lt > 0 and (
+                    st == "PENDING"
+                    or (live_orders_checked and lt in live_ord_ids and st not in ("OPEN", "FILLED", "RUNNER", "CLOSED"))
+                ):
+                    _add_candidate(lt)
+        if include_all_placed:
+            for key in ("all_placed_tickets", "mt5_order_tickets"):
+                for t in (signal_data.get(key) or []):
+                    t_int = _int_num(t, 0)
+                    if t_int <= 0 or t_int in market_set:
+                        continue
+                    if live_orders_checked:
+                        if t_int in live_ord_ids:
+                            _add_candidate(t_int)
+                    else:
+                        if layer_status_by_ticket.get(t_int) not in ("CLOSED", "CANCELLED"):
+                            _add_candidate(t_int)
+
+        cancelled: List[int] = []
+        cancelled_set: Set[int] = set()
+        for t in candidates:
+            if self.cancel_pending_order(t):
+                cancelled.append(t)
+                cancelled_set.add(t)
+
+        if cancelled_set or live_orders_checked:
+            signal_data["pending_tickets"] = [
+                pt for pt in (signal_data.get("pending_tickets") or [])
+                if _int_num(pt, 0) > 0
+                and _int_num(pt, 0) not in cancelled_set
+                and (not live_orders_checked or _int_num(pt, 0) in live_ord_ids)
+            ]
+            if cancelled_set and isinstance(layers, dict):
+                for l_info in layers.values():
+                    if isinstance(l_info, dict) and _int_num(l_info.get("ticket"), 0) in cancelled_set:
+                        st = str(l_info.get("status") or "").strip().upper()
+                        if st not in ("OPEN", "FILLED", "RUNNER", "CLOSED"):
+                            l_info["status"] = "CANCELLED"
+
+        return cancelled
 
     def get_bot_positions(self, symbol: Optional[str] = None) -> List[Any]:
         """Retrieve all active MT5 market positions placed by this bot (magic == MAGIC_NUMBER)."""
@@ -3839,6 +4279,8 @@ class MT5Executor:
             _add_pending(t)
 
         for t in (signal_data.get("mt5_order_tickets") or []):
+            _add_all(t)
+        for t in (signal_data.get("all_placed_tickets") or []):
             _add_all(t)
 
         layers = signal_data.get("layers")
@@ -4612,11 +5054,9 @@ class MT5Executor:
         layers = signal_data.get("layers") or {}
         raw_tp1 = signal_data.get("raw_tp1")
         market_tickets = list(signal_data.get("market_tickets") or [])
-        pending_tickets = list(signal_data.get("pending_tickets") or [])
         active_set = set(market_tickets)
 
-        for pt in pending_tickets:
-            self.cancel_pending_order(pt)
+        self.cancel_signal_pending_orders(signal_data)
         signal_data["pending_tickets"] = []
 
         top_ticket = (layers.get("TOP") or {}).get("ticket") if layers else None
@@ -4805,12 +5245,13 @@ class MT5Executor:
         self,
         signal_data: Dict[str, Any],
         live_price: Optional[float] = None,
+        chart_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         v3.1 Pre-TP1 Proactive Runner Breakout Preparation:
         1. Dynamically selects current (runner_layers, early_layers) from open market_tickets.
         2. Resets any early_layers back to final_tp (tp_stage="TP1") if a deeper limit filled after an earlier lift.
-        3. When RUNNER_PROACTIVE_TP_LIFT=True and live_price enters the strict tight TP1 activation zone,
+        3. When RUNNER_PROACTIVE_TP_LIFT=True and chart_price enters the strict tight TP1 activation zone,
            lifts ONLY runner_layers' broker TP to TP2 (tp_stage="TP2") so early_layers bank at broker TP1
            while deepest runner(s) ride through the breakout.
         """
@@ -4842,6 +5283,9 @@ class MT5Executor:
         signal_data["runner_tickets"] = list(runner_tickets)
         signal_data["runner_layer"] = runner_layers[-1] if runner_layers else None
         signal_data["runner_ticket"] = runner_tickets[-1] if runner_tickets else None
+        if runner_layers:
+            signal_data["last_runner_layers"] = list(runner_layers)
+            signal_data["last_runner_layer"] = runner_layers[-1]
 
         reset_tickets: List[int] = []
         if final_tp is not None:
@@ -4864,6 +5308,11 @@ class MT5Executor:
                 cand_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
                 if isinstance(cand_px, (int, float)) and not isinstance(cand_px, bool) and cand_px > 0:
                     live_price = float(cand_px)
+                if chart_price is None:
+                    cand_chart = getattr(tick, "bid", None)
+                    if isinstance(cand_chart, (int, float)) and not isinstance(cand_chart, bool) and cand_chart > 0:
+                        chart_price = float(cand_chart)
+        eval_price = chart_price if chart_price is not None else live_price
 
         lifted_tickets: List[int] = []
         proactive = bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT))
@@ -4884,12 +5333,12 @@ class MT5Executor:
             proactive = False
         tp2 = tp_levels.get("TP2")
 
-        if proactive and max_stage >= 2 and raw_tp1 is not None and tp2 is not None and live_price is not None and runner_layers:
+        if proactive and max_stage >= 2 and raw_tp1 is not None and tp2 is not None and eval_price is not None and runner_layers:
             anchor = self._resolve_milestone_anchor(signal_data, tp_levels, 1)
             eff_buf, _ = self._compute_proximity_and_pullback(
-                float(raw_tp1), float(live_price), pip_size, anchor=anchor
+                float(raw_tp1), float(eval_price), pip_size, anchor=anchor
             )
-            dist_to_tp1 = (float(raw_tp1) - float(live_price)) if is_buy else (float(live_price) - float(raw_tp1))
+            dist_to_tp1 = (float(raw_tp1) - float(eval_price)) if is_buy else (float(eval_price) - float(raw_tp1))
             should_lift_early = dist_to_tp1 <= eff_buf + 1e-9
 
             # In Gold Calibrated Reversal Guard mode, lift ONLY the deepest runner's broker TP to TP2
@@ -4900,7 +5349,7 @@ class MT5Executor:
                 if sig_entry is not None and sig_entry > 0:
                     leg_span = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
                     if leg_span > 1e-9:
-                        prog_pct = ((float(live_price) - sig_entry) / leg_span) if is_buy else ((sig_entry - float(live_price)) / leg_span)
+                        prog_pct = ((float(eval_price) - sig_entry) / leg_span) if is_buy else ((sig_entry - float(eval_price)) / leg_span)
                         lift_pct = float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT))
                         if prog_pct + 1e-9 >= lift_pct:
                             should_lift_early = True
@@ -4936,6 +5385,12 @@ class MT5Executor:
         """Resolve primary L1 / recorded signal entry price for measuring % progress toward TP1."""
         direction = (signal_data.get("direction") or "BUY").strip().upper()
         layers = signal_data.get("layers") or {}
+        rec_entry = signal_data.get("recorded_entry_price")
+        if isinstance(rec_entry, numbers.Real) and not isinstance(rec_entry, bool) and float(rec_entry) > 0:
+            for lk in ("L1", "TOP"):
+                l_obj = layers.get(lk)
+                if isinstance(l_obj, dict) and str(l_obj.get("order_type") or "").strip().upper() == "MARKET":
+                    return float(rec_entry)
         for lk in ("L1", "TOP"):
             l_obj = layers.get(lk)
             if isinstance(l_obj, dict):
@@ -4959,6 +5414,107 @@ class MT5Executor:
                     return float(tp_px)
         return None
 
+    def _apply_stage0_profit_lock(
+        self,
+        signal_data: Dict[str, Any],
+        symbol: str,
+        direction: str,
+        runner_entry: float,
+        pip_size: float,
+        digits: int,
+        tick: Any,
+        sym_info: Any,
+        has_unfilled_zone_layers: bool = False,
+    ) -> float:
+        """
+        Lock open Stage 0 runner position(s) at Entry +/- STAGE0_PROFIT_LOCK_OFFSET_PIPS (BE + 5p)
+        on broker SL + virtual state, and sweep pending L2..L4 limits on single-layer unfilled zones
+        so flash crashes cannot turn a near-TP1 winner red or leave unfilled limits exposed.
+        """
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        eff_pip = pip_size if pip_size > 0 else 0.10
+        lock_offset = float(_cfg("STAGE0_PROFIT_LOCK_OFFSET_PIPS", STAGE0_PROFIT_LOCK_OFFSET_PIPS)) * eff_pip
+        lock_sl = round((runner_entry + lock_offset) if is_buy else (runner_entry - lock_offset), digits)
+        clamped_lock_sl = self._clamp_sl_for_broker_stops(lock_sl, direction, tick, sym_info, digits)
+        is_green_sl = (
+            ((clamped_lock_sl > runner_entry + 1e-9) if is_buy else (clamped_lock_sl < runner_entry - 1e-9))
+            if lock_offset > 0.0
+            else True
+        )
+
+        layers = signal_data.get("layers") or {}
+        ticket_to_layer: Dict[int, Dict[str, Any]] = {}
+        for l_val in layers.values():
+            if isinstance(l_val, dict):
+                lt = _int_num(l_val.get("ticket"), 0)
+                if lt > 0:
+                    ticket_to_layer[lt] = l_val
+
+        open_tickets = list(
+            dict.fromkeys(
+                t
+                for t in (
+                    [_int_num(x, 0) for x in (signal_data.get("market_tickets") or [])]
+                    + [_int_num(x, 0) for x in (signal_data.get("runner_tickets") or [])]
+                )
+                if t > 0
+            )
+        )
+        any_sl_synced = False
+        for tkt in open_tickets:
+            l_info = ticket_to_layer.get(tkt)
+            cur_sl = 0.0
+            if not self.dry_run:
+                with self._mt5_lock:
+                    pos_res = mt5.positions_get(ticket=tkt)
+                if pos_res:
+                    cur_sl = _num(getattr(pos_res[0], "sl", 0.0), 0.0)
+            if cur_sl <= 0.0 and l_info is not None:
+                cur_sl = _num(l_info.get("sl") or l_info.get("be_sl"), 0.0)
+
+            already_better = cur_sl > 0.0 and (
+                (is_buy and cur_sl >= clamped_lock_sl - 1e-9)
+                or (not is_buy and cur_sl <= clamped_lock_sl + 1e-9)
+            )
+            if already_better:
+                any_sl_synced = True
+                continue
+            if not is_green_sl:
+                continue
+            if self.modify_position_sltp(tkt, sl=clamped_lock_sl, tp=None):
+                any_sl_synced = True
+                if l_info is not None:
+                    l_info["sl"] = clamped_lock_sl
+                prev_bsl = _num(signal_data.get("broker_sl"), 0.0)
+                if (
+                    prev_bsl <= 0.0
+                    or (is_buy and clamped_lock_sl > prev_bsl + 1e-9)
+                    or (not is_buy and clamped_lock_sl < prev_bsl - 1e-9)
+                ):
+                    signal_data["broker_sl"] = clamped_lock_sl
+
+        signal_data["stage0_profit_lock_active"] = True
+        signal_data["stage0_profit_lock_sl"] = lock_sl
+        signal_data["stage0_broker_sl_synced"] = bool(any_sl_synced or not open_tickets)
+
+        if has_unfilled_zone_layers:
+            signal_data["stage0_zone_protected"] = True
+            if (
+                (self.dry_run or signal_data["stage0_broker_sl_synced"])
+                and bool(_cfg("CANCEL_PENDING_ON_STAGE0_LOCK_EXIT", CANCEL_PENDING_ON_STAGE0_LOCK_EXIT))
+            ):
+                self.cancel_signal_pending_orders(signal_data)
+                signal_data["pending_tickets"] = []
+                for l_val in layers.values():
+                    if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
+                        l_val["status"] = "CANCELLED"
+
+        logger.info(
+            f"Stage 0 Profit-Lock ARMED (lock_sl={lock_sl}, broker_sl={clamped_lock_sl if is_green_sl else None}, "
+            f"synced={signal_data['stage0_broker_sl_synced']}, entry={runner_entry}, zone_protected={has_unfilled_zone_layers})"
+        )
+        return lock_sl
+
     def evaluate_gold_reversal_guard(
         self,
         signal_data: Dict[str, Any],
@@ -4966,18 +5522,15 @@ class MT5Executor:
         runner_entry_override: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Gold (XAUUSD) Calibrated Peak-Profit Giveback Guard ("Bank It" Without Choking Winners):
-        1. Strict Arming Zone (`ARM_THRESHOLD_PCT = 0.85`): stays completely OFF in mid-range;
-           only sets `reversal_guard_armed = True` once progress reaches >= 85% of distance to TP1
-           (or once `tp1_reached == True`).
-        2. Healthy Reversal Trigger (`GIVEBACK_PCT = 0.30`): tracks `drawdown_from_peak =
-           (peak_profit - current_profit) / peak_profit` (with post-TP1 cap `MAX_GIVEBACK_DOLLARS`).
-           Triggers market exit ONLY when giveback threshold is breached AND pullback >= Gold noise floor.
-        3. Gold Noise Floor (`MIN_GOLD_PULLBACK_DOLLARS = 1.50`): requires at least
-           `max(1.50, 0.35 * M1_ATR_14)` dollars of actual price reversal.
-        4. Adaptive Spread Spike Filter: pauses exit triggers during temporary spread spikes.
-        5. Scaling Continuity: keeps `reversal_guard_armed = True` and updates `peak_profit`
-           dynamically across TP1 -> TP2 -> TP3 -> TP4.
+        Gold (XAUUSD) Calibrated Peak-Profit Giveback Guard + Stage 0 Profit-Lock:
+        1. Chart-price arming (`ARM_THRESHOLD_PCT = 0.85`, or `0.80` on true tight scalps,
+           plus Cliff-Gap Catch #1 when runner `tp_stage == "TP2"` has reached `final_tp`).
+        2. Stage 0 Profit-Lock: upon arming in profit >= STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS,
+           locks hard broker SL at `Entry +/- STAGE0_PROFIT_LOCK_OFFSET_PIPS` (+5p),
+           cancels unfilled L2..L4 pending limits on single-layer zones, and guarantees green exits.
+        3. Wide-Zone Protection: unfilled-zone setups & true wide zones are immune to tight scalp
+           calibration and premature Stage 0 $1.50/30% market-kills while protected by Stage 0 lock.
+        4. Confirmation ticks (`REVERSAL_CONFIRM_TICKS = 2`) and Adaptive Spread Spike Filter.
         """
         symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
         direction = (signal_data.get("direction") or "BUY").strip().upper()
@@ -4989,6 +5542,9 @@ class MT5Executor:
             return {
                 "armed": False,
                 "triggered": False,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
                 "hard_ceiling_triggered": False,
                 "paused_by_spread": False,
                 "disabled_post_tp1": True,
@@ -5007,18 +5563,45 @@ class MT5Executor:
         if tick is None:
             tick = self.get_tick(symbol)
         if tick is None:
-            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": False}
+            return {
+                "armed": bool(signal_data.get("reversal_guard_armed", False)),
+                "triggered": False,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
+                "paused_by_spread": False,
+            }
 
         raw_exec = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
         if not isinstance(raw_exec, numbers.Real) or isinstance(raw_exec, bool) or float(raw_exec) <= 0:
-            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": False}
+            return {
+                "armed": bool(signal_data.get("reversal_guard_armed", False)),
+                "triggered": False,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
+                "paused_by_spread": False,
+            }
         exec_price = float(raw_exec)
+        raw_chart = getattr(tick, "bid", None)
+        chart_price = (
+            float(raw_chart)
+            if isinstance(raw_chart, numbers.Real) and not isinstance(raw_chart, bool) and float(raw_chart) > 0
+            else exec_price
+        )
 
         is_spike, spread_dollars, eff_max_spread = self.check_spread_spike(symbol, tick)
         signal_data["spread_spike_paused"] = is_spike
 
         layers = signal_data.get("layers") or {}
         market_tickets = list(signal_data.get("market_tickets") or [])
+        pending_tickets = list(signal_data.get("pending_tickets") or [])
+        has_pending_layer = any(
+            isinstance(lv, dict) and str(lv.get("status") or "").strip().upper() == "PENDING"
+            for lv in layers.values()
+        )
+        has_unfilled_zone_layers = (len(market_tickets) == 1) and (bool(pending_tickets) or has_pending_layer)
+
         raw_rls = signal_data.get("runner_layers")
         if isinstance(raw_rls, list) and raw_rls:
             runner_layers = [str(x) for x in raw_rls if x]
@@ -5033,22 +5616,68 @@ class MT5Executor:
         if runner_entry_override is not None and float(runner_entry_override) > 0:
             runner_entry = float(runner_entry_override)
         elif primary_rl and isinstance(layers.get(primary_rl), dict):
-            tp_px = layers[primary_rl].get("target_price")
-            if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
-                runner_entry = float(tp_px)
+            l_obj = layers[primary_rl]
+            rec_entry = signal_data.get("recorded_entry_price")
+            if (
+                primary_rl in ("L1", "TOP")
+                and str(l_obj.get("order_type") or "").strip().upper() == "MARKET"
+                and isinstance(rec_entry, numbers.Real)
+                and not isinstance(rec_entry, bool)
+                and float(rec_entry) > 0
+            ):
+                runner_entry = float(rec_entry)
+            else:
+                tp_px = l_obj.get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
+                    runner_entry = float(tp_px)
         if runner_entry is None:
             runner_entry = sig_entry
         if sig_entry is None:
             sig_entry = runner_entry
 
         if runner_entry is None or runner_entry <= 0:
-            return {"armed": bool(signal_data.get("reversal_guard_armed", False)), "triggered": False, "paused_by_spread": is_spike}
+            return {
+                "armed": bool(signal_data.get("reversal_guard_armed", False)),
+                "triggered": False,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
+                "paused_by_spread": is_spike,
+            }
 
         pip_size = self.get_pip_size(symbol)
         sym_info = self.get_symbol_info(symbol)
         digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
         raw_tp1 = signal_data.get("raw_tp1") or tp_levels.get("TP1")
+
+        zone_mid_leg: Optional[float] = None
+        zone_obj = signal_data.get("zone")
+        if raw_tp1 is not None and isinstance(zone_obj, dict):
+            z_mid = zone_obj.get("mid")
+            if not (isinstance(z_mid, numbers.Real) and not isinstance(z_mid, bool) and float(z_mid) > 0):
+                z_top = zone_obj.get("top")
+                z_bot = zone_obj.get("bottom")
+                if (
+                    isinstance(z_top, numbers.Real) and not isinstance(z_top, bool)
+                    and isinstance(z_bot, numbers.Real) and not isinstance(z_bot, bool)
+                ):
+                    z_mid = (float(z_top) + float(z_bot)) / 2.0
+            if isinstance(z_mid, numbers.Real) and not isinstance(z_mid, bool) and float(z_mid) > 0:
+                zone_mid_leg = (float(raw_tp1) - float(z_mid)) if is_buy else (float(z_mid) - float(raw_tp1))
+
+        tp1_leg = (
+            ((float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1)))
+            if (raw_tp1 is not None and sig_entry is not None)
+            else None
+        )
+        is_tight_scalp = bool(
+            tp1_leg is not None
+            and 0.0 < tp1_leg <= 4.0
+            and not has_unfilled_zone_layers
+            and not bool(signal_data.get("stage0_zone_protected"))
+            and (zone_mid_leg is None or zone_mid_leg <= 4.0)
+        )
 
         current_profit = round((exec_price - runner_entry) if is_buy else (runner_entry - exec_price), 6)
 
@@ -5076,15 +5705,22 @@ class MT5Executor:
         if not armed:
             if (not staged_exit_on) and (signal_data.get("tp1_reached") or signal_data.get("tp1_touched")):
                 armed = True
-            elif raw_tp1 is not None and sig_entry is not None:
-                tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
-                if tp1_leg > 1e-9:
-                    # Require price to reach >= arm_pct (default 85%) of TP1 leg.
-                    # On tight legs (<= 4.0), require at least 80% progress (e.g. 82.4% in scalp test).
-                    # Never arm prematurely on tiny 15-pip wiggles before reaching 80% of TP1.
-                    eff_arm_pct = min(arm_pct, 0.80) if tp1_leg <= 4.0 else arm_pct
-                    sig_progress = ((exec_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - exec_price) / tp1_leg)
-                    if sig_progress + 1e-9 >= eff_arm_pct and current_profit > 0:
+            elif tp1_leg is not None and tp1_leg > 1e-9:
+                eff_arm_pct = min(arm_pct, 0.80) if is_tight_scalp else arm_pct
+                sig_progress = ((chart_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - chart_price) / tp1_leg)
+                if sig_progress + 1e-9 >= eff_arm_pct and current_profit > 0:
+                    armed = True
+
+            # Cliff-Gap Catch #1: if 70% lift already promoted the runner to TP2 and chart_price reached final_tp, arm immediately
+            if not armed and current_profit > 0:
+                runner_on_tp2 = (str(signal_data.get("tp_stage") or "").strip().upper() == "TP2") or any(
+                    isinstance(layers.get(rk), dict) and str(layers[rk].get("tp_stage") or "").strip().upper() == "TP2"
+                    for rk in runner_layers
+                )
+                f_tp = signal_data.get("final_tp") or signal_data.get("hard_broker_tp")
+                if runner_on_tp2 and isinstance(f_tp, numbers.Real) and not isinstance(f_tp, bool) and float(f_tp) > 0:
+                    f_tp_val = float(f_tp)
+                    if (is_buy and chart_price >= f_tp_val - 1e-9) or (not is_buy and chart_price <= f_tp_val + 1e-9):
                         armed = True
 
             if armed:
@@ -5096,8 +5732,8 @@ class MT5Executor:
                 signal_data["runner_peak_price"] = round(peak_px, digits)
                 signal_data["runner_reversal_ticks"] = 0
                 logger.info(
-                    f"Gold Reversal Guard ARMED (exec={exec_price}, peak_profit=${peak_profit:.2f}, "
-                    f"runner_entry={runner_entry}, arm_pct={arm_pct*100:.0f}%)"
+                    f"Gold Reversal Guard ARMED (exec={exec_price}, chart={chart_price}, "
+                    f"peak_profit=${peak_profit:.2f}, runner_entry={runner_entry}, arm_pct={arm_pct*100:.0f}%)"
                 )
             else:
                 signal_data["reversal_guard_armed"] = False
@@ -5108,6 +5744,9 @@ class MT5Executor:
                 return {
                     "armed": False,
                     "triggered": False,
+                    "stage0_lock_triggered": False,
+                    "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                    "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
                     "hard_ceiling_triggered": False,
                     "paused_by_spread": is_spike,
                     "spread_dollars": spread_dollars,
@@ -5137,31 +5776,73 @@ class MT5Executor:
         drawdown_from_peak = (pullback_dollars / peak_profit) if peak_profit > 1e-9 else 0.0
         signal_data["drawdown_from_peak"] = round(drawdown_from_peak, 6)
 
+        if not signal_data.get("tp1_reached"):
+            stage0_lock_on = bool(_cfg("STAGE0_PROFIT_LOCK_ENABLED", STAGE0_PROFIT_LOCK_ENABLED))
+            min_lock_profit = float(_cfg("STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS", STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS))
+            if (
+                stage0_lock_on
+                and (not signal_data.get("stage0_profit_lock_active") or not signal_data.get("stage0_broker_sl_synced", True))
+                and current_profit + 1e-9 >= min_lock_profit
+            ):
+                self._apply_stage0_profit_lock(
+                    signal_data=signal_data,
+                    symbol=symbol,
+                    direction=direction,
+                    runner_entry=runner_entry,
+                    pip_size=pip_size,
+                    digits=digits,
+                    tick=tick,
+                    sym_info=sym_info,
+                    has_unfilled_zone_layers=has_unfilled_zone_layers,
+                )
+
+            if signal_data.get("stage0_profit_lock_active"):
+                s0_sl = signal_data.get("stage0_profit_lock_sl")
+                if isinstance(s0_sl, numbers.Real) and not isinstance(s0_sl, bool) and float(s0_sl) > 0:
+                    s0_sl_f = float(s0_sl)
+                    s0_hit = (exec_price <= s0_sl_f + 1e-9) if is_buy else (exec_price >= s0_sl_f - 1e-9)
+                    if s0_hit and not is_spike:
+                        logger.info(
+                            f"Stage 0 Profit-Lock TRIGGERED (exec={exec_price}, lock_sl={s0_sl_f}, "
+                            f"peak=${peak_profit:.2f}, live=${current_profit:.2f})"
+                        )
+                        return {
+                            "armed": True,
+                            "triggered": True,
+                            "stage0_lock_triggered": True,
+                            "stage0_profit_lock_active": True,
+                            "stage0_profit_lock_sl": s0_sl_f,
+                            "hard_ceiling_triggered": False,
+                            "paused_by_spread": False,
+                            "spread_dollars": spread_dollars,
+                            "max_allowed_spread": eff_max_spread,
+                            "peak_profit": peak_profit,
+                            "current_profit": current_profit,
+                            "pullback_dollars": pullback_dollars,
+                            "drawdown_from_peak": drawdown_from_peak,
+                            "noise_floor_dollars": float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS)),
+                            "m1_atr_14": 0.0,
+                            "peak_price": peak_px,
+                            "live_price": exec_price,
+                        }
+
         m1_atr_14 = self.get_m1_atr(symbol)
         min_pb_dollars = float(_cfg("MIN_GOLD_PULLBACK_DOLLARS", MIN_GOLD_PULLBACK_DOLLARS))
         atr_mult = float(_cfg("ATR_NOISE_FLOOR_MULT", ATR_NOISE_FLOOR_MULT))
         noise_floor_dollars = round(max(min_pb_dollars, atr_mult * m1_atr_14), 4)
-        tp1_leg_dollars = (
-            ((float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1)))
-            if (raw_tp1 is not None and sig_entry is not None)
-            else None
-        )
-        if (
-            tp1_leg_dollars is not None
-            and 0.0 < tp1_leg_dollars <= 4.0
-            and not signal_data.get("tp2_reached")
-        ):
-            # Scale floor proportionally to the leg but require at least 50% leg giveback
-            # (e.g. $2.50 leg -> $1.25 floor; $3.00 leg -> $1.50 floor; $4.00 leg -> $2.00 floor)
-            noise_floor_dollars = min(noise_floor_dollars, max(1.10, round(0.50 * tp1_leg_dollars, 4)))
+        if is_tight_scalp and tp1_leg is not None and not signal_data.get("tp2_reached"):
+            noise_floor_dollars = min(noise_floor_dollars, max(1.65, round(0.60 * tp1_leg, 4)))
 
         giveback_pct = float(_cfg("GIVEBACK_PCT", GIVEBACK_PCT))
         max_gb_dollars = float(_cfg("MAX_GIVEBACK_DOLLARS", MAX_GIVEBACK_DOLLARS))
         hard_ceil_cfg = float(_cfg("HARD_GIVEBACK_CEILING_DOLLARS", HARD_GIVEBACK_CEILING_DOLLARS))
         positive_caps = [v for v in (max_gb_dollars, hard_ceil_cfg) if v > 0.0]
         hard_ceiling_dollars = min(positive_caps) if positive_caps else 0.0
+        zone_protected = bool(has_unfilled_zone_layers or signal_data.get("stage0_zone_protected"))
+        min_peak_for_ceiling = 5.0 if zone_protected else 0.0
         hard_ceiling_breached = (
-            peak_profit > 0.0
+            peak_profit >= min_peak_for_ceiling
+            and peak_profit > 0.0
             and hard_ceiling_dollars > 0.0
             and pullback_dollars + 1e-9 >= hard_ceiling_dollars
         )
@@ -5176,6 +5857,9 @@ class MT5Executor:
             return {
                 "armed": True,
                 "triggered": True,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
                 "hard_ceiling_triggered": True,
                 "paused_by_spread": False,
                 "spread_dollars": spread_dollars,
@@ -5197,6 +5881,9 @@ class MT5Executor:
             return {
                 "armed": True,
                 "triggered": False,
+                "stage0_lock_triggered": False,
+                "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+                "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
                 "hard_ceiling_triggered": False,
                 "paused_by_spread": True,
                 "spread_dollars": spread_dollars,
@@ -5225,14 +5912,17 @@ class MT5Executor:
             else:
                 cand_trigger = False
         else:
-            # Pre-TP1: exact arming / giveback AND >= Gold noise floor
-            cand_trigger = (
-                peak_profit > 0.0
-                and drawdown_from_peak + 1e-9 >= giveback_pct
-                and pullback_dollars + 1e-9 >= noise_floor_dollars
-            )
+            # Pre-TP1: suppress Stage 0 $1.50/30% market-kill on unfilled-zone / Stage 0 zone-protected signals
+            if zone_protected:
+                cand_trigger = False
+            else:
+                cand_trigger = (
+                    peak_profit > 0.0
+                    and drawdown_from_peak + 1e-9 >= giveback_pct
+                    and pullback_dollars + 1e-9 >= noise_floor_dollars
+                )
 
-        confirm_req = max(1, _int_num(_cfg("REVERSAL_CONFIRM_TICKS", 1), 1))
+        confirm_req = max(1, _int_num(_cfg("REVERSAL_CONFIRM_TICKS", 2), 2))
         if cand_trigger:
             rev_ticks = _int_num(signal_data.get("reversal_guard_ticks", 0), 0) + 1
             signal_data["reversal_guard_ticks"] = rev_ticks
@@ -5244,6 +5934,9 @@ class MT5Executor:
         return {
             "armed": True,
             "triggered": triggered,
+            "stage0_lock_triggered": False,
+            "stage0_profit_lock_active": bool(signal_data.get("stage0_profit_lock_active", False)),
+            "stage0_profit_lock_sl": signal_data.get("stage0_profit_lock_sl"),
             "hard_ceiling_triggered": False,
             "paused_by_spread": False,
             "spread_dollars": spread_dollars,
@@ -5257,6 +5950,56 @@ class MT5Executor:
             "peak_price": peak_px,
             "live_price": exec_price,
         }
+
+    def _eval_stage1_atr_armed(
+        self,
+        signal_data: Dict[str, Any],
+        stage: int,
+        tp_levels: Dict[str, float],
+        direction: str,
+        chart_peak: Optional[float],
+        atr_stop: float,
+    ) -> bool:
+        """
+        Dual-Gate Stage 1 ATR Activation:
+        Holds pure `fsm_floor` (BE + 5p) on initial TP1 handoff and arms Stage 1 ATR trailing ONLY when:
+        - `stage >= 2` (or already armed / missing TP1..TP2 / threshold <= 0), OR
+        - Gate A: `chart_peak` progresses >= STAGE1_ATR_ACTIVATION_PCT (default 0.45) of TP1 -> TP2, OR
+        - Gate B: `atr_stop` naturally crosses past `TP1` into pure TP1-plus profit protection.
+        """
+        if stage >= 2 or bool(signal_data.get("stage1_atr_armed")):
+            signal_data["stage1_atr_armed"] = True
+            return True
+
+        act_pct = float(_cfg("STAGE1_ATR_ACTIVATION_PCT", STAGE1_ATR_ACTIVATION_PCT))
+        tp1_raw = tp_levels.get("TP1") if isinstance(tp_levels, dict) else None
+        if tp1_raw is None:
+            tp1_raw = signal_data.get("raw_tp1")
+        tp2_raw = tp_levels.get("TP2") if isinstance(tp_levels, dict) else None
+        if tp2_raw is None:
+            tp2_raw = signal_data.get("raw_tp2")
+
+        if act_pct <= 0.0 or tp1_raw is None or tp2_raw is None:
+            signal_data["stage1_atr_armed"] = True
+            return True
+
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        tp1_f = float(tp1_raw)
+        tp2_f = float(tp2_raw)
+        leg = (tp2_f - tp1_f) if is_buy else (tp1_f - tp2_f)
+        if leg <= 1e-9:
+            signal_data["stage1_atr_armed"] = True
+            return True
+
+        gate_a = False
+        if chart_peak is not None and isinstance(chart_peak, numbers.Real) and not isinstance(chart_peak, bool):
+            prog = ((float(chart_peak) - tp1_f) / leg) if is_buy else ((tp1_f - float(chart_peak)) / leg)
+            gate_a = prog + 1e-9 >= act_pct
+
+        gate_b = (atr_stop >= tp1_f - 1e-9) if is_buy else (atr_stop <= tp1_f + 1e-9)
+        armed = bool(gate_a or gate_b)
+        signal_data["stage1_atr_armed"] = armed
+        return armed
 
     def handle_tp1_scaling_and_select_runner(self, signal_data: Dict[str, Any]) -> Optional[int]:
         """
@@ -5287,16 +6030,17 @@ class MT5Executor:
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
         raw_tp1 = signal_data.get("raw_tp1") or tp_levels.get("TP1")
 
+        signal_data["stage0_profit_lock_active"] = False
+        signal_data["stage0_zone_protected"] = False
+
         market_tickets = list(signal_data.get("market_tickets") or [])
-        pending_tickets = list(signal_data.get("pending_tickets") or [])
 
         # 1. Pending order cancellation policy
         if _cfg("CANCEL_PENDING_ON_TP1", CANCEL_PENDING_ON_TP1):
-            for pt in pending_tickets:
-                self.cancel_pending_order(pt)
+            self.cancel_signal_pending_orders(signal_data)
             signal_data["pending_tickets"] = []
             for l_val in layers.values():
-                if isinstance(l_val, dict) and l_val.get("status") == "PENDING":
+                if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
                     l_val["status"] = "CANCELLED"
 
         # 2. Dynamic runner vs early layer selection
@@ -5374,20 +6118,29 @@ class MT5Executor:
         # 4. Fetch live price before setting floor so proximity/early TP1 scaling never arms a premature virtual floor
         tick = self.get_tick(symbol)
         live_price: Optional[float] = None
+        chart_price: Optional[float] = None
         if tick is not None:
             cand_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
             if isinstance(cand_px, (int, float)) and not isinstance(cand_px, bool) and cand_px > 0:
                 live_price = float(cand_px)
+            cand_chart = getattr(tick, "bid", None)
+            if isinstance(cand_chart, (int, float)) and not isinstance(cand_chart, bool) and cand_chart > 0:
+                chart_price = float(cand_chart)
+        eval_chart_px = chart_price if chart_price is not None else live_price
 
         clean_break_dist = float(_cfg("RUNNER_CLEAN_BREAK_PIPS", RUNNER_CLEAN_BREAK_PIPS)) * pip_size
         already_clean_tp1 = False
-        if raw_tp1 is not None and live_price is not None:
+        if raw_tp1 is not None and eval_chart_px is not None:
             if is_buy:
-                already_clean_tp1 = live_price >= round(float(raw_tp1) + clean_break_dist, digits)
+                already_clean_tp1 = eval_chart_px >= round(float(raw_tp1) + clean_break_dist, digits)
             else:
-                already_clean_tp1 = live_price <= round(float(raw_tp1) - clean_break_dist, digits)
+                already_clean_tp1 = eval_chart_px <= round(float(raw_tp1) - clean_break_dist, digits)
 
-        if already_clean_tp1 and max_stage >= 2:
+        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+        if staged_exit_on:
+            milestone_idx = 2 if max_stage >= 2 else 1
+            cleared = ["TP1"]
+        elif already_clean_tp1 and max_stage >= 2:
             milestone_idx = 2
             cleared = ["TP1"]
         else:
@@ -5395,7 +6148,6 @@ class MT5Executor:
             cleared = []
 
         # 5. Lock runner SL floor & step all runner_tickets' broker TP to TP2
-        staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
         be_after_tp1 = bool(_cfg("BE_AFTER_TP1", BE_AFTER_TP1))
         offset_value = float(_cfg("BE_OFFSET_PIPS", BE_OFFSET_PIPS)) * pip_size
         tp1_floor_price = floor_price
@@ -5406,8 +6158,8 @@ class MT5Executor:
         tp1_touch_enabled = bool(_cfg("TP1_TOUCH_BANK_ENABLED", TP1_TOUCH_BANK_ENABLED))
         touched_now = bool(
             raw_tp1 is not None
-            and live_price is not None
-            and ((live_price >= float(raw_tp1)) if is_buy else (live_price <= float(raw_tp1)))
+            and eval_chart_px is not None
+            and ((eval_chart_px >= float(raw_tp1)) if is_buy else (eval_chart_px <= float(raw_tp1)))
         )
         tp1_touched = bool(
             raw_tp1 is not None
@@ -5422,6 +6174,9 @@ class MT5Executor:
             signal_data["runner_tickets"] = list(runner_tickets)
             signal_data["runner_layer"] = runner_layer
             signal_data["runner_ticket"] = runner_ticket
+            if runner_layers:
+                signal_data["last_runner_layers"] = list(runner_layers)
+                signal_data["last_runner_layer"] = runner_layer
             signal_data["runner_milestone_idx"] = milestone_idx
             signal_data["runner_milestone_name"] = f"TP{milestone_idx}"
             signal_data["runner_cleared_milestones"] = list(cleared)
@@ -5438,6 +6193,14 @@ class MT5Executor:
                         val = _num(getattr(r_pos[0], "price_open", 0.0), 0.0)
                         if val > 0:
                             r_open = val
+                if (
+                    r_open is None
+                    and runner_layer in ("L1", "TOP")
+                    and isinstance(primary_info, dict)
+                    and str(primary_info.get("order_type") or "").strip().upper() == "MARKET"
+                    and signal_data.get("recorded_entry_price")
+                ):
+                    r_open = float(signal_data["recorded_entry_price"])
                 if r_open is None and isinstance(primary_info, dict) and primary_info.get("target_price"):
                     r_open = float(primary_info["target_price"])
                 if r_open is None and signal_data.get("recorded_entry_price"):
@@ -5456,15 +6219,32 @@ class MT5Executor:
                     runner_entry=r_open,
                 )
 
-                seed_px = (
-                    live_price
-                    if live_price is not None
-                    else (
-                        float(raw_tp1)
-                        if raw_tp1 is not None
-                        else (float(r_open) if r_open is not None else 0.0)
-                    )
+                if live_price is not None:
+                    seed_px = live_price
+                elif raw_tp1 is not None:
+                    seed_px = float(raw_tp1)
+                    if not is_buy and sym_info is not None:
+                        spr_pts = _num(getattr(sym_info, "spread", 0.0), 0.0)
+                        pt_sz = _num(getattr(sym_info, "point", 0.01), 0.01) or 0.01
+                        if spr_pts > 0.0:
+                            seed_px = round(seed_px + spr_pts * pt_sz, digits)
+                else:
+                    seed_px = float(r_open) if r_open is not None else 0.0
+
+                chart_seed_px = (
+                    eval_chart_px
+                    if eval_chart_px is not None
+                    else (float(raw_tp1) if raw_tp1 is not None else seed_px)
                 )
+                prev_cp = signal_data.get("chart_peak")
+                if isinstance(prev_cp, numbers.Real) and not isinstance(prev_cp, bool) and float(prev_cp) > 0.0 and chart_seed_px > 0.0:
+                    chart_peak = round(
+                        max(float(prev_cp), float(chart_seed_px)) if is_buy else min(float(prev_cp), float(chart_seed_px)),
+                        digits,
+                    )
+                else:
+                    chart_peak = round(float(chart_seed_px), digits)
+
                 prev_tp = signal_data.get("trail_peak")
                 if isinstance(prev_tp, numbers.Real) and not isinstance(prev_tp, bool) and float(prev_tp) > 0.0 and seed_px > 0.0:
                     trail_peak = round(
@@ -5476,8 +6256,18 @@ class MT5Executor:
 
                 trail_dist, tier_used = self._compute_staged_trail_dist(symbol, stage, digits)
                 atr_stop = round((trail_peak - trail_dist) if is_buy else (trail_peak + trail_dist), digits)
+                s1_atr_armed = self._eval_stage1_atr_armed(
+                    signal_data,
+                    stage,
+                    tp_levels,
+                    direction,
+                    chart_peak,
+                    atr_stop,
+                )
 
-                stop_cands: List[float] = [atr_stop]
+                stop_cands: List[float] = []
+                if s1_atr_armed or fsm_floor is None:
+                    stop_cands.append(atr_stop)
                 if fsm_floor is not None:
                     stop_cands.append(fsm_floor)
                 prev_ts = signal_data.get("trail_stop")
@@ -5499,6 +6289,7 @@ class MT5Executor:
 
                 signal_data["tp1_touched"] = True
                 signal_data["fsm_floor"] = fsm_floor
+                signal_data["chart_peak"] = chart_peak
                 signal_data["trail_peak"] = trail_peak
                 signal_data["runner_peak_price"] = trail_peak
                 signal_data["trail_dist"] = trail_dist
@@ -5757,6 +6548,9 @@ class MT5Executor:
             signal_data["runner_tickets"] = list(runner_tickets)
             signal_data["runner_layer"] = runner_layer
             signal_data["runner_ticket"] = runner_ticket
+            if runner_layers:
+                signal_data["last_runner_layers"] = list(runner_layers)
+                signal_data["last_runner_layer"] = runner_layer
             signal_data["tp_stage"] = next_stage_key if runner_tickets else "TP1"
             signal_data["runner_max_tp_stage"] = configured_max_stage
             signal_data["effective_max_stage"] = max_stage
@@ -5996,6 +6790,10 @@ class MT5Executor:
             signal_data["market_tickets"] = remaining_mkt
             signal_data["last_runner_tickets"] = list(to_close)
             signal_data["last_runner_ticket"] = to_close[-1] if to_close else None
+            r_layers_list = [str(lk) for lk in runner_layers if lk]
+            if r_layers_list:
+                signal_data["last_runner_layers"] = list(r_layers_list)
+                signal_data["last_runner_layer"] = r_layers_list[-1]
             signal_data["runner_close_reason"] = reason
             signal_data["runner_tickets"] = []
             signal_data["runner_ticket"] = None
@@ -6004,6 +6802,9 @@ class MT5Executor:
             signal_data["runner_proximity_armed"] = False
             signal_data["runner_reversal_ticks"] = 0
             signal_data["tp2_shortfall_armed"] = False
+
+            if bool(_cfg("CANCEL_PENDING_ON_TP1", CANCEL_PENDING_ON_TP1)) and signal_data.get("tp1_reached"):
+                self.cancel_signal_pending_orders(signal_data)
 
             has_open_or_pending = bool(remaining_mkt or signal_data.get("pending_tickets"))
             signal_data["status"] = "BE_APPLIED" if has_open_or_pending else "CLOSED"
@@ -6044,7 +6845,11 @@ class MT5Executor:
         signal_data["runner_layer"] = runner_layers[-1] if runner_layers else None
         signal_data["last_runner_tickets"] = list(runner_tickets)
         signal_data["last_runner_ticket"] = runner_tickets[-1]
+        if runner_layers:
+            signal_data["last_runner_layers"] = list(runner_layers)
+            signal_data["last_runner_layer"] = runner_layers[-1]
         signal_data["last_backstop_closed_tickets"] = []
+        signal_data["last_closed_sub_runner_tickets"] = []
         signal_data.setdefault("runner_proximity_armed", False)
         signal_data.setdefault("runner_reversal_ticks", 0)
 
@@ -6083,9 +6888,28 @@ class MT5Executor:
                     pos_res = mt5.positions_get(ticket=rt)
                     if pos_res:
                         live_positions_map[rt] = pos_res[0]
+                        self._cached_pos_profits[_int_num(rt, 0)] = round(
+                            _num(getattr(pos_res[0], "profit", 0.0), 0.0)
+                            + _num(getattr(pos_res[0], "swap", 0.0), 0.0),
+                            2,
+                        )
 
             if not live_positions_map:
                 staged_on_close = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
+                close_info = self.get_position_close_info(runner_tickets[-1])
+                raw_rc = str(close_info.get("reason", "UNKNOWN")).strip().upper()
+                reason_label_map = {
+                    "TP": "Broker Take Profit Hit",
+                    "SL": "Trailed Stop Loss Hit (Locked in Gain)",
+                    "MANUAL/BOT": "Closed Manually / from MT5",
+                }
+                code_map = {
+                    "TP": "TP_CEILING",
+                    "SL": "BROKER_SL",
+                    "MANUAL/BOT": "MANUAL",
+                }
+                ext_reason = reason_label_map.get(raw_rc, "Trailed Stop Loss Hit (Locked in Gain)")
+                ext_code = code_map.get(raw_rc, "BROKER_SL")
                 bsl = _num(
                     signal_data.get("broker_sl")
                     or signal_data.get("trail_stop")
@@ -6097,15 +6921,16 @@ class MT5Executor:
                     signal_data,
                     runner_tickets,
                     runner_layers,
-                    reason="Trailed Stop Loss Hit (Locked in Gain)",
+                    reason=ext_reason,
                     close_position=False,
-                    exit_reason_code="BROKER_SL" if staged_on_close else None,
-                    exit_price=bsl if (staged_on_close and bsl > 0.0) else None,
+                    exit_reason_code=ext_code if staged_on_close else None,
+                    exit_price=bsl if (staged_on_close and ext_code == "BROKER_SL" and bsl > 0.0) else None,
                     exit_stage=self.get_runner_fsm_stage(signal_data) if staged_on_close else None,
                 )
 
             if len(live_positions_map) < len(runner_tickets):
                 closed_sub = [rt for rt in runner_tickets if rt not in live_positions_map]
+                signal_data["last_closed_sub_runner_tickets"] = list(closed_sub)
                 for idx_r, rt in enumerate(list(runner_tickets)):
                     if rt in closed_sub:
                         lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
@@ -6145,6 +6970,12 @@ class MT5Executor:
         if not isinstance(raw_live, (int, float)) or isinstance(raw_live, bool) or raw_live <= 0:
             return True
         live_price = float(raw_live)
+        raw_chart = getattr(tick, "bid", None)
+        chart_price = (
+            float(raw_chart)
+            if isinstance(raw_chart, (int, float)) and not isinstance(raw_chart, bool) and raw_chart > 0
+            else live_price
+        )
 
         pip_size = self.get_pip_size(p_symbol)
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
@@ -6164,7 +6995,7 @@ class MT5Executor:
 
         if bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED)):
             # ===================================================================
-            # v3.5.0 STAGED GOLD RUNNER EXIT ARCHITECTURE (11-Step Tick Order)
+            # v3.5.2 STAGED GOLD RUNNER EXIT ARCHITECTURE (11-Step Tick Order)
             # ===================================================================
             # (1) Read live price + spread spike check; hard-disable Stage 0 Gold Guard
             is_spike, spread_dollars, eff_max_spread = self.check_spread_spike(p_symbol, tick)
@@ -6173,7 +7004,7 @@ class MT5Executor:
             signal_data["tp1_touched"] = True
             signal_data["reversal_guard_armed"] = False
 
-            # (2) Update single canonical trail_peak (seeded at TP1 scaling handoff)
+            # (2) Update canonical trail_peak (exec space) and chart_peak (chart bid space)
             prev_peak = signal_data.get("trail_peak")
             if not (isinstance(prev_peak, numbers.Real) and not isinstance(prev_peak, bool) and float(prev_peak) > 0.0):
                 prev_peak = signal_data.get("runner_peak_price")
@@ -6186,6 +7017,16 @@ class MT5Executor:
                 trail_peak = round(live_price, digits)
             signal_data["trail_peak"] = trail_peak
             signal_data["runner_peak_price"] = trail_peak
+
+            prev_cp = signal_data.get("chart_peak")
+            if isinstance(prev_cp, numbers.Real) and not isinstance(prev_cp, bool) and float(prev_cp) > 0.0:
+                chart_peak = round(
+                    max(float(prev_cp), chart_price) if is_buy else min(float(prev_cp), chart_price),
+                    digits,
+                )
+            else:
+                chart_peak = round(chart_price, digits)
+            signal_data["chart_peak"] = chart_peak
 
             ref_entry = (
                 float(runner_entry)
@@ -6224,9 +7065,9 @@ class MT5Executor:
                     )
 
             # (4) Non-runner L2 (TP2) & L3 (TP3) backstop auto-close
-            self._close_reached_layer_targets(signal_data, tp_levels, is_buy, live_price, runner_tickets)
+            self._close_reached_layer_targets(signal_data, tp_levels, is_buy, chart_price, runner_tickets)
 
-            # (5) Sequential while loop clean-break progression (TPk +/- RUNNER_CLEAN_BREAK_PIPS * pip_size)
+            # (5) Sequential while loop clean-break progression (evaluated in chart_price bid space)
             prev_stage = self.get_runner_fsm_stage(signal_data)
             k = max(1, min(max_stage, _int_num(signal_data.get("runner_milestone_idx", 1), 1)))
             cleared = list(signal_data.get("runner_cleared_milestones") or [])
@@ -6241,7 +7082,7 @@ class MT5Executor:
                     break
                 target_f = float(target)
                 clean_level = round(target_f + clean_break_dist, digits) if is_buy else round(target_f - clean_break_dist, digits)
-                broke_clean = (live_price >= clean_level) if is_buy else (live_price <= clean_level)
+                broke_clean = (chart_price >= clean_level) if is_buy else (chart_price <= clean_level)
                 if not broke_clean:
                     break
 
@@ -6302,7 +7143,7 @@ class MT5Executor:
                 signal_data["fsm_floor"] = fsm_floor
             stage_changed = bool(stage != prev_stage or milestone_advanced)
 
-            # (6) Proactive broker TP lift at >= RUNNER_EARLY_TP_LIFT_PCT (70%) of leg OR proximity buffer
+            # (6) Proactive broker TP lift at >= RUNNER_EARLY_TP_LIFT_PCT (70%) of leg OR proximity buffer (chart space)
             cur_target = tp_levels.get(f"TP{k}")
             if cur_target is not None and bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT)) and k < max_stage:
                 cur_target_f = float(cur_target)
@@ -6311,12 +7152,12 @@ class MT5Executor:
                 if anchor is not None and float(anchor) > 0:
                     leg_span = (cur_target_f - float(anchor)) if is_buy else (float(anchor) - cur_target_f)
                     if leg_span > 1e-9:
-                        prog = ((live_price - float(anchor)) / leg_span) if is_buy else ((float(anchor) - live_price) / leg_span)
+                        prog = ((chart_price - float(anchor)) / leg_span) if is_buy else ((float(anchor) - chart_price) / leg_span)
                         if prog + 1e-9 >= float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT)):
                             lift_now = True
                 if not lift_now:
-                    eff_buf, _ = self._compute_proximity_and_pullback(cur_target_f, live_price, pip_size, anchor=anchor)
-                    dist_t = (cur_target_f - live_price) if is_buy else (live_price - cur_target_f)
+                    eff_buf, _ = self._compute_proximity_and_pullback(cur_target_f, chart_price, pip_size, anchor=anchor)
+                    dist_t = (cur_target_f - chart_price) if is_buy else (chart_price - cur_target_f)
                     if dist_t <= eff_buf + 1e-9:
                         lift_now = True
                 if lift_now:
@@ -6336,12 +7177,23 @@ class MT5Executor:
                             stepped_milestone_stage = lift_stage
                         signal_data["tp_stage"] = lift_stage
 
-            # (7) Stage tier (mult, min_d, max_d) -> trail_dist, trail_tier_used, atr_stop
+            # (7) Stage tier (mult, min_d, max_d) -> trail_dist, trail_tier_used, atr_stop + Dual-Gate Stage 1 ATR check
             trail_dist, tier_used = self._compute_staged_trail_dist(p_symbol, stage, digits)
             atr_stop = round((trail_peak - trail_dist) if is_buy else (trail_peak + trail_dist), digits)
             signal_data["trail_dist"] = trail_dist
             signal_data["trail_tier_used"] = tier_used
             signal_data["atr_stop"] = atr_stop
+
+            was_s1_armed = bool(signal_data.get("stage1_atr_armed"))
+            s1_atr_armed = self._eval_stage1_atr_armed(
+                signal_data,
+                stage,
+                tp_levels,
+                direction,
+                chart_peak,
+                atr_stop,
+            )
+            just_armed_s1 = (not was_s1_armed) and s1_atr_armed
 
             # (8) Protective selection + monotonic trail_stop ratchet (never loosens on stage handoff or ATR expansion)
             prev_trail_stop: Optional[float] = None
@@ -6351,7 +7203,9 @@ class MT5Executor:
                     prev_trail_stop = round(float(pv), digits)
                     break
 
-            stop_cands: List[float] = [atr_stop]
+            stop_cands: List[float] = []
+            if s1_atr_armed or fsm_floor is None:
+                stop_cands.append(atr_stop)
             if fsm_floor is not None:
                 stop_cands.append(fsm_floor)
             if prev_trail_stop is not None:
@@ -6376,7 +7230,7 @@ class MT5Executor:
             )
             signal_data["active_stop_source"] = active_stop_source
 
-            # (10) Broker SL/TP sync (immediate on stage change, throttled by TP1_TRAIL_STEP_DOLLARS otherwise)
+            # (10) Broker SL/TP sync (immediate on stage change or Stage 1 ATR arming, throttled by TP1_TRAIL_STEP_DOLLARS otherwise)
             self._sync_tp1_trail_broker_sl(
                 signal_data,
                 p_symbol,
@@ -6387,7 +7241,7 @@ class MT5Executor:
                 sym_info=sym_info,
                 runner_tp=stepped_milestone_tp,
                 runner_stage=stepped_milestone_stage,
-                force_sl_sync=stage_changed,
+                force_sl_sync=bool(stage_changed or just_armed_s1),
                 fallback_sl=fsm_floor,
             )
 
@@ -6437,7 +7291,7 @@ class MT5Executor:
 
         if tp1_trail_on:
             if raw_tp1_val is not None and not signal_data.get("tp1_touched"):
-                touched_now = (live_price >= float(raw_tp1_val)) if is_buy else (live_price <= float(raw_tp1_val))
+                touched_now = (chart_price >= float(raw_tp1_val)) if is_buy else (chart_price <= float(raw_tp1_val))
                 if touched_now:
                     signal_data["tp1_touched"] = True
             if signal_data.get("tp1_touched"):
@@ -6467,7 +7321,7 @@ class MT5Executor:
                     )
         elif tp1_touch_enabled:
             if raw_tp1_val is not None:
-                touched_now = (live_price >= float(raw_tp1_val)) if is_buy else (live_price <= float(raw_tp1_val))
+                touched_now = (chart_price >= float(raw_tp1_val)) if is_buy else (chart_price <= float(raw_tp1_val))
                 if touched_now and not signal_data.get("tp1_touched"):
                     self._apply_tp1_touch_protection(
                         signal_data,
@@ -6862,6 +7716,12 @@ class MT5Executor:
                 signal_data["market_tickets"] = []
                 return False
             pos = positions[0]
+            t_int_leg = _int_num(ticket, 0)
+            if t_int_leg > 0:
+                self._cached_pos_profits[t_int_leg] = round(
+                    _num(getattr(pos, "profit", 0.0), 0.0) + _num(getattr(pos, "swap", 0.0), 0.0),
+                    2,
+                )
             pos_sl = _num(getattr(pos, "sl", 0.0), 0.0)
             raw_sym = getattr(pos, "symbol", None)
             p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else symbol
