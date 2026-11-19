@@ -4143,7 +4143,9 @@ class MT5Executor:
             realized_today = float(self._dry_run_daily_realized_pnl or 0.0)
             floating_pnl = float(self._dry_run_floating_pnl or 0.0)
         else:
-            curr_bal = float(fin.get("balance") or 0.0)
+            bal = float(fin.get("balance") or 0.0)
+            cred = float(fin.get("credit") or 0.0)
+            curr_bal = bal if bal >= 30.0 else round(bal + cred, 2)
             realized_today = self.get_realized_today_pnl()
             floating_pnl = 0.0
             magic = _cfg("MAGIC_NUMBER", MAGIC_NUMBER)
@@ -4234,7 +4236,12 @@ class MT5Executor:
         the current account balance.
         """
         fin = self.get_account_financials()
-        curr_bal = float(fin.get("balance") or (self._dry_run_capital or 0.0))
+        if self.dry_run or not self._connected:
+            curr_bal = float(self._dry_run_capital) if self._dry_run_capital is not None else float(fin.get("balance") or 0.0)
+        else:
+            bal = float(fin.get("balance") or 0.0)
+            cred = float(fin.get("credit") or 0.0)
+            curr_bal = bal if bal >= 30.0 else round(bal + cred, 2)
         realized_today = float(
             self.get_realized_today_pnl()
             if (not self.dry_run and self._connected)
