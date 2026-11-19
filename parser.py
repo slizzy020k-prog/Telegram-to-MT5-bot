@@ -133,6 +133,8 @@ PARTIAL_CLOSE_PATTERNS = [
 CANCEL_PENDING_PATTERNS = [
     r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:all\s+|the\s+|my\s+|our\s+|this\s+|these\s+|remaining\s+|unfilled\s+)*(?:pending\s+)?(?:(?:buy|sell)(?:\s*(?:/|and|&|,)\s*(?:buy|sell))?\s+)+(?:(?:xauusd(?:\.[a-z0-9]+)?|gold|xau)\s+)?(?:pending\s+)?(?:limits?|stops?|orders?)\b",
     r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:all\s+|the\s+|my\s+|our\s+|this\s+|these\s+|remaining\s+|unfilled\s+)*(?:pending\s+(?:limits?|stops?|orders?)|(?:buy|sell)\s+pending|limits|stops)\b",
+    r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:all\s+|the\s+|my\s+|our\s+|this\s+|these\s+|remaining\s+|unfilled\s+)*limit\b\s+\w+",
+    r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:the\s+|my\s+|our\s+|this\s+|these\s+|all\s+|remaining\s+|unfilled\s+)+limit\b",
     r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+pending\b",
 ]
 _CANCEL_PENDING_NEGATION_RE = re.compile(

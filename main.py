@@ -5319,7 +5319,8 @@ async def _handle_trade_management_action(
             )
             return
 
-        closed_tkts = list(market_tickets)
+        res_fc = await _mt5_call(executor.close_signal_exposure, target_signal)
+        closed_tkts = list((res_fc or {}).get("closed_tickets") or market_tickets)
         await _mt5_call(executor.apply_proximity_close, market_tickets, pending_tickets, symbol)
         added_p, _ = await _account_closed_tickets(target_signal, closed_tkts)
         fin = await _mt5_call(executor.get_account_financials)

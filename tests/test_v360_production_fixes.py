@@ -266,6 +266,11 @@ async def test_fix_b3_delete_sell_limit_and_delete_buy_limit_cancel_pending_only
     assert p_bare is not None
     assert p_bare.management_action == "ACTION_FULL_CLOSE"
 
+    p_lads = parse_message("Delete limit lads left without us", message_id=10006)
+    assert p_lads is not None
+    assert p_lads.management_action == "ACTION_CANCEL_PENDING"
+    assert p_lads.cancel_direction is None
+
     ex = _setup_test_env(tmp_path, "fix_b3")
     tick_now = SimpleNamespace(bid=3740.00, ask=3740.30, time=1700000200)
 
@@ -299,6 +304,25 @@ async def test_fix_b3_delete_sell_limit_and_delete_buy_limit_cancel_pending_only
         s_buy_final = main.state_mgr.get_signal(9901, chat_id=-1004369388188)
         assert s_buy_final["pending_tickets"] == []
         assert s_buy_final["status"] in ("CANCELLED", "CLOSED")
+
+        # 3. Cross-channel isolation: "Delete limit lads left without us" OR "close all" in Channel A (-1004369388188)
+        #    MUST NEVER cancel Channel B's (-1003712081715) pending BUY LIMITs (Msg 13187)!
+        await main.handle_new_message(
+            FakeEvent(13187, "BUY LIMIT 3659-3640\nSL 3630\nTP 3662\nTP 3669", chat_id=-1003712081715)
+        )
+        await main.handle_new_message(
+            FakeEvent(10003, "Sell limit xauusd 3755\nTp 3745\nSl 3765", chat_id=-1004369388188)
+        )
+        assert len(main.state_mgr.get_signal(13187, chat_id=-1003712081715)["pending_tickets"]) == 4
+        assert len(main.state_mgr.get_signal(10003, chat_id=-1004369388188)["pending_tickets"]) == 1
+
+        await main.handle_new_message(
+            FakeEvent(10006, "Delete limit lads left without us", chat_id=-1004369388188)
+        )
+        assert main.state_mgr.get_signal(10003, chat_id=-1004369388188)["pending_tickets"] == []
+        s_13187_after = main.state_mgr.get_signal(13187, chat_id=-1003712081715)
+        assert s_13187_after["status"] == "ACTIVE"
+        assert len(s_13187_after["pending_tickets"]) == 4
 
 
 @pytest.mark.asyncio

@@ -5039,10 +5039,11 @@ class MT5Executor:
         market_tickets: List[int],
         pending_tickets: List[int],
         symbol: Optional[str] = None,
+        sweep_all_magic: bool = False,
     ) -> None:
         """
-        Close all recorded market positions, cancel all pending orders, and run a
-        MAGIC_NUMBER safety sweep to guarantee no orphaned orders remain.
+        Close all recorded market positions and cancel all recorded pending orders for the target signal.
+        Never sweeps unrelated signals' orders from other channels unless `sweep_all_magic=True`.
         """
         closed_set = set()
         for ticket in list(market_tickets):
@@ -5050,9 +5051,18 @@ class MT5Executor:
                 closed_set.add(ticket)
 
         for ticket in list(pending_tickets):
-            self.cancel_pending_order(ticket)
+            if not self.cancel_pending_order(ticket):
+                # Fill-race fallback: if pending order filled right before cancel, close the filled position
+                if not self.dry_run and self._connected:
+                    try:
+                        with self._mt5_lock:
+                            filled_p = mt5.positions_get(ticket=ticket)
+                    except Exception:
+                        filled_p = None
+                    if filled_p and self.close_market_position(ticket):
+                        closed_set.add(ticket)
 
-        if not self.dry_run and self._connected:
+        if sweep_all_magic and not self.dry_run and self._connected:
             for p in self.get_bot_positions(symbol):
                 p_t = _int_num(getattr(p, "ticket", 0), 0)
                 if p_t and p_t not in closed_set:
