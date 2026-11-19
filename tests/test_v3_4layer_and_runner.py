@@ -883,12 +883,15 @@ def test_v31_multilayer_2_3_4_and_dual_runner_scaling_and_late_fill_reset(monkey
 
 
 @pytest.mark.asyncio
-async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profit(tmp_path):
+async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profit(tmp_path, monkeypatch):
     """
     Scenario 3 (Strict Activation Zone + Near-Miss Reversal near TP1):
     - Mid-range drop (even 18 pips!) NEVER arms or closes prematurely (also verified on tight 25-pip TP via 35% midrange clamp).
     - Near-miss surge within a hair of TP1 (3899.75 vs TP1=3900.0) followed by clear sustained >=12p reversal banks all profit & writes TradeLedger!
     """
+    monkeypatch.setattr(config, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(main, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
     main.state_mgr = StateManager(tmp_path / "strict_rev_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "strict_rev_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)

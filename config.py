@@ -234,7 +234,7 @@ TP5_STEP_PIPS: float = _env_float(
 )
 
 # Dynamic Multi-Layer Active Runner Scaling & Gold Calibrated Peak-Profit Giveback Guard ("Bank It")
-GOLD_REVERSAL_GUARD_ENABLED: bool = _env_bool("GOLD_REVERSAL_GUARD_ENABLED", True)
+GOLD_REVERSAL_GUARD_ENABLED: bool = _env_bool("GOLD_REVERSAL_GUARD_ENABLED", False)
 ARM_THRESHOLD_PCT: float = _env_float("ARM_THRESHOLD_PCT", 0.90, min_val=0.10, max_val=0.99)
 GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.95)
 MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
@@ -592,6 +592,7 @@ STAGED_TRAIL_TIERS: Dict[int, Tuple[float, float, float]] = validate_staged_trai
 # v3.6.0 PROGRESSIVE PROFIT RATCHET + HIGHER-TP STAGED BANKING
 # ===========================================================================
 PROFIT_RATCHET_ENABLED: bool = _env_bool("PROFIT_RATCHET_ENABLED", True)
+PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED: bool = _env_bool("PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED", False)
 RATCHET_BROKER_STEP_DOLLARS: float = _env_float(
     "RATCHET_BROKER_STEP_DOLLARS", 0.25, min_val=0.05, max_val=10.0, positive_only=True
 )
@@ -707,7 +708,7 @@ PEAK_HARVEST_MAX_CUSHION: float = _env_float(
 )
 
 # Pre-TP1 BANK_HARVEST, Tiered Waterfall & Pending Order Hygiene
-BANK_HARVEST_ENABLED: bool = _env_bool("BANK_HARVEST_ENABLED", True)
+BANK_HARVEST_ENABLED: bool = _env_bool("BANK_HARVEST_ENABLED", False)
 BANK_HARVEST_ARM_MFE_DOLLARS: float = _env_float(
     "BANK_HARVEST_ARM_MFE_DOLLARS", 5.00, min_val=1.00, max_val=50.0, positive_only=True
 )
@@ -748,9 +749,72 @@ MAX_TP_DISTANCE_DOLLARS: float = _env_float(
     "MAX_TP_DISTANCE_DOLLARS", 250.0, min_val=10.0, max_val=2000.0, positive_only=True
 )
 
+# ===========================================================================
+# DYNAMIC RISK MANAGEMENT (ATR-SCALED SL/TP & OPTIONAL ATR TRAILING STOP)
+# ===========================================================================
+DYNAMIC_ATR_SLTP_ENABLED: bool = _env_bool("DYNAMIC_ATR_SLTP_ENABLED", True)
+DYNAMIC_SLTP_MODE: str = _env_choice(
+    "DYNAMIC_SLTP_MODE", "ADAPTIVE", ("ADAPTIVE", "FALLBACK_ONLY", "PURE_ATR")
+)
+DYNAMIC_ATR_TIMEFRAME: str = _env_choice(
+    "DYNAMIC_ATR_TIMEFRAME", "M5", ("M1", "M5", "M15", "H1")
+)
+DYNAMIC_ATR_PERIOD: int = _env_int("DYNAMIC_ATR_PERIOD", 14, min_val=2, max_val=200)
+DYNAMIC_ATR_BASELINE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_BASELINE_DOLLARS", 4.00, min_val=0.10, max_val=200.0, positive_only=True
+)
+DYNAMIC_SL_ATR_MULT: float = _env_float(
+    "DYNAMIC_SL_ATR_MULT", 2.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+DYNAMIC_TP_ATR_MULT: float = _env_float(
+    "DYNAMIC_TP_ATR_MULT", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+DYNAMIC_TP_STEP_ATR_MULT: float = _env_float(
+    "DYNAMIC_TP_STEP_ATR_MULT", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+DYNAMIC_SL_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_SL_MIN_DOLLARS", 4.50, min_val=0.20, max_val=200.0, positive_only=True
+)
+DYNAMIC_SL_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_SL_MAX_DOLLARS", 35.00, min_val=0.50, max_val=500.0, positive_only=True
+)
+DYNAMIC_TP_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_TP_MIN_DOLLARS", 2.00, min_val=0.20, max_val=200.0, positive_only=True
+)
+DYNAMIC_TP_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_TP_MAX_DOLLARS", 50.00, min_val=0.50, max_val=500.0, positive_only=True
+)
+DYNAMIC_SLTP_SCALE_MIN: float = _env_float(
+    "DYNAMIC_SLTP_SCALE_MIN", 0.75, min_val=0.20, max_val=2.0, positive_only=True
+)
+DYNAMIC_SLTP_SCALE_MAX: float = _env_float(
+    "DYNAMIC_SLTP_SCALE_MAX", 1.75, min_val=0.50, max_val=5.0, positive_only=True
+)
+
+# Optional Dynamic ATR Trailing Stop (OFF by default; toggle live via /atrtrail)
+DYNAMIC_ATR_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TRAIL_ENABLED", False)
+DYNAMIC_ATR_TRAIL_TIMEFRAME: str = _env_choice(
+    "DYNAMIC_ATR_TRAIL_TIMEFRAME", "M5", ("M1", "M5", "M15", "H1")
+)
+DYNAMIC_ATR_TRAIL_MULT: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_MULT", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_ACTIVATION_MULT: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, min_val=0.0, max_val=20.0
+)
+DYNAMIC_ATR_TRAIL_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 1.50, min_val=0.20, max_val=100.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00, min_val=0.50, max_val=200.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_STEP_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, min_val=0.05, max_val=20.0, positive_only=True
+)
+
 
 def validate_ratchet_cushion_pairs() -> None:
-    """Ensure all v3.6 min/max cushion and pullback pairs satisfy min <= max."""
+    """Ensure all v3.6 min/max cushion, pullback, and dynamic risk pairs satisfy min <= max."""
     g = globals()
     pairs = (
         ("RATCHET_TIER2_MIN_CUSHION", "RATCHET_TIER2_MAX_CUSHION"),
@@ -761,6 +825,10 @@ def validate_ratchet_cushion_pairs() -> None:
         ("BANK_HARVEST_PULLBACK_MIN", "BANK_HARVEST_PULLBACK_MAX"),
         ("PEAK_HARVEST_MIN_BROKER_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
         ("PEAK_HARVEST_MIN_VIRT_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
+        ("DYNAMIC_SL_MIN_DOLLARS", "DYNAMIC_SL_MAX_DOLLARS"),
+        ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
+        ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
+        ("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_MAX_DOLLARS"),
     )
     for min_k, max_k in pairs:
         mn, mx = float(g[min_k]), float(g[max_k])

@@ -229,7 +229,7 @@ def test_bank_all_at_tp1_does_not_suppress_proactive_tp_lift():
 
 
 @pytest.mark.asyncio
-async def test_telegram_saved_messages_reversal_commands():
+async def test_telegram_saved_messages_reversal_commands(monkeypatch):
     """
     Test Telegram Saved Messages /reversal live control commands:
     - /reversal (status)
@@ -238,6 +238,14 @@ async def test_telegram_saved_messages_reversal_commands():
     - /reversal 40 2.0 2 (custom calibration)
     - /reversal off and /reversal on
     """
+    for k in (
+        "GOLD_REVERSAL_GUARD_ENABLED",
+        "ARM_THRESHOLD_PCT",
+        "GIVEBACK_PCT",
+        "MIN_GOLD_PULLBACK_DOLLARS",
+        "REVERSAL_CONFIRM_TICKS",
+    ):
+        monkeypatch.setattr(config, k, getattr(config, k))
     # 1. Status command
     ev1 = MockTelethonEvent(9901, "/reversal")
     await handle_saved_messages_command(ev1)

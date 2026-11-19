@@ -40,6 +40,27 @@ from config import (
     DAILY_PNL_CACHE_TTL_SECONDS,
     DEFAULT_SYMBOL,
     DEFAULT_TP_STEP_PIPS,
+    DYNAMIC_ATR_BASELINE_DOLLARS,
+    DYNAMIC_ATR_PERIOD,
+    DYNAMIC_ATR_SLTP_ENABLED,
+    DYNAMIC_ATR_TIMEFRAME,
+    DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
+    DYNAMIC_ATR_TRAIL_ENABLED,
+    DYNAMIC_ATR_TRAIL_MAX_DOLLARS,
+    DYNAMIC_ATR_TRAIL_MIN_DOLLARS,
+    DYNAMIC_ATR_TRAIL_MULT,
+    DYNAMIC_ATR_TRAIL_STEP_DOLLARS,
+    DYNAMIC_ATR_TRAIL_TIMEFRAME,
+    DYNAMIC_SL_ATR_MULT,
+    DYNAMIC_SL_MAX_DOLLARS,
+    DYNAMIC_SL_MIN_DOLLARS,
+    DYNAMIC_SLTP_MODE,
+    DYNAMIC_SLTP_SCALE_MAX,
+    DYNAMIC_SLTP_SCALE_MIN,
+    DYNAMIC_TP_ATR_MULT,
+    DYNAMIC_TP_MAX_DOLLARS,
+    DYNAMIC_TP_MIN_DOLLARS,
+    DYNAMIC_TP_STEP_ATR_MULT,
     EMERGENCY_CUTOFF_LOSS_PCT,
     FLOAT_LOSS_FORCE_CLOSE_PCT,
     ENFORCE_HIGH_RISK_LOT_CAP,
@@ -73,6 +94,7 @@ from config import (
     PENDING_DUPLICATE_ORDER_TOLERANCE,
     PENDING_DUPLICATE_PRICE_TOLERANCE,
     PROFIT_RATCHET_ENABLED,
+    PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED,
     RATCHET_BROKER_STEP_DOLLARS,
     RATCHET_LIFT_MIN_MFE_DOLLARS,
     RATCHET_STAGE4_MAX_CUSHION,
@@ -158,6 +180,13 @@ from config import (
     TRAIL_TP4_MIN,
 )
 from parser import ZoneInfo, compute_zone_4tiers, derive_tp_levels
+from dynamic_risk import (
+    DynamicRiskPolicy,
+    compute_atr_fallback_sl_distance,
+    compute_dynamic_atr_trail_stop,
+    read_dynamic_risk_policy,
+    scale_sl_tp_by_atr,
+)
 
 logger = logging.getLogger("copier.mt5")
 
@@ -246,6 +275,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DEFAULT_SYMBOL",
         "DAILY_PNL_CACHE_TTL_SECONDS",
         "PROFIT_RATCHET_ENABLED",
+        "PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED",
         "RATCHET_BROKER_STEP_DOLLARS",
         "STOP_LEVEL_SAFETY_BUFFER_DOLLARS",
         "HARD_MAX_SPREAD_DOLLARS",
@@ -262,6 +292,27 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "PENDING_DUPLICATE_PRICE_TOLERANCE",
         "PENDING_DUPLICATE_ORDER_TOLERANCE",
         "MAX_TP_DISTANCE_DOLLARS",
+        "DYNAMIC_ATR_SLTP_ENABLED",
+        "DYNAMIC_SLTP_MODE",
+        "DYNAMIC_ATR_TIMEFRAME",
+        "DYNAMIC_ATR_PERIOD",
+        "DYNAMIC_ATR_BASELINE_DOLLARS",
+        "DYNAMIC_SL_ATR_MULT",
+        "DYNAMIC_TP_ATR_MULT",
+        "DYNAMIC_TP_STEP_ATR_MULT",
+        "DYNAMIC_SL_MIN_DOLLARS",
+        "DYNAMIC_SL_MAX_DOLLARS",
+        "DYNAMIC_TP_MIN_DOLLARS",
+        "DYNAMIC_TP_MAX_DOLLARS",
+        "DYNAMIC_SLTP_SCALE_MIN",
+        "DYNAMIC_SLTP_SCALE_MAX",
+        "DYNAMIC_ATR_TRAIL_ENABLED",
+        "DYNAMIC_ATR_TRAIL_TIMEFRAME",
+        "DYNAMIC_ATR_TRAIL_MULT",
+        "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT",
+        "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_STEP_DOLLARS",
     )
 }
 
@@ -579,13 +630,15 @@ class MT5Executor:
         self._dry_run_floating_pnl: float = 0.0
         self._dry_run_last_m1_candle: Optional[Dict[str, float]] = None
         self._dry_run_m1_atr: Optional[float] = None
+        self._dry_run_atr: Optional[float] = None
+        self.last_dynamic_risk_snapshot: Optional[Dict[str, Any]] = None
         self._cached_pos_profits: Dict[int, float] = {}
         self._bot_closed_tickets: Set[int] = set()
         self._ticket_placed_monotonic: Dict[int, float] = {}
         self._last_live_query_ok: bool = True
         self._last_live_pos_query_ok: bool = True
         self._last_live_ord_query_ok: bool = True
-        self._atr_cache: Dict[Tuple[str, int], Tuple[float, float]] = {}
+        self._atr_cache: Dict[Tuple[Any, ...], Tuple[float, float]] = {}
         self._server_offset_cache: Optional[int] = None
         self._server_offset_cache_ts: float = 0.0
         self._last_preflight_ctx: Optional[Dict[str, Any]] = None
@@ -899,30 +952,56 @@ class MT5Executor:
             logger.debug(f"Could not fetch closed M1 candle for {symbol}: {e}")
             return None
 
-    def get_m1_atr(self, symbol: str, period: Optional[int] = None) -> float:
+    _ATR_TIMEFRAME_MAP: Dict[str, Tuple[str, int]] = {
+        "M1": ("TIMEFRAME_M1", 1),
+        "M5": ("TIMEFRAME_M5", 5),
+        "M15": ("TIMEFRAME_M15", 15),
+        "H1": ("TIMEFRAME_H1", 16385),
+    }
+
+    def get_atr(
+        self,
+        symbol: str,
+        timeframe: Optional[str] = None,
+        period: Optional[int] = None,
+    ) -> float:
         """
-        Compute the closed-bar M1 ATR(period) in price dollars/points (default period=14).
-        Returns `self._dry_run_m1_atr` in dry-run when set, or 0.0 safely when bars are unavailable.
+        Compute closed-bar ATR(period) for the requested timeframe (M1/M5/M15/H1).
+        In dry_run, returns `_dry_run_atr` when set, or `_dry_run_m1_atr` when timeframe == 'M1'.
         """
-        eff_period = max(2, _int_num(period if period is not None else _cfg("M1_ATR_PERIOD", M1_ATR_PERIOD), 14))
+        tf = str(timeframe or _cfg("DYNAMIC_ATR_TIMEFRAME", DYNAMIC_ATR_TIMEFRAME) or "M5").strip().upper()
+        if tf not in self._ATR_TIMEFRAME_MAP:
+            tf = "M5"
+        default_per = (
+            _cfg("M1_ATR_PERIOD", M1_ATR_PERIOD)
+            if tf == "M1"
+            else _cfg("DYNAMIC_ATR_PERIOD", DYNAMIC_ATR_PERIOD)
+        )
+        eff_period = max(2, _int_num(period if period is not None else default_per, 14))
+
         if self.dry_run:
-            return float(self._dry_run_m1_atr) if self._dry_run_m1_atr is not None and self._dry_run_m1_atr > 0 else 0.0
+            if tf == "M1" and self._dry_run_m1_atr is not None and self._dry_run_m1_atr > 0:
+                return float(self._dry_run_m1_atr)
+            if self._dry_run_atr is not None and self._dry_run_atr > 0:
+                return float(self._dry_run_atr)
+            return 0.0
         if not self._connected:
             return 0.0
 
         sym_key = (symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)).strip().upper()
-        cache_key = (sym_key, eff_period)
+        cache_key = (sym_key, eff_period) if tf == "M1" else (sym_key, tf, eff_period)
         atr_cache = getattr(self, "_atr_cache", None)
         if atr_cache is not None:
             cached = atr_cache.get(cache_key)
             if cached is not None and (time.monotonic() - cached[0]) < 60.0:
                 return cached[1]
 
+        tf_const_name, tf_fallback = self._ATR_TIMEFRAME_MAP[tf]
         try:
-            timeframe_m1 = _mt5_const("TIMEFRAME_M1", 1)
+            mt5_tf = _mt5_const(tf_const_name, tf_fallback)
             with self._mt5_lock:
                 resolved = self.resolve_symbol(symbol)
-                rates = mt5.copy_rates_from_pos(resolved, timeframe_m1, 1, eff_period + 1)
+                rates = mt5.copy_rates_from_pos(resolved, mt5_tf, 1, eff_period + 1)
             if rates is None or len(rates) < 2:
                 return 0.0
 
@@ -943,15 +1022,10 @@ class MT5Executor:
             prev_close = _field(rates[0], "close")
             for idx in range(1, len(rates)):
                 bar = rates[idx]
-                h = _field(bar, "high")
-                l = _field(bar, "low")
-                c = _field(bar, "close")
+                h, l, c = _field(bar, "high"), _field(bar, "low"), _field(bar, "close")
                 if h is None or l is None or c is None:
                     continue
-                if prev_close is not None:
-                    tr = max(h - l, abs(h - prev_close), abs(l - prev_close))
-                else:
-                    tr = h - l
+                tr = max(h - l, abs(h - prev_close), abs(l - prev_close)) if prev_close is not None else (h - l)
                 if tr >= 0.0:
                     trs.append(tr)
                 prev_close = c
@@ -963,8 +1037,16 @@ class MT5Executor:
                 atr_cache[cache_key] = (time.monotonic(), atr_val)
             return atr_val
         except Exception as e:
-            logger.debug(f"Could not compute M1 ATR({eff_period}) for {symbol}: {e}")
+            logger.debug(f"Could not compute {tf} ATR({eff_period}) for {symbol}: {e}")
             return 0.0
+
+    def get_m1_atr(self, symbol: str, period: Optional[int] = None) -> float:
+        """
+        Compute the closed-bar M1 ATR(period) in price dollars/points (default period=14).
+        Returns `self._dry_run_m1_atr` in dry-run when set, or 0.0 safely when bars are unavailable.
+        """
+        eff_period = max(2, _int_num(period if period is not None else _cfg("M1_ATR_PERIOD", M1_ATR_PERIOD), 14))
+        return self.get_atr(symbol, timeframe="M1", period=eff_period)
 
     def is_valid_live_tick(self, symbol: str, tick: Any) -> bool:
         """
@@ -1309,6 +1391,72 @@ class MT5Executor:
             return (id(result) % 900000) + 100000
         return None
 
+    def _get_dynamic_risk_policy(self) -> DynamicRiskPolicy:
+        """Resolve DynamicRiskPolicy respecting monkeypatches on either config or mt5_executor."""
+        proxy = SimpleNamespace(
+            DYNAMIC_ATR_SLTP_ENABLED=_cfg("DYNAMIC_ATR_SLTP_ENABLED", DYNAMIC_ATR_SLTP_ENABLED),
+            DYNAMIC_SLTP_MODE=_cfg("DYNAMIC_SLTP_MODE", DYNAMIC_SLTP_MODE),
+            DYNAMIC_ATR_TIMEFRAME=_cfg("DYNAMIC_ATR_TIMEFRAME", DYNAMIC_ATR_TIMEFRAME),
+            DYNAMIC_ATR_PERIOD=_cfg("DYNAMIC_ATR_PERIOD", DYNAMIC_ATR_PERIOD),
+            DYNAMIC_ATR_BASELINE_DOLLARS=_cfg("DYNAMIC_ATR_BASELINE_DOLLARS", DYNAMIC_ATR_BASELINE_DOLLARS),
+            DYNAMIC_SL_ATR_MULT=_cfg("DYNAMIC_SL_ATR_MULT", DYNAMIC_SL_ATR_MULT),
+            DYNAMIC_TP_ATR_MULT=_cfg("DYNAMIC_TP_ATR_MULT", DYNAMIC_TP_ATR_MULT),
+            DYNAMIC_TP_STEP_ATR_MULT=_cfg("DYNAMIC_TP_STEP_ATR_MULT", DYNAMIC_TP_STEP_ATR_MULT),
+            DYNAMIC_SL_MIN_DOLLARS=_cfg("DYNAMIC_SL_MIN_DOLLARS", DYNAMIC_SL_MIN_DOLLARS),
+            DYNAMIC_SL_MAX_DOLLARS=_cfg("DYNAMIC_SL_MAX_DOLLARS", DYNAMIC_SL_MAX_DOLLARS),
+            DYNAMIC_TP_MIN_DOLLARS=_cfg("DYNAMIC_TP_MIN_DOLLARS", DYNAMIC_TP_MIN_DOLLARS),
+            DYNAMIC_TP_MAX_DOLLARS=_cfg("DYNAMIC_TP_MAX_DOLLARS", DYNAMIC_TP_MAX_DOLLARS),
+            DYNAMIC_SLTP_SCALE_MIN=_cfg("DYNAMIC_SLTP_SCALE_MIN", DYNAMIC_SLTP_SCALE_MIN),
+            DYNAMIC_SLTP_SCALE_MAX=_cfg("DYNAMIC_SLTP_SCALE_MAX", DYNAMIC_SLTP_SCALE_MAX),
+            DYNAMIC_ATR_TRAIL_ENABLED=_cfg("DYNAMIC_ATR_TRAIL_ENABLED", DYNAMIC_ATR_TRAIL_ENABLED),
+            DYNAMIC_ATR_TRAIL_TIMEFRAME=_cfg("DYNAMIC_ATR_TRAIL_TIMEFRAME", DYNAMIC_ATR_TRAIL_TIMEFRAME),
+            DYNAMIC_ATR_TRAIL_MULT=_cfg("DYNAMIC_ATR_TRAIL_MULT", DYNAMIC_ATR_TRAIL_MULT),
+            DYNAMIC_ATR_TRAIL_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", DYNAMIC_ATR_TRAIL_ACTIVATION_MULT),
+            DYNAMIC_ATR_TRAIL_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_MIN_DOLLARS),
+            DYNAMIC_ATR_TRAIL_MAX_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MAX_DOLLARS", DYNAMIC_ATR_TRAIL_MAX_DOLLARS),
+            DYNAMIC_ATR_TRAIL_STEP_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_STEP_DOLLARS", DYNAMIC_ATR_TRAIL_STEP_DOLLARS),
+        )
+        return read_dynamic_risk_policy(proxy)
+
+    def apply_dynamic_atr_sl_tp(
+        self,
+        symbol: str,
+        direction: str,
+        sl_anchor: float,
+        tp_anchor: float,
+        sl: Optional[float],
+        raw_tp1: Optional[float],
+        tp_levels: Optional[Dict[str, float]],
+        final_tp: Optional[float],
+        pip_size: float,
+        digits: int,
+    ) -> Dict[str, Any]:
+        """Compute ATR-scaled SL/TP levels, cache the snapshot, and log when applied."""
+        policy = self._get_dynamic_risk_policy()
+        atr = self.get_atr(symbol, policy.atr_timeframe, policy.atr_period)
+        fr_off = float(_cfg("TP_FRONT_RUN_OFFSET", TP_FRONT_RUN_OFFSET)) * (pip_size / 0.10 if pip_size > 0 else 1.0)
+        snap = scale_sl_tp_by_atr(
+            direction=direction,
+            sl_anchor=sl_anchor,
+            tp_anchor=tp_anchor,
+            atr=atr,
+            policy=policy,
+            digits=digits,
+            sl=sl,
+            raw_tp1=raw_tp1,
+            tp_levels=tp_levels,
+            final_tp=final_tp,
+            front_run_offset=fr_off,
+        )
+        self.last_dynamic_risk_snapshot = snap
+        if snap.get("applied"):
+            logger.info(
+                f"[DYNAMIC RISK] {direction} {symbol} ({snap['mode']} {snap['timeframe']} "
+                f"ATR=${snap['atr']:.2f}, Ratio={snap['vol_ratio']:.2f}x): "
+                f"SL {sl} -> {snap['sl']} | TP1 {raw_tp1} -> {snap['raw_tp1']}"
+            )
+        return snap
+
     def _compute_fallback_sl(
         self,
         is_buy: bool,
@@ -1320,8 +1468,19 @@ class MT5Executor:
         resolved_sym: str,
         kind_label: str,
     ) -> float:
-        """Normalize explicit SL or compute FALLBACK_SL_PIPS stop loss away from ref_price."""
+        """Normalize explicit SL or compute ATR-scaled / FALLBACK_SL_PIPS stop loss away from ref_price."""
         if sl is None or sl == 0.0:
+            policy = self._get_dynamic_risk_policy()
+            if policy.sltp_enabled:
+                atr = self.get_atr(resolved_sym, policy.atr_timeframe, policy.atr_period)
+                atr_dist = compute_atr_fallback_sl_distance(atr, policy)
+                if atr_dist is not None and atr_dist > 0.0:
+                    final_sl = round(ref_price - atr_dist, digits) if is_buy else round(ref_price + atr_dist, digits)
+                    logger.info(
+                        f"Attached ATR fallback SL ({policy.atr_timeframe} ATR=${atr:.2f}, "
+                        f"dist=${atr_dist:.2f}): {final_sl} on {kind_label} {direction_label} {resolved_sym}"
+                    )
+                    return final_sl
             fb_pips = _cfg("FALLBACK_SL_PIPS", FALLBACK_SL_PIPS)
             offset = fb_pips * pip_size
             final_sl = round(ref_price - offset, digits) if is_buy else round(ref_price + offset, digits)
@@ -2074,6 +2233,7 @@ class MT5Executor:
         raw_tp4: Optional[float] = None,
         raw_tp5: Optional[float] = None,
         tp_levels: Optional[Dict[str, float]] = None,
+        step_scale: float = 1.0,
     ) -> Tuple[Dict[str, Optional[float]], Dict[str, float]]:
         """
         Resolve per-layer TP targets (L1->final_tp, L2->TP2, L3->TP3, L4->TP5) and full TP1..TP5 map.
@@ -2108,11 +2268,12 @@ class MT5Executor:
             seed_tps.append(round(float(final_tp), digits))
 
         if seed_tps:
+            sc = step_scale if (isinstance(step_scale, (int, float)) and step_scale > 0.0) else 1.0
             steps = [
-                float(_cfg("TP2_STEP_PIPS", TP2_STEP_PIPS)),
-                float(_cfg("TP3_STEP_PIPS", TP3_STEP_PIPS)),
-                float(_cfg("TP4_STEP_PIPS", TP4_STEP_PIPS)),
-                float(_cfg("TP5_STEP_PIPS", TP5_STEP_PIPS)),
+                round(float(_cfg("TP2_STEP_PIPS", TP2_STEP_PIPS)) * sc, 4),
+                round(float(_cfg("TP3_STEP_PIPS", TP3_STEP_PIPS)) * sc, 4),
+                round(float(_cfg("TP4_STEP_PIPS", TP4_STEP_PIPS)) * sc, 4),
+                round(float(_cfg("TP5_STEP_PIPS", TP5_STEP_PIPS)) * sc, 4),
             ]
             derived = derive_tp_levels(seed_tps, direction=direction, pip_size=pip_size, step_pips=steps)
             for k, v in derived.items():
@@ -2299,6 +2460,75 @@ class MT5Executor:
                 return round(float(target_price), digits)
         return shifted
 
+    def _prepare_dynamic_sltp_inputs(
+        self,
+        symbol: str,
+        direction: str,
+        sl_anchor: float,
+        tp_anchor: float,
+        sl: Optional[float],
+        final_tp: Optional[float],
+        raw_tp1: Optional[float],
+        raw_tp2: Optional[float],
+        raw_tp3: Optional[float],
+        raw_tp4: Optional[float],
+        raw_tp5: Optional[float],
+        tp_levels: Optional[Dict[str, float]],
+        pip_size: float,
+        digits: int,
+    ) -> Tuple[Optional[float], Dict[str, Optional[float]], Dict[str, float]]:
+        """Apply ATR-scaled SL/TP once before resolving L1..L4 layer targets."""
+        self.last_dynamic_risk_snapshot = None
+        input_map: Dict[str, float] = {}
+        if isinstance(tp_levels, dict):
+            for k, v in tp_levels.items():
+                if v is not None:
+                    input_map[str(k).upper()] = round(float(v), digits)
+        for idx, val in enumerate((raw_tp1, raw_tp2, raw_tp3, raw_tp4, raw_tp5), start=1):
+            if val is not None:
+                input_map[f"TP{idx}"] = round(float(val), digits)
+
+        snap = self.apply_dynamic_atr_sl_tp(
+            symbol=symbol,
+            direction=direction,
+            sl_anchor=sl_anchor,
+            tp_anchor=tp_anchor,
+            sl=sl,
+            raw_tp1=input_map.get("TP1"),
+            tp_levels=input_map or None,
+            final_tp=final_tp,
+            pip_size=pip_size,
+            digits=digits,
+        )
+        eff_sl = sl
+        eff_tp_map = dict(input_map)
+        eff_final_tp = final_tp
+        step_scale = 1.0
+        if snap.get("applied"):
+            eff_sl = snap.get("sl")
+            eff_tp_map = dict(snap.get("tp_levels") or {})
+            eff_final_tp = snap.get("final_tp")
+            step_scale = float(snap.get("vol_ratio") or 1.0)
+
+        layer_tps, merged_tps = self._resolve_4layer_tps(
+            direction=direction,
+            pip_size=pip_size,
+            digits=digits,
+            final_tp=eff_final_tp,
+            raw_tp1=eff_tp_map.get("TP1"),
+            raw_tp2=eff_tp_map.get("TP2"),
+            raw_tp3=eff_tp_map.get("TP3"),
+            raw_tp4=eff_tp_map.get("TP4"),
+            raw_tp5=eff_tp_map.get("TP5"),
+            tp_levels=eff_tp_map or None,
+            step_scale=step_scale,
+        )
+        if snap.get("applied") and isinstance(self.last_dynamic_risk_snapshot, dict):
+            self.last_dynamic_risk_snapshot["tp_levels"] = dict(merged_tps)
+            self.last_dynamic_risk_snapshot["raw_tp1"] = merged_tps.get("TP1", snap.get("raw_tp1"))
+            self.last_dynamic_risk_snapshot["final_tp"] = layer_tps.get("L1")
+        return eff_sl, layer_tps, merged_tps
+
     def execute_4layer_zone(
         self,
         symbol: str,
@@ -2321,6 +2551,7 @@ class MT5Executor:
         Split a Zone entry into 4 layers across [0%, 33.3%, 66.7%, 100%] (L1..L4 -> TP1/TP2/TP3/TP5).
         Returns (market_tickets, pending_tickets, layers_data).
         """
+        self.last_dynamic_risk_snapshot = None
         if zone is None:
             self.last_error = "Invalid 4-layer zone parameters (zone=None)"
             return [], [], {}
@@ -2367,10 +2598,13 @@ class MT5Executor:
             self.last_error = warn or "High Risk Lot Cap reached"
             return [], [], {}
 
-        layer_tps, _ = self._resolve_4layer_tps(
+        sl_anchor = min(tiers.values()) if direction_norm == "BUY" else max(tiers.values())
+        sl, layer_tps, _ = self._prepare_dynamic_sltp_inputs(
+            symbol=resolved_sym,
             direction=direction_norm,
-            pip_size=pip_size,
-            digits=digits,
+            sl_anchor=sl_anchor,
+            tp_anchor=tiers["L1"],
+            sl=sl,
             final_tp=final_tp,
             raw_tp1=raw_tp1,
             raw_tp2=raw_tp2,
@@ -2378,6 +2612,8 @@ class MT5Executor:
             raw_tp4=raw_tp4,
             raw_tp5=raw_tp5,
             tp_levels=tp_levels,
+            pip_size=pip_size,
+            digits=digits,
         )
 
         logger.info(
@@ -2458,6 +2694,7 @@ class MT5Executor:
         consolidates to 1 clean order (L1) rather than stacking 4 identical orders at the same price.
         Returns (market_tickets, pending_tickets, layers_data).
         """
+        self.last_dynamic_risk_snapshot = None
         if price is None or float(price) <= 0.0:
             self.last_error = f"Invalid single-price parameter (price={price})"
             return [], [], {}
@@ -2513,10 +2750,12 @@ class MT5Executor:
         if sum(alloc_lots) <= 0.0:
             self.last_error = warn or "High Risk Lot Cap reached"
             return [], [], {}
-        layer_tps, _ = self._resolve_4layer_tps(
+        sl, layer_tps, _ = self._prepare_dynamic_sltp_inputs(
+            symbol=resolved_sym,
             direction=direction_norm,
-            pip_size=pip_size,
-            digits=digits,
+            sl_anchor=target_px,
+            tp_anchor=target_px,
+            sl=sl,
             final_tp=final_tp,
             raw_tp1=raw_tp1,
             raw_tp2=raw_tp2,
@@ -2524,6 +2763,8 @@ class MT5Executor:
             raw_tp4=raw_tp4,
             raw_tp5=raw_tp5,
             tp_levels=tp_levels,
+            pip_size=pip_size,
+            digits=digits,
         )
 
         logger.info(
@@ -2571,6 +2812,7 @@ class MT5Executor:
         or a restricted layer subset (e.g. max_layers=1 -> L1 only for unpriced stubs).
         Returns (market_tickets, pending_tickets, layers_data).
         """
+        self.last_dynamic_risk_snapshot = None
         prereq = self._validate_entry_prerequisites(symbol, direction, "4-layer market")
         if prereq is None:
             return [], [], {}
@@ -2589,10 +2831,12 @@ class MT5Executor:
         raw_entry = tick.ask if direction_norm == "BUY" else tick.bid
         entry_px = round(float(raw_entry), digits)
 
-        layer_tps, _ = self._resolve_4layer_tps(
+        sl, layer_tps, _ = self._prepare_dynamic_sltp_inputs(
+            symbol=resolved_sym,
             direction=direction_norm,
-            pip_size=pip_size,
-            digits=digits,
+            sl_anchor=entry_px,
+            tp_anchor=entry_px,
+            sl=sl,
             final_tp=final_tp,
             raw_tp1=raw_tp1,
             raw_tp2=raw_tp2,
@@ -2600,6 +2844,8 @@ class MT5Executor:
             raw_tp4=raw_tp4,
             raw_tp5=raw_tp5,
             tp_levels=tp_levels,
+            pip_size=pip_size,
+            digits=digits,
         )
 
         logger.info(
@@ -7021,7 +7267,11 @@ class MT5Executor:
                             })
                     else:
                         lv["bank_harvest_ticks"] = 0
-                elif role in ("CORE_RUNNER", "SOLO_RUNNER") and (new_tier == "TIER_0T" or now_squeeze):
+                elif (
+                    role in ("CORE_RUNNER", "SOLO_RUNNER")
+                    and (new_tier == "TIER_0T" or now_squeeze)
+                    and bool(_cfg("PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED", PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED))
+                ):
                     v_hit = (exec_price <= float(virt_sl) + 1e-9) if is_buy else (exec_price >= float(virt_sl) - 1e-9)
                     if v_hit:
                         vr_t = _int_num(lv.get("virt_ratchet_ticks"), 0) + 1
@@ -9767,7 +10017,13 @@ class MT5Executor:
                 )
 
             # Near-Target Squeeze 2-tick virtual exit (spread-paused) when virt_sl > trail_stop
-            if ratchet_on and not is_spike and primary_layer and primary_layer in ratchet_map:
+            if (
+                ratchet_on
+                and not is_spike
+                and bool(_cfg("PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED", PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED))
+                and primary_layer
+                and primary_layer in ratchet_map
+            ):
                 pr_r = ratchet_map[primary_layer]
                 lv_p = layers.get(primary_layer) if isinstance(layers.get(primary_layer), dict) else None
                 virt_sl_r = pr_r.get("virt_sl")
@@ -11280,4 +11536,141 @@ class MT5Executor:
             "modified_tickets": mod_tkts,
             "banked_tickets": list(signal_data.get("last_banked_tickets") or []),
             "status": signal_data.get("status"),
+        }
+
+    def _resolve_ticket_current_sl(
+        self,
+        signal_data: Dict[str, Any],
+        ticket: int,
+        l_info: Dict[str, Any],
+        is_buy: bool,
+        digits: int,
+    ) -> Optional[float]:
+        """Resolve tightest active SL on `ticket` from broker position or tracked layer state."""
+        cands: List[float] = []
+        if not self.dry_run:
+            with self._mt5_lock:
+                pos_res = mt5.positions_get(ticket=ticket)
+            if pos_res:
+                p_sl = _num(getattr(pos_res[0], "sl", 0.0), 0.0)
+                if p_sl > 0.0:
+                    cands.append(round(p_sl, digits))
+        if not cands:
+            for key in ("dynamic_atr_trail_sl", "ratchet_sl", "broker_sl", "be_sl", "sl"):
+                val = _num(l_info.get(key), 0.0)
+                if val > 0.0:
+                    cands.append(round(val, digits))
+            if not cands:
+                sig_sl = _num(signal_data.get("sl"), 0.0)
+                if sig_sl > 0.0:
+                    cands.append(round(sig_sl, digits))
+        if not cands:
+            return None
+        return max(cands) if is_buy else min(cands)
+
+    def evaluate_dynamic_atr_trailing_stop(
+        self,
+        signal_data: Dict[str, Any],
+        tick: Any = None,
+    ) -> Dict[str, Any]:
+        """
+        Optional Dynamic ATR Trailing Stop (enabled when DYNAMIC_ATR_TRAIL_ENABLED=True).
+        Dynamically adjusts per-ticket trailing distance with volatility (ATR), forward-only.
+        """
+        if not isinstance(signal_data, dict):
+            return {"enabled": False, "updated_tickets": []}
+        policy = self._get_dynamic_risk_policy()
+        if not policy.trail_enabled:
+            return {"enabled": False, "updated_tickets": []}
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        if tick is None:
+            tick = self.get_tick(symbol)
+        if tick is None or not self.is_valid_live_tick(symbol, tick):
+            return {"enabled": True, "paused_by_spread": True, "updated_tickets": []}
+        is_spike, _, _ = self.check_spread_spike(symbol, tick)
+        if is_spike:
+            return {"enabled": True, "paused_by_spread": True, "updated_tickets": []}
+
+        atr = self.get_atr(symbol, policy.trail_timeframe, policy.atr_period)
+        if atr <= 0.0:
+            return {"enabled": True, "paused_by_spread": False, "updated_tickets": [], "atr": 0.0, "timeframe": policy.trail_timeframe}
+
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+        raw_dist = max(0.0, stops_lvl * (pt or 0.01))
+        safety_buf = float(_cfg("STOP_LEVEL_SAFETY_BUFFER_DOLLARS", STOP_LEVEL_SAFETY_BUFFER_DOLLARS)) if (not self.dry_run or raw_dist > 0.0) else 0.0
+        stops_buffer = (raw_dist + max(0.0, safety_buf)) if raw_dist > 0.0 else 0.0
+
+        live_price = float(tick.bid) if is_buy else float(tick.ask)
+        layers = signal_data.get("layers") or {}
+        prev_meta = signal_data.get("dynamic_atr_trail") if isinstance(signal_data.get("dynamic_atr_trail"), dict) else {}
+        was_armed = bool(prev_meta.get("armed"))
+        any_armed = False
+        updated_tickets: List[Tuple[int, str, float, float, float]] = []
+        last_trail_dist = prev_meta.get("trail_dist", 0.0)
+
+        for lk in self._ordered_open_layer_keys(signal_data):
+            lv = layers.get(lk)
+            t_int = _int_num((lv or {}).get("ticket"), 0)
+            if not isinstance(lv, dict) or t_int <= 0:
+                continue
+            entry_px = self._resolve_layer_entry(signal_data, lk, lv) or 0.0
+            if entry_px <= 0.0:
+                continue
+            cur_sl = self._resolve_ticket_current_sl(signal_data, t_int, lv, is_buy, digits)
+            step = compute_dynamic_atr_trail_stop(
+                direction=direction,
+                entry_price=entry_px,
+                live_price=live_price,
+                prev_peak=lv.get("dynamic_atr_trail_peak"),
+                current_sl=cur_sl,
+                atr=atr,
+                policy=policy,
+                digits=digits,
+                stops_buffer=stops_buffer,
+            )
+            if step.get("peak_price") is not None:
+                lv["dynamic_atr_trail_peak"] = step["peak_price"]
+            last_trail_dist = step.get("trail_dist") or last_trail_dist
+            any_armed = any_armed or bool(step.get("armed"))
+            cand_sl = step.get("candidate_sl")
+            if not step.get("should_update") or not cand_sl or cand_sl <= 0.0:
+                continue
+            if self.is_within_freeze_level(symbol, cand_sl, tick=tick, sym_info=sym_info):
+                continue
+            if not self.modify_position_sltp(t_int, sl=cand_sl, tp=None):
+                continue
+
+            lv["sl"] = cand_sl
+            lv["broker_sl"] = cand_sl
+            lv["dynamic_atr_trail_sl"] = cand_sl
+            lv["dynamic_atr_trail_dist"] = step["trail_dist"]
+            lv["dynamic_atr_trail_atr"] = step["atr"]
+            prev_bsl = _num(signal_data.get("broker_sl"), 0.0)
+            if prev_bsl <= 0.0 or (is_buy and cand_sl > prev_bsl) or (not is_buy and cand_sl < prev_bsl):
+                signal_data["broker_sl"] = cand_sl
+            updated_tickets.append((t_int, lk, cand_sl, step["trail_dist"], step["atr"]))
+
+        if any_armed or updated_tickets:
+            last_sl = updated_tickets[-1][2] if updated_tickets else prev_meta.get("last_sl")
+            signal_data["dynamic_atr_trail"] = {
+                "armed": any_armed,
+                "timeframe": policy.trail_timeframe,
+                "atr": round(atr, 4),
+                "trail_dist": last_trail_dist,
+                "last_sl": last_sl,
+            }
+
+        return {
+            "enabled": True,
+            "paused_by_spread": False,
+            "atr": round(atr, 4),
+            "timeframe": policy.trail_timeframe,
+            "updated_tickets": updated_tickets,
+            "newly_armed": bool(any_armed and not was_armed),
         }

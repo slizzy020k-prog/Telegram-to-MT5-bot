@@ -398,10 +398,16 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"RUNNER_MAX_MIDRANGE_RATIO must be in (0, 1], got {midrange_ratio!r}."
         )
 
-    if hasattr(cfg, "GOLD_REVERSAL_GUARD_ENABLED"):
-        gold_rg = getattr(cfg, "GOLD_REVERSAL_GUARD_ENABLED")
-        if not isinstance(gold_rg, bool):
-            errors.append(f"GOLD_REVERSAL_GUARD_ENABLED must be a bool, got {gold_rg!r}.")
+    for bool_flag in (
+        "GOLD_REVERSAL_GUARD_ENABLED",
+        "PROFIT_RATCHET_ENABLED",
+        "BANK_HARVEST_ENABLED",
+        "PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED",
+    ):
+        if hasattr(cfg, bool_flag):
+            flag_val = getattr(cfg, bool_flag)
+            if not isinstance(flag_val, bool):
+                errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
 
     for ratio_name in ("ARM_THRESHOLD_PCT", "GIVEBACK_PCT", "RUNNER_EARLY_TP_LIFT_PCT"):
         if hasattr(cfg, ratio_name):
@@ -511,6 +517,58 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
         )
 
 
+def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
+    """Validate Dynamic Risk Management (ATR SL/TP & ATR Trailing Stop) fields."""
+    for bool_flag in ("DYNAMIC_ATR_SLTP_ENABLED", "DYNAMIC_ATR_TRAIL_ENABLED"):
+        if hasattr(cfg, bool_flag):
+            flag_val = getattr(cfg, bool_flag)
+            if not isinstance(flag_val, bool):
+                errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
+    valid_modes = ("ADAPTIVE", "FALLBACK_ONLY", "PURE_ATR")
+    valid_tfs = ("M1", "M5", "M15", "H1")
+    dr_mode = str(getattr(cfg, "DYNAMIC_SLTP_MODE", "ADAPTIVE")).strip().upper()
+    if dr_mode not in valid_modes:
+        errors.append(f"DYNAMIC_SLTP_MODE must be one of {valid_modes}, got {dr_mode!r}.")
+    for tf_field in ("DYNAMIC_ATR_TIMEFRAME", "DYNAMIC_ATR_TRAIL_TIMEFRAME"):
+        tf_val = str(getattr(cfg, tf_field, "M5")).strip().upper()
+        if tf_val not in valid_tfs:
+            errors.append(f"{tf_field} must be one of {valid_tfs}, got {tf_val!r}.")
+    atr_period = getattr(cfg, "DYNAMIC_ATR_PERIOD", 14)
+    if isinstance(atr_period, bool) or not isinstance(atr_period, int) or not (2 <= atr_period <= 200):
+        errors.append(f"DYNAMIC_ATR_PERIOD must be an integer in [2, 200], got {atr_period!r}.")
+    act_mult = getattr(cfg, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00)
+    if not _is_finite_number(act_mult) or float(act_mult) < 0.0:
+        errors.append(f"DYNAMIC_ATR_TRAIL_ACTIVATION_MULT must be >= 0, got {act_mult!r}.")
+    for pos_field in (
+        "DYNAMIC_ATR_BASELINE_DOLLARS",
+        "DYNAMIC_SL_ATR_MULT",
+        "DYNAMIC_TP_ATR_MULT",
+        "DYNAMIC_TP_STEP_ATR_MULT",
+        "DYNAMIC_SL_MIN_DOLLARS",
+        "DYNAMIC_SL_MAX_DOLLARS",
+        "DYNAMIC_TP_MIN_DOLLARS",
+        "DYNAMIC_TP_MAX_DOLLARS",
+        "DYNAMIC_SLTP_SCALE_MIN",
+        "DYNAMIC_SLTP_SCALE_MAX",
+        "DYNAMIC_ATR_TRAIL_MULT",
+        "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_STEP_DOLLARS",
+    ):
+        val = getattr(cfg, pos_field, 1.0)
+        if not _is_finite_number(val) or float(val) <= 0.0:
+            errors.append(f"{pos_field} must be > 0, got {val!r}.")
+    for lo_field, hi_field in (
+        ("DYNAMIC_SL_MIN_DOLLARS", "DYNAMIC_SL_MAX_DOLLARS"),
+        ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
+        ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
+        ("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_MAX_DOLLARS"),
+    ):
+        lo_v, hi_v = getattr(cfg, lo_field, 1.0), getattr(cfg, hi_field, 10.0)
+        if _is_finite_number(lo_v) and _is_finite_number(hi_v) and float(lo_v) > float(hi_v):
+            errors.append(f"{lo_field} ({lo_v}) cannot exceed {hi_field} ({hi_v}).")
+
+
 def validate_environment(check_packages: bool = True, cfg: Any = None) -> Dict[str, Any]:
     """Validate local packages, trading configuration invariants, and writable paths."""
     errors: List[str] = []
@@ -544,6 +602,7 @@ def validate_environment(check_packages: bool = True, cfg: Any = None) -> Dict[s
     _validate_channel_ids(cfg, errors, warnings)
     _validate_lots_and_orders(cfg, errors, warnings)
     _validate_tp_and_runner_buffers(cfg, errors, warnings)
+    _validate_dynamic_risk_config(cfg, errors)
 
     _check_writable_file_path("LOG_FILE_PATH", getattr(cfg, "LOG_FILE_PATH", None), errors)
     _check_writable_file_path("STATE_FILE_PATH", getattr(cfg, "STATE_FILE_PATH", None), errors)

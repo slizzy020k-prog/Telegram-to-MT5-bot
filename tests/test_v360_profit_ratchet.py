@@ -44,6 +44,7 @@ def _pin_v360_defaults(monkeypatch):
     defaults = {
         "STAGED_EXIT_ENABLED": True,
         "PROFIT_RATCHET_ENABLED": True,
+        "PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED": True,
         "BANK_HARVEST_ENABLED": True,
         "TIERED_STAGE_BANKING_ENABLED": True,
         "CANCEL_PENDING_ON_BE": True,

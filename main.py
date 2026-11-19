@@ -107,6 +107,7 @@ from config import (
     STAGE0_PROFIT_LOCK_ENABLED,
     STAGED_EXIT_ENABLED,
     PROFIT_RATCHET_ENABLED,
+    PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED,
     BANK_HARVEST_ENABLED,
     TIERED_STAGE_BANKING_ENABLED,
     CANCEL_PENDING_ON_BE,
@@ -115,6 +116,8 @@ from config import (
     SINGLE_PRICE_CONSOLIDATE_ORDERS,
     PENDING_DUPLICATE_PRICE_TOLERANCE,
     PENDING_DUPLICATE_ORDER_TOLERANCE,
+    DYNAMIC_ATR_SLTP_ENABLED,
+    DYNAMIC_ATR_TRAIL_ENABLED,
 )
 from parser import (
     parse_message,
@@ -145,6 +148,14 @@ from risk_controls import (
     apply_lot_cap_command,
     format_limits_status_lines,
     read_risk_limits,
+)
+from dynamic_risk import (
+    apply_atr_trail_command,
+    apply_dynamic_risk_command,
+    compute_atr_fallback_tp_distance,
+    compute_volatility_ratio,
+    format_dynamic_risk_status_line,
+    read_dynamic_risk_policy,
 )
 
 
@@ -598,6 +609,7 @@ _MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
     "STAGE0_PROFIT_LOCK_ENABLED": STAGE0_PROFIT_LOCK_ENABLED,
     "CANCEL_PENDING_ON_STAGE0_LOCK_EXIT": CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
     "PROFIT_RATCHET_ENABLED": PROFIT_RATCHET_ENABLED,
+    "PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED": PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED,
     "BANK_HARVEST_ENABLED": BANK_HARVEST_ENABLED,
     "TIERED_STAGE_BANKING_ENABLED": TIERED_STAGE_BANKING_ENABLED,
     "CANCEL_PENDING_ON_BE": CANCEL_PENDING_ON_BE,
@@ -607,7 +619,47 @@ _MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
     "PENDING_DUPLICATE_PRICE_TOLERANCE": PENDING_DUPLICATE_PRICE_TOLERANCE,
     "PENDING_DUPLICATE_ORDER_TOLERANCE": PENDING_DUPLICATE_ORDER_TOLERANCE,
     "LIMIT_ENTRY_FRONT_RUN_OFFSET": LIMIT_ENTRY_FRONT_RUN_OFFSET,
+    "DYNAMIC_ATR_SLTP_ENABLED": DYNAMIC_ATR_SLTP_ENABLED,
+    "DYNAMIC_ATR_TRAIL_ENABLED": DYNAMIC_ATR_TRAIL_ENABLED,
 }
+
+
+def _merge_dynamic_risk_into_signal_fields(
+    snap: Optional[Dict[str, Any]],
+    sl: Optional[float],
+    final_tp: Optional[float],
+    raw_tp1: Optional[float],
+    raw_tp2: Optional[float],
+    raw_tp3: Optional[float],
+    raw_tp4: Optional[float],
+    raw_tp5: Optional[float],
+    tp_levels: Optional[Dict[str, float]],
+) -> Dict[str, Any]:
+    """Return updated SL/TP signal fields when ATR-scaled SL/TP modified entry targets."""
+    if not (isinstance(snap, dict) and snap.get("applied")):
+        return {
+            "sl": sl,
+            "final_tp": final_tp,
+            "raw_tp1": raw_tp1,
+            "raw_tp2": raw_tp2,
+            "raw_tp3": raw_tp3,
+            "raw_tp4": raw_tp4,
+            "raw_tp5": raw_tp5,
+            "tp_levels": tp_levels,
+            "dynamic_risk": None,
+        }
+    t_map = dict(snap.get("tp_levels") or tp_levels or {})
+    return {
+        "sl": snap.get("sl") if snap.get("sl") is not None else sl,
+        "final_tp": snap.get("final_tp") if snap.get("final_tp") is not None else final_tp,
+        "raw_tp1": t_map.get("TP1", snap.get("raw_tp1", raw_tp1)),
+        "raw_tp2": t_map.get("TP2", raw_tp2),
+        "raw_tp3": t_map.get("TP3", raw_tp3),
+        "raw_tp4": t_map.get("TP4", raw_tp4),
+        "raw_tp5": t_map.get("TP5", raw_tp5),
+        "tp_levels": t_map or tp_levels,
+        "dynamic_risk": dict(snap),
+    }
 
 
 def _main_cfg(name: str, default: Any) -> Any:
@@ -2554,19 +2606,36 @@ async def _delayed_sell_now_task(
             extra_notes.extend(risk_alerts)
             risk_block = ("\n\n" + "\n".join(extra_notes)) if extra_notes else ""
 
-            state_mgr.update_signal(
-                msg_id,
-                {
-                    "status": "ACTIVE",
-                    "awaiting_favorable_price": False,
-                    "market_tickets": mk_tkts,
-                    "pending_tickets": pd_tkts,
-                    "layers": layers_data,
-                    "max_orders": MAX_ORDERS_PER_SIGNAL,
-                    "tp1_guard_armed": True,
-                },
-                chat_id=chat_id,
+            dyn_d = _merge_dynamic_risk_into_signal_fields(
+                getattr(executor, "last_dynamic_risk_snapshot", None),
+                sl, final_tp, tp1_price, sig.get("raw_tp2"), sig.get("raw_tp3"),
+                sig.get("raw_tp4"), sig.get("raw_tp5"), sig.get("tp_levels"),
             )
+            sl = dyn_d["sl"]
+            update_d: Dict[str, Any] = {
+                "status": "ACTIVE",
+                "awaiting_favorable_price": False,
+                "market_tickets": mk_tkts,
+                "pending_tickets": pd_tkts,
+                "layers": layers_data,
+                "max_orders": MAX_ORDERS_PER_SIGNAL,
+                "tp1_guard_armed": True,
+            }
+            if dyn_d["dynamic_risk"] is not None:
+                update_d.update({
+                    "sl": dyn_d["sl"],
+                    "final_tp": dyn_d["final_tp"],
+                    "hard_broker_tp": dyn_d["final_tp"],
+                    "raw_tp1": dyn_d["raw_tp1"],
+                    "tp1_price": dyn_d["raw_tp1"],
+                    "raw_tp2": dyn_d["raw_tp2"],
+                    "raw_tp3": dyn_d["raw_tp3"],
+                    "raw_tp4": dyn_d["raw_tp4"],
+                    "raw_tp5": dyn_d["raw_tp5"],
+                    "tp_levels": dyn_d["tp_levels"],
+                    "dynamic_risk": dyn_d["dynamic_risk"],
+                })
+            state_mgr.update_signal(msg_id, update_d, chat_id=chat_id)
             updated_sig = state_mgr.get_signal(msg_id, chat_id=chat_id) or sig
             await notify_saved_messages(
                 f"🚀 **Delayed {direction.title()} Now 4-Layer Executed [ID: {msg_id}]**\n"
@@ -4142,10 +4211,26 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
             age_sec = UNPRICED_TP_GRACE_SECONDS + 1.0
 
         if age_sec >= UNPRICED_TP_GRACE_SECONDS:
-            pip_offset = FALLBACK_TP1_PIPS * pip_size
+            _cfg_fb = sys.modules.get("config") or config
+            _pol_fb = read_dynamic_risk_policy(_cfg_fb)
+            fb_atr = (
+                await _mt5_call(executor.get_atr, symbol, _pol_fb.atr_timeframe, _pol_fb.atr_period)
+                if _pol_fb.sltp_enabled
+                else 0.0
+            )
+            atr_tp_dist = compute_atr_fallback_tp_distance(fb_atr, _pol_fb)
+            if atr_tp_dist is not None and atr_tp_dist > 0.0:
+                pip_offset = atr_tp_dist
+                vr = compute_volatility_ratio(fb_atr, _pol_fb)
+                step_list = [round(s * vr, 4) for s in (TP2_STEP_PIPS, TP3_STEP_PIPS, TP4_STEP_PIPS, TP5_STEP_PIPS)]
+                fb_note = f"ATR={fb_atr:.2f} (${pip_offset:.2f})"
+            else:
+                pip_offset = FALLBACK_TP1_PIPS * pip_size
+                step_list = None
+                fb_note = f"+{FALLBACK_TP1_PIPS} pips"
             raw_tp1 = round(curr_price + pip_offset, 2) if direction == "BUY" else round(curr_price - pip_offset, 2)
             final_tp = round(raw_tp1 - TP_FRONT_RUN_OFFSET, 2) if direction == "BUY" else round(raw_tp1 + TP_FRONT_RUN_OFFSET, 2)
-            tp_levels = derive_tp_levels([raw_tp1], direction=direction, pip_size=pip_size)
+            tp_levels = derive_tp_levels([raw_tp1], direction=direction, pip_size=pip_size, step_pips=step_list)
             layers = sig.get("layers") if isinstance(sig.get("layers"), dict) else {}
             market_set = set(sig.get("market_tickets", []))
             modified_mk: set = set()
@@ -4173,7 +4258,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
             sig["tp_stage"] = "TP1"
             sig["fallback_tp_applied"] = True
             state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
-            logger.info(f"Attached fallback TP1 ({raw_tp1}, +{FALLBACK_TP1_PIPS} pips) on unpriced Signal {msg_id}")
+            logger.info(f"Attached fallback TP1 ({raw_tp1}, {fb_note}) on unpriced Signal {msg_id}")
             await notify_saved_messages(
                 f"🛡️ **Fallback TP1 Attached [ID: {msg_id}]**\n"
                 f"• No TP edit received after {int(UNPRICED_TP_GRACE_SECONDS)}s.\n"
@@ -4286,7 +4371,12 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
         pr_res = await _mt5_call(executor.evaluate_profit_ratchet_tick, sig, tick, 0)
 
         # 1) BANK_HARVEST on L1 ONLY (keeps CORE_RUNNER open to scale to TP2..TP5)
-        for hc in (pr_res.get("harvest_close_tickets") or []):
+        hc_list = (
+            list(pr_res.get("harvest_close_tickets") or [])
+            if bool(_main_cfg("BANK_HARVEST_ENABLED", BANK_HARVEST_ENABLED))
+            else []
+        )
+        for hc in hc_list:
             hc_tk = _safe_ticket_int(hc.get("ticket"))
             hc_lk = hc.get("layer")
             if hc_tk is None:
@@ -4324,7 +4414,11 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
                     return
 
         # 2) Spread-paused virtual stops (TIER_0T tight-TP1 harvest or Near-Target Squeeze)
-        vc_list = list(pr_res.get("virtual_close_tickets") or [])
+        vc_list = (
+            list(pr_res.get("virtual_close_tickets") or [])
+            if bool(_main_cfg("PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED", PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED))
+            else []
+        )
         if vc_list and await _mt5_call(executor.try_begin_signal_close, sig):
             closed_vc: List[int] = []
             try:
@@ -4403,7 +4497,7 @@ async def _process_pre_tp1_or_backstop_tick(msg_id: str, sig: Dict[str, Any]) ->
     _cfg_mod = sys.modules.get("config")
     gold_guard_on = bool(
         GOLD_REVERSAL_GUARD_ENABLED
-        if GOLD_REVERSAL_GUARD_ENABLED != getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True)
+        if GOLD_REVERSAL_GUARD_ENABLED != getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
         else getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)
     )
     runner_layers, early_layers = executor.select_dynamic_runners(
@@ -4852,6 +4946,35 @@ async def tp1_proximity_watcher_task() -> None:
                     else:
                         await _process_pre_tp1_or_backstop_tick(msg_id, sig)
 
+                    sig_dt = state_mgr.get_signal(msg_id, chat_id=sig_chat) or sig
+                    if (
+                        sig_dt.get("status") != "CLOSED"
+                        and sig_dt.get("market_tickets")
+                        and bool(_main_cfg("DYNAMIC_ATR_TRAIL_ENABLED", DYNAMIC_ATR_TRAIL_ENABLED))
+                    ):
+                        dt_res = await _mt5_call(executor.evaluate_dynamic_atr_trailing_stop, sig_dt)
+                        if dt_res.get("updated_tickets") or dt_res.get("newly_armed"):
+                            dt_upd: Dict[str, Any] = {
+                                "layers": sig_dt.get("layers", {}),
+                                "dynamic_atr_trail": sig_dt.get("dynamic_atr_trail"),
+                            }
+                            if sig_dt.get("broker_sl") is not None:
+                                dt_upd["broker_sl"] = sig_dt["broker_sl"]
+                            state_mgr.update_signal(msg_id, dt_upd, chat_id=sig_chat)
+                        for _t, _lk, _new_sl, _tdist, _tatr in (dt_res.get("updated_tickets") or []):
+                            logger.info(
+                                f"[DYNAMIC ATR TRAIL] Msg {msg_id} {_lk} (#{_t}): SL -> {_new_sl} "
+                                f"({dt_res.get('timeframe')} ATR=${_tatr:.2f}, dist=${_tdist:.2f})"
+                            )
+                        if dt_res.get("newly_armed"):
+                            _meta = sig_dt.get("dynamic_atr_trail") or {}
+                            await notify_saved_messages(
+                                f"🎯 **Dynamic ATR Trailing Stop Armed [ID: {msg_id}]**\n"
+                                f"• {sig_dt.get('direction')} `{sig_dt.get('symbol', DEFAULT_SYMBOL)}` | "
+                                f"{_meta.get('timeframe', 'M5')} ATR=`${float(_meta.get('atr') or 0.0):.2f}` | "
+                                f"Trail=`${float(_meta.get('trail_dist') or 0.0):.2f}`"
+                            )
+
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -5261,28 +5384,46 @@ async def _handle_trade_management_action(
             await notify_saved_messages(f"❌ Reactivation rejected by MT5 for Msg ID {target_msg_id}: `{err_reason}`")
             return
 
-        state_mgr.update_signal(
-            target_msg_id,
-            {
-                "status": "ACTIVE",
-                "market_tickets": mk_tkts,
-                "pending_tickets": pd_tkts,
-                "layers": layers_data,
-                "max_orders": MAX_ORDERS_PER_SIGNAL,
-                "tp1_reached": False,
-                "accounted_tickets": [],
-                "banked_profit": 0.0,
-                "runner_ticket": None,
-                "runner_layer": None,
-                "runner_milestone_idx": 1,
-                "runner_milestone_name": "TP1",
-                "runner_cleared_milestones": [],
-                "runner_proximity_armed": False,
-                "tp2_shortfall_armed": False,
-                "ledger_recorded": False,
-            },
-            chat_id=target_chat_id,
+        dyn_r = _merge_dynamic_risk_into_signal_fields(
+            getattr(executor, "last_dynamic_risk_snapshot", None),
+            sl, target_signal.get("final_tp"), raw_tp1,
+            target_signal.get("raw_tp2"), target_signal.get("raw_tp3"),
+            target_signal.get("raw_tp4"), target_signal.get("raw_tp5"),
+            tp_levels or None,
         )
+        upd_r: Dict[str, Any] = {
+            "status": "ACTIVE",
+            "market_tickets": mk_tkts,
+            "pending_tickets": pd_tkts,
+            "layers": layers_data,
+            "max_orders": MAX_ORDERS_PER_SIGNAL,
+            "tp1_reached": False,
+            "accounted_tickets": [],
+            "banked_profit": 0.0,
+            "runner_ticket": None,
+            "runner_layer": None,
+            "runner_milestone_idx": 1,
+            "runner_milestone_name": "TP1",
+            "runner_cleared_milestones": [],
+            "runner_proximity_armed": False,
+            "tp2_shortfall_armed": False,
+            "ledger_recorded": False,
+        }
+        if dyn_r["dynamic_risk"] is not None:
+            upd_r.update({
+                "sl": dyn_r["sl"],
+                "final_tp": dyn_r["final_tp"],
+                "hard_broker_tp": dyn_r["final_tp"],
+                "raw_tp1": dyn_r["raw_tp1"],
+                "tp1_price": dyn_r["raw_tp1"],
+                "raw_tp2": dyn_r["raw_tp2"],
+                "raw_tp3": dyn_r["raw_tp3"],
+                "raw_tp4": dyn_r["raw_tp4"],
+                "raw_tp5": dyn_r["raw_tp5"],
+                "tp_levels": dyn_r["tp_levels"],
+                "dynamic_risk": dyn_r["dynamic_risk"],
+            })
+        state_mgr.update_signal(target_msg_id, upd_r, chat_id=target_chat_id)
         await notify_saved_messages(
             f"🔄 **4-Layer Setup Reactivated ('Active') [ID: {target_msg_id}]**\n"
             f"• Symbol: `{symbol}` ({direction})\n"
@@ -5880,6 +6021,19 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
             )
             return reject_alert, False
 
+        dyn_n = _merge_dynamic_risk_into_signal_fields(
+            getattr(executor, "last_dynamic_risk_snapshot", None),
+            sl, final_tp, raw_tp1, raw_tp2, raw_tp3, raw_tp4, raw_tp5, tp_levels,
+        )
+        sl = dyn_n["sl"]
+        final_tp = dyn_n["final_tp"]
+        raw_tp1 = dyn_n["raw_tp1"]
+        raw_tp2 = dyn_n["raw_tp2"]
+        raw_tp3 = dyn_n["raw_tp3"]
+        raw_tp4 = dyn_n["raw_tp4"]
+        raw_tp5 = dyn_n["raw_tp5"]
+        tp_levels = dyn_n["tp_levels"]
+
         arm_tick = await _mt5_call(executor.get_tick, symbol)
         tp1_guard_armed = _compute_initial_tp1_guard_armed(
             arm_tick, direction, raw_tp1, bool(market_tickets)
@@ -5897,6 +6051,7 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
                 if str(_lv.get("order_type") or "").upper() == "MARKET" and _is_num(_lv.get("target_price")):
                     recorded_ent = float(_lv["target_price"])
                     break
+        extra_dyn = {"dynamic_risk": dyn_n["dynamic_risk"]} if dyn_n["dynamic_risk"] is not None else {}
         created_sig = state_mgr.create_signal(
             message_id=msg_id,
             chat_id=chat_id,
@@ -5928,6 +6083,7 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
             initial_price=initial_price if _is_num(initial_price) else recorded_ent,
             recorded_entry_price=recorded_ent,
             tp1_guard_armed=tp1_guard_armed,
+            **extra_dyn,
         )
 
         new_lots = (await _mt5_call(executor.get_total_active_lots))["open_lots"]
@@ -6406,41 +6562,46 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order(s)"
                 state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 return f"❌ **Edited Zone Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`", False
-            arm_tick = await _mt5_call(executor.get_tick, symbol)
-            state_mgr.update_signal(
-                msg_id,
-                {
-                    "status": "ACTIVE",
-                    "sl": new_sl,
-                    "raw_tp1": raw_tp1,
-                    "tp1_price": raw_tp1,
-                    "raw_tp2": raw_tp2,
-                    "raw_tp3": raw_tp3,
-                    "raw_tp4": raw_tp4,
-                    "raw_tp5": raw_tp5,
-                    "tp_levels": merged_tp_levels or None,
-                    "final_tp": new_tp,
-                    "hard_broker_tp": new_tp,
-                    "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
-                    "zone": zone.to_dict(),
-                    "is_zone": True,
-                    "is_zone_order": True,
-                    "zone_completed": True,
-                    "max_orders": MAX_ORDERS_PER_SIGNAL,
-                    "layers": l_data,
-                    "market_tickets": mk_tkts,
-                    "pending_tickets": pd_tkts,
-                    "tp1_guard_armed": _compute_initial_tp1_guard_armed(
-                        arm_tick, direction, raw_tp1, bool(mk_tkts)
-                    ),
-                    "raw_text": raw_text,
-                },
-                chat_id=chat_id,
+            dyn_ez = _merge_dynamic_risk_into_signal_fields(
+                getattr(executor, "last_dynamic_risk_snapshot", None),
+                new_sl, new_tp, raw_tp1, raw_tp2, raw_tp3, raw_tp4, raw_tp5, merged_tp_levels or None,
             )
+            new_sl_z = dyn_ez["sl"]
+            new_tp_z = dyn_ez["final_tp"]
+            arm_tick = await _mt5_call(executor.get_tick, symbol)
+            upd_ez: Dict[str, Any] = {
+                "status": "ACTIVE",
+                "sl": new_sl_z,
+                "raw_tp1": dyn_ez["raw_tp1"],
+                "tp1_price": dyn_ez["raw_tp1"],
+                "raw_tp2": dyn_ez["raw_tp2"],
+                "raw_tp3": dyn_ez["raw_tp3"],
+                "raw_tp4": dyn_ez["raw_tp4"],
+                "raw_tp5": dyn_ez["raw_tp5"],
+                "tp_levels": dyn_ez["tp_levels"] or None,
+                "final_tp": new_tp_z,
+                "hard_broker_tp": new_tp_z,
+                "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
+                "zone": zone.to_dict(),
+                "is_zone": True,
+                "is_zone_order": True,
+                "zone_completed": True,
+                "max_orders": MAX_ORDERS_PER_SIGNAL,
+                "layers": l_data,
+                "market_tickets": mk_tkts,
+                "pending_tickets": pd_tkts,
+                "tp1_guard_armed": _compute_initial_tp1_guard_armed(
+                    arm_tick, direction, dyn_ez["raw_tp1"], bool(mk_tkts)
+                ),
+                "raw_text": raw_text,
+            }
+            if dyn_ez["dynamic_risk"] is not None:
+                upd_ez["dynamic_risk"] = dyn_ez["dynamic_risk"]
+            state_mgr.update_signal(msg_id, upd_ez, chat_id=chat_id)
             return (
                 f"✏️ **Delayed {direction.title()} Now → 4-Layer Zone Executed [ID: {msg_id}]**\n"
                 f"• Market: {mk_tkts} | Pending Limits: {pd_tkts}\n"
-                f"• SL: `{new_sl}` | Broker TP1: `{new_tp}`",
+                f"• SL: `{new_sl_z}` | Broker TP1: `{new_tp_z}`",
                 False,
             )
         elif parsed.single_price is not None:
@@ -6465,37 +6626,40 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                 err_reason = getattr(executor, "last_error", None) or "Broker rejected order"
                 state_mgr.update_signal(msg_id, {"status": "CLOSED", "raw_text": raw_text}, chat_id=chat_id)
                 return f"❌ **Edited Order Rejected by MT5 [ID: {msg_id}]**: `{err_reason}`", False
-            arm_tick = await _mt5_call(executor.get_tick, symbol)
-            state_mgr.update_signal(
-                msg_id,
-                {
-                    "status": "ACTIVE",
-                    "sl": new_sl,
-                    "single_price": parsed.single_price,
-                    "is_stop_order": is_stop_order,
-                    "is_limit_order": is_limit_order,
-                    "order_intent": order_intent,
-                    "raw_tp1": raw_tp1,
-                    "tp1_price": raw_tp1,
-                    "raw_tp2": raw_tp2,
-                    "raw_tp3": raw_tp3,
-                    "raw_tp4": raw_tp4,
-                    "raw_tp5": raw_tp5,
-                    "tp_levels": merged_tp_levels or None,
-                    "final_tp": new_tp,
-                    "hard_broker_tp": new_tp,
-                    "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
-                    "max_orders": MAX_ORDERS_PER_SIGNAL,
-                    "layers": l_data,
-                    "market_tickets": mk_tkts,
-                    "pending_tickets": pd_tkts,
-                    "tp1_guard_armed": _compute_initial_tp1_guard_armed(
-                        arm_tick, direction, raw_tp1, bool(mk_tkts)
-                    ),
-                    "raw_text": raw_text,
-                },
-                chat_id=chat_id,
+            dyn_es = _merge_dynamic_risk_into_signal_fields(
+                getattr(executor, "last_dynamic_risk_snapshot", None),
+                new_sl, new_tp, raw_tp1, raw_tp2, raw_tp3, raw_tp4, raw_tp5, merged_tp_levels or None,
             )
+            arm_tick = await _mt5_call(executor.get_tick, symbol)
+            upd_es: Dict[str, Any] = {
+                "status": "ACTIVE",
+                "sl": dyn_es["sl"],
+                "single_price": parsed.single_price,
+                "is_stop_order": is_stop_order,
+                "is_limit_order": is_limit_order,
+                "order_intent": order_intent,
+                "raw_tp1": dyn_es["raw_tp1"],
+                "tp1_price": dyn_es["raw_tp1"],
+                "raw_tp2": dyn_es["raw_tp2"],
+                "raw_tp3": dyn_es["raw_tp3"],
+                "raw_tp4": dyn_es["raw_tp4"],
+                "raw_tp5": dyn_es["raw_tp5"],
+                "tp_levels": dyn_es["tp_levels"] or None,
+                "final_tp": dyn_es["final_tp"],
+                "hard_broker_tp": dyn_es["final_tp"],
+                "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
+                "max_orders": MAX_ORDERS_PER_SIGNAL,
+                "layers": l_data,
+                "market_tickets": mk_tkts,
+                "pending_tickets": pd_tkts,
+                "tp1_guard_armed": _compute_initial_tp1_guard_armed(
+                    arm_tick, direction, dyn_es["raw_tp1"], bool(mk_tkts)
+                ),
+                "raw_text": raw_text,
+            }
+            if dyn_es["dynamic_risk"] is not None:
+                upd_es["dynamic_risk"] = dyn_es["dynamic_risk"]
+            state_mgr.update_signal(msg_id, upd_es, chat_id=chat_id)
             return (
                 f"✏️ **Delayed {direction.title()} Now → 4-Layer {order_intent} Executed [ID: {msg_id}]**\n"
                 f"• Market: {mk_tkts} | Pending: {pd_tkts} @ `{parsed.single_price}`",
@@ -7229,6 +7393,8 @@ _KNOWN_SAVED_COMMANDS = {
     "/floatcap", "floatcap",
     "/losslimit", "losslimit", "/drawdown", "drawdown", "/ddcap", "ddcap",
     "/lotcap", "lotcap", "/riskcap", "riskcap", "/tradecap", "tradecap",
+    "/dynamicrisk", "dynamicrisk", "/atrsltp", "atrsltp", "/atrrisk", "atrrisk",
+    "/atrtrail", "atrtrail", "/dynamictrail", "dynamictrail",
     "/reversal", "reversal", "/gold_reversal", "gold_reversal",
     "/resume", "resume", "/unpause", "unpause", "/reset_loss", "reset_loss", "/reset_drawdown", "reset_drawdown",
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
@@ -7249,6 +7415,8 @@ _KNOWN_SAVED_PREFIXES = (
     "/floatcap ", "floatcap ",
     "/losslimit ", "losslimit ", "/drawdown ", "drawdown ", "/ddcap ", "ddcap ",
     "/lotcap ", "lotcap ", "/riskcap ", "riskcap ", "/tradecap ", "tradecap ",
+    "/dynamicrisk ", "dynamicrisk ", "/atrsltp ", "atrsltp ", "/atrrisk ", "atrrisk ",
+    "/atrtrail ", "atrtrail ", "/dynamictrail ", "dynamictrail ",
     "/reversal ", "reversal ", "/gold_reversal ", "gold_reversal ",
     "/sl ", "/tp ", "/tp1 ", "/tp2 ", "/tp3 ", "/tp4 ", "/tp5 ",
     "/trail ", "/trade ", "/exec ",
@@ -7345,6 +7513,18 @@ def _normalize_saved_adjust_or_trail_prompt(raw_msg: str) -> Tuple[Optional[str]
 def _is_known_saved_command(text: str) -> bool:
     """Return True if a Saved Messages input is a command rather than a numeric prompt reply."""
     return text in _KNOWN_SAVED_COMMANDS or text.startswith(_KNOWN_SAVED_PREFIXES)
+
+
+async def _fetch_dynamic_risk_status_line(cfg_mod: Any) -> str:
+    """Fetch live ATR values and format Dynamic Risk status line for /status and /health."""
+    pol = read_dynamic_risk_policy(cfg_mod)
+    sltp_atr = await _mt5_call(executor.get_atr, DEFAULT_SYMBOL, pol.atr_timeframe, pol.atr_period)
+    trail_atr = (
+        sltp_atr
+        if pol.trail_timeframe == pol.atr_timeframe
+        else await _mt5_call(executor.get_atr, DEFAULT_SYMBOL, pol.trail_timeframe, pol.atr_period)
+    )
+    return format_dynamic_risk_status_line(cfg_mod, sltp_atr, trail_atr)
 
 
 def _format_uptime() -> str:
@@ -7564,6 +7744,40 @@ async def handle_saved_messages_command(event: Any) -> None:
         await event.reply(reply_msg)
         return
 
+    # LIVE CONTROL: /dynamicrisk [on|off|adaptive|fallback|pure|sl_mult tp_mult [tf]]
+    if text in ("/dynamicrisk", "dynamicrisk", "/atrsltp", "atrsltp", "/atrrisk", "atrrisk") or text.startswith(
+        ("/dynamicrisk ", "dynamicrisk ", "/atrsltp ", "atrsltp ", "/atrrisk ", "atrrisk ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        pol = read_dynamic_risk_policy(_cfg_mod)
+        live_atr = await _mt5_call(executor.get_atr, DEFAULT_SYMBOL, pol.atr_timeframe, pol.atr_period)
+        changed, reply_msg = apply_dynamic_risk_command(_cfg_mod, raw_msg.split()[1:], live_atr=live_atr)
+        if changed:
+            logger.info(
+                f"[/dynamicrisk] enabled={bool(getattr(_cfg_mod, 'DYNAMIC_ATR_SLTP_ENABLED', True))}, "
+                f"mode={getattr(_cfg_mod, 'DYNAMIC_SLTP_MODE', 'ADAPTIVE')}, "
+                f"tf={getattr(_cfg_mod, 'DYNAMIC_ATR_TIMEFRAME', 'M5')}"
+            )
+        await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /atrtrail [on|off|mult [activation_mult] [M1|M5|M15|H1]]
+    if text in ("/atrtrail", "atrtrail", "/dynamictrail", "dynamictrail") or text.startswith(
+        ("/atrtrail ", "atrtrail ", "/dynamictrail ", "dynamictrail ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        pol = read_dynamic_risk_policy(_cfg_mod)
+        live_atr = await _mt5_call(executor.get_atr, DEFAULT_SYMBOL, pol.trail_timeframe, pol.atr_period)
+        changed, reply_msg = apply_atr_trail_command(_cfg_mod, raw_msg.split()[1:], live_atr=live_atr)
+        if changed:
+            logger.info(
+                f"[/atrtrail] enabled={bool(getattr(_cfg_mod, 'DYNAMIC_ATR_TRAIL_ENABLED', False))}, "
+                f"mult={getattr(_cfg_mod, 'DYNAMIC_ATR_TRAIL_MULT', 1.50)}, "
+                f"tf={getattr(_cfg_mod, 'DYNAMIC_ATR_TRAIL_TIMEFRAME', 'M5')}"
+            )
+        await event.reply(reply_msg)
+        return
+
     # LIVE CONTROL: /reversal [wide|tight|<giveback_pct> [floor] [ticks]]
     if text in ("/reversal", "reversal", "/gold_reversal", "gold_reversal") or any(
         text.startswith(p) for p in ("/reversal ", "reversal ", "/gold_reversal ", "gold_reversal ")
@@ -7642,7 +7856,7 @@ async def handle_saved_messages_command(event: Any) -> None:
                 logger.warning(f"Failed to parse /reversal args: {e}")
 
         # Status display
-        cur_on = bool(getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", True))
+        cur_on = bool(getattr(_cfg_mod, "GOLD_REVERSAL_GUARD_ENABLED", False))
         cur_arm = float(getattr(_cfg_mod, "ARM_THRESHOLD_PCT", 0.85)) * 100.0
         cur_gb = float(getattr(_cfg_mod, "GIVEBACK_PCT", 0.30)) * 100.0
         cur_floor = float(getattr(_cfg_mod, "MIN_GOLD_PULLBACK_DOLLARS", 1.50))
@@ -7905,11 +8119,25 @@ async def handle_saved_messages_command(event: Any) -> None:
             await event.reply(f"❌ **Order Rejected by MT5**: `{err_reason}`")
             return
 
+        dyn_t = _merge_dynamic_risk_into_signal_fields(
+            getattr(executor, "last_dynamic_risk_snapshot", None),
+            sl, final_tp, raw_tp1, raw_tp2, raw_tp3, raw_tp4, raw_tp5, tp_levels,
+        )
+        sl = dyn_t["sl"]
+        final_tp = dyn_t["final_tp"]
+        raw_tp1 = dyn_t["raw_tp1"]
+        raw_tp2 = dyn_t["raw_tp2"]
+        raw_tp3 = dyn_t["raw_tp3"]
+        raw_tp4 = dyn_t["raw_tp4"]
+        raw_tp5 = dyn_t["raw_tp5"]
+        tp_levels = dyn_t["tp_levels"]
+
         eff_mid = getattr(msg, "id", None) or int(time.time() * 1000) % 1000000
         arm_tick = await _mt5_call(executor.get_tick, symbol)
         tp1_guard_armed = _compute_initial_tp1_guard_armed(
             arm_tick, direction, raw_tp1, bool(market_tickets)
         )
+        extra_dyn_t = {"dynamic_risk": dyn_t["dynamic_risk"]} if dyn_t["dynamic_risk"] is not None else {}
         created_sig = state_mgr.create_signal(
             message_id=eff_mid,
             chat_id="me",
@@ -7941,6 +8169,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             initial_price=initial_price,
             recorded_entry_price=initial_price,
             tp1_guard_armed=tp1_guard_armed,
+            **extra_dyn_t,
         )
         await event.reply(
             f"🚀 **Saved Messages 4-Layer Trade Executed ({order_intent}) [ID: {eff_mid}]**\n"
@@ -8114,6 +8343,7 @@ async def handle_saved_messages_command(event: Any) -> None:
         dd_st_h = await _mt5_call(executor.get_daily_drawdown_status)
         _cfg_mod_h = sys.modules.get("config") or config
         limits_h = format_limits_status_lines(_cfg_mod_h, dd_st_h, risk_st_h)
+        dyn_line_h = await _fetch_dynamic_risk_status_line(_cfg_mod_h)
 
         await event.reply(
             f"🩺 **XAUUSD Copier v3.0 Health Telemetry**\n"
@@ -8129,6 +8359,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"• Active Lots (`/lotcap`): {limits_h['active_lots_label']}\n"
             f"{limits_h['drawdown_guard_line']}\n"
             f"{limits_h['float_cap_line']}\n"
+            f"{dyn_line_h}\n"
             f"• Runner FSM Mode: `{RUNNER_PROXIMITY_MODE}` "
             f"(Buf: `{RUNNER_PROXIMITY_BUFFER_PIPS}` pips / `{RUNNER_PROXIMITY_BUFFER_PCT}%`, "
             f"MidrangeClamp: `{RUNNER_MAX_MIDRANGE_RATIO}`, "
@@ -8597,6 +8828,7 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         _cfg_mod = sys.modules.get("config") or config
         limits_lines = format_limits_status_lines(_cfg_mod, dd_st, risk_st)
+        dyn_line = await _fetch_dynamic_risk_status_line(_cfg_mod)
         srv_date = await _trading_day_str_async()
         ledger_stats = trade_ledger.get_stats(server_date=srv_date)
         lots_vec_str = "/".join(f"{b:.2f}" for b in BASE_LAYER_LOTS)
@@ -8608,6 +8840,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Daily Loss Limit (`dailyloss`): {dl_state_str}"
             f"\n{limits_lines['drawdown_guard_line']}"
             f"\n{limits_lines['float_cap_line']}"
+            f"\n{dyn_line}"
             f"\n• Trade Ledger (`{TRADES_LEDGER_PATH.name}`): `{ledger_stats['total_trades']}` closed | "
             f"Win Rate: `{ledger_stats['win_rate_pct']:.1f}%` | "
             f"Realized: `{format_profit(ledger_stats['total_realized_pnl'], curr)}` "
@@ -8626,7 +8859,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"\n• Runner Exit Architecture: `{staged_badge}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return

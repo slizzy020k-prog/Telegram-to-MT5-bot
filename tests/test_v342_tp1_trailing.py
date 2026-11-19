@@ -39,6 +39,9 @@ def _pin_v342_baseline(monkeypatch):
         monkeypatch.setattr(config, key, False, raising=False)
         monkeypatch.setattr(ex_mod, key, False, raising=False)
         monkeypatch.setattr(main, key, False, raising=False)
+    monkeypatch.setattr(config, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
+    monkeypatch.setattr(main, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
 
 
 def _reset_runtime(tmp_path, name: str = "v342"):
