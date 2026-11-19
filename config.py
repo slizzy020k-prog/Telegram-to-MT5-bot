@@ -230,7 +230,7 @@ TP5_STEP_PIPS: float = _env_float(
 
 # Dynamic Multi-Layer Active Runner Scaling & Gold Calibrated Peak-Profit Giveback Guard ("Bank It")
 GOLD_REVERSAL_GUARD_ENABLED: bool = _env_bool("GOLD_REVERSAL_GUARD_ENABLED", True)
-ARM_THRESHOLD_PCT: float = _env_float("ARM_THRESHOLD_PCT", 0.85, min_val=0.10, max_val=0.99)
+ARM_THRESHOLD_PCT: float = _env_float("ARM_THRESHOLD_PCT", 0.90, min_val=0.10, max_val=0.99)
 GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.95)
 MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
     "MIN_GOLD_PULLBACK_DOLLARS", 1.50, min_val=0.10, max_val=50.0, positive_only=True
@@ -245,7 +245,7 @@ ATR_NOISE_FLOOR_MULT: float = _env_float("ATR_NOISE_FLOOR_MULT", 0.35, min_val=0
 M1_ATR_PERIOD: int = _env_int("M1_ATR_PERIOD", 14, min_val=2, max_val=200)
 MAX_GIVEBACK_DOLLARS: float = _env_float("MAX_GIVEBACK_DOLLARS", 4.50, min_val=0.0, max_val=200.0)
 MAX_ALLOWED_SPREAD_DOLLARS: float = _env_float(
-    "MAX_ALLOWED_SPREAD_DOLLARS", 0.40, min_val=0.05, max_val=20.0, positive_only=True
+    "MAX_ALLOWED_SPREAD_DOLLARS", 0.45, min_val=0.05, max_val=20.0, positive_only=True
 )
 ADAPTIVE_SPREAD_CEILING_DOLLARS: float = _env_float(
     "ADAPTIVE_SPREAD_CEILING_DOLLARS", 0.80, min_val=0.05, max_val=20.0, positive_only=True
@@ -474,12 +474,12 @@ STAGED_EXIT_ENABLED: bool = _env_bool("STAGED_EXIT_ENABLED", True)
 
 # Stage 1 (TP1 cleared) — reuses v3.4.2 keys for .env compatibility
 TP1_TRAIL_ENABLED: bool = _env_bool("TP1_TRAIL_ENABLED", True)
-TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.5, min_val=0.1, max_val=20.0)
+TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.55, min_val=0.1, max_val=20.0)
 TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.50, min_val=0.10, max_val=100.0)
 TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.50, min_val=0.10, max_val=100.0)
 TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.25, min_val=0.01, max_val=20.0)
 STAGE1_ATR_ACTIVATION_PCT: float = _env_float(
-    "STAGE1_ATR_ACTIVATION_PCT", 0.45, min_val=0.0, max_val=1.0
+    "STAGE1_ATR_ACTIVATION_PCT", 0.50, min_val=0.0, max_val=1.0
 )
 
 # Stage 2 (TP2 cleared)
@@ -579,3 +579,187 @@ def validate_staged_trail_tiers(
 
 
 STAGED_TRAIL_TIERS: Dict[int, Tuple[float, float, float]] = validate_staged_trail_tiers()
+
+
+# ===========================================================================
+# v3.6.0 PROGRESSIVE PROFIT RATCHET + HIGHER-TP STAGED BANKING
+# ===========================================================================
+PROFIT_RATCHET_ENABLED: bool = _env_bool("PROFIT_RATCHET_ENABLED", True)
+RATCHET_BROKER_STEP_DOLLARS: float = _env_float(
+    "RATCHET_BROKER_STEP_DOLLARS", 0.25, min_val=0.05, max_val=10.0, positive_only=True
+)
+STOP_LEVEL_SAFETY_BUFFER_DOLLARS: float = _env_float(
+    "STOP_LEVEL_SAFETY_BUFFER_DOLLARS", 0.05, min_val=0.0, max_val=5.0
+)
+HARD_MAX_SPREAD_DOLLARS: float = _env_float(
+    "HARD_MAX_SPREAD_DOLLARS", 1.25, min_val=0.20, max_val=20.0, positive_only=True
+)
+MIN_VALID_SPREAD_DOLLARS: float = _env_float(
+    "MIN_VALID_SPREAD_DOLLARS", 0.05, min_val=0.0, max_val=5.0
+)
+
+# Ratchet Tiers (Stage 0 -> Stage 5 + Near-Target Squeeze)
+RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS: float = _env_float(
+    "RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS", 3.50, min_val=0.50, max_val=20.0, positive_only=True
+)
+RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS", 2.00, min_val=0.50, max_val=20.0, positive_only=True
+)
+RATCHET_TIGHT_TP1_LOCK_PCT: float = _env_float(
+    "RATCHET_TIGHT_TP1_LOCK_PCT", 0.40, min_val=0.10, max_val=0.90
+)
+RATCHET_LIFT_MIN_MFE_DOLLARS: float = _env_float(
+    "RATCHET_LIFT_MIN_MFE_DOLLARS", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+RATCHET_TIER1A_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER1A_MFE_DOLLARS", 3.50, min_val=0.50, max_val=20.0, positive_only=True
+)
+RATCHET_TIER1A_LOCK_DOLLARS: float = _env_float(
+    "RATCHET_TIER1A_LOCK_DOLLARS", 0.50, min_val=0.10, max_val=10.0, positive_only=True
+)
+RATCHET_TIER1B_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER1B_MFE_DOLLARS", 4.25, min_val=0.50, max_val=20.0, positive_only=True
+)
+RATCHET_TIER1B_LOCK_DOLLARS: float = _env_float(
+    "RATCHET_TIER1B_LOCK_DOLLARS", 0.75, min_val=0.10, max_val=10.0, positive_only=True
+)
+RATCHET_TIER2_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER2_MFE_DOLLARS", 5.00, min_val=1.00, max_val=30.0, positive_only=True
+)
+RATCHET_TIER2_RETENTION_PCT: float = _env_float(
+    "RATCHET_TIER2_RETENTION_PCT", 0.30, min_val=0.10, max_val=0.90
+)
+RATCHET_TIER2_MIN_LOCK_DOLLARS: float = _env_float(
+    "RATCHET_TIER2_MIN_LOCK_DOLLARS", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+)
+RATCHET_TIER2_MIN_CUSHION: float = _env_float(
+    "RATCHET_TIER2_MIN_CUSHION", 3.50, min_val=0.50, max_val=20.0, positive_only=True
+)
+RATCHET_TIER2_MAX_CUSHION: float = _env_float(
+    "RATCHET_TIER2_MAX_CUSHION", 4.00, min_val=0.50, max_val=25.0, positive_only=True
+)
+RATCHET_TIER3_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER3_MFE_DOLLARS", 8.00, min_val=1.00, max_val=50.0, positive_only=True
+)
+RATCHET_TIER3_RETENTION_PCT: float = _env_float(
+    "RATCHET_TIER3_RETENTION_PCT", 0.55, min_val=0.10, max_val=0.95
+)
+RATCHET_TIER3_MIN_CUSHION: float = _env_float(
+    "RATCHET_TIER3_MIN_CUSHION", 3.50, min_val=0.50, max_val=25.0, positive_only=True
+)
+RATCHET_TIER3_MAX_CUSHION: float = _env_float(
+    "RATCHET_TIER3_MAX_CUSHION", 4.25, min_val=0.50, max_val=30.0, positive_only=True
+)
+RATCHET_TIER4_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER4_MFE_DOLLARS", 15.00, min_val=2.00, max_val=100.0, positive_only=True
+)
+RATCHET_TIER4_RETENTION_PCT: float = _env_float(
+    "RATCHET_TIER4_RETENTION_PCT", 0.68, min_val=0.10, max_val=0.95
+)
+RATCHET_TIER4_MIN_CUSHION: float = _env_float(
+    "RATCHET_TIER4_MIN_CUSHION", 3.75, min_val=0.50, max_val=30.0, positive_only=True
+)
+RATCHET_TIER4_MAX_CUSHION: float = _env_float(
+    "RATCHET_TIER4_MAX_CUSHION", 5.00, min_val=0.50, max_val=40.0, positive_only=True
+)
+RATCHET_TIER5_MFE_DOLLARS: float = _env_float(
+    "RATCHET_TIER5_MFE_DOLLARS", 25.00, min_val=5.00, max_val=200.0, positive_only=True
+)
+RATCHET_TIER5_RETENTION_PCT: float = _env_float(
+    "RATCHET_TIER5_RETENTION_PCT", 0.78, min_val=0.10, max_val=0.98
+)
+RATCHET_TIER5_MIN_CUSHION: float = _env_float(
+    "RATCHET_TIER5_MIN_CUSHION", 4.50, min_val=0.50, max_val=40.0, positive_only=True
+)
+RATCHET_TIER5_MAX_CUSHION: float = _env_float(
+    "RATCHET_TIER5_MAX_CUSHION", 6.00, min_val=0.50, max_val=50.0, positive_only=True
+)
+RATCHET_STAGE4_RETENTION_PCT: float = _env_float(
+    "RATCHET_STAGE4_RETENTION_PCT", 0.85, min_val=0.10, max_val=0.98
+)
+RATCHET_STAGE4_MIN_CUSHION: float = _env_float(
+    "RATCHET_STAGE4_MIN_CUSHION", 3.00, min_val=0.50, max_val=30.0, positive_only=True
+)
+RATCHET_STAGE4_MAX_CUSHION: float = _env_float(
+    "RATCHET_STAGE4_MAX_CUSHION", 4.50, min_val=0.50, max_val=40.0, positive_only=True
+)
+PEAK_HARVEST_ARM_PCT: float = _env_float(
+    "PEAK_HARVEST_ARM_PCT", 0.85, min_val=0.50, max_val=0.99
+)
+PEAK_HARVEST_CUSHION_MULT: float = _env_float(
+    "PEAK_HARVEST_CUSHION_MULT", 0.65, min_val=0.20, max_val=1.00
+)
+PEAK_HARVEST_MIN_BROKER_CUSHION: float = _env_float(
+    "PEAK_HARVEST_MIN_BROKER_CUSHION", 2.75, min_val=0.50, max_val=20.0, positive_only=True
+)
+PEAK_HARVEST_MIN_VIRT_CUSHION: float = _env_float(
+    "PEAK_HARVEST_MIN_VIRT_CUSHION", 2.25, min_val=0.50, max_val=20.0, positive_only=True
+)
+PEAK_HARVEST_MAX_CUSHION: float = _env_float(
+    "PEAK_HARVEST_MAX_CUSHION", 3.50, min_val=0.50, max_val=25.0, positive_only=True
+)
+
+# Pre-TP1 BANK_HARVEST, Tiered Waterfall & Pending Order Hygiene
+BANK_HARVEST_ENABLED: bool = _env_bool("BANK_HARVEST_ENABLED", True)
+BANK_HARVEST_ARM_MFE_DOLLARS: float = _env_float(
+    "BANK_HARVEST_ARM_MFE_DOLLARS", 5.00, min_val=1.00, max_val=50.0, positive_only=True
+)
+BANK_HARVEST_ALT_ARM_PCT: float = _env_float(
+    "BANK_HARVEST_ALT_ARM_PCT", 0.80, min_val=0.30, max_val=0.99
+)
+BANK_HARVEST_ALT_MIN_MFE_DOLLARS: float = _env_float(
+    "BANK_HARVEST_ALT_MIN_MFE_DOLLARS", 2.50, min_val=0.50, max_val=20.0, positive_only=True
+)
+BANK_HARVEST_PULLBACK_ATR_MULT: float = _env_float(
+    "BANK_HARVEST_PULLBACK_ATR_MULT", 1.15, min_val=0.20, max_val=5.0, positive_only=True
+)
+BANK_HARVEST_PULLBACK_MIN: float = _env_float(
+    "BANK_HARVEST_PULLBACK_MIN", 1.75, min_val=0.50, max_val=20.0, positive_only=True
+)
+BANK_HARVEST_PULLBACK_MAX: float = _env_float(
+    "BANK_HARVEST_PULLBACK_MAX", 2.50, min_val=0.50, max_val=25.0, positive_only=True
+)
+BANK_HARVEST_BROKER_CUSHION_DOLLARS: float = _env_float(
+    "BANK_HARVEST_BROKER_CUSHION_DOLLARS", 2.50, min_val=0.50, max_val=25.0, positive_only=True
+)
+TIERED_STAGE_BANKING_ENABLED: bool = _env_bool("TIERED_STAGE_BANKING_ENABLED", True)
+CANCEL_PENDING_ON_BE: bool = _env_bool("CANCEL_PENDING_ON_BE", True)
+CANCEL_PENDING_ON_PROFIT_LOCK: bool = _env_bool("CANCEL_PENDING_ON_PROFIT_LOCK", True)
+PENDING_PNL_BACKFILL_MAX_SECONDS: float = _env_float(
+    "PENDING_PNL_BACKFILL_MAX_SECONDS", 60.0, min_val=5.0, max_val=600.0, positive_only=True
+)
+
+# v3.6.0+ Pending Order Consolidation, Duplicate Guard & TP Sanity (Fix B)
+SINGLE_PRICE_CONSOLIDATE_ORDERS: bool = _env_bool("SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
+PENDING_DUPLICATE_PRICE_TOLERANCE: float = _env_float(
+    "PENDING_DUPLICATE_PRICE_TOLERANCE", 0.50, min_val=0.0, max_val=20.0
+)
+PENDING_DUPLICATE_ORDER_TOLERANCE: float = _env_float(
+    "PENDING_DUPLICATE_ORDER_TOLERANCE", 0.25, min_val=0.0, max_val=20.0
+)
+MAX_TP_DISTANCE_DOLLARS: float = _env_float(
+    "MAX_TP_DISTANCE_DOLLARS", 250.0, min_val=10.0, max_val=2000.0, positive_only=True
+)
+
+
+def validate_ratchet_cushion_pairs() -> None:
+    """Ensure all v3.6 min/max cushion and pullback pairs satisfy min <= max."""
+    g = globals()
+    pairs = (
+        ("RATCHET_TIER2_MIN_CUSHION", "RATCHET_TIER2_MAX_CUSHION"),
+        ("RATCHET_TIER3_MIN_CUSHION", "RATCHET_TIER3_MAX_CUSHION"),
+        ("RATCHET_TIER4_MIN_CUSHION", "RATCHET_TIER4_MAX_CUSHION"),
+        ("RATCHET_TIER5_MIN_CUSHION", "RATCHET_TIER5_MAX_CUSHION"),
+        ("RATCHET_STAGE4_MIN_CUSHION", "RATCHET_STAGE4_MAX_CUSHION"),
+        ("BANK_HARVEST_PULLBACK_MIN", "BANK_HARVEST_PULLBACK_MAX"),
+        ("PEAK_HARVEST_MIN_BROKER_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
+        ("PEAK_HARVEST_MIN_VIRT_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
+    )
+    for min_k, max_k in pairs:
+        mn, mx = float(g[min_k]), float(g[max_k])
+        if mn > mx:
+            _cfg_logger.warning(f"{min_k} ({mn:.2f}) > {max_k} ({mx:.2f}); swapping to keep min <= max.")
+            g[min_k], g[max_k] = mx, mn
+
+
+validate_ratchet_cushion_pairs()

@@ -57,6 +57,8 @@ def _pin_v352_defaults(monkeypatch):
     """Pin deterministic v3.5.2 config & module globals regardless of local `.env`."""
     defaults = {
         "STAGED_EXIT_ENABLED": True,
+        "PROFIT_RATCHET_ENABLED": False,
+        "TIERED_STAGE_BANKING_ENABLED": False,
         "BE_OFFSET_PIPS": 5.0,
         "BE_AFTER_TP1": True,
         "RUNNER_MAX_TP_STAGE": 5,

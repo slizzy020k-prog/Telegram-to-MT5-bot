@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -10,6 +11,7 @@ from config import (
     LAYER_LOTS,
     MAX_ORDERS_PER_SIGNAL,
     MAX_SL_PIPS,
+    MAX_TP_DISTANCE_DOLLARS,
     SINGLE_PRICE_LOT,
     TP2_STEP_PIPS,
     TP3_STEP_PIPS,
@@ -80,6 +82,33 @@ _UNAMBIGUOUS_BE_PATTERNS = [
 
 BREAKEVEN_PATTERNS = [r"\bbe\b"] + _UNAMBIGUOUS_BE_PATTERNS
 
+_BE_NON_COMMAND_RE = re.compile(
+    r"(?:"
+    # Conditionals: "If we break even enter again.", "When price gets stopped at BE..."
+    r"\b(?:if|when|whenever|in\s+case|should|once)\s+(?:we|it|you|price|gold|this|trade|trades|sells?|buys?|entries?)?\s*"
+    r"(?:get\s+|got\s+|gets\s+|hit\s+|hits\s+|are\s+|is\s+)?"
+    r"(?:stopped\s+(?:out\s+)?(?:at\s+|on\s+)?|closed\s+(?:at\s+|on\s+)?|taken\s+out\s+(?:at\s+|on\s+)?)?"
+    r"(?:breakevens?|break[\s\-]+evens?|be)\b"
+    r"|"
+    # Past-tense / passive BE-hit recaps (scoped strictly to BE so "TP1 hit, go breakeven!" passes)
+    r"\b(?:breakevens?|break[\s\-]+evens?|be)\s+(?:was\s+|is\s+|got\s+|just\s+|has\s+been\s+)?"
+    r"(?:hit|hits|hitted|triggered|tagged|touched|smashed|stopped|wicked|taken\s+out|closed)\b"
+    r"|"
+    r"\b(?:hit|hits|hitted|triggered|tagged|touched|stopped(?:\s+out)?|wicked(?:\s+out)?|taken\s+out|closed(?:\s+out)?|out)\s+"
+    r"(?:at\s+|on\s+|by\s+)?(?:our\s+|my\s+|the\s+)?(?:breakevens?|break[\s\-]+evens?|be)\b"
+    r"|"
+    # Negations: "don't breakeven", "wait to move sl to BE"
+    r"\b(?:don'?t|do\s+not|no|not|never|avoid|hold\s+off(?:\s+on)?|wait(?:\s+for|\s+before|\s+to)?)\s+"
+    r"(?:set\s+|go\s+|move\s+(?:sl\s+)?(?:to\s+)?|put\s+(?:sl\s+)?(?:to\s+)?)?"
+    r"(?:breakevens?|break[\s\-]+evens?|be)\b"
+    r"|"
+    # Discretionary / optional chatter: "move sl to BE if you want", "if you'd like", "up to you"
+    r"\b(?:if\s+(?:you|u)\s+(?:want(?:\s+to)?|would\s+like(?:\s+to)?|'d\s+like(?:\s+to)?|prefer|wish|choose)|"
+    r"(?:it'?s\s+)?up\s+to\s+(?:you|u)|at\s+your\s+(?:own\s+)?discretion|optional(?:ly)?)\b"
+    r")",
+    re.IGNORECASE,
+)
+
 WORST_HOLD_PATTERNS = [
     r"\bclose\s+worst\b",
     r"\bworst\s+entr(?:y|ies)\b",
@@ -100,6 +129,16 @@ PARTIAL_CLOSE_PATTERNS = [
     r"\bclose\s+50\s*%",
     r"\bbank\s+profit\b",
 ]
+
+CANCEL_PENDING_PATTERNS = [
+    r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:all\s+|the\s+|my\s+|our\s+|this\s+|these\s+|remaining\s+|unfilled\s+)*(?:pending\s+)?(?:(?:buy|sell)(?:\s*(?:/|and|&|,)\s*(?:buy|sell))?\s+)+(?:(?:xauusd(?:\.[a-z0-9]+)?|gold|xau)\s+)?(?:pending\s+)?(?:limits?|stops?|orders?)\b",
+    r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+(?:all\s+|the\s+|my\s+|our\s+|this\s+|these\s+|remaining\s+|unfilled\s+)*(?:pending\s+(?:limits?|stops?|orders?)|(?:buy|sell)\s+pending|limits|stops)\b",
+    r"\b(?:delete|cancel|remove|clear|drop|kill|void)\s+pending\b",
+]
+_CANCEL_PENDING_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|didn'?t|not|never|no\s+need\s+to)\s+(?:delete|cancel|remove|clear|drop|kill|void)\b",
+    re.IGNORECASE,
+)
 
 FULL_CLOSE_PATTERNS = [
     r"^\s*close\s*[!.]*\s*$",                        # bare "close" (whole message only)
@@ -246,6 +285,12 @@ SINGLE_PRICE_PATTERN = re.compile(
 TP_PATTERN = re.compile(
     r"\b(?:tp|take\s*profit|target)(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:(?:to|at|is)\s+)?(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
     re.IGNORECASE,
+)
+
+# Context-gated "FP" typo for "TP" at start of line (e.g. "FP 3685" in a real Gold setup with TP/SL anchor)
+_FP_TYPO_LINE_PATTERN = re.compile(
+    r"^\s*fp(?:#?([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s+([1-9])(?:\s*[:=@\-\.]\s*|\s*->\s*|\s+)|\s*[:=@\-]?\s*(?:->\s*)?)(?:(?:to|at|is)\s+)?(?:[\u2600-\U0001FAFF]\s*)?(\d{2,6}(?:\.\d+)?)\b(?!\s*pips?\b)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Stop Loss patterns (explicit SL/Stoploss + standalone Stop excluding "Buy stop <price>")
@@ -624,7 +669,7 @@ def _has_real_trade_structure(text: str) -> bool:
 def _is_unambiguous_breakeven_cmd(lower: str) -> bool:
     """
     Return True when `lower` contains an explicit breakeven command (without needing a reply),
-    excluding priced new-signal entries and past-tense 'entry was' recaps.
+    excluding priced new-signal entries, past-tense recaps, conditionals, and negations.
     """
     words = lower.split()
     if not words or len(words) > 30:
@@ -632,6 +677,8 @@ def _is_unambiguous_breakeven_cmd(lower: str) -> bool:
     if DIRECTION_PATTERN.search(lower) and re.search(r"\b\d{4}(?:\.\d+)?\b", lower):
         return False
     if re.search(r"\bentry\s+was\b|\blast\s+night\b|\byesterday\b", lower):
+        return False
+    if _BE_NON_COMMAND_RE.search(lower):
         return False
     return any(re.search(p, lower) for p in _UNAMBIGUOUS_BE_PATTERNS)
 
@@ -718,10 +765,20 @@ def gate_3_classify_trade_management(
     has_4digit_price = bool(re.search(r"\b\d{4}(?:\.\d+)?\b", lower))
     unambig_be = _is_unambiguous_breakeven_cmd(lower)
 
+    _matches_cancel_pending_phrase = any(re.search(p, lower) for p in CANCEL_PENDING_PATTERNS)
+    if _matches_cancel_pending_phrase and _CANCEL_PENDING_NEGATION_RE.search(lower):
+        return None
+    _is_cancel_pending = (
+        _matches_cancel_pending_phrase
+        and "?" not in lower
+        and not _MARKET_NOW_PATTERN.search(lower)
+        and not re.search(r"\b(?:sl|tp\d*|stop\s*loss|take\s*profit)\b", lower)
+    )
+
     if not effective_is_reply:
         # Non-reply chatter must never act on a live trade by accident:
         # 1) Anything that looks like a priced entry signal is NOT a management command.
-        if has_direction and has_4digit_price:
+        if has_direction and has_4digit_price and not _is_cancel_pending:
             return None
         # 2) Long messages are conversation, not commands (except explicit TP-milestone-hit edits or unambiguous BE commands).
         if word_count > 10:
@@ -738,7 +795,7 @@ def gate_3_classify_trade_management(
                 action = "ACTION_TP3_HIT"
                 cancel_limits = False
                 tp_hit_stage = 3
-            elif not unambig_be:
+            elif not unambig_be and not (_is_cancel_pending and word_count <= 20):
                 return None
 
     # Ambiguous single words (e.g. "be careful", "cut your losses", "exit early") are only
@@ -758,6 +815,18 @@ def gate_3_classify_trade_management(
         action = "ACTION_CLOSE_WORST_HOLD_LAYERS"
         cancel_limits = False
 
+    # 1b. Cancel Pending Limit/Stop Orders (preserving bare "delete limit" -> ACTION_FULL_CLOSE)
+    cancel_direction: Optional[str] = None
+    if not action and _is_cancel_pending:
+        action = "ACTION_CANCEL_PENDING"
+        cancel_limits = True
+        _has_buy_kw = bool(re.search(r"\bbuy\b", lower))
+        _has_sell_kw = bool(re.search(r"\bsell\b", lower))
+        if _has_buy_kw and not _has_sell_kw:
+            cancel_direction = "BUY"
+        elif _has_sell_kw and not _has_buy_kw:
+            cancel_direction = "SELL"
+
     # 2. Full Close / Invalidate / Cancel
     if not action and _hit(FULL_CLOSE_PATTERNS):
         action = "ACTION_FULL_CLOSE"
@@ -771,7 +840,7 @@ def gate_3_classify_trade_management(
     )
     if not action and is_tp1_eligible:
         hit_stage = detect_tp_milestone_hit(lower)
-        if hit_stage == 1 and (effective_is_reply or is_edit or not unambig_be):
+        if hit_stage == 1 and not unambig_be:
             action = "ACTION_TP1_HIT_REPLY"
             cancel_limits = True
             tp_hit_stage = 1
@@ -785,7 +854,7 @@ def gate_3_classify_trade_management(
             tp_hit_stage = 3
 
     # 4. Breakeven
-    if not action and _hit(BREAKEVEN_PATTERNS):
+    if not action and not _BE_NON_COMMAND_RE.search(lower) and _hit(BREAKEVEN_PATTERNS):
         action = "ACTION_BREAKEVEN"
         cancel_limits = True
 
@@ -905,11 +974,38 @@ def gate_3_classify_trade_management(
         }
         if tp_hit_stage is not None:
             payload["tp_hit_stage"] = tp_hit_stage
+        if action == "ACTION_CANCEL_PENDING":
+            payload["direction"] = cancel_direction
+            payload["cancel_direction"] = cancel_direction
         mgmt_obj = SignalAction(payload)
         logger.info(f"Gate 3: Classified trade management command: {action} (ReplyTo: {reply_to_msg_id})")
         return mgmt_obj
 
     return None
+
+
+def _has_fp_context_anchor(text: str) -> bool:
+    """Allow line-start 'FP' TP typo only when text already has a valid TP or Gold SL anchor."""
+    if not text:
+        return False
+    if TP_PATTERN.search(text):
+        return True
+    for m in _EXPLICIT_SL_PATTERN.finditer(text):
+        try:
+            if 500.0 <= float(m.group(1)) < 100000.0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
+def _iter_tp_matches_in_order(text: str) -> List[re.Match]:
+    """Return TP_PATTERN matches (plus context-gated _FP_TYPO_LINE_PATTERN matches) in document order."""
+    matches = list(TP_PATTERN.finditer(text))
+    if _has_fp_context_anchor(text):
+        matches.extend(_FP_TYPO_LINE_PATTERN.finditer(text))
+        matches.sort(key=lambda m: m.start())
+    return matches
 
 
 def extract_labeled_tps(text: str) -> Tuple[Dict[str, float], List[float]]:
@@ -922,7 +1018,7 @@ def extract_labeled_tps(text: str) -> Tuple[Dict[str, float], List[float]]:
     if not text:
         return labeled, unlabeled
 
-    for m in TP_PATTERN.finditer(text):
+    for m in _iter_tp_matches_in_order(text):
         idx_str = m.group(1) or m.group(2)
         price = round(float(m.group(3)), 2)
         if idx_str:
@@ -947,7 +1043,7 @@ def extract_tps(text: str, direction: str = "BUY") -> List[float]:
     labeled: Dict[int, float] = {}
     unlabeled: List[float] = []
 
-    for m in TP_PATTERN.finditer(text):
+    for m in _iter_tp_matches_in_order(text):
         idx_str = m.group(1) or m.group(2)
         price = float(m.group(3))
         if idx_str:
@@ -976,6 +1072,7 @@ def _strip_entry_text(text: str) -> str:
     """Extract only entry-relevant segments before TP/SL clauses for zone/price parsing."""
     clean_lines = []
     seen_targets = False
+    allow_fp = _has_fp_context_anchor(text)
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -984,7 +1081,7 @@ def _strip_entry_text(text: str) -> str:
             r"^(?:tp\d*|sl|stop\s*loss|stoploss|stop|take\s*profit|target\d*)\b",
             stripped,
             re.IGNORECASE,
-        ):
+        ) or (allow_fp and _FP_TYPO_LINE_PATTERN.match(stripped)):
             seen_targets = True
             continue
         has_inline_target = bool(
@@ -1405,6 +1502,28 @@ def gate_4_extract_signal(
     })
 
 
+def _is_valid_tp_vs_ref(
+    val: Any,
+    direction: str,
+    tp_ref: Optional[float],
+    max_dist: float,
+) -> bool:
+    """Validate a single TP candidate against Gold range, direction, and max distance."""
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(fv):
+        return False
+    if fv < 500.0 or fv >= 100000.0:
+        return False
+    if tp_ref is None:
+        return fv >= 1000.0
+    if (direction or "BUY").upper() == "BUY":
+        return fv > tp_ref and (fv - tp_ref) <= max_dist
+    return fv < tp_ref and (tp_ref - fv) <= max_dist
+
+
 def gate_5_validate_price_sanity(
     action: SignalAction,
     live_price: Optional[float] = None,
@@ -1412,12 +1531,11 @@ def gate_5_validate_price_sanity(
 ) -> SignalAction:
     """
     Gate 5: Price & Typo Sanity Validation.
-    Prevents missing-digit typos (e.g. SL 387 vs 3875) from wiping accounts.
+    Prevents missing-digit typos (e.g. SL 387 vs 3875) and wrong-side/out-of-range TPs
+    from wiping accounts or triggering 10016 Invalid stops errors.
     """
-    direction = action.get("direction", "BUY")
+    direction = (action.get("direction") or "BUY").upper()
     raw_sl = action.get("sl")
-    final_tp = action.get("final_tp")
-    raw_tp1 = action.get("raw_tp1")
     tiers = action.get("entry_tiers")
     single_p = action.get("single_price")
 
@@ -1433,14 +1551,99 @@ def gate_5_validate_price_sanity(
         sl_ref = live_price
         tp_ref = live_price
 
-    # Validate TP sanity against entry price regardless of whether SL is present
-    if final_tp is not None and tp_ref is not None:
-        if direction == "BUY" and final_tp <= tp_ref:
-            logger.warning(f"Gate 5 Sanity Check: TP {final_tp} cannot be <= top entry {tp_ref} on BUY. Rejecting invalid TP!")
+    # Validate & sanitize ALL TP fields before checking SL (runs even when raw_sl is None)
+    max_tp_dist = float(MAX_TP_DISTANCE_DOLLARS)
+    raw_labeled_tps = dict(action.get("labeled_tps") or {})
+    raw_unlabeled_tps = list(action.get("unlabeled_tps") or [])
+    raw_explicit_tps = list(action.get("explicit_tps") or [])
+    raw_tp_levels = dict(action.get("tp_levels") or {})
+
+    valid_labeled: Dict[str, float] = {}
+    any_tp_stripped = False
+    for k, v in raw_labeled_tps.items():
+        if _is_valid_tp_vs_ref(v, direction, tp_ref, max_tp_dist):
+            valid_labeled[k] = round(float(v), 2)
+        else:
+            any_tp_stripped = True
+            logger.warning(
+                f"Gate 5 Sanity Check: Stripped invalid {direction} {k}={v} "
+                f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
+            )
+
+    valid_unlabeled: List[float] = []
+    for v in raw_unlabeled_tps:
+        if _is_valid_tp_vs_ref(v, direction, tp_ref, max_tp_dist):
+            valid_unlabeled.append(round(float(v), 2))
+        else:
+            any_tp_stripped = True
+            logger.warning(
+                f"Gate 5 Sanity Check: Stripped invalid {direction} unlabeled TP={v} "
+                f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
+            )
+
+    valid_explicit: List[float] = []
+    for v in raw_explicit_tps:
+        if _is_valid_tp_vs_ref(v, direction, tp_ref, max_tp_dist):
+            valid_explicit.append(round(float(v), 2))
+        else:
+            any_tp_stripped = True
+            logger.warning(
+                f"Gate 5 Sanity Check: Stripped invalid {direction} explicit TP={v} "
+                f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
+            )
+
+    if not raw_explicit_tps and (raw_tp_levels or any(action.get(f"raw_tp{i}") is not None for i in range(1, 6))):
+        fallback_vals: List[Any] = [raw_tp_levels.get(f"TP{i}") for i in range(1, 6)]
+        if not any(v is not None for v in fallback_vals):
+            fallback_vals = [action.get(f"raw_tp{i}") for i in range(1, 6)]
+        for v in fallback_vals:
+            if v is None:
+                continue
+            if _is_valid_tp_vs_ref(v, direction, tp_ref, max_tp_dist):
+                valid_explicit.append(round(float(v), 2))
+            else:
+                any_tp_stripped = True
+                logger.warning(
+                    f"Gate 5 Sanity Check: Stripped invalid {direction} fallback TP={v} "
+                    f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
+                )
+
+    if any_tp_stripped:
+        action["invalid_explicit_tps"] = list(raw_explicit_tps or raw_unlabeled_tps or raw_labeled_tps.values())
+        action["labeled_tps"] = valid_labeled
+        action["unlabeled_tps"] = valid_unlabeled
+        action["explicit_tps"] = valid_explicit
+        rebuilt_tp_levels = derive_tp_levels(valid_explicit, direction=direction) if valid_explicit else {}
+        action["tp_levels"] = rebuilt_tp_levels
+        for i in range(1, 6):
+            action[f"raw_tp{i}"] = rebuilt_tp_levels.get(f"TP{i}")
+        rebuilt_tp1 = action.get("raw_tp1")
+        if rebuilt_tp1 is not None:
+            pip_distance_20 = TP1_CLOSE_PROXIMITY_PIPS * 0.10
+            if direction == "BUY":
+                action["final_tp"] = round(rebuilt_tp1 - TP_FRONT_RUN_OFFSET, 2)
+                action["proximity_close_price"] = round(rebuilt_tp1 - pip_distance_20, 2)
+            else:
+                action["final_tp"] = round(rebuilt_tp1 + TP_FRONT_RUN_OFFSET, 2)
+                action["proximity_close_price"] = round(rebuilt_tp1 + pip_distance_20, 2)
+        else:
             action["final_tp"] = None
-        elif direction == "SELL" and final_tp >= tp_ref:
-            logger.warning(f"Gate 5 Sanity Check: TP {final_tp} cannot be >= bottom entry {tp_ref} on SELL. Rejecting invalid TP!")
-            action["final_tp"] = None
+            action["proximity_close_price"] = None
+
+    final_tp = action.get("final_tp")
+    if final_tp is not None and not _is_valid_tp_vs_ref(final_tp, direction, tp_ref, max_tp_dist):
+        logger.warning(
+            f"Gate 5 Sanity Check: Rejected final_tp={final_tp} on {direction} "
+            f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
+        )
+        action["final_tp"] = None
+        action["proximity_close_price"] = None
+        any_tp_stripped = True
+
+    action["tp_sanity_rejected"] = bool(any_tp_stripped)
+    action["tp_valid"] = not (bool(any_tp_stripped) and not bool(action.get("tp_levels")))
+    final_tp = action.get("final_tp")
+    raw_tp1 = action.get("raw_tp1")
 
     if raw_sl is None:
         action["sl_valid"] = False

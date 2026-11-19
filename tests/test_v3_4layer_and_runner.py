@@ -20,6 +20,15 @@ def _make_tick(bid: float, ask: float, ts: float = 1794886034.0) -> SimpleNamesp
     return SimpleNamespace(bid=bid, ask=ask, time=ts)
 
 
+@pytest.fixture(autouse=True)
+def _pin_v31_v35_baseline(monkeypatch):
+    """Pin pre-v3.6 Profit Ratchet & Tiered Stage Banking off for legacy v3.1-v3.5 tests."""
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
+
+
 def _make_sym_info(
     digits: int = 2,
     point: float = 0.01,
@@ -230,6 +239,10 @@ def test_4layer_zone_splitting_buy_sell_and_cross_boundary():
 
 
 def test_4layer_single_price_limit_and_stop_and_10016_fallback():
+    import config
+    orig_cons = getattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
     tick_ref = {"tick": _make_tick(3895.00, 3895.50)}
     env = _build_mock_mt5(tick_ref, start_ticket=6000)
     for p in env["patches"]:
@@ -292,6 +305,8 @@ def test_4layer_single_price_limit_and_stop_and_10016_fallback():
             assert len(mk4) == 4 and pd4 == []
             assert all(layers4[k]["order_type"] == "MARKET" for k in ("L1", "L2", "L3", "L4"))
     finally:
+        config.SINGLE_PRICE_CONSOLIDATE_ORDERS = orig_cons
+        ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = orig_cons
         for p in reversed(env["patches"]):
             p.stop()
 
@@ -950,6 +965,10 @@ async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_pa
     - Then breaks TP1 -> early layers bank TP1 -> L4 ignores 6-pip noisy dips near TP2 & TP3 -> reaches TP4!
     """
     monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
+    for k in ("STAGED_EXIT_ENABLED", "PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, k, False, raising=False)
+        monkeypatch.setattr(ex_mod, k, False, raising=False)
+        monkeypatch.setattr(main, k, False, raising=False)
     main.state_mgr = StateManager(tmp_path / "antichoke_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "antichoke_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)

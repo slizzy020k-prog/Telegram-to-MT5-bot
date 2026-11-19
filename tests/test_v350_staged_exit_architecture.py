@@ -44,6 +44,8 @@ def _pin_v350_staged_defaults(monkeypatch):
     """
     defaults = {
         "STAGED_EXIT_ENABLED": True,
+        "PROFIT_RATCHET_ENABLED": False,
+        "TIERED_STAGE_BANKING_ENABLED": False,
         "BE_OFFSET_PIPS": 5.0,
         "BE_AFTER_TP1": True,
         "RUNNER_MAX_TP_STAGE": 5,

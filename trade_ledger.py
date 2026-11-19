@@ -22,6 +22,14 @@ _CANONICAL_EXIT_REASON_CODES = {
     "TP_CEILING",
     "BROKER_SL",
     "MANUAL",
+    "BANK_HARVEST",
+    "BANK_HARVEST_SL",
+    "PROFIT_RATCHET_SL",
+    "BE_SL",
+    "STAGE0_PROFIT_LOCK",
+    "STAGE2_BANK_TP",
+    "PARTIAL_BANK",
+    "TRAILED_SL",
 }
 
 
@@ -100,6 +108,20 @@ def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> st
         return up
     if "signal deleted" in low or signal_data.get("deleted_from_chat"):
         return str(exit_reason or "Signal Deleted")
+    if "bank_harvest_sl" in low or "bank harvest sl" in low:
+        return "BANK_HARVEST_SL"
+    if "bank_harvest" in low or "bank harvest" in low:
+        return "BANK_HARVEST"
+    if "profit_ratchet" in low or "profit ratchet" in low:
+        return "PROFIT_RATCHET_SL"
+    if "stage0_profit_lock" in low or "stage 0 profit-lock" in low or "stage 0 profit lock" in low:
+        return "STAGE0_PROFIT_LOCK"
+    if "stage2_bank_tp" in low or "stage 2 bank" in low:
+        return "STAGE2_BANK_TP"
+    if "partial_bank" in low or "partial bank" in low:
+        return "PARTIAL_BANK"
+    if "be_sl" in low or "breakeven stop" in low or "breakeven sl" in low:
+        return "BE_SL"
     if "gold reversal guard" in low or "gold_guard" in low:
         return "GOLD_GUARD"
     if "shortfall" in low:
@@ -157,7 +179,7 @@ def _resolve_ref_entry(signal_data: Dict[str, Any], is_buy: bool) -> Optional[fl
     if runner_layer and isinstance(layers, dict):
         r_obj = layers.get(runner_layer)
         if isinstance(r_obj, dict):
-            for k in ("entry", "price_open", "target_price"):
+            for k in ("entry_price", "entry", "price_open", "target_price"):
                 if _is_num(r_obj.get(k)) and float(r_obj[k]) > 0:
                     return float(r_obj[k])
 
@@ -175,7 +197,7 @@ def _resolve_ref_entry(signal_data: Dict[str, Any], is_buy: bool) -> Optional[fl
         for lk in ("L4", "L3", "L2", "L1", "BOTTOM", "MID", "TOP"):
             l_obj = layers.get(lk)
             if isinstance(l_obj, dict):
-                for k in ("entry", "price_open", "target_price"):
+                for k in ("entry_price", "entry", "price_open", "target_price"):
                     if _is_num(l_obj.get(k)) and float(l_obj[k]) > 0:
                         return float(l_obj[k])
     return None
@@ -342,6 +364,7 @@ def build_trade_record(
     raw_tier = signal_data.get("trail_tier_used")
     trail_tier_used: Optional[Dict[str, Any]] = dict(raw_tier) if isinstance(raw_tier, dict) else None
 
+    layers = signal_data.get("layers")
     resolved_r_layers = [
         str(x)
         for x in (
@@ -370,6 +393,33 @@ def build_trade_record(
         or (resolved_r_layers[-1] if resolved_r_layers else None)
     )
 
+    layer_exits: List[Dict[str, Any]] = []
+    if isinstance(layers, dict):
+        for lk, lv in layers.items():
+            if not isinstance(lv, dict):
+                continue
+            st_lv = str(lv.get("status") or "").strip().upper()
+            if st_lv in _TERMINAL_UNFILLED_STATUSES and not lv.get("exit_deal_tickets") and lv.get("realized_pnl") is None:
+                continue
+            if st_lv == "PENDING" and not lv.get("exit_price"):
+                continue
+            l_entry = lv.get("entry_price") or lv.get("entry") or lv.get("price_open") or lv.get("target_price")
+            layer_exits.append({
+                "layer": str(lk),
+                "ticket": _safe_int(lv.get("ticket")),
+                "role": lv.get("role"),
+                "lot": round(_safe_float(lv.get("lot"), 0.0), 4),
+                "remaining_lot": round(_safe_float(lv.get("remaining_lot"), _safe_float(lv.get("lot"), 0.0)), 4),
+                "entry_price": round(float(l_entry), 4) if _is_num(l_entry) else None,
+                "mfe_peak_price": round(float(lv["mfe_peak_price"]), 4) if _is_num(lv.get("mfe_peak_price")) else None,
+                "mfe_dollars": round(float(lv["mfe_dollars"]), 4) if _is_num(lv.get("mfe_dollars")) else None,
+                "ratchet_tier": lv.get("ratchet_tier"),
+                "exit_price": round(float(lv["exit_price"]), 4) if _is_num(lv.get("exit_price")) else None,
+                "exit_reason_code": lv.get("exit_reason_code"),
+                "realized_pnl": round(float(lv["realized_pnl"]), 2) if _is_num(lv.get("realized_pnl")) else None,
+                "exit_deal_tickets": list(lv.get("exit_deal_tickets") or []),
+            })
+
     record: Dict[str, Any] = {
         "schema_version": 3,
         "closed_at": datetime.now(timezone.utc).isoformat(),
@@ -395,6 +445,7 @@ def build_trade_record(
         "max_favorable_excursion": mfe_dict,
         "giveback_from_peak": giveback_from_peak,
         "trail_tier_used": trail_tier_used,
+        "layer_exits": layer_exits,
         "realized_pnl": round(_safe_float(realized_pnl, 0.0), 2),
         "currency": str(currency or "GBP"),
         "dry_run": bool(dry_run),

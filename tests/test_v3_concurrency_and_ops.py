@@ -67,6 +67,9 @@ def _reset_runtime(tmp_path, name: str = "v3_ops"):
     main._telegram_reconnect_count = 0
     main.state_mgr = StateManager(tmp_path / f"{name}_state.json")
     main.trade_ledger = TradeLedger(tmp_path / f"{name}_ledger.jsonl")
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    main.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
 
 
 # ---------------------------------------------------------------------------

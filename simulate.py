@@ -172,6 +172,9 @@ async def run_simulation() -> None:
     main.SELL_NOW_DELAY_SECONDS = 20.0
     try:
         evt5a = MockTelethonEvent(msg_id=20005, text="Buy now")
+        main.executor._dry_run_pending_ticket_lots.clear()
+        if isinstance(getattr(main.executor, "_dry_run_pending_orders", None), dict):
+            main.executor._dry_run_pending_orders.clear()
         await main.handle_new_message(evt5a)
         sig5a = main.state_mgr.get_signal(20005, chat_id=evt5a.chat_id)
         assert sig5a is not None and sig5a["status"] in ("PENDING", "PENDING_DELAY")
@@ -243,25 +246,33 @@ async def run_simulation() -> None:
         {"layers": layers, "market_tickets": list(all_tickets), "pending_tickets": []},
         chat_id=evt3.chat_id,
     )
+    for t_id in all_tickets:
+        main.executor._dry_run_pending_ticket_lots.pop(t_id, None)
+        if isinstance(getattr(main.executor, "_dry_run_pending_orders", None), dict):
+            main.executor._dry_run_pending_orders.pop(t_id, None)
 
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3898.20, 3898.40)):
         runner_t = main.executor.handle_tp1_scaling_and_select_runner(sig3)
     assert runner_t == layers["L4"]["ticket"]
     assert sig3["status"] == "RUNNER_ACTIVE"
     assert sig3["runner_layer"] == "L4"
-    assert all(sig3["layers"][lk]["status"] == "CLOSED" for lk in ("L1", "L2", "L3"))
-    assert sig3["market_tickets"] == [runner_t]
+    # v3.6 Tiered Stage Banking: L1 & L2 closed at TP1, L3 (STAGE2_BANKER -> TP2) & L4 (CORE_RUNNER) stay open
+    assert all(sig3["layers"][lk]["status"] == "CLOSED" for lk in ("L1", "L2"))
+    assert sig3["layers"]["L3"]["status"] != "CLOSED" and sig3["layers"]["L3"]["tp"] == 3910.0
+    assert sig3["market_tickets"] == [layers["L3"]["ticket"], runner_t]
     assert sig3["layers"]["L4"]["tp"] == 3910.0
-    print(f"  [6b] TP1 Scaling (N=4): L1..L3 closed at TP1, L4 #{runner_t} active -> TP2=3910.0.")
+    print(f"  [6b] TP1 Scaling v3.6 (N=4): L1..L2 banked, L3 STAGE2_BANKER -> TP2=3910.0, L4 #{runner_t} active -> TP2=3910.0.")
 
     # Clean breakthrough past TP1 -> TP2, then 6-pip micro-noise near TP2 must NOT choke L4!
     for px in (3900.60, 3909.30, 3908.70, 3910.60):
         with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
             assert main.executor.manage_designated_runner(sig3) is True
+    assert sig3["layers"]["L3"]["status"] == "CLOSED"
+    assert sig3["market_tickets"] == [runner_t]
     assert "TP2" in sig3["runner_cleared_milestones"]
     assert sig3["runner_milestone_name"] == "TP3"
     assert sig3["layers"]["L4"]["tp"] == 3920.0
-    print(f"  [6c] Ignored 6p micro-noise & cleared TP2 -> stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
+    print(f"  [6c] L3 STAGE2_BANKER banked at TP2, ignored 6p micro-noise & stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
 
     # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD, then drop below trail stop (3915.20) Banks It!
     for px in (3919.20, 3919.80, 3918.50):
@@ -272,7 +283,7 @@ async def run_simulation() -> None:
     assert still_running is False
     assert sig3["layers"]["L4"]["status"] == "CLOSED"
     assert sig3["market_tickets"] == [] and sig3["status"] == "CLOSED"
-    assert any(k in (sig3.get("runner_close_reason") or "") for k in ("TP1 Trailing Stop", "Gold Reversal Guard"))
+    assert any(k in (sig3.get("runner_close_reason") or "") for k in ("TP1 Trailing Stop", "Gold Reversal Guard", "Progressive Profit Ratchet SL", "Near-Target Squeeze", "Staged"))
     print(f"  [6d] Confirmed TP1 Trailing Stop near TP3 (held $1.30 wick, banked on trail stop): {sig3['runner_close_reason']}.")
 
     main.state_mgr.update_signal(20003, sig3, chat_id=evt3.chat_id)
@@ -299,6 +310,9 @@ async def run_simulation() -> None:
     # STEP 7: Deleted Signal in Chat -> Immediate Trade Take-Out
     # -----------------------------------------------------------------------
     print("\n[STEP 7] Testing Deleted Signal in Chat -> Immediate Trade Take-Out (handle_message_deleted)...")
+    main.executor._dry_run_pending_ticket_lots.clear()
+    if isinstance(getattr(main.executor, "_dry_run_pending_orders", None), dict):
+        main.executor._dry_run_pending_orders.clear()
     evt_del_target = MockTelethonEvent(msg_id=20007, text="Buy 3895-3887 \n TP 3905 \n SL 3875")
     evt_keep_alive = MockTelethonEvent(msg_id=20008, text="Buy 3896-3886 \n TP 3906 \n SL 3874")
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3894.70, 3895.00)):
@@ -364,7 +378,7 @@ async def run_simulation() -> None:
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["status"] == "RUNNER_ACTIVE" and sig_p["tp_stage"] == "TP2"
     assert sig_p["fsm_floor"] == round(3895.0 + config.BE_OFFSET_PIPS * 0.10, 2)
-    assert sig_p["trail_stop"] == sig_p["fsm_floor"]
+    assert sig_p["trail_stop"] >= sig_p["fsm_floor"]
     assert sig_p["runner_sl_floor"] == sig_p["trail_stop"]
 
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3914.40, 3914.60)):

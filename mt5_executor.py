@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import MetaTrader5 as mt5
@@ -19,10 +20,20 @@ from config import (
     ARM_THRESHOLD_PCT,
     ATR_NOISE_FLOOR_MULT,
     AUTO_ADJUST_LOTS_TO_BALANCE,
+    BANK_HARVEST_ALT_ARM_PCT,
+    BANK_HARVEST_ALT_MIN_MFE_DOLLARS,
+    BANK_HARVEST_ARM_MFE_DOLLARS,
+    BANK_HARVEST_BROKER_CUSHION_DOLLARS,
+    BANK_HARVEST_ENABLED,
+    BANK_HARVEST_PULLBACK_ATR_MULT,
+    BANK_HARVEST_PULLBACK_MAX,
+    BANK_HARVEST_PULLBACK_MIN,
     BASE_LAYER_LOTS,
     BE_AFTER_TP1,
     BE_LAYERS,
     BE_OFFSET_PIPS,
+    CANCEL_PENDING_ON_BE,
+    CANCEL_PENDING_ON_PROFIT_LOCK,
     CANCEL_PENDING_ON_STAGE0_LOCK_EXIT,
     CANCEL_PENDING_ON_TP1,
     DAILY_LOSS_PAUSE_PCT,
@@ -36,6 +47,7 @@ from config import (
     GIVEBACK_PCT,
     GOLD_REVERSAL_GUARD_ENABLED,
     HARD_GIVEBACK_CEILING_DOLLARS,
+    HARD_MAX_SPREAD_DOLLARS,
     LAYER_LOTS,
     LAYER_NAMES,
     LEGACY_LAYER_MAP,
@@ -44,13 +56,52 @@ from config import (
     MAX_ALLOWED_SPREAD_DOLLARS,
     MAX_GIVEBACK_DOLLARS,
     MAX_ORDERS_PER_SIGNAL,
+    MAX_TP_DISTANCE_DOLLARS,
     MIN_GOLD_PULLBACK_DOLLARS,
     MIN_SL_BUFFER_PIPS,
+    MIN_VALID_SPREAD_DOLLARS,
     MT5_LOGIN,
     MT5_PASSWORD,
     MT5_PATH,
     MT5_SERVER,
     NO_TP2_SURGE_ARM_PIPS,
+    PEAK_HARVEST_ARM_PCT,
+    PEAK_HARVEST_CUSHION_MULT,
+    PEAK_HARVEST_MAX_CUSHION,
+    PEAK_HARVEST_MIN_BROKER_CUSHION,
+    PEAK_HARVEST_MIN_VIRT_CUSHION,
+    PENDING_DUPLICATE_ORDER_TOLERANCE,
+    PENDING_DUPLICATE_PRICE_TOLERANCE,
+    PROFIT_RATCHET_ENABLED,
+    RATCHET_BROKER_STEP_DOLLARS,
+    RATCHET_LIFT_MIN_MFE_DOLLARS,
+    RATCHET_STAGE4_MAX_CUSHION,
+    RATCHET_STAGE4_MIN_CUSHION,
+    RATCHET_STAGE4_RETENTION_PCT,
+    RATCHET_TIER1A_LOCK_DOLLARS,
+    RATCHET_TIER1A_MFE_DOLLARS,
+    RATCHET_TIER1B_LOCK_DOLLARS,
+    RATCHET_TIER1B_MFE_DOLLARS,
+    RATCHET_TIER2_MAX_CUSHION,
+    RATCHET_TIER2_MIN_CUSHION,
+    RATCHET_TIER2_MIN_LOCK_DOLLARS,
+    RATCHET_TIER2_MFE_DOLLARS,
+    RATCHET_TIER2_RETENTION_PCT,
+    RATCHET_TIER3_MAX_CUSHION,
+    RATCHET_TIER3_MIN_CUSHION,
+    RATCHET_TIER3_MFE_DOLLARS,
+    RATCHET_TIER3_RETENTION_PCT,
+    RATCHET_TIER4_MAX_CUSHION,
+    RATCHET_TIER4_MIN_CUSHION,
+    RATCHET_TIER4_MFE_DOLLARS,
+    RATCHET_TIER4_RETENTION_PCT,
+    RATCHET_TIER5_MAX_CUSHION,
+    RATCHET_TIER5_MIN_CUSHION,
+    RATCHET_TIER5_MFE_DOLLARS,
+    RATCHET_TIER5_RETENTION_PCT,
+    RATCHET_TIGHT_TP1_LOCK_PCT,
+    RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS,
+    RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS,
     RISK_LOT_MULTIPLIER,
     RUNNER_CLEAN_BREAK_PIPS,
     RUNNER_CONTINUOUS_TRAIL_ENABLED,
@@ -69,11 +120,14 @@ from config import (
     SHORTFALL_ARM_PIPS,
     SHORTFALL_CONFIRM_TICKS,
     SHORTFALL_PULLBACK_PIPS,
+    SINGLE_PRICE_CONSOLIDATE_ORDERS,
     STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS,
     STAGE0_PROFIT_LOCK_ENABLED,
     STAGE0_PROFIT_LOCK_OFFSET_PIPS,
     STAGE1_ATR_ACTIVATION_PCT,
     STAGED_EXIT_ENABLED,
+    STOP_LEVEL_SAFETY_BUFFER_DOLLARS,
+    TIERED_STAGE_BANKING_ENABLED,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
     TP1_TOUCH_BANK_BUFFER_PIPS,
@@ -188,6 +242,23 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "EMERGENCY_CUTOFF_LOSS_PCT",
         "DEFAULT_SYMBOL",
         "DAILY_PNL_CACHE_TTL_SECONDS",
+        "PROFIT_RATCHET_ENABLED",
+        "RATCHET_BROKER_STEP_DOLLARS",
+        "STOP_LEVEL_SAFETY_BUFFER_DOLLARS",
+        "HARD_MAX_SPREAD_DOLLARS",
+        "MIN_VALID_SPREAD_DOLLARS",
+        "RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS",
+        "RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS",
+        "RATCHET_TIGHT_TP1_LOCK_PCT",
+        "RATCHET_LIFT_MIN_MFE_DOLLARS",
+        "BANK_HARVEST_ENABLED",
+        "TIERED_STAGE_BANKING_ENABLED",
+        "CANCEL_PENDING_ON_BE",
+        "CANCEL_PENDING_ON_PROFIT_LOCK",
+        "SINGLE_PRICE_CONSOLIDATE_ORDERS",
+        "PENDING_DUPLICATE_PRICE_TOLERANCE",
+        "PENDING_DUPLICATE_ORDER_TOLERANCE",
+        "MAX_TP_DISTANCE_DOLLARS",
     )
 }
 
@@ -500,6 +571,7 @@ class MT5Executor:
         self._dry_run_capital: Optional[float] = None
         self._dry_run_ticket_lots: Dict[int, float] = {}
         self._dry_run_pending_ticket_lots: Dict[int, float] = {}
+        self._dry_run_pending_orders: Dict[int, Dict[str, Any]] = {}
         self._dry_run_daily_realized_pnl: float = 0.0
         self._dry_run_floating_pnl: float = 0.0
         self._dry_run_last_m1_candle: Optional[Dict[str, float]] = None
@@ -521,6 +593,10 @@ class MT5Executor:
         self._daily_loss_baseline_realized: float = 0.0
         self._daily_drawdown_ref_balance: Optional[float] = None
         self._daily_drawdown_baseline_date: Optional[str] = None
+        self._last_fill_prices: Dict[int, float] = {}
+        self.last_modify_result: Dict[str, Any] = {}
+        self._lift_abort_warn_ts: Dict[str, float] = {}
+        self._last_close_details: Dict[int, Dict[str, Any]] = {}
 
     def _record_ticket_placed(self, ticket: int) -> None:
         """Record monotonic placement timestamp for MT5 IPC visibility grace windows."""
@@ -887,29 +963,82 @@ class MT5Executor:
             logger.debug(f"Could not compute M1 ATR({eff_period}) for {symbol}: {e}")
             return 0.0
 
+    def is_valid_live_tick(self, symbol: str, tick: Any) -> bool:
+        """
+        Validate tick bid/ask sanity and guard against live corrupt zero-spread ticks
+        (< MIN_VALID_SPREAD_DOLLARS). Synthetic zero-spread ticks in dry_run remain allowed.
+        """
+        if tick is None:
+            return False
+        bid = _num(getattr(tick, "bid", 0.0), 0.0)
+        ask = _num(getattr(tick, "ask", 0.0), 0.0)
+        if bid <= 0.0 or ask <= 0.0 or ask < bid:
+            return False
+        spread = ask - bid
+        min_valid = float(_cfg("MIN_VALID_SPREAD_DOLLARS", MIN_VALID_SPREAD_DOLLARS))
+        if self.dry_run:
+            if spread > 1e-9 and spread + 1e-9 < min_valid:
+                return False
+        else:
+            if spread + 1e-9 < min_valid:
+                return False
+        return True
+
+    def is_within_freeze_level(
+        self, symbol: str, target_price: Optional[float], tick: Any = None, sym_info: Any = None
+    ) -> bool:
+        """
+        Return True when `target_price` sits inside broker `trade_freeze_level * point`
+        of current market bid/ask in live mode (always False in dry_run or when freeze == 0).
+        """
+        if self.dry_run or target_price is None or float(target_price) <= 0.0:
+            return False
+        info = sym_info if sym_info is not None else self.get_symbol_info(symbol)
+        if info is None:
+            return False
+        freeze_lvl = _num(getattr(info, "trade_freeze_level", 0.0), 0.0)
+        if freeze_lvl <= 0.0:
+            return False
+        pt = _num(getattr(info, "point", 0.01), 0.01) or 0.01
+        freeze_dist = freeze_lvl * pt
+        t = tick if tick is not None else self.get_tick(symbol)
+        if t is None:
+            return False
+        bid = _num(getattr(t, "bid", 0.0), 0.0)
+        ask = _num(getattr(t, "ask", 0.0), 0.0)
+        tp_f = float(target_price)
+        if bid > 0.0 and abs(tp_f - bid) <= freeze_dist + 1e-9:
+            return True
+        if ask > 0.0 and abs(tp_f - ask) <= freeze_dist + 1e-9:
+            return True
+        return False
+
     def check_spread_spike(self, symbol: str, tick: Any) -> Tuple[bool, float, float]:
         """
-        Adaptive Spread Spike Filter:
+        Adaptive Spread Spike Filter with absolute HARD_MAX_SPREAD_DOLLARS ($1.25) cap:
         - Returns `(is_spike, spread_dollars, max_allowed_spread_dollars)`.
-        - On low-spread ECN feeds (baseline <= MAX_ALLOWED_SPREAD_DOLLARS = $0.40), enforces
-          `max($0.40, 1.5 * rolling_median_spread)` so momentary spread spikes > $0.40 pause exits.
-        - On standard broker feeds like PU Prime (`XAUUSD.s` normal spread $0.50-$0.52 > $0.40),
-          adapts cleanly to `max(ADAPTIVE_SPREAD_CEILING_DOLLARS = $0.80, 1.5 * rolling_median_spread)`
-          so normal trading is never blocked while true news/rollover spikes (> $0.80) pause exits.
+        - Caps eff_max at HARD_MAX_SPREAD_DOLLARS so slow rollover ramps ($0.52 -> $2.60)
+          cannot poison the rolling median history.
+        - Corrupt zero-spread live ticks (< MIN_VALID_SPREAD_DOLLARS) do not pollute history.
         """
         cfg_max = float(_cfg("MAX_ALLOWED_SPREAD_DOLLARS", MAX_ALLOWED_SPREAD_DOLLARS))
         adapt_ceil = float(_cfg("ADAPTIVE_SPREAD_CEILING_DOLLARS", ADAPTIVE_SPREAD_CEILING_DOLLARS))
+        hard_max = float(_cfg("HARD_MAX_SPREAD_DOLLARS", HARD_MAX_SPREAD_DOLLARS))
+        min_valid = float(_cfg("MIN_VALID_SPREAD_DOLLARS", MIN_VALID_SPREAD_DOLLARS))
         mult = float(_cfg("ADAPTIVE_SPREAD_MULTIPLIER", ADAPTIVE_SPREAD_MULTIPLIER))
         if tick is None:
-            return False, 0.0, cfg_max
+            return False, 0.0, min(hard_max, cfg_max)
 
         bid = _num(getattr(tick, "bid", 0.0), 0.0)
         ask = _num(getattr(tick, "ask", 0.0), 0.0)
         if bid <= 0.0 or ask <= 0.0 or ask < bid:
-            return False, 0.0, cfg_max
+            return False, 0.0, min(hard_max, cfg_max)
 
         spread_dollars = round(ask - bid, 4)
-        sym_key = (symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)).upper()
+        if not self.dry_run and spread_dollars + 1e-9 < min_valid:
+            return True, spread_dollars, min(hard_max, cfg_max)
+
+        sym_key = (symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)).strip()
 
         with self._closing_lock:
             hist = self._spread_history.setdefault(sym_key, deque(maxlen=30))
@@ -921,12 +1050,12 @@ class MT5Executor:
                 else:
                     eff_max = max(cfg_max, round(mult * med, 4))
             else:
-                if not self.dry_run and spread_dollars <= adapt_ceil + 1e-6:
-                    hist.append(spread_dollars)
+                if spread_dollars <= min(hard_max, adapt_ceil) + 1e-6:
                     eff_max = max(adapt_ceil, round(mult * spread_dollars, 4)) if spread_dollars > cfg_max + 1e-6 else cfg_max
                 else:
                     eff_max = cfg_max
 
+            eff_max = round(min(hard_max, eff_max), 4)
             is_spike = spread_dollars > eff_max + 1e-6
             if not is_spike:
                 hist.append(spread_dollars)
@@ -1323,13 +1452,115 @@ class MT5Executor:
                 return None
             if self.dry_run:
                 self._dry_run_ticket_lots[ticket] = final_lot
+            fill_px = _num(getattr(result, "price", 0.0), 0.0) or float(entry_price)
+            self._last_fill_prices[ticket] = round(fill_px, digits)
+            if len(self._last_fill_prices) > 512:
+                self._last_fill_prices = dict(list(self._last_fill_prices.items())[-256:])
             self._record_ticket_placed(ticket)
             logger.info(
                 f"Opened Market {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
-                f"Lot={final_lot}, Price={entry_price}, SL={final_sl}, TP={final_tp}"
+                f"Lot={final_lot}, Price={fill_px}, SL={final_sl}, TP={final_tp}"
             )
             return ticket
         return None
+
+    @staticmethod
+    def _normalize_sym_base(symbol: Optional[str]) -> str:
+        s = (symbol or "").strip().upper()
+        if "." in s:
+            s = s.split(".", 1)[0]
+        if "_" in s:
+            s = s.split("_", 1)[0]
+        return s
+
+    def has_duplicate_pending_order(
+        self,
+        symbol: str,
+        direction: str,
+        price: float,
+        tolerance: Optional[float] = None,
+        exclude_tickets: Optional[Sequence[int]] = None,
+    ) -> Tuple[bool, Optional[int], Optional[float]]:
+        """
+        Check whether an unfilled pending LIMIT/STOP order already exists for the same
+        symbol + direction within `tolerance` price points (default PENDING_DUPLICATE_ORDER_TOLERANCE).
+        Returns (is_duplicate, matching_ticket, matching_price).
+        """
+        try:
+            target_px = float(price)
+        except (TypeError, ValueError):
+            return False, None, None
+        if not math.isfinite(target_px) or target_px <= 0.0:
+            return False, None, None
+
+        dir_norm = (direction or "").strip().upper()
+        if dir_norm not in ("BUY", "SELL"):
+            return False, None, None
+
+        tol = max(
+            0.0,
+            float(
+                tolerance
+                if tolerance is not None
+                else _cfg("PENDING_DUPLICATE_ORDER_TOLERANCE", PENDING_DUPLICATE_ORDER_TOLERANCE)
+            ),
+        )
+        excl: Set[int] = {
+            _int_num(t, 0) for t in (exclude_tickets or []) if _int_num(t, 0) > 0
+        }
+        sym_resolved = self.resolve_symbol(symbol)
+        target_base = self._normalize_sym_base(sym_resolved or symbol)
+
+        if self.dry_run or not self._connected:
+            dry_orders = getattr(self, "_dry_run_pending_orders", None)
+            if not isinstance(dry_orders, dict):
+                return False, None, None
+            active_lots = getattr(self, "_dry_run_pending_ticket_lots", {})
+            for stale_t in list(dry_orders.keys()):
+                if stale_t not in active_lots:
+                    dry_orders.pop(stale_t, None)
+            for t_k, rec in dry_orders.items():
+                if not isinstance(rec, dict):
+                    continue
+                t_int = _int_num(t_k, 0)
+                if t_int <= 0 or t_int in excl:
+                    continue
+                if self._normalize_sym_base(rec.get("symbol")) != target_base:
+                    continue
+                if str(rec.get("direction") or "").strip().upper() != dir_norm:
+                    continue
+                o_px = _num(rec.get("price"), 0.0)
+                if o_px > 0.0 and abs(o_px - target_px) <= tol + 1e-6:
+                    return True, t_int, o_px
+            return False, None, None
+
+        buy_types = (
+            _mt5_const("ORDER_TYPE_BUY_LIMIT", 2),
+            _mt5_const("ORDER_TYPE_BUY_STOP", 4),
+        )
+        sell_types = (
+            _mt5_const("ORDER_TYPE_SELL_LIMIT", 3),
+            _mt5_const("ORDER_TYPE_SELL_STOP", 5),
+        )
+        wanted_types = buy_types if dir_norm == "BUY" else sell_types
+
+        live_orders = self.get_live_orders(sym_resolved)
+        for ord_obj in live_orders:
+            t_int = _int_num(getattr(ord_obj, "ticket", 0), 0)
+            if t_int <= 0 or t_int in excl:
+                continue
+            o_type = _int_num(getattr(ord_obj, "type", -1), -1)
+            if o_type not in wanted_types:
+                continue
+            o_sym = getattr(ord_obj, "symbol", None)
+            if isinstance(o_sym, str) and o_sym.strip():
+                if self._normalize_sym_base(o_sym) != target_base:
+                    continue
+            o_px = _num(getattr(ord_obj, "price_open", 0.0), 0.0)
+            if o_px > 0.0 and abs(o_px - target_px) <= tol + 1e-6:
+                return True, t_int, o_px
+
+        return False, None, None
 
     def _place_pending_order(
         self,
@@ -1341,8 +1572,11 @@ class MT5Executor:
         tp: Optional[float],
         comment: str,
         pending_kind: str,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Optional[int]:
         """Shared pending LIMIT / STOP placement helper."""
+        self.last_error = None
         kind_upper = pending_kind.strip().upper()
         caller_label = "place_stop_order" if kind_upper == "STOP" else "place_limit_order"
         if price is None or float(price) <= 0.0:
@@ -1364,6 +1598,21 @@ class MT5Executor:
             order_type = _mt5_const("ORDER_TYPE_BUY_LIMIT", 2) if is_buy else _mt5_const("ORDER_TYPE_SELL_LIMIT", 3)
 
         target_price = round(float(price), digits)
+        if not allow_duplicate_price:
+            is_dup, dup_t, dup_px = self.has_duplicate_pending_order(
+                resolved_sym,
+                direction_norm,
+                target_price,
+                exclude_tickets=exclude_tickets,
+            )
+            if is_dup:
+                self.last_error = (
+                    f"Duplicate pending {direction_norm} order @ {target_price} "
+                    f"(matches #{dup_t} @ {dup_px})"
+                )
+                logger.warning(f"{caller_label} blocked: {self.last_error}")
+                return None
+
         final_sl = self._compute_fallback_sl(
             is_buy, target_price, sl, pip_size, digits, direction_norm, resolved_sym, kind_upper.title()
         )
@@ -1403,6 +1652,18 @@ class MT5Executor:
                 return None
             if self.dry_run:
                 self._dry_run_pending_ticket_lots[ticket] = final_lot
+                if not isinstance(getattr(self, "_dry_run_pending_orders", None), dict):
+                    self._dry_run_pending_orders = {}
+                self._dry_run_pending_orders[ticket] = {
+                    "ticket": ticket,
+                    "symbol": resolved_sym,
+                    "direction": direction_norm,
+                    "price": target_price,
+                    "lot": final_lot,
+                    "sl": final_sl,
+                    "tp": final_tp,
+                    "kind": kind_upper,
+                }
             self._record_ticket_placed(ticket)
             logger.info(
                 f"Placed {kind_upper.title()} {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
@@ -1420,6 +1681,8 @@ class MT5Executor:
         sl: Optional[float] = None,
         tp: Optional[float] = None,
         comment: str = "TG Layer Limit",
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Optional[int]:
         """Place a BUY LIMIT or SELL LIMIT order at the specified price."""
         return self._place_pending_order(
@@ -1431,6 +1694,8 @@ class MT5Executor:
             tp=tp,
             comment=comment,
             pending_kind="LIMIT",
+            exclude_tickets=exclude_tickets,
+            allow_duplicate_price=allow_duplicate_price,
         )
 
     def place_stop_order(
@@ -1442,6 +1707,8 @@ class MT5Executor:
         sl: Optional[float] = None,
         tp: Optional[float] = None,
         comment: str = "TG Layer Stop",
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Optional[int]:
         """Place a BUY STOP or SELL STOP breakout order at the specified price."""
         return self._place_pending_order(
@@ -1453,6 +1720,8 @@ class MT5Executor:
             tp=tp,
             comment=comment,
             pending_kind="STOP",
+            exclude_tickets=exclude_tickets,
+            allow_duplicate_price=allow_duplicate_price,
         )
 
     def _place_pending_with_stops_fallback(
@@ -1467,24 +1736,34 @@ class MT5Executor:
         market_comment: str,
         pending_kind: str = "LIMIT",
         enforce_risk_cap: bool = True,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Tuple[Optional[int], str]:
         """
         Place a pending LIMIT or STOP order; if broker rejects because live price is touching
         or inside trade_stops_level of target_price, fall back to immediate Market entry.
+        Duplicate-blocked pending orders NEVER fall back to Market entry.
         """
         kind_upper = pending_kind.strip().upper()
         if kind_upper == "STOP":
             t = self.place_stop_order(
                 symbol=symbol, direction=direction, price=target_price, lot=lot,
                 sl=sl, tp=tp, comment=pending_comment,
+                exclude_tickets=exclude_tickets,
+                allow_duplicate_price=allow_duplicate_price,
             )
         else:
             t = self.place_limit_order(
                 symbol=symbol, direction=direction, price=target_price, lot=lot,
                 sl=sl, tp=tp, comment=pending_comment,
+                exclude_tickets=exclude_tickets,
+                allow_duplicate_price=allow_duplicate_price,
             )
         if t:
             return t, kind_upper
+
+        if isinstance(self.last_error, str) and self.last_error.startswith("Duplicate pending "):
+            return None, "FAILED"
 
         if self.dry_run:
             return None, "FAILED"
@@ -1598,6 +1877,8 @@ class MT5Executor:
         stop_comment: Optional[str] = None,
         allow_market_buffer: bool = True,
         enforce_risk_cap: bool = True,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Tuple[Optional[int], str]:
         """
         Route a single layer to MARKET, LIMIT, or STOP based on explicit order_intent
@@ -1640,6 +1921,8 @@ class MT5Executor:
             market_comment=market_comment,
             pending_kind=pending_kind,
             enforce_risk_cap=enforce_risk_cap,
+            exclude_tickets=exclude_tickets,
+            allow_duplicate_price=allow_duplicate_price,
         )
 
     def allocate_4layer_lots(
@@ -1923,11 +2206,14 @@ class MT5Executor:
         order_intent: str = "AUTO",
         entry_label: str = "4Layer",
         enforce_risk_cap: bool = True,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """Shared execution loop for L1..L4 layers across Zone, Single-Price, and Market entries."""
         market_tickets: List[int] = []
         pending_tickets: List[int] = []
         layers_data: Dict[str, Dict[str, Any]] = {}
+        eff_exclude: List[int] = [_int_num(x, 0) for x in (exclude_tickets or []) if _int_num(x, 0) > 0]
 
         for l_name, target_px, l_lot, l_tp in layer_specs:
             if l_lot <= 0.0:
@@ -1948,16 +2234,22 @@ class MT5Executor:
                 stop_comment=f"TG {l_name} (Stop)",
                 allow_market_buffer=allow_mkt_buf,
                 enforce_risk_cap=enforce_risk_cap,
+                exclude_tickets=eff_exclude,
+                allow_duplicate_price=allow_duplicate_price,
             )
             if t:
+                layer_entry_px: Optional[float] = None
                 if o_type == "MARKET":
                     market_tickets.append(t)
                     status = "OPEN"
+                    layer_entry_px = self._last_fill_prices.get(t, target_px)
                 else:
                     pending_tickets.append(t)
+                    eff_exclude.append(t)
                     status = "PENDING"
-                layers_data[l_name] = {
+                layer_dict: Dict[str, Any] = {
                     "lot": l_lot,
+                    "remaining_lot": l_lot,
                     "target_price": target_px,
                     "tp": l_tp,
                     "tp_stage": "TP1",
@@ -1965,6 +2257,10 @@ class MT5Executor:
                     "order_type": o_type,
                     "status": status,
                 }
+                if layer_entry_px is not None:
+                    layer_dict["entry_price"] = layer_entry_px
+                    layer_dict["entry"] = layer_entry_px
+                layers_data[l_name] = layer_dict
 
         return market_tickets, pending_tickets, layers_data
 
@@ -1983,6 +2279,8 @@ class MT5Executor:
         tp_levels: Optional[Dict[str, float]] = None,
         base_lots: Optional[Sequence[float]] = None,
         multiplier: Optional[float] = None,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """
         Split a Zone entry into 4 layers across [0%, 33.3%, 66.7%, 100%] (L1..L4 -> TP1/TP2/TP3/TP5).
@@ -2054,6 +2352,8 @@ class MT5Executor:
             order_intent="AUTO",
             entry_label="Zone",
             enforce_risk_cap=False,
+            exclude_tickets=exclude_tickets,
+            allow_duplicate_price=allow_duplicate_price,
         )
 
     def _resolve_active_layer_subset(
@@ -2103,10 +2403,13 @@ class MT5Executor:
         multiplier: Optional[float] = None,
         max_layers: Optional[int] = None,
         layers_subset: Optional[Sequence[str]] = None,
+        exclude_tickets: Optional[Sequence[int]] = None,
+        allow_duplicate_price: bool = False,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """
-        Split a Single-Price entry (LIMIT, STOP, or smart AUTO) into 4 layers (L1..L4 -> TP1/TP2/TP3/TP5),
-        or a restricted layer subset (e.g. max_layers=1 -> L1 only for un-SL/no-TP stubs).
+        Execute a Single-Price entry (LIMIT, STOP, or smart AUTO).
+        When SINGLE_PRICE_CONSOLIDATE_ORDERS is True and max_layers/layers_subset are omitted,
+        consolidates to 1 clean order (L1) rather than stacking 4 identical orders at the same price.
         Returns (market_tickets, pending_tickets, layers_data).
         """
         if price is None or float(price) <= 0.0:
@@ -2118,9 +2421,17 @@ class MT5Executor:
             return [], [], {}
         direction_norm, resolved_sym, tick, _, digits, pip_size = prereq
 
+        eff_max_layers = max_layers
+        if (
+            eff_max_layers is None
+            and layers_subset is None
+            and bool(_cfg("SINGLE_PRICE_CONSOLIDATE_ORDERS", SINGLE_PRICE_CONSOLIDATE_ORDERS))
+        ):
+            eff_max_layers = 1
+
         active_names, eff_base_lots = self._resolve_active_layer_subset(
             base_lots=base_lots,
-            max_layers=max_layers,
+            max_layers=eff_max_layers,
             layers_subset=layers_subset,
         )
         eff_intent = (order_intent or "AUTO").strip().upper()
@@ -2178,6 +2489,8 @@ class MT5Executor:
             order_intent=eff_intent,
             entry_label=f"Single-{eff_intent}",
             enforce_risk_cap=False,
+            exclude_tickets=exclude_tickets,
+            allow_duplicate_price=allow_duplicate_price,
         )
 
     def execute_4layer_market(
@@ -2427,12 +2740,29 @@ class MT5Executor:
     # Compatibility alias for 3tier
     execute_3tier_zone = execute_3layer_zone
 
-    def modify_position_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
-        """Modify SL and TP of an open MT5 market position (thread-safe)."""
+    def modify_position_sltp(
+        self,
+        ticket: int,
+        sl: Optional[float],
+        tp: Optional[float],
+        require_both: bool = False,
+    ) -> bool:
+        """
+        Modify SL and TP of an open MT5 market position (thread-safe).
+        When `require_both=True`, independent single-leg fallback is disabled so a
+        failed SL write never silently applies a TP lift.
+        """
+        self.last_modify_result = {"ok": False, "sl_ok": False, "tp_ok": False, "retcode": None}
         if not ticket:
             return False
         if self.dry_run:
             logger.info(f"[DRY-RUN] Modified Position #{ticket}: SL={sl}, TP={tp}")
+            self.last_modify_result = {
+                "ok": True,
+                "sl_ok": sl is not None,
+                "tp_ok": tp is not None,
+                "retcode": 10009,
+            }
             return True
 
         with self._mt5_lock:
@@ -2456,9 +2786,28 @@ class MT5Executor:
             new_sl = round(float(sl), digits) if sl is not None else cur_sl
             new_tp = round(float(tp), digits) if tp is not None else cur_tp
 
-            if abs(new_sl - cur_sl) <= 1e-6 and abs(new_tp - cur_tp) <= 1e-6:
+            sl_changed = abs(new_sl - cur_sl) > 1e-6
+            tp_changed = abs(new_tp - cur_tp) > 1e-6
+            if not sl_changed and not tp_changed:
                 logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No-op).")
+                self.last_modify_result = {"ok": True, "sl_ok": True, "tp_ok": True, "retcode": 10025}
                 return True
+
+            if sym_info is not None and _num(getattr(sym_info, "trade_freeze_level", 0.0), 0.0) > 0.0:
+                tick_f = self.get_tick(p_symbol)
+                frozen_sl = sl_changed and (
+                    (cur_sl > 0.0 and self.is_within_freeze_level(p_symbol, cur_sl, tick_f, sym_info))
+                    or self.is_within_freeze_level(p_symbol, new_sl, tick_f, sym_info)
+                )
+                frozen_tp = tp_changed and (
+                    (cur_tp > 0.0 and self.is_within_freeze_level(p_symbol, cur_tp, tick_f, sym_info))
+                    or self.is_within_freeze_level(p_symbol, new_tp, tick_f, sym_info)
+                )
+                if frozen_sl or frozen_tp:
+                    self.last_error = "10029 TRADE_RETCODE_FROZEN"
+                    self.last_modify_result = {"ok": False, "sl_ok": False, "tp_ok": False, "retcode": 10029}
+                    logger.debug(f"Position #{ticket} SL/TP modify skipped: within broker trade_freeze_level.")
+                    return False
 
             request = {
                 "action": _mt5_const("TRADE_ACTION_SLTP", 6),
@@ -2470,6 +2819,7 @@ class MT5Executor:
 
             done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
             no_changes_code = _mt5_const("TRADE_RETCODE_NO_CHANGES", 10025)
+            frozen_code = _mt5_const("TRADE_RETCODE_FROZEN", 10029)
 
             def _is_mod_ok(res: Any) -> bool:
                 if not res:
@@ -2479,22 +2829,29 @@ class MT5Executor:
                 return str(getattr(res, "comment", "")).strip().lower() == "no changes"
 
             result = mt5.order_send(request)
+            retcode = getattr(result, "retcode", None) if result else None
             if result and result.retcode == done_code:
                 logger.info(f"Updated SL/TP on Position #{ticket}: SL={new_sl}, TP={new_tp}")
+                self.last_modify_result = {"ok": True, "sl_ok": True, "tp_ok": True, "retcode": retcode}
                 return True
             comment = getattr(result, "comment", "") if result else mt5.last_error()
             if _is_mod_ok(result):
                 logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
+                self.last_modify_result = {"ok": True, "sl_ok": True, "tp_ok": True, "retcode": retcode}
                 return True
 
-            # Independent leg fallback: if BOTH sl and tp were requested and combined modification
-            # failed (e.g. 10016 Invalid stops on one side), apply valid TP and valid SL independently
-            # so a stop-level conflict on SL never blocks TP updates (and vice versa).
-            if sl is not None and tp is not None:
+            if retcode == frozen_code:
+                self.last_error = str(comment or "10029 Frozen")
+                self.last_modify_result = {"ok": False, "sl_ok": False, "tp_ok": False, "retcode": frozen_code}
+                logger.warning(f"Position #{ticket} SL/TP modify frozen by broker (10029): {comment}")
+                return False
+
+            # Independent leg fallback ONLY when not require_both and both legs were requested
+            if (not require_both) and sl is not None and tp is not None:
                 tp_applied = False
                 sl_applied = False
                 eff_tp = cur_tp
-                if abs(new_tp - cur_tp) > 1e-6:
+                if tp_changed:
                     res_tp = mt5.order_send({
                         "action": _mt5_const("TRADE_ACTION_SLTP", 6),
                         "position": ticket,
@@ -2509,7 +2866,7 @@ class MT5Executor:
                             f"Updated TP independently on Position #{ticket}: TP={new_tp} "
                             f"(combined SL/TP rejected: {comment})"
                         )
-                if abs(new_sl - cur_sl) > 1e-6:
+                if sl_changed:
                     res_sl = mt5.order_send({
                         "action": _mt5_const("TRADE_ACTION_SLTP", 6),
                         "position": ticket,
@@ -2524,9 +2881,16 @@ class MT5Executor:
                             f"(combined SL/TP rejected: {comment})"
                         )
                 if tp_applied or sl_applied:
+                    self.last_modify_result = {
+                        "ok": True,
+                        "sl_ok": sl_applied,
+                        "tp_ok": tp_applied,
+                        "retcode": retcode,
+                    }
                     return True
 
             self.last_error = str(comment)
+            self.last_modify_result = {"ok": False, "sl_ok": False, "tp_ok": False, "retcode": retcode}
             logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
             return False
 
@@ -2535,6 +2899,31 @@ class MT5Executor:
         if not ticket:
             return False
         if self.dry_run:
+            dry_orders = getattr(self, "_dry_run_pending_orders", None)
+            if isinstance(dry_orders, dict) and ticket in dry_orders:
+                rec = dry_orders[ticket]
+                ord_px = _num(rec.get("price"), 0.0)
+                rec_dir = str(rec.get("direction") or "").strip().upper()
+                rec_sym = str(rec.get("symbol") or "").upper()
+                if sl is not None:
+                    rec["sl"] = round(float(sl), 2)
+                if tp is not None:
+                    cand_tp = round(float(tp), 2)
+                    max_tp_dist = float(_cfg("MAX_TP_DISTANCE_DOLLARS", MAX_TP_DISTANCE_DOLLARS))
+                    tp_bad = False
+                    if ord_px > 0.0 and cand_tp > 0.0:
+                        if rec_dir == "BUY" and cand_tp <= ord_px:
+                            tp_bad = True
+                        elif rec_dir == "SELL" and cand_tp >= ord_px:
+                            tp_bad = True
+                        elif ("XAU" in rec_sym or "GOLD" in rec_sym) and abs(cand_tp - ord_px) > max_tp_dist:
+                            tp_bad = True
+                    if not tp_bad:
+                        rec["tp"] = cand_tp
+                    else:
+                        logger.warning(
+                            f"[DRY-RUN] Pending Order #{ticket} ({rec_dir} @ {ord_px}) rejected invalid TP {cand_tp}."
+                        )
             logger.info(f"[DRY-RUN] Modified Pending Order #{ticket}: SL={sl}, TP={tp}")
             return True
 
@@ -2559,11 +2948,36 @@ class MT5Executor:
             new_sl = round(float(sl), digits) if sl is not None else cur_sl
             new_tp = round(float(tp), digits) if tp is not None else cur_tp
 
+            ord_price = _num(getattr(order, "price_open", 0.0), 0.0)
+            o_type = _int_num(getattr(order, "type", -1), -1)
+            buy_limit = _mt5_const("ORDER_TYPE_BUY_LIMIT", 2)
+            sell_limit = _mt5_const("ORDER_TYPE_SELL_LIMIT", 3)
+            buy_stop = _mt5_const("ORDER_TYPE_BUY_STOP", 4)
+            sell_stop = _mt5_const("ORDER_TYPE_SELL_STOP", 5)
+            if ord_price > 0.0 and new_tp > 0.0:
+                max_tp_dist = float(_cfg("MAX_TP_DISTANCE_DOLLARS", MAX_TP_DISTANCE_DOLLARS))
+                is_gold = "XAU" in o_symbol.upper() or "GOLD" in o_symbol.upper()
+                tp_bad = False
+                if o_type in (buy_limit, buy_stop) and new_tp <= ord_price:
+                    tp_bad = True
+                elif o_type in (sell_limit, sell_stop) and new_tp >= ord_price:
+                    tp_bad = True
+                elif is_gold and abs(new_tp - ord_price) > max_tp_dist:
+                    tp_bad = True
+                if tp_bad:
+                    logger.warning(
+                        f"Pending Order #{ticket} ({o_symbol}, type={o_type}, price={ord_price}) "
+                        f"rejected invalid TP {new_tp}; preserving cur_tp={cur_tp}."
+                    )
+                    cur_tp_bad = (
+                        (o_type in (buy_limit, buy_stop) and cur_tp > 0.0 and cur_tp <= ord_price)
+                        or (o_type in (sell_limit, sell_stop) and cur_tp > 0.0 and cur_tp >= ord_price)
+                    )
+                    new_tp = 0.0 if cur_tp_bad else cur_tp
+
             if abs(new_sl - cur_sl) <= 1e-6 and abs(new_tp - cur_tp) <= 1e-6:
                 logger.debug(f"Pending Order #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No-op).")
                 return True
-
-            ord_price = _num(getattr(order, "price_open", 0.0), 0.0)
             ord_time = _int_num(getattr(order, "type_time", 0), _mt5_const("ORDER_TIME_GTC", 0))
             ord_fill = _int_num(getattr(order, "type_filling", 0), _mt5_const("ORDER_FILLING_RETURN", 2))
 
@@ -2655,6 +3069,14 @@ class MT5Executor:
         if t_int <= 0 or price is None or float(price) <= 0.0:
             return False
         if self.dry_run:
+            dry_orders = getattr(self, "_dry_run_pending_orders", None)
+            if isinstance(dry_orders, dict) and t_int in dry_orders:
+                rec = dry_orders[t_int]
+                rec["price"] = round(float(price), 2)
+                if sl is not None:
+                    rec["sl"] = round(float(sl), 2)
+                if tp is not None:
+                    rec["tp"] = round(float(tp), 2)
             logger.info(f"[DRY-RUN] Modified Pending Order #{t_int}: Price={price}, SL={sl}, TP={tp}")
             return True
 
@@ -2750,6 +3172,8 @@ class MT5Executor:
             return False
         if self.dry_run:
             self._dry_run_pending_ticket_lots.pop(ticket, None)
+            if isinstance(getattr(self, "_dry_run_pending_orders", None), dict):
+                self._dry_run_pending_orders.pop(ticket, None)
             self._dry_run_ticket_lots.pop(ticket, None)
             logger.info(f"[DRY-RUN] Cancelled Pending Order #{ticket}")
             return True
@@ -2775,6 +3199,8 @@ class MT5Executor:
             result = mt5.order_send(request)
             done_code = _mt5_const("TRADE_RETCODE_DONE", 10009)
             if result and result.retcode == done_code:
+                if isinstance(getattr(self, "_dry_run_pending_orders", None), dict):
+                    self._dry_run_pending_orders.pop(ticket, None)
                 logger.info(f"Successfully cancelled Pending Order #{ticket}")
                 return True
             comment = getattr(result, "comment", "") if result else mt5.last_error()
@@ -2865,58 +3291,295 @@ class MT5Executor:
             with self._closing_lock:
                 self._closing_tickets.discard(t_int)
 
+    def close_partial_volume(
+        self,
+        ticket: Optional[int],
+        close_volume: float,
+        current_volume: Optional[float] = None,
+        symbol: Optional[str] = None,
+        direction: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Safely close a partial volume of an open position without ever violating
+        broker volume_min or turning an indivisible 0.01 lot into a full close (FM-4).
+        """
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0 or close_volume is None or float(close_volume) <= 0.0:
+            return {"ok": False, "skipped_indivisible": False, "reason": "invalid_args"}
+
+        with self._closing_lock:
+            if t_int in self._closing_tickets:
+                return {"ok": False, "skipped_indivisible": False, "reason": "already_closing"}
+            self._closing_tickets.add(t_int)
+
+        try:
+            eff_sym = symbol or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+            sym_info = self.get_symbol_info(eff_sym)
+            vol_min, _, vol_step, dec = _extract_symbol_volume_limits(sym_info)
+
+            if self.dry_run:
+                cur_vol = _num(
+                    current_volume if current_volume is not None else self._dry_run_ticket_lots.get(t_int),
+                    0.0,
+                )
+                if cur_vol <= 0.0:
+                    cur_vol = round(float(close_volume) * 2.0, dec)
+                if cur_vol + 1e-9 < 2.0 * vol_min:
+                    return {"ok": False, "skipped_indivisible": True, "remaining_volume": round(cur_vol, dec)}
+                eps = max(1e-12, vol_step * 1e-7)
+                c_vol = round(math.floor((float(close_volume) + eps) / vol_step) * vol_step, dec)
+                rem = round(cur_vol - c_vol, dec)
+                if c_vol + 1e-9 < vol_min or rem + 1e-9 < vol_min:
+                    return {"ok": False, "skipped_indivisible": True, "remaining_volume": round(cur_vol, dec)}
+                if t_int in self._dry_run_ticket_lots:
+                    self._dry_run_ticket_lots[t_int] = rem
+                self.invalidate_realized_pnl_cache()
+                logger.info(f"[DRY-RUN] Partial close Position #{t_int}: closed {c_vol} lots, remaining={rem}")
+                return {
+                    "ok": True,
+                    "dry_run": True,
+                    "closed_volume": c_vol,
+                    "remaining_volume": rem,
+                    "retcode": 10009,
+                }
+
+            with self._mt5_lock:
+                if not self._ensure_connected():
+                    return {"ok": False, "skipped_indivisible": False, "reason": "disconnected"}
+                pos = mt5.positions_get(ticket=t_int)
+                if not pos:
+                    return {"ok": False, "skipped_indivisible": False, "reason": "not_found"}
+                p = pos[0]
+                raw_sym = getattr(p, "symbol", None)
+                p_symbol = raw_sym if isinstance(raw_sym, str) and raw_sym else eff_sym
+                sym_info = self.get_symbol_info(p_symbol)
+                vol_min, _, vol_step, dec = _extract_symbol_volume_limits(sym_info)
+                cur_vol = _num(getattr(p, "volume", 0.0), 0.0)
+                if cur_vol + 1e-9 < 2.0 * vol_min:
+                    logger.info(
+                        f"Skipping partial close on #{t_int}: volume {cur_vol} < 2 * volume_min ({2*vol_min:.2f})."
+                    )
+                    return {"ok": False, "skipped_indivisible": True, "remaining_volume": round(cur_vol, dec)}
+
+                eps = max(1e-12, vol_step * 1e-7)
+                c_vol = round(math.floor((float(close_volume) + eps) / vol_step) * vol_step, dec)
+                rem = round(cur_vol - c_vol, dec)
+                if c_vol + 1e-9 < vol_min or rem + 1e-9 < vol_min:
+                    logger.info(
+                        f"Skipping partial close on #{t_int}: close={c_vol}, remaining={rem}, volume_min={vol_min}."
+                    )
+                    return {"ok": False, "skipped_indivisible": True, "remaining_volume": round(cur_vol, dec)}
+
+                tick = self.get_tick(p_symbol)
+                if not tick:
+                    return {"ok": False, "skipped_indivisible": False, "reason": "no_tick"}
+
+                buy_order_type = _mt5_const("ORDER_TYPE_BUY", 0)
+                sell_order_type = _mt5_const("ORDER_TYPE_SELL", 1)
+                is_buy_pos = _int_num(getattr(p, "type", buy_order_type), buy_order_type) == buy_order_type
+                close_type = sell_order_type if is_buy_pos else buy_order_type
+                close_price = getattr(tick, "bid", None) if is_buy_pos else getattr(tick, "ask", None)
+                if not isinstance(close_price, (int, float)) or isinstance(close_price, bool) or close_price <= 0:
+                    return {"ok": False, "skipped_indivisible": False, "reason": "bad_price"}
+
+                if self.is_within_freeze_level(p_symbol, float(close_price), tick, sym_info):
+                    return {
+                        "ok": False,
+                        "skipped_indivisible": False,
+                        "remaining_volume": round(cur_vol, dec),
+                        "retcode": _mt5_const("TRADE_RETCODE_FROZEN", 10029),
+                        "reason": "frozen",
+                    }
+
+                request = {
+                    "action": _mt5_const("TRADE_ACTION_DEAL", 1),
+                    "position": t_int,
+                    "symbol": p_symbol,
+                    "volume": c_vol,
+                    "type": close_type,
+                    "price": float(close_price),
+                    "deviation": 20,
+                    "magic": _cfg("MAGIC_NUMBER", MAGIC_NUMBER),
+                    "comment": "TG Copier Partial",
+                    "type_time": _mt5_const("ORDER_TIME_GTC", 0),
+                }
+                success, res = self.send_order_with_filling_fallback(request)
+                retcode = getattr(res, "retcode", None) if res else None
+                if success and res and retcode == _mt5_const("TRADE_RETCODE_DONE", 10009):
+                    self.invalidate_realized_pnl_cache()
+                    deal_id = _int_num(getattr(res, "deal", 0), 0)
+                    deal_px = _num(getattr(res, "price", 0.0), 0.0) or float(close_price)
+                    logger.info(
+                        f"Partial closed #{t_int} ({p_symbol}): {c_vol} lots @ {deal_px}, remaining={rem}"
+                    )
+                    return {
+                        "ok": True,
+                        "skipped_indivisible": False,
+                        "closed_volume": c_vol,
+                        "remaining_volume": rem,
+                        "deal_ticket": deal_id or None,
+                        "price": deal_px,
+                        "retcode": retcode,
+                    }
+                return {
+                    "ok": False,
+                    "skipped_indivisible": False,
+                    "remaining_volume": round(cur_vol, dec),
+                    "retcode": retcode,
+                    "reason": self.last_error or "partial_close_failed",
+                }
+        finally:
+            with self._closing_lock:
+                self._closing_tickets.discard(t_int)
+
     def _compute_close_info_from_deals(self, ticket: int, deals: Any) -> Dict[str, Any]:
-        """Compute {"profit": float, "reason": str} from a single history_deals_get result."""
+        """
+        Compute rich deal-history attribution for a closed/partially-closed position:
+        {profit, gross_profit, commission, swap, fee, reason, exit_price, entry_price,
+         closed_volume, close_time, exit_deal_tickets, exit_deals, deals_settled}.
+        """
         t_int = _int_num(ticket, 0)
         reason = "UNKNOWN"
         if deals:
+            in_entry = _mt5_const("DEAL_ENTRY_IN", 0)
             out_entries = {
                 _mt5_const("DEAL_ENTRY_OUT", 1),
                 _mt5_const("DEAL_ENTRY_INOUT", 2),
                 _mt5_const("DEAL_ENTRY_OUT_BY", 3),
             }
-            exit_deals = [d for d in deals if _int_num(getattr(d, "entry", -1), -1) in out_entries]
-            if exit_deals:
-                net_profit = sum(
-                    _num(getattr(d, "profit", 0.0))
-                    + _num(getattr(d, "commission", 0.0))
-                    + _num(getattr(d, "swap", 0.0))
-                    + _num(getattr(d, "fee", 0.0))
-                    for d in deals
-                )
+            in_deals = [d for d in deals if _int_num(getattr(d, "entry", -1), -1) == in_entry]
+            exit_deals_raw = [d for d in deals if _int_num(getattr(d, "entry", -1), -1) in out_entries]
+            if exit_deals_raw:
+                total_gross = sum(_num(getattr(d, "profit", 0.0)) for d in deals)
+                total_comm = sum(_num(getattr(d, "commission", 0.0)) for d in deals)
+                total_swap = sum(_num(getattr(d, "swap", 0.0)) for d in deals)
+                total_fee = sum(_num(getattr(d, "fee", 0.0)) for d in deals)
+                net_profit = total_gross + total_comm + total_swap + total_fee
                 profit = round(net_profit, 2)
-                d = exit_deals[-1]
+
+                sl_const = _mt5_const("DEAL_REASON_SL", 4)
+                tp_const = _mt5_const("DEAL_REASON_TP", 5)
+
+                exit_deals_info: List[Dict[str, Any]] = []
+                total_exit_vol = 0.0
+                weighted_exit_px = 0.0
+                exit_deal_tickets: List[int] = []
+                for ed in exit_deals_raw:
+                    dtkt = _int_num(getattr(ed, "ticket", 0), 0)
+                    if dtkt > 0:
+                        exit_deal_tickets.append(dtkt)
+                    ev = max(0.0, _num(getattr(ed, "volume", 0.0), 0.0))
+                    epx = _num(getattr(ed, "price", 0.0), 0.0)
+                    if ev > 0.0 and epx > 0.0:
+                        weighted_exit_px += ev * epx
+                        total_exit_vol += ev
+                    ed_gross = _num(getattr(ed, "profit", 0.0))
+                    ed_comm = _num(getattr(ed, "commission", 0.0))
+                    ed_swap = _num(getattr(ed, "swap", 0.0))
+                    ed_fee = _num(getattr(ed, "fee", 0.0))
+                    ed_net = round(ed_gross + ed_comm + ed_swap + ed_fee, 2)
+                    ed_raw_r = getattr(ed, "reason", None)
+                    ed_reason = "SL" if ed_raw_r == sl_const else ("TP" if ed_raw_r == tp_const else "MANUAL/BOT")
+                    exit_deals_info.append({
+                        "deal_ticket": dtkt or None,
+                        "profit": ed_net,
+                        "gross_profit": round(ed_gross, 2),
+                        "commission": round(ed_comm, 2),
+                        "swap": round(ed_swap, 2),
+                        "fee": round(ed_fee, 2),
+                        "price": round(epx, 4) if epx > 0.0 else None,
+                        "volume": round(ev, 4) if ev > 0.0 else None,
+                        "reason": ed_reason,
+                        "time": _int_num(getattr(ed, "time", 0), 0) or None,
+                    })
+
+                if exit_deals_info and in_deals:
+                    in_costs = sum(
+                        _num(getattr(id_d, "profit", 0.0))
+                        + _num(getattr(id_d, "commission", 0.0))
+                        + _num(getattr(id_d, "swap", 0.0))
+                        + _num(getattr(id_d, "fee", 0.0))
+                        for id_d in in_deals
+                    )
+                    if abs(in_costs) > 1e-9:
+                        exit_deals_info[0]["profit"] = round(exit_deals_info[0]["profit"] + in_costs, 2)
+
+                d = exit_deals_raw[-1]
                 d_reason = getattr(d, "reason", None)
-                if d_reason == _mt5_const("DEAL_REASON_SL", 4):
+                if d_reason == sl_const:
                     reason = "SL"
-                elif d_reason == _mt5_const("DEAL_REASON_TP", 5):
+                elif d_reason == tp_const:
                     reason = "TP"
                 else:
                     reason = "MANUAL/BOT"
-                return {"profit": profit, "reason": reason}
+
+                last_epx = _num(getattr(d, "price", 0.0), 0.0)
+                exit_price = (
+                    round(weighted_exit_px / total_exit_vol, 4)
+                    if total_exit_vol > 0.0 and weighted_exit_px > 0.0
+                    else (round(last_epx, 4) if last_epx > 0.0 else None)
+                )
+                entry_price: Optional[float] = None
+                if in_deals:
+                    in_px = _num(getattr(in_deals[-1], "price", 0.0), 0.0)
+                    if in_px > 0.0:
+                        entry_price = round(in_px, 4)
+
+                return {
+                    "profit": profit,
+                    "gross_profit": round(total_gross, 2),
+                    "commission": round(total_comm, 2),
+                    "swap": round(total_swap, 2),
+                    "fee": round(total_fee, 2),
+                    "reason": reason,
+                    "exit_price": exit_price,
+                    "entry_price": entry_price,
+                    "closed_volume": round(total_exit_vol, 4) if total_exit_vol > 0.0 else None,
+                    "close_time": _int_num(getattr(d, "time", 0), 0) or None,
+                    "exit_deal_tickets": exit_deal_tickets,
+                    "exit_deals": exit_deals_info,
+                    "deals_settled": True,
+                }
 
         fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
         return {
             "profit": self._cached_pos_profits.get(t_int, 0.0),
+            "gross_profit": self._cached_pos_profits.get(t_int, 0.0),
+            "commission": 0.0,
+            "swap": 0.0,
+            "fee": 0.0,
             "reason": fallback_reason,
+            "exit_price": None,
+            "entry_price": None,
+            "closed_volume": None,
+            "close_time": None,
+            "exit_deal_tickets": [],
+            "exit_deals": [],
+            "deals_settled": False,
         }
 
     def get_position_close_info(self, ticket: Optional[int]) -> Dict[str, Any]:
         """
-        Return {"profit": float, "reason": str} for a closed position.
-        Uses a single mt5.history_deals_get(position=ticket) call on the happy path and retries
-        briefly (outside _mt5_lock) only if exit deals have not settled yet in MT5 history.
-        reason is one of: "TP", "SL", "MANUAL/BOT", "UNKNOWN".
+        Return `{"profit": float, "reason": str}` (preserving the strict 2-key contract)
+        while populating full deal-level attribution (`exit_price`, `entry_price`, `exit_deals`,
+        `deals_settled`, etc.) in `self._last_close_details[ticket]`.
         """
         t_int = _int_num(ticket, 0)
         if t_int <= 0:
             return {"profit": 0.0, "reason": "UNKNOWN"}
 
         if self.dry_run or not self._connected:
-            return {
+            rich = {
                 "profit": self._cached_pos_profits.get(t_int, 1.25),
                 "reason": "UNKNOWN",
+                "deals_settled": True,
+                "exit_price": None,
+                "entry_price": None,
+                "exit_deal_tickets": [],
+                "exit_deals": [],
             }
+            self._last_close_details[t_int] = rich
+            return {"profit": rich["profit"], "reason": rich["reason"]}
 
         out_entries = {
             _mt5_const("DEAL_ENTRY_OUT", 1),
@@ -2929,7 +3592,7 @@ class MT5Executor:
                 deals = mt5.history_deals_get(position=t_int)
             has_exit = bool(deals and any(_int_num(getattr(d, "entry", -1), -1) in out_entries for d in deals))
             if not has_exit:
-                for delay in (0.15, 0.20):
+                for delay in (0.15, 0.30, 0.50, 0.75):
                     time.sleep(delay)
                     with self._mt5_lock:
                         deals = mt5.history_deals_get(position=t_int)
@@ -2939,18 +3602,51 @@ class MT5Executor:
                     if has_exit:
                         break
                 if not has_exit:
+                    with self._mt5_lock:
+                        now_utc = datetime.now(timezone.utc)
+                        win_deals = mt5.history_deals_get(now_utc - timedelta(hours=1), now_utc + timedelta(minutes=2))
+                    if win_deals:
+                        matched = [
+                            d for d in win_deals
+                            if _int_num(getattr(d, "position_id", -1), -1) == t_int
+                        ]
+                        if matched and any(_int_num(getattr(d, "entry", -1), -1) in out_entries for d in matched):
+                            deals = matched
+                            has_exit = True
+                if not has_exit:
                     logger.warning(
                         f"history_deals_get(position={t_int}) returned no exit deals after retries; "
                         f"using cached profit fallback ({self._cached_pos_profits.get(t_int, 0.0):.2f})."
                     )
-            return self._compute_close_info_from_deals(t_int, deals)
+            rich = self._compute_close_info_from_deals(t_int, deals)
+            self._last_close_details[t_int] = rich
+            return {"profit": rich["profit"], "reason": rich["reason"]}
         except Exception as e:
             logger.warning(f"Could not determine close info for #{t_int}: {e}")
             fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
-            return {
+            rich = {
                 "profit": self._cached_pos_profits.get(t_int, 0.0),
                 "reason": fallback_reason,
+                "deals_settled": False,
+                "exit_price": None,
+                "entry_price": None,
+                "exit_deal_tickets": [],
+                "exit_deals": [],
             }
+            self._last_close_details[t_int] = rich
+            return {"profit": rich["profit"], "reason": rich["reason"]}
+
+    def get_position_close_details(self, ticket: Optional[int]) -> Dict[str, Any]:
+        """Query `get_position_close_info` and return the full deal-level metadata dictionary."""
+        t_int = _int_num(ticket, 0)
+        res = self.get_position_close_info(ticket)
+        if t_int > 0 and isinstance(getattr(self, "_last_close_details", None), dict) and t_int in self._last_close_details:
+            merged = dict(self._last_close_details[t_int])
+            if isinstance(res, dict):
+                merged["profit"] = res.get("profit", merged.get("profit", 0.0))
+                merged["reason"] = res.get("reason", merged.get("reason", "UNKNOWN"))
+            return merged
+        return dict(res) if isinstance(res, dict) else {"profit": 0.0, "reason": "UNKNOWN"}
 
     def get_position_closed_profit(self, ticket: Optional[int]) -> float:
         """
@@ -3775,20 +4471,35 @@ class MT5Executor:
                 if has_ticket_lists and ticket in pd_tickets and ticket not in mk_tickets:
                     continue
                 layer_obj = layers.get(layer_name) if layer_name else None
-                entry_ref = (
-                    _num(layer_obj.get("target_price"), 0.0)
-                    if isinstance(layer_obj, dict) and layer_obj.get("target_price") is not None
-                    else _num(signal_data.get("recorded_entry_price"), 0.0)
-                )
+                entry_ref = 0.0
+                if isinstance(layer_obj, dict):
+                    for ek in ("entry_price", "entry", "price_open", "target_price"):
+                        if _num(layer_obj.get(ek), 0.0) > 0.0:
+                            entry_ref = _num(layer_obj.get(ek), 0.0)
+                            break
+                if entry_ref <= 0.0:
+                    entry_ref = _num(signal_data.get("recorded_entry_price"), 0.0)
                 if entry_ref > 0.0:
                     calc_sl = round(entry_ref + offset_value, digits) if is_buy else round(entry_ref - offset_value, digits)
                     if isinstance(layer_obj, dict):
-                        prev_be = _num(layer_obj.get("be_sl"), 0.0)
-                        if is_buy and prev_be > 0.0 and prev_be > calc_sl:
-                            calc_sl = prev_be
-                        elif not is_buy and prev_be > 0.0 and prev_be < calc_sl:
-                            calc_sl = prev_be
+                        for stop_k in ("be_sl", "sl", "broker_sl", "ratchet_sl"):
+                            prev_v = _num(layer_obj.get(stop_k), 0.0)
+                            if prev_v > 0.0:
+                                if is_buy and prev_v > calc_sl:
+                                    calc_sl = prev_v
+                                elif not is_buy and prev_v < calc_sl:
+                                    # Only tighten against previous green / BE / ratchet stops (never clamp above wide red SL)
+                                    if stop_k != "sl" or prev_v <= entry_ref + 1e-9:
+                                        calc_sl = prev_v
+                        s0_sl = _num(signal_data.get("stage0_profit_lock_sl"), 0.0)
+                        if s0_sl > 0.0:
+                            if is_buy and s0_sl >= entry_ref - 1e-9 and s0_sl > calc_sl:
+                                calc_sl = s0_sl
+                            elif not is_buy and s0_sl <= entry_ref + 1e-9 and s0_sl < calc_sl:
+                                calc_sl = s0_sl
                         layer_obj["be_sl"] = calc_sl
+                        layer_obj["sl"] = calc_sl
+                        layer_obj["broker_sl"] = calc_sl
                     applied_sls[ticket] = calc_sl
                 if ticket not in be_done_set:
                     logger.info(
@@ -3796,12 +4507,38 @@ class MT5Executor:
                     )
                     modified_tickets.append(ticket)
                     be_done_set.add(ticket)
+
+            if applied_sls:
+                best_be_sl = max(applied_sls.values()) if is_buy else min(applied_sls.values())
+                prev_bsl = _num(signal_data.get("broker_sl"), 0.0)
+                if prev_bsl <= 0.0 or (is_buy and best_be_sl > prev_bsl) or (not is_buy and best_be_sl < prev_bsl):
+                    signal_data["broker_sl"] = best_be_sl
+                if signal_data.get("status") == "RUNNER_ACTIVE":
+                    cur_floor = signal_data.get("runner_sl_floor")
+                    if cur_floor is None or (is_buy and best_be_sl > float(cur_floor)) or (not is_buy and best_be_sl < float(cur_floor)):
+                        signal_data["runner_sl_floor"] = best_be_sl
+
+            cancelled_pending: List[int] = []
+            if (
+                bool(_cfg("CANCEL_PENDING_ON_BE", CANCEL_PENDING_ON_BE))
+                and pd_tickets
+                and (mk_tickets or modified_tickets or be_done_set)
+            ):
+                cancelled_pending = self.cancel_signal_pending_orders(signal_data)
+                cancel_set = set(cancelled_pending) | set(pd_tickets)
+                signal_data["pending_tickets"] = []
+                for l_val in layers.values():
+                    if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
+                        if _int_num(l_val.get("ticket"), 0) in cancel_set or _int_num(l_val.get("ticket"), 0) > 0:
+                            l_val["status"] = "CANCELLED"
+
             signal_data["be_done_tickets"] = sorted(be_done_set)
             signal_data["be_deferred_tickets"] = []
             return {
                 "modified_tickets": modified_tickets,
                 "deferred_tickets": [],
                 "promoted_tickets": [],
+                "cancelled_pending_tickets": cancelled_pending,
                 "be_done_tickets": sorted(be_done_set),
                 "applied_sls": applied_sls,
             }
@@ -3815,24 +4552,43 @@ class MT5Executor:
                 continue
 
             # Catch sub-second fill race if a pending limit filled before 1s reconciler ran
+            p0 = pos[0]
+            p_open = _num(getattr(p0, "price_open", 0.0), 0.0)
+            p_vol = _num(getattr(p0, "volume", 0.0), 0.0)
             if ticket in pd_tickets:
                 pd_tickets = [t for t in pd_tickets if t != ticket]
                 if ticket not in mk_tickets:
                     mk_tickets.append(ticket)
                 if layer_name and isinstance(layers.get(layer_name), dict):
                     layers[layer_name]["status"] = "FILLED"
+                    if p_open > 0.0:
+                        layers[layer_name]["entry_price"] = round(p_open, digits)
+                        layers[layer_name]["entry"] = round(p_open, digits)
+                    if p_vol > 0.0:
+                        layers[layer_name]["remaining_lot"] = p_vol
                 promoted_tickets.append(ticket)
                 logger.info(
                     f"Instant BE fill-race catch: Pending #{ticket} ({layer_name}) already filled on MT5; promoting & protecting now."
                 )
 
-            p0 = pos[0]
-            p_open = _num(getattr(p0, "price_open", 0.0), 0.0)
             p_sl = _num(getattr(p0, "sl", 0.0), 0.0)
             pos_is_buy = _int_num(getattr(p0, "type", buy_order_type), buy_order_type) == buy_order_type
+            if p_open > 0.0 and layer_name and isinstance(layers.get(layer_name), dict):
+                if layers[layer_name].get("entry_price") is None:
+                    layers[layer_name]["entry_price"] = round(p_open, digits)
+                    layers[layer_name]["entry"] = round(p_open, digits)
+                if layers[layer_name].get("remaining_lot") is None and p_vol > 0.0:
+                    layers[layer_name]["remaining_lot"] = p_vol
+            if p_open > 0.0 and signal_data.get("recorded_entry_price") is None:
+                signal_data["recorded_entry_price"] = round(p_open, digits)
+                signal_data["initial_price"] = round(p_open, digits)
+
             if ticket in be_done_set and p_open > 0.0:
                 if (pos_is_buy and p_sl >= p_open - 1e-6) or (not pos_is_buy and p_sl > 0.0 and p_sl <= p_open + 1e-6):
                     applied_sls[ticket] = p_sl
+                    if layer_name and isinstance(layers.get(layer_name), dict):
+                        layers[layer_name]["sl"] = p_sl
+                        layers[layer_name]["broker_sl"] = p_sl
                     continue
 
             new_sl = self._move_ticket_to_be(ticket, offset_value, digits, direction)
@@ -3842,6 +4598,8 @@ class MT5Executor:
                 applied_sls[ticket] = new_sl
                 if layer_name and isinstance(layers.get(layer_name), dict):
                     layers[layer_name]["be_sl"] = new_sl
+                    layers[layer_name]["sl"] = new_sl
+                    layers[layer_name]["broker_sl"] = new_sl
                 logger.info(
                     f"Layer {layer_name or 'OPEN'} (Ticket #{ticket}) moved to BE: NewSL={new_sl}"
                 )
@@ -3856,15 +4614,37 @@ class MT5Executor:
             signal_data["market_tickets"] = mk_tickets
             signal_data["pending_tickets"] = pd_tickets
 
-        if signal_data.get("status") == "RUNNER_ACTIVE" and applied_sls:
-            cur_floor = signal_data.get("runner_sl_floor")
+        if applied_sls:
             best_be_sl = max(applied_sls.values()) if is_buy else min(applied_sls.values())
-            if cur_floor is None:
-                signal_data["runner_sl_floor"] = best_be_sl
-            else:
-                cur_floor_f = float(cur_floor)
-                if (is_buy and best_be_sl > cur_floor_f) or (not is_buy and best_be_sl < cur_floor_f):
+            prev_bsl = _num(signal_data.get("broker_sl"), 0.0)
+            if prev_bsl <= 0.0 or (is_buy and best_be_sl > prev_bsl) or (not is_buy and best_be_sl < prev_bsl):
+                signal_data["broker_sl"] = best_be_sl
+
+            if signal_data.get("status") == "RUNNER_ACTIVE":
+                cur_floor = signal_data.get("runner_sl_floor")
+                if cur_floor is None:
                     signal_data["runner_sl_floor"] = best_be_sl
+                else:
+                    cur_floor_f = float(cur_floor)
+                    if (is_buy and best_be_sl > cur_floor_f) or (not is_buy and best_be_sl < cur_floor_f):
+                        signal_data["runner_sl_floor"] = best_be_sl
+                cur_ts = signal_data.get("trail_stop")
+                if isinstance(cur_ts, numbers.Real) and not isinstance(cur_ts, bool) and float(cur_ts) > 0.0:
+                    if (is_buy and best_be_sl > float(cur_ts)) or (not is_buy and best_be_sl < float(cur_ts)):
+                        signal_data["trail_stop"] = best_be_sl
+
+        # Strictly AFTER fill-race promotion: sweep leftover unfilled pending orders when CANCEL_PENDING_ON_BE=True
+        cancelled_pending = []
+        if (
+            bool(_cfg("CANCEL_PENDING_ON_BE", CANCEL_PENDING_ON_BE))
+            and pd_tickets
+            and (mk_tickets or modified_tickets or be_done_set)
+        ):
+            cancelled_pending = self.cancel_signal_pending_orders(signal_data)
+            signal_data["pending_tickets"] = []
+            for l_val in layers.values():
+                if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
+                    l_val["status"] = "CANCELLED"
 
         signal_data["be_done_tickets"] = sorted(be_done_set)
         signal_data["be_deferred_tickets"] = deferred_tickets
@@ -3872,6 +4652,7 @@ class MT5Executor:
             "modified_tickets": modified_tickets,
             "deferred_tickets": deferred_tickets,
             "promoted_tickets": promoted_tickets,
+            "cancelled_pending_tickets": cancelled_pending,
             "be_done_tickets": sorted(be_done_set),
             "applied_sls": applied_sls,
         }
@@ -3950,12 +4731,22 @@ class MT5Executor:
             if not wp_ticket:
                 continue
             price_open = _num(getattr(wp, "price_open", 0.0), 0.0)
+            wp_sl = _num(getattr(wp, "sl", 0.0), 0.0)
             wp_tp = _num(getattr(wp, "tp", 0.0), 0.0)
             wp_profit = _num(getattr(wp, "profit", 0.0), 0.0)
-            if _int_num(getattr(wp, "type", buy_order_type), buy_order_type) == buy_order_type:
+            wp_is_buy = _int_num(getattr(wp, "type", buy_order_type), buy_order_type) == buy_order_type
+            if wp_is_buy:
                 new_sl = round(price_open + offset_value, digits)
             else:
                 new_sl = round(price_open - offset_value, digits)
+
+            already_better = wp_sl > 0.0 and (
+                (wp_is_buy and wp_sl >= new_sl - 1e-6)
+                or (not wp_is_buy and wp_sl <= new_sl + 1e-6)
+            )
+            if already_better:
+                be_tickets.append(wp_ticket)
+                continue
 
             if self.modify_position_sltp(ticket=wp_ticket, sl=new_sl, tp=wp_tp):
                 be_tickets.append(wp_ticket)
@@ -4406,11 +5197,13 @@ class MT5Executor:
         sym_info: Any,
         digits: int,
     ) -> float:
-        """Clamp SL distance to at least broker trade_stops_level from live bid (BUY) / ask (SELL)."""
+        """Clamp SL distance to at least broker trade_stops_level + STOP_LEVEL_SAFETY_BUFFER_DOLLARS."""
         is_buy = (direction or "BUY").strip().upper() == "BUY"
         stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
         pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
-        min_stop_dist = max(0.0, stops_lvl * (pt or 0.01))
+        raw_dist = max(0.0, stops_lvl * (pt or 0.01))
+        safety_buf = float(_cfg("STOP_LEVEL_SAFETY_BUFFER_DOLLARS", STOP_LEVEL_SAFETY_BUFFER_DOLLARS)) if (not self.dry_run or raw_dist > 0.0) else 0.0
+        min_stop_dist = raw_dist + max(0.0, safety_buf) if raw_dist > 0.0 else 0.0
         target_sl = round(float(desired_sl), digits)
         if tick is None or min_stop_dist <= 0.0:
             return target_sl
@@ -5241,6 +6034,918 @@ class MT5Executor:
                     return float(tp_px)
         return None
 
+    def _ordered_open_layer_keys(self, signal_data: Dict[str, Any]) -> List[str]:
+        """Return currently open filled layer keys ordered shallow -> deep."""
+        layers = signal_data.get("layers")
+        if not isinstance(layers, dict) or not layers:
+            return []
+        mkt_set = {_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0}
+        ordered = (
+            LAYER_NAMES
+            if any(k in layers for k in LAYER_NAMES)
+            else ("TOP", "MID", "BOTTOM")
+        )
+        open_keys: List[str] = []
+        for lk in ordered:
+            lv = layers.get(lk)
+            if not isinstance(lv, dict):
+                continue
+            lt = _int_num(lv.get("ticket"), 0)
+            st = str(lv.get("status") or "").strip().upper()
+            if lt > 0 and (lt in mkt_set or not mkt_set) and st in ("OPEN", "FILLED", "RUNNER"):
+                open_keys.append(lk)
+            elif lt > 0 and mkt_set and lt in mkt_set and st not in ("CLOSED", "CANCELLED", "PENDING"):
+                open_keys.append(lk)
+        return open_keys
+
+    def assign_or_preserve_layer_roles(self, signal_data: Dict[str, Any]) -> Dict[str, str]:
+        """
+        Assign sticky v3.6 roles across open market layers (`SOLO_RUNNER`, `BANK_LAYER`,
+        `BANK_TP1`, `STAGE2_BANKER`, `CORE_RUNNER`) or assign `LATE_RECOVERY` to late race fills
+        once `roles_locked=True` so existing roles/runners can never suffer downward dominoes.
+        """
+        layers = signal_data.get("layers")
+        if not isinstance(layers, dict) or not layers:
+            return {}
+        open_keys = self._ordered_open_layer_keys(signal_data)
+        if not open_keys:
+            return {}
+
+        roles_locked = bool(signal_data.get("roles_locked"))
+        if not roles_locked:
+            # Also auto-lock if a previous v3.6 action already set stage0/runner lift state
+            if any(
+                isinstance(layers.get(lk), dict)
+                and str(layers[lk].get("tp_stage") or "TP1").strip().upper() != "TP1"
+                and str(layers[lk].get("role") or "").strip().upper() != ""
+                for lk in open_keys
+            ):
+                roles_locked = True
+                signal_data["roles_locked"] = True
+
+        tiered_on = bool(_cfg("TIERED_STAGE_BANKING_ENABLED", TIERED_STAGE_BANKING_ENABLED))
+        assigned: Dict[str, str] = {}
+        if roles_locked:
+            for lk in open_keys:
+                lv = layers[lk]
+                r = str(lv.get("role") or "").strip().upper()
+                if not r:
+                    lv["role"] = "LATE_RECOVERY"
+                    r = "LATE_RECOVERY"
+                assigned[lk] = r
+        else:
+            n = len(open_keys)
+            if n == 1:
+                assigned[open_keys[0]] = "SOLO_RUNNER"
+            elif n == 2:
+                assigned[open_keys[0]] = "BANK_LAYER"
+                assigned[open_keys[1]] = "CORE_RUNNER"
+                signal_data["bank_harvest_layer"] = open_keys[0]
+            elif n == 3:
+                assigned[open_keys[0]] = "BANK_LAYER"
+                assigned[open_keys[1]] = "BANK_TP1"
+                assigned[open_keys[2]] = "CORE_RUNNER"
+                signal_data["bank_harvest_layer"] = open_keys[0]
+            else:
+                assigned[open_keys[0]] = "BANK_LAYER"
+                for mid_k in open_keys[1:-2]:
+                    assigned[mid_k] = "BANK_TP1"
+                assigned[open_keys[-2]] = "STAGE2_BANKER" if tiered_on else "BANK_TP1"
+                assigned[open_keys[-1]] = "CORE_RUNNER"
+                signal_data["bank_harvest_layer"] = open_keys[0]
+            for lk, role_val in assigned.items():
+                layers[lk]["role"] = role_val
+
+        r_layers = [lk for lk in open_keys if assigned.get(lk) in ("SOLO_RUNNER", "CORE_RUNNER")]
+        if not r_layers and open_keys:
+            # Edge case: CORE_RUNNER already closed while LATE_RECOVERY/STAGE2_BANKER remains open
+            non_bank = [lk for lk in open_keys if assigned.get(lk) not in ("BANK_LAYER", "BANK_TP1")]
+            r_layers = non_bank[-1:] if non_bank else [open_keys[-1]]
+        r_tickets = [_int_num(layers[lk].get("ticket"), 0) for lk in r_layers if _int_num(layers[lk].get("ticket"), 0) > 0]
+        if r_layers and not _is_legacy_3layer_dict(layers):
+            signal_data["runner_layers"] = list(r_layers)
+            signal_data["runner_tickets"] = list(r_tickets)
+            signal_data["runner_layer"] = r_layers[-1]
+            signal_data["runner_ticket"] = r_tickets[-1] if r_tickets else None
+            signal_data["last_runner_layers"] = list(r_layers)
+            signal_data["last_runner_layer"] = r_layers[-1]
+        return assigned
+
+    def hydrate_signal_layers_from_mt5(
+        self,
+        signal_data: Dict[str, Any],
+        live_positions_by_ticket: Optional[Dict[int, Any]] = None,
+    ) -> bool:
+        """
+        Idempotently hydrate active or recently filled layers (including pre-v3.6 live positions
+        and previously set limits when filled) from live MT5 positions (`price_open`, `volume`,
+        `sl`, `tp`). Never cancels unfilled limits and never loosens existing broker SLs.
+        """
+        if not isinstance(signal_data, dict):
+            return False
+        layers = signal_data.get("layers")
+        if not isinstance(layers, dict) or not layers:
+            return False
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+
+        pos_map = live_positions_by_ticket
+        if pos_map is None and not self.dry_run and self._connected:
+            with self._mt5_lock:
+                raw_pos = mt5.positions_get()
+            if raw_pos is not None:
+                pos_map = {
+                    _int_num(getattr(p, "ticket", 0), 0): p
+                    for p in raw_pos
+                    if _int_num(getattr(p, "ticket", 0), 0) > 0
+                }
+        pos_map = pos_map or {}
+
+        changed = False
+        ordered = LAYER_NAMES if any(k in layers for k in LAYER_NAMES) else ("TOP", "MID", "BOTTOM")
+        first_open_entry: Optional[float] = None
+        any_promoted_mkt = False
+
+        for lk in ordered:
+            lv = layers.get(lk)
+            if not isinstance(lv, dict):
+                continue
+            lt = _int_num(lv.get("ticket"), 0)
+            p = pos_map.get(lt) if lt > 0 else None
+            if p is not None:
+                p_open = _num(getattr(p, "price_open", 0.0), 0.0)
+                p_vol = _num(getattr(p, "volume", 0.0), 0.0)
+                p_sl = _num(getattr(p, "sl", 0.0), 0.0)
+                p_tp = _num(getattr(p, "tp", 0.0), 0.0)
+                st_u = str(lv.get("status") or "").strip().upper()
+                if st_u == "PENDING":
+                    lv["status"] = "FILLED"
+                    changed = True
+                if p_open > 0.0 and (_num(lv.get("entry_price"), 0.0) <= 0.0 or _num(lv.get("entry"), 0.0) <= 0.0):
+                    ep = round(p_open, digits)
+                    lv["entry_price"] = ep
+                    lv["entry"] = ep
+                    changed = True
+                if p_vol > 0.0 and (_num(lv.get("remaining_lot"), 0.0) <= 0.0 or p_vol < _num(lv.get("remaining_lot"), 0.0) - 1e-6):
+                    lv["remaining_lot"] = round(p_vol, 4)
+                    changed = True
+                if p_sl > 0.0:
+                    r_psl = round(p_sl, digits)
+                    if lv.get("broker_sl") != r_psl:
+                        lv["broker_sl"] = r_psl
+                        changed = True
+                    cur_entry = _num(lv.get("entry_price") or lv.get("target_price"), 0.0)
+                    if cur_entry > 0.0:
+                        is_green = (r_psl >= cur_entry - 1e-6) if is_buy else (r_psl <= cur_entry + 1e-6)
+                        if is_green:
+                            prev_rsl = _num(lv.get("ratchet_sl"), 0.0)
+                            if prev_rsl <= 0.0 or (is_buy and r_psl > prev_rsl + 1e-6) or (not is_buy and r_psl < prev_rsl - 1e-6):
+                                lv["ratchet_sl"] = r_psl
+                                changed = True
+                if p_tp > 0.0 and _num(lv.get("tp"), 0.0) <= 0.0:
+                    lv["tp"] = round(p_tp, digits)
+                    changed = True
+
+                mkt_list = list(signal_data.get("market_tickets") or [])
+                if lt not in mkt_list:
+                    mkt_list.append(lt)
+                    signal_data["market_tickets"] = mkt_list
+                    any_promoted_mkt = True
+                    changed = True
+                pd_list = list(signal_data.get("pending_tickets") or [])
+                if lt in pd_list:
+                    signal_data["pending_tickets"] = [t for t in pd_list if t != lt]
+                    changed = True
+
+            # Capture earliest open entry for recorded_entry_price backfill
+            st_now = str(lv.get("status") or "").strip().upper()
+            if first_open_entry is None and st_now in ("OPEN", "FILLED", "RUNNER"):
+                cand_e = _num(lv.get("entry_price") or lv.get("entry"), 0.0)
+                if cand_e > 0.0:
+                    first_open_entry = cand_e
+
+        if first_open_entry is not None and _num(signal_data.get("recorded_entry_price"), 0.0) <= 0.0:
+            signal_data["recorded_entry_price"] = round(first_open_entry, digits)
+            signal_data["initial_price"] = round(first_open_entry, digits)
+            changed = True
+
+        open_keys = self._ordered_open_layer_keys(signal_data)
+        if open_keys and (
+            any_promoted_mkt
+            or any(not str((layers.get(lk) or {}).get("role") or "").strip() for lk in open_keys)
+        ):
+            self.assign_or_preserve_layer_roles(signal_data)
+            changed = True
+
+        return changed
+
+    @staticmethod
+    def compute_ticket_ratchet_levels(
+        direction: str,
+        entry_price: float,
+        mfe_exec: float,
+        tp1_leg: Optional[float],
+        prog_to_tp1: float,
+        stage: int,
+        leg_prog: float,
+        leg_span: Optional[float],
+        atr_val: float,
+        role: str,
+        is_solo: bool = False,
+        lift_active: bool = False,
+        digits: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Pure Rev 2 v3.6 Profit Ratchet calculation for a single filled ticket.
+        Computes monotonic broker SL lock ($L_broker) and spread-paused virtual lock ($L_virt).
+        """
+        is_buy = (direction or "BUY").strip().upper() == "BUY"
+        sign = 1.0 if is_buy else -1.0
+        role_u = str(role or "CORE_RUNNER").strip().upper()
+        atr = float(atr_val) if atr_val and float(atr_val) > 0.0 else 1.67
+
+        out: Dict[str, Any] = {
+            "tier": None,
+            "l_broker": None,
+            "l_virt": None,
+            "broker_sl": None,
+            "virt_sl": None,
+            "is_squeeze": False,
+            "arm_bank_harvest": False,
+            "harvest_virt_pb": None,
+        }
+        if entry_price <= 0.0 or mfe_exec <= 0.0:
+            return out
+
+        peak_prog = max(
+            float(prog_to_tp1 or 0.0),
+            (float(mfe_exec) / float(tp1_leg)) if (tp1_leg is not None and tp1_leg > 1e-9) else 0.0,
+        )
+
+        def _finalize(tier_name: str, l_brk: float, l_vrt: float, is_sq: bool = False, arm_bh: bool = False, bh_pb: Optional[float] = None) -> Dict[str, Any]:
+            l_brk_r = max(0.0, round(l_brk, 6))
+            l_vrt_r = max(l_brk_r, round(l_vrt, 6))
+            return {
+                "tier": tier_name,
+                "l_broker": l_brk_r,
+                "l_virt": l_vrt_r,
+                "broker_sl": round(entry_price + sign * l_brk_r, digits),
+                "virt_sl": round(entry_price + sign * l_vrt_r, digits),
+                "is_squeeze": is_sq,
+                "arm_bank_harvest": arm_bh,
+                "harvest_virt_pb": bh_pb,
+            }
+
+        if role_u == "LATE_RECOVERY":
+            t1_mfe = float(_cfg("RATCHET_TIER1A_MFE_DOLLARS", RATCHET_TIER1A_MFE_DOLLARS))
+            t1_lock = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+            if mfe_exec + 1e-9 >= t1_mfe:
+                return _finalize("TIER_1A", t1_lock, t1_lock)
+            return out
+
+        if role_u == "BANK_LAYER":
+            bh_on = bool(_cfg("BANK_HARVEST_ENABLED", BANK_HARVEST_ENABLED))
+            bh_mfe = float(_cfg("BANK_HARVEST_ARM_MFE_DOLLARS", BANK_HARVEST_ARM_MFE_DOLLARS))
+            bh_alt_pct = float(_cfg("BANK_HARVEST_ALT_ARM_PCT", BANK_HARVEST_ALT_ARM_PCT))
+            bh_alt_min = float(_cfg("BANK_HARVEST_ALT_MIN_MFE_DOLLARS", BANK_HARVEST_ALT_MIN_MFE_DOLLARS))
+            arm_bh = bh_on and (
+                (mfe_exec + 1e-9 >= bh_mfe)
+                or (peak_prog + 1e-9 >= bh_alt_pct and mfe_exec + 1e-9 >= bh_alt_min)
+            )
+            if arm_bh:
+                pb_mult = float(_cfg("BANK_HARVEST_PULLBACK_ATR_MULT", BANK_HARVEST_PULLBACK_ATR_MULT))
+                pb_min = float(_cfg("BANK_HARVEST_PULLBACK_MIN", BANK_HARVEST_PULLBACK_MIN))
+                pb_max = float(_cfg("BANK_HARVEST_PULLBACK_MAX", BANK_HARVEST_PULLBACK_MAX))
+                brk_cush = float(_cfg("BANK_HARVEST_BROKER_CUSHION_DOLLARS", BANK_HARVEST_BROKER_CUSHION_DOLLARS))
+                t1_lock = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+                virt_pb = round(max(pb_min, min(pb_max, pb_mult * atr)), 4)
+                l_brk = max(t1_lock, mfe_exec - brk_cush)
+                l_vrt = max(l_brk, mfe_exec - virt_pb)
+                return _finalize("BANK_HARVEST", l_brk, l_vrt, arm_bh=True, bh_pb=virt_pb)
+            # Below BANK_HARVEST arming threshold, still lock Tier 1a/1b green broker SL at $3.50/$4.25
+            t1b_mfe = float(_cfg("RATCHET_TIER1B_MFE_DOLLARS", RATCHET_TIER1B_MFE_DOLLARS))
+            t1b_lock = float(_cfg("RATCHET_TIER1B_LOCK_DOLLARS", RATCHET_TIER1B_LOCK_DOLLARS))
+            t1a_mfe = float(_cfg("RATCHET_TIER1A_MFE_DOLLARS", RATCHET_TIER1A_MFE_DOLLARS))
+            t1a_lock = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+            if mfe_exec + 1e-9 >= t1b_mfe:
+                return _finalize("TIER_1B", t1b_lock, t1b_lock)
+            if mfe_exec + 1e-9 >= t1a_mfe:
+                return _finalize("TIER_1A", t1a_lock, t1a_lock)
+            return out
+
+        # CORE_RUNNER, SOLO_RUNNER, STAGE2_BANKER (and BANK_TP1 falls through to Tier 1a/1b/2+ if lifted or waiting)
+        t5_mfe = float(_cfg("RATCHET_TIER5_MFE_DOLLARS", RATCHET_TIER5_MFE_DOLLARS))
+        t4_mfe = float(_cfg("RATCHET_TIER4_MFE_DOLLARS", RATCHET_TIER4_MFE_DOLLARS))
+        t3_mfe = float(_cfg("RATCHET_TIER3_MFE_DOLLARS", RATCHET_TIER3_MFE_DOLLARS))
+        t2_mfe = float(_cfg("RATCHET_TIER2_MFE_DOLLARS", RATCHET_TIER2_MFE_DOLLARS))
+        t1b_mfe = float(_cfg("RATCHET_TIER1B_MFE_DOLLARS", RATCHET_TIER1B_MFE_DOLLARS))
+        t1a_mfe = float(_cfg("RATCHET_TIER1A_MFE_DOLLARS", RATCHET_TIER1A_MFE_DOLLARS))
+        t1a_lock = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+        t1b_lock = float(_cfg("RATCHET_TIER1B_LOCK_DOLLARS", RATCHET_TIER1B_LOCK_DOLLARS))
+
+        tight_max_leg = float(_cfg("RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS", RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS))
+        tight_min_mfe = float(_cfg("RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS", RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS))
+        tight_lock_pct = float(_cfg("RATCHET_TIGHT_TP1_LOCK_PCT", RATCHET_TIGHT_TP1_LOCK_PCT))
+        lift_min_mfe = float(_cfg("RATCHET_LIFT_MIN_MFE_DOLLARS", RATCHET_LIFT_MIN_MFE_DOLLARS))
+        lift_pct = float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT))
+
+        is_tight_0t = bool(
+            stage == 0
+            and tp1_leg is not None
+            and 0.0 < tp1_leg <= tight_max_leg + 1e-9
+            and peak_prog + 1e-9 >= max(lift_pct, 0.76)
+            and mfe_exec + 1e-9 >= tight_min_mfe
+            and mfe_exec + 1e-9 < t1a_mfe
+        )
+
+        tier_name: Optional[str] = None
+        l_broker = 0.0
+        l_virt = 0.0
+        cush = 3.50
+
+        if mfe_exec + 1e-9 >= t5_mfe:
+            c5 = max(float(_cfg("RATCHET_TIER5_MIN_CUSHION", RATCHET_TIER5_MIN_CUSHION)), min(float(_cfg("RATCHET_TIER5_MAX_CUSHION", RATCHET_TIER5_MAX_CUSHION)), 2.50 * atr))
+            ret5 = float(_cfg("RATCHET_TIER5_RETENTION_PCT", RATCHET_TIER5_RETENTION_PCT))
+            l_broker = l_virt = max(ret5 * mfe_exec, mfe_exec - c5)
+            tier_name, cush = "TIER_5", c5
+        elif mfe_exec + 1e-9 >= t4_mfe:
+            c4 = max(float(_cfg("RATCHET_TIER4_MIN_CUSHION", RATCHET_TIER4_MIN_CUSHION)), min(float(_cfg("RATCHET_TIER4_MAX_CUSHION", RATCHET_TIER4_MAX_CUSHION)), 2.25 * atr))
+            ret4 = float(_cfg("RATCHET_TIER4_RETENTION_PCT", RATCHET_TIER4_RETENTION_PCT))
+            l_broker = l_virt = max(ret4 * mfe_exec, mfe_exec - c4)
+            tier_name, cush = "TIER_4", c4
+        elif mfe_exec + 1e-9 >= t3_mfe:
+            c3 = max(float(_cfg("RATCHET_TIER3_MIN_CUSHION", RATCHET_TIER3_MIN_CUSHION)), min(float(_cfg("RATCHET_TIER3_MAX_CUSHION", RATCHET_TIER3_MAX_CUSHION)), 2.00 * atr))
+            ret3 = float(_cfg("RATCHET_TIER3_RETENTION_PCT", RATCHET_TIER3_RETENTION_PCT))
+            l_broker = l_virt = max(ret3 * mfe_exec, mfe_exec - c3)
+            tier_name, cush = "TIER_3", c3
+        elif mfe_exec + 1e-9 >= t2_mfe:
+            c2 = max(float(_cfg("RATCHET_TIER2_MIN_CUSHION", RATCHET_TIER2_MIN_CUSHION)), min(float(_cfg("RATCHET_TIER2_MAX_CUSHION", RATCHET_TIER2_MAX_CUSHION)), 2.00 * atr))
+            ret2 = float(_cfg("RATCHET_TIER2_RETENTION_PCT", RATCHET_TIER2_RETENTION_PCT))
+            min_l2 = float(_cfg("RATCHET_TIER2_MIN_LOCK_DOLLARS", RATCHET_TIER2_MIN_LOCK_DOLLARS))
+            l_broker = l_virt = max(min_l2, ret2 * mfe_exec, mfe_exec - c2)
+            tier_name, cush = "TIER_2", c2
+        elif is_tight_0t:
+            tier_name = "TIER_0T"
+            l_broker = t1a_lock
+            l_virt = max(t1a_lock, tight_lock_pct * mfe_exec)
+            cush = max(0.50, mfe_exec - l_virt)
+        elif mfe_exec + 1e-9 >= t1b_mfe:
+            tier_name = "TIER_1B"
+            l_broker = l_virt = t1b_lock
+            cush = max(1.0, mfe_exec - t1b_lock)
+        elif (mfe_exec + 1e-9 >= t1a_mfe) or (lift_active and mfe_exec + 1e-9 >= lift_min_mfe):
+            tier_name = "TIER_1A"
+            l_broker = l_virt = t1a_lock
+            cush = max(1.0, mfe_exec - t1a_lock)
+
+        if stage == 4 and role_u in ("CORE_RUNNER", "SOLO_RUNNER") and mfe_exec > 0.0:
+            cs4 = max(float(_cfg("RATCHET_STAGE4_MIN_CUSHION", RATCHET_STAGE4_MIN_CUSHION)), min(float(_cfg("RATCHET_STAGE4_MAX_CUSHION", RATCHET_STAGE4_MAX_CUSHION)), 1.75 * atr))
+            ret_s4 = float(_cfg("RATCHET_STAGE4_RETENTION_PCT", RATCHET_STAGE4_RETENTION_PCT))
+            l_s4 = max(ret_s4 * mfe_exec, mfe_exec - cs4)
+            if l_s4 > l_broker:
+                l_broker = l_virt = l_s4
+                tier_name, cush = "STAGE4_SQUEEZE", cs4
+
+        is_sq = False
+        if tier_name in ("TIER_2", "TIER_3", "TIER_4", "TIER_5", "STAGE4_SQUEEZE") and role_u in ("CORE_RUNNER", "SOLO_RUNNER"):
+            pk_arm = float(_cfg("PEAK_HARVEST_ARM_PCT", PEAK_HARVEST_ARM_PCT))
+            sq_mult = float(_cfg("PEAK_HARVEST_CUSHION_MULT", PEAK_HARVEST_CUSHION_MULT))
+            sq_min_brk = float(_cfg("PEAK_HARVEST_MIN_BROKER_CUSHION", PEAK_HARVEST_MIN_BROKER_CUSHION))
+            sq_min_vrt = float(_cfg("PEAK_HARVEST_MIN_VIRT_CUSHION", PEAK_HARVEST_MIN_VIRT_CUSHION))
+            sq_max = float(_cfg("PEAK_HARVEST_MAX_CUSHION", PEAK_HARVEST_MAX_CUSHION))
+            if stage >= 2 and leg_span is not None and leg_span + 1e-9 >= 5.00 and leg_prog + 1e-9 >= pk_arm:
+                c_sq_b = max(sq_min_brk, min(sq_max, sq_mult * cush))
+                c_sq_v = max(sq_min_vrt, min(sq_max, sq_mult * cush))
+                l_broker = max(l_broker, mfe_exec - c_sq_b)
+                l_virt = max(l_broker, l_virt, mfe_exec - c_sq_v)
+                is_sq = True
+            elif stage == 0 and is_solo and tp1_leg is not None and tp1_leg + 1e-9 >= 10.00 and peak_prog + 1e-9 >= pk_arm:
+                c_sq_b = max(sq_min_brk, min(sq_max, 0.75 * cush))
+                c_sq_v = max(max(sq_min_vrt, 2.50), min(sq_max, 0.75 * cush))
+                l_broker = max(l_broker, mfe_exec - c_sq_b)
+                l_virt = max(l_broker, l_virt, mfe_exec - c_sq_v)
+                is_sq = True
+
+        if tier_name is None:
+            return out
+        return _finalize(tier_name, l_broker, l_virt, is_sq=is_sq)
+
+    def _sync_ticket_ratchet_sl(
+        self,
+        signal_data: Dict[str, Any],
+        layer_key: Optional[str],
+        ticket: int,
+        desired_broker_sl: float,
+        step_dollars: Optional[float] = None,
+        force_sync: bool = False,
+        tick: Any = None,
+        sym_info: Any = None,
+        digits: int = 2,
+        floor_lock_sl: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        Per-ticket monotonic broker SL synchronization (FM-8: never broadcasts across layers).
+        Clamps to stops_level + safety buffer, rejects non-green clamping, checks `>= step_dollars`
+        improvement unless `force_sync=True`, and updates only `layers[layer_key]` (plus
+        signal_data["broker_sl"] for CORE_RUNNER/SOLO_RUNNER).
+        """
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0 or desired_broker_sl <= 0.0:
+            return {"synced": False, "sl": None, "rejected": False, "retcode": None}
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        if sym_info is None:
+            sym_info = self.get_symbol_info(symbol)
+            digits = _int_num(getattr(sym_info, "digits", digits), digits) if sym_info else digits
+        if tick is None:
+            tick = self.get_tick(symbol)
+        eff_step = float(
+            _cfg("RATCHET_BROKER_STEP_DOLLARS", RATCHET_BROKER_STEP_DOLLARS)
+            if step_dollars is None
+            else step_dollars
+        )
+
+        layers = signal_data.get("layers") or {}
+        l_info = layers.get(layer_key) if (layer_key and isinstance(layers.get(layer_key), dict)) else None
+        entry_px = self._resolve_layer_entry(signal_data, layer_key, l_info) or 0.0
+
+        cur_sl = 0.0
+        if not self.dry_run:
+            with self._mt5_lock:
+                pos_res = mt5.positions_get(ticket=t_int)
+            if pos_res:
+                cur_sl = round(_num(getattr(pos_res[0], "sl", 0.0), 0.0), digits)
+                p_open = _num(getattr(pos_res[0], "price_open", 0.0), 0.0)
+                if p_open > 0.0 and entry_px <= 0.0:
+                    entry_px = round(p_open, digits)
+        if l_info is not None:
+            for k_sl in ("ratchet_sl", "broker_sl", "be_sl"):
+                sv = _num(l_info.get(k_sl), 0.0)
+                if sv > 0.0:
+                    if cur_sl <= 0.0 or (is_buy and sv > cur_sl) or (not is_buy and sv < cur_sl):
+                        cur_sl = round(sv, digits)
+
+        target_sl = round(float(desired_broker_sl), digits)
+        if cur_sl > 0.0:
+            # Maintain strict monotonicity even against existing tighter manual/BE/ratchet SL
+            cur_is_green = (cur_sl >= entry_px - 1e-6) if (entry_px > 0 and is_buy) else (cur_sl <= entry_px + 1e-6 if entry_px > 0 else True)
+            if cur_is_green:
+                target_sl = round(max(target_sl, cur_sl) if is_buy else min(target_sl, cur_sl), digits)
+
+        clamped_sl = self._clamp_sl_for_broker_stops(target_sl, direction, tick, sym_info, digits)
+        if floor_lock_sl is not None and floor_lock_sl > 0.0:
+            # Do not replace desired SL if clamping pushed it worse than desired minimum lock; try fallback
+            fallback_clamped = self._clamp_sl_for_broker_stops(float(floor_lock_sl), direction, tick, sym_info, digits)
+            if (is_buy and clamped_sl < float(floor_lock_sl) - 1e-6) or (not is_buy and clamped_sl > float(floor_lock_sl) + 1e-6):
+                clamped_sl = fallback_clamped
+
+        # Strictly green guard when entry known
+        if entry_px > 0.0:
+            if (is_buy and clamped_sl <= entry_px + 1e-6) or (not is_buy and clamped_sl >= entry_px - 1e-6):
+                return {"synced": False, "sl": None, "rejected": True, "retcode": 10016}
+
+        already_better = cur_sl > 0.0 and (
+            (is_buy and cur_sl >= clamped_sl - 1e-9) or (not is_buy and cur_sl <= clamped_sl + 1e-9)
+        )
+        if already_better:
+            if l_info is not None:
+                l_info["broker_sl"] = cur_sl
+                l_info["ratchet_sl"] = cur_sl
+            return {"synced": True, "sl": cur_sl, "rejected": False, "retcode": 10025}
+
+        improvement = (clamped_sl - cur_sl) if (cur_sl > 0.0 and is_buy) else ((cur_sl - clamped_sl) if cur_sl > 0.0 else float("inf"))
+        cur_is_protected = cur_sl > 0.0 and (entry_px <= 0.0 or ((cur_sl >= entry_px - 1e-6) if is_buy else (cur_sl <= entry_px + 1e-6)))
+        if (not force_sync) and cur_is_protected and (improvement + 1e-9 < eff_step):
+            return {"synced": False, "sl": cur_sl, "rejected": False, "retcode": None}
+
+        ok = self.modify_position_sltp(t_int, sl=clamped_sl, tp=None)
+        retcode = (getattr(self, "last_modify_result", {}) or {}).get("retcode")
+        if ok:
+            if l_info is not None:
+                l_info["broker_sl"] = clamped_sl
+                l_info["ratchet_sl"] = clamped_sl
+                l_info["sl"] = clamped_sl
+            role_u = str((l_info or {}).get("role") or "").strip().upper()
+            if role_u in ("CORE_RUNNER", "SOLO_RUNNER", "") or t_int == _int_num(signal_data.get("runner_ticket"), 0):
+                prev_bsl = _num(signal_data.get("broker_sl"), 0.0)
+                if prev_bsl <= 0.0 or (is_buy and clamped_sl > prev_bsl + 1e-9) or (not is_buy and clamped_sl < prev_bsl - 1e-9):
+                    signal_data["broker_sl"] = clamped_sl
+            return {"synced": True, "sl": clamped_sl, "rejected": False, "retcode": retcode or 10009}
+        return {"synced": False, "sl": None, "rejected": True, "retcode": retcode}
+
+    def _lift_ticket_tp_two_step(
+        self,
+        signal_data: Dict[str, Any],
+        layer_key: Optional[str],
+        ticket: int,
+        next_tp: float,
+        next_tp_stage: str,
+        desired_broker_sl: float,
+        entry_price: float,
+        mfe_exec: Optional[float] = None,
+        tick: Any = None,
+        sym_info: Any = None,
+        digits: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Strict 2-Step SL-First TP Lift (`FM-1`, `FM-6`):
+          1) Enforce minimum clearance gate & strictly green broker SL write (`tp=None`).
+          2) If Step 1 fails or rejects (`10016`/`10029`), ABORT Step 2 and keep TP1/TPk intact.
+          3) Step 2 writes TP only (`sl=None`) outside `trade_freeze_level`.
+        """
+        t_int = _int_num(ticket, 0)
+        if t_int <= 0 or next_tp is None or float(next_tp) <= 0.0:
+            return {"lifted": False, "aborted_clearance": True}
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        if sym_info is None:
+            sym_info = self.get_symbol_info(symbol)
+            digits = _int_num(getattr(sym_info, "digits", digits), digits) if sym_info else digits
+        if tick is None:
+            tick = self.get_tick(symbol)
+
+        layers = signal_data.get("layers") or {}
+        l_info = layers.get(layer_key) if (layer_key and isinstance(layers.get(layer_key), dict)) else None
+        target_tp = round(float(next_tp), digits)
+        if l_info is not None and abs(_num(l_info.get("tp"), 0.0) - target_tp) < 1e-6 and l_info.get("tp_stage") == next_tp_stage:
+            return {"lifted": False, "already_at_tp": True}
+
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) or 0.01
+        raw_stop_dist = max(0.0, stops_lvl * pt)
+        safety_buf = float(_cfg("STOP_LEVEL_SAFETY_BUFFER_DOLLARS", STOP_LEVEL_SAFETY_BUFFER_DOLLARS)) if (not self.dry_run or raw_stop_dist > 0.0) else 0.0
+        min_stop_dist = raw_stop_dist + (max(0.0, safety_buf) if raw_stop_dist > 0.0 else 0.0)
+
+        min_mfe_cfg = float(_cfg("RATCHET_LIFT_MIN_MFE_DOLLARS", RATCHET_LIFT_MIN_MFE_DOLLARS))
+        if mfe_exec is not None and entry_price > 0.0:
+            l_req = abs(float(desired_broker_sl) - float(entry_price))
+            req_mfe = max(min_mfe_cfg, (l_req + min_stop_dist + 0.10) if not self.dry_run else min_mfe_cfg)
+            if float(mfe_exec) + 1e-9 < req_mfe:
+                return {"lifted": False, "aborted_clearance": True, "req_mfe": round(req_mfe, 2)}
+
+        # Step 1: Strictly green broker SL FIRST (never combined sl+tp call!)
+        sl_res = self._sync_ticket_ratchet_sl(
+            signal_data=signal_data,
+            layer_key=layer_key,
+            ticket=t_int,
+            desired_broker_sl=desired_broker_sl,
+            force_sync=True,
+            tick=tick,
+            sym_info=sym_info,
+            digits=digits,
+        )
+        if not sl_res.get("synced"):
+            warn_key = f"{t_int}:{next_tp_stage}"
+            now_m = time.monotonic()
+            throttled = (now_m - self._lift_abort_warn_ts.get(warn_key, 0.0)) < 60.0
+            if not throttled:
+                self._lift_abort_warn_ts[warn_key] = now_m
+                logger.warning(
+                    f"2-Step TP Lift ABORTED on #{t_int} ({layer_key}): Broker SL sync rejected "
+                    f"(desired={desired_broker_sl}, retcode={sl_res.get('retcode')}); keeping current TP intact."
+                )
+            return {
+                "lifted": False,
+                "aborted_sl_fail": True,
+                "retcode": sl_res.get("retcode"),
+                "notify_abort": not throttled,
+            }
+
+        # Step 2: Broker TP ONLY (check freeze_level first)
+        cur_tp = _num((l_info or {}).get("tp"), 0.0)
+        if self.is_within_freeze_level(symbol, cur_tp, tick, sym_info) or self.is_within_freeze_level(symbol, target_tp, tick, sym_info):
+            return {"lifted": False, "aborted_frozen": True, "retcode": 10029}
+
+        tp_ok = self.modify_position_sltp(t_int, sl=None, tp=target_tp)
+        if not tp_ok:
+            retcode = (getattr(self, "last_modify_result", {}) or {}).get("retcode")
+            return {"lifted": False, "aborted_tp_fail": True, "retcode": retcode}
+
+        if l_info is not None:
+            l_info["tp"] = target_tp
+            l_info["tp_stage"] = next_tp_stage
+        logger.info(
+            f"2-Step Lift #{t_int} ({layer_key}): Broker SL locked @ {sl_res.get('sl')} -> TP lifted to {next_tp_stage}={target_tp}"
+        )
+        return {"lifted": True, "sl": sl_res.get("sl"), "tp": target_tp, "tp_stage": next_tp_stage}
+
+    def evaluate_profit_ratchet_tick(
+        self,
+        signal_data: Dict[str, Any],
+        tick: Any = None,
+        stage: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        v3.6 Continuous Per-Ticket Progressive Profit Ratchet + BANK_HARVEST + 2-Step TP Lift.
+        Runs on every 1s tick across active open positions in Stage 0 and Stages 1-4.
+        """
+        result: Dict[str, Any] = {
+            "paused_by_spread": False,
+            "events": [],
+            "harvest_close_tickets": [],
+            "virtual_close_tickets": [],
+            "pending_swept": [],
+            "lift_aborts": [],
+        }
+        if not isinstance(signal_data, dict):
+            return result
+        if not bool(_cfg("PROFIT_RATCHET_ENABLED", PROFIT_RATCHET_ENABLED)):
+            return result
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        if tick is None:
+            tick = self.get_tick(symbol)
+        if tick is None or not self.is_valid_live_tick(symbol, tick):
+            result["paused_by_spread"] = True
+            signal_data["spread_spike_paused"] = True
+            return result
+
+        is_spike, spread_dollars, eff_max_spread = self.check_spread_spike(symbol, tick)
+        signal_data["spread_spike_paused"] = is_spike
+        if is_spike:
+            result["paused_by_spread"] = True
+            return result
+
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        exec_price = float(tick.bid) if is_buy else float(tick.ask)
+        raw_chart = getattr(tick, "bid", None)
+        chart_price = float(raw_chart) if isinstance(raw_chart, numbers.Real) and not isinstance(raw_chart, bool) and float(raw_chart) > 0 else exec_price
+
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        pip_size = self.get_pip_size(symbol)
+        tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
+        raw_tp1 = signal_data.get("raw_tp1") or tp_levels.get("TP1")
+
+        open_keys = self._ordered_open_layer_keys(signal_data)
+        if not open_keys:
+            return result
+        roles = self.assign_or_preserve_layer_roles(signal_data)
+        layers = signal_data.get("layers") or {}
+
+        eff_stage = stage if stage is not None else self.get_runner_fsm_stage(signal_data)
+        sig_entry = self._resolve_signal_primary_entry(signal_data)
+        tp1_leg: Optional[float] = None
+        prog_to_tp1 = 0.0
+        if raw_tp1 is not None and sig_entry is not None and sig_entry > 0.0:
+            tp1_leg = (float(raw_tp1) - sig_entry) if is_buy else (sig_entry - float(raw_tp1))
+            if tp1_leg > 1e-9:
+                prog_to_tp1 = ((chart_price - sig_entry) / tp1_leg) if is_buy else ((sig_entry - chart_price) / tp1_leg)
+
+        configured_max_stage = max(1, min(5, _int_num(signal_data.get("runner_max_tp_stage") or _cfg("RUNNER_MAX_TP_STAGE", RUNNER_MAX_TP_STAGE), 5)))
+        max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
+        signal_data["effective_max_stage"] = max_stage
+
+        leg_prog = 0.0
+        leg_span: Optional[float] = None
+        if eff_stage >= 1 and eff_stage < max_stage:
+            prev_tp_k = tp_levels.get(f"TP{eff_stage}")
+            next_tp_k = tp_levels.get(f"TP{eff_stage + 1}")
+            if prev_tp_k is not None and next_tp_k is not None:
+                leg_span = (float(next_tp_k) - float(prev_tp_k)) if is_buy else (float(prev_tp_k) - float(next_tp_k))
+                if leg_span > 1e-9:
+                    leg_prog = ((chart_price - float(prev_tp_k)) / leg_span) if is_buy else ((float(prev_tp_k) - chart_price) / leg_span)
+
+        atr_val = self.get_m1_atr(symbol)
+        is_solo = len(open_keys) == 1
+        confirm_req = max(1, _int_num(_cfg("REVERSAL_CONFIRM_TICKS", 2), 2))
+        proactive = bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT)) and eff_stage == 0 and max_stage >= 2
+        bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False)) or (max_stage <= 1)
+        bank_single_tp1 = bool(_cfg("BANK_SINGLE_LAYER_AT_TP1", False))
+        lift_pct = float(_cfg("RUNNER_EARLY_TP_LIFT_PCT", RUNNER_EARLY_TP_LIFT_PCT))
+
+        should_lift_stage0 = False
+        if proactive and not bank_all_tp1 and not (bank_single_tp1 and is_solo) and raw_tp1 is not None and tp_levels.get("TP2") is not None:
+            if prog_to_tp1 + 1e-9 >= lift_pct:
+                should_lift_stage0 = True
+            else:
+                anchor = self._resolve_milestone_anchor(signal_data, tp_levels, 1)
+                eff_buf, _ = self._compute_proximity_and_pullback(float(raw_tp1), chart_price, pip_size, anchor=anchor)
+                dist_t = (float(raw_tp1) - chart_price) if is_buy else (chart_price - float(raw_tp1))
+                if dist_t <= eff_buf + 1e-9:
+                    should_lift_stage0 = True
+
+        lock_roles_now = False
+        sweep_pendings_now = False
+
+        for lk in open_keys:
+            lv = layers[lk]
+            lt = _int_num(lv.get("ticket"), 0)
+            if lt <= 0:
+                continue
+            role = roles.get(lk, "CORE_RUNNER")
+            entry_px = self._resolve_layer_entry(signal_data, lk, lv)
+            if entry_px is None or entry_px <= 0.0:
+                continue
+
+            cur_prof = round((exec_price - entry_px) if is_buy else (entry_px - exec_price), 6)
+            prev_mfe = _num(lv.get("mfe_dollars"), 0.0)
+            new_mfe = round(max(prev_mfe, cur_prof, 0.0), 6)
+            prev_pk = lv.get("mfe_peak_price")
+            if cur_prof > prev_mfe + 1e-9 or prev_pk is None:
+                pk_px = round(exec_price, digits) if cur_prof > 0.0 else (round(float(prev_pk), digits) if prev_pk is not None else round(entry_px, digits))
+                if prev_pk is None or (is_buy and exec_price > float(prev_pk)) or (not is_buy and exec_price < float(prev_pk)):
+                    lv["mfe_peak_price"] = round(exec_price, digits)
+                elif prev_pk is not None:
+                    lv["mfe_peak_price"] = round(float(prev_pk), digits)
+            if cur_prof > prev_mfe + 1e-9:
+                lv["bank_harvest_ticks"] = 0
+                lv["virt_ratchet_ticks"] = 0
+            lv["mfe_dollars"] = new_mfe
+
+            if role in ("CORE_RUNNER", "SOLO_RUNNER"):
+                sig_prev_pp = _num(signal_data.get("peak_profit"), 0.0)
+                if new_mfe > sig_prev_pp:
+                    signal_data["peak_profit"] = new_mfe
+                    signal_data["reversal_guard_peak_profit"] = new_mfe
+                if lv.get("mfe_peak_price") is not None:
+                    prev_rpk = signal_data.get("runner_peak_price")
+                    lpk = float(lv["mfe_peak_price"])
+                    if prev_rpk is None or (is_buy and lpk > float(prev_rpk)) or (not is_buy and lpk < float(prev_rpk)):
+                        signal_data["runner_peak_price"] = lpk
+
+            can_lift_role = (
+                should_lift_stage0
+                and role in ("CORE_RUNNER", "SOLO_RUNNER", "STAGE2_BANKER")
+                and str(lv.get("tp_stage") or "TP1").strip().upper() == "TP1"
+            )
+            r_res = self.compute_ticket_ratchet_levels(
+                direction=direction,
+                entry_price=entry_px,
+                mfe_exec=new_mfe,
+                tp1_leg=tp1_leg,
+                prog_to_tp1=prog_to_tp1,
+                stage=eff_stage,
+                leg_prog=leg_prog,
+                leg_span=leg_span,
+                atr_val=atr_val,
+                role=role,
+                is_solo=is_solo,
+                lift_active=can_lift_role,
+                digits=digits,
+            )
+
+            new_tier = r_res.get("tier")
+            prev_tier = lv.get("ratchet_tier")
+            tier_jumped = bool(new_tier and new_tier != prev_tier)
+            was_squeeze = bool(lv.get("squeeze_active"))
+            now_squeeze = bool(r_res.get("is_squeeze"))
+            if now_squeeze:
+                lv["squeeze_active"] = True
+
+            if new_tier is not None:
+                lock_roles_now = True
+                sweep_pendings_now = True
+                lv["ratchet_tier"] = new_tier
+                if r_res.get("arm_bank_harvest") and not lv.get("bank_harvest_armed"):
+                    lv["bank_harvest_armed"] = True
+
+            # Pre-TP1 2-Step SL-First TP Lift for CORE_RUNNER, SOLO_RUNNER, and N=4 STAGE2_BANKER (-> TP2)
+            tp2_val = tp_levels.get("TP2")
+            lifted_this_tick = False
+            if can_lift_role and tp2_val is not None:
+                min_lift_sl = round(entry_px + float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS)), digits) if is_buy else round(entry_px - float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS)), digits)
+                lift_sl = r_res.get("broker_sl") or min_lift_sl
+                if is_buy:
+                    lift_sl = max(lift_sl, min_lift_sl)
+                else:
+                    lift_sl = min(lift_sl, min_lift_sl)
+                old_tp_val = lv.get("tp")
+                lift_res = self._lift_ticket_tp_two_step(
+                    signal_data=signal_data,
+                    layer_key=lk,
+                    ticket=lt,
+                    next_tp=float(tp2_val),
+                    next_tp_stage="TP2",
+                    desired_broker_sl=lift_sl,
+                    entry_price=entry_px,
+                    mfe_exec=new_mfe,
+                    tick=tick,
+                    sym_info=sym_info,
+                    digits=digits,
+                )
+                if lift_res.get("lifted"):
+                    lifted_this_tick = True
+                    lock_roles_now = True
+                    sweep_pendings_now = True
+                    if role in ("CORE_RUNNER", "SOLO_RUNNER"):
+                        signal_data["tp_stage"] = "TP2"
+                    result["events"].append({
+                        "type": "TP_LIFT",
+                        "layer": lk,
+                        "role": role,
+                        "ticket": lt,
+                        "entry_price": entry_px,
+                        "peak_price": lv.get("mfe_peak_price"),
+                        "mfe_dollars": new_mfe,
+                        "tier": new_tier or "TIER_1A",
+                        "broker_sl": lift_res.get("sl"),
+                        "old_tp": old_tp_val,
+                        "new_tp": lift_res.get("tp"),
+                        "new_tp_stage": "TP2",
+                    })
+                elif lift_res.get("aborted_sl_fail") and lift_res.get("notify_abort"):
+                    result["lift_aborts"].append({
+                        "layer": lk,
+                        "ticket": lt,
+                        "desired_sl": lift_sl,
+                        "retcode": lift_res.get("retcode"),
+                    })
+
+            # Continuous broker SL ratchet progression
+            broker_sl_target = r_res.get("broker_sl")
+            if broker_sl_target is not None:
+                sync_res = self._sync_ticket_ratchet_sl(
+                    signal_data=signal_data,
+                    layer_key=lk,
+                    ticket=lt,
+                    desired_broker_sl=float(broker_sl_target),
+                    force_sync=bool(tier_jumped or (now_squeeze and not was_squeeze)),
+                    tick=tick,
+                    sym_info=sym_info,
+                    digits=digits,
+                )
+                if eff_stage == 0 and sync_res.get("synced") and role in ("CORE_RUNNER", "SOLO_RUNNER", "BANK_LAYER"):
+                    signal_data["stage0_profit_lock_active"] = True
+                    signal_data["stage0_profit_lock_sl"] = sync_res.get("sl") or broker_sl_target
+                    signal_data["stage0_broker_sl_synced"] = True
+
+                # One-shot Tier Jump / Squeeze alert (only when not already emitting TP_LIFT on same tick)
+                if (tier_jumped or (now_squeeze and not was_squeeze)) and not lifted_this_tick and lv.get("last_alerted_tier") != (f"{new_tier}_SQ" if now_squeeze else new_tier):
+                    lv["last_alerted_tier"] = f"{new_tier}_SQ" if now_squeeze else new_tier
+                    result["events"].append({
+                        "type": "SQUEEZE" if (now_squeeze and not was_squeeze) else "TIER_JUMP",
+                        "layer": lk,
+                        "role": role,
+                        "ticket": lt,
+                        "entry_price": entry_px,
+                        "peak_price": lv.get("mfe_peak_price"),
+                        "mfe_dollars": new_mfe,
+                        "tier": new_tier,
+                        "broker_sl": sync_res.get("sl") or lv.get("ratchet_sl") or broker_sl_target,
+                        "virt_sl": r_res.get("virt_sl"),
+                    })
+
+            # Virtual Spread-Paused Harvest Checks (2 confirming ticks)
+            virt_sl = r_res.get("virt_sl")
+            if virt_sl is not None:
+                if role == "BANK_LAYER" and r_res.get("arm_bank_harvest"):
+                    bh_hit = (exec_price <= float(virt_sl) + 1e-9) if is_buy else (exec_price >= float(virt_sl) - 1e-9)
+                    if bh_hit:
+                        bh_t = _int_num(lv.get("bank_harvest_ticks"), 0) + 1
+                        lv["bank_harvest_ticks"] = bh_t
+                        if bh_t >= confirm_req:
+                            result["harvest_close_tickets"].append({
+                                "layer": lk,
+                                "ticket": lt,
+                                "entry_price": entry_px,
+                                "peak_price": lv.get("mfe_peak_price"),
+                                "mfe_dollars": new_mfe,
+                                "virt_sl": float(virt_sl),
+                                "exec_price": exec_price,
+                            })
+                    else:
+                        lv["bank_harvest_ticks"] = 0
+                elif role in ("CORE_RUNNER", "SOLO_RUNNER") and (new_tier == "TIER_0T" or now_squeeze):
+                    v_hit = (exec_price <= float(virt_sl) + 1e-9) if is_buy else (exec_price >= float(virt_sl) - 1e-9)
+                    if v_hit:
+                        vr_t = _int_num(lv.get("virt_ratchet_ticks"), 0) + 1
+                        lv["virt_ratchet_ticks"] = vr_t
+                        if vr_t >= confirm_req:
+                            result["virtual_close_tickets"].append({
+                                "layer": lk,
+                                "ticket": lt,
+                                "role": role,
+                                "tier": "SQUEEZE" if now_squeeze else "TIER_0T",
+                                "entry_price": entry_px,
+                                "peak_price": lv.get("mfe_peak_price"),
+                                "mfe_dollars": new_mfe,
+                                "virt_sl": float(virt_sl),
+                                "exec_price": exec_price,
+                            })
+                    else:
+                        lv["virt_ratchet_ticks"] = 0
+
+        if lock_roles_now:
+            signal_data["roles_locked"] = True
+        if sweep_pendings_now and bool(_cfg("CANCEL_PENDING_ON_PROFIT_LOCK", CANCEL_PENDING_ON_PROFIT_LOCK)) and signal_data.get("pending_tickets"):
+            swept = self.cancel_signal_pending_orders(signal_data)
+            signal_data["pending_tickets"] = []
+            for l_val in layers.values():
+                if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
+                    l_val["status"] = "CANCELLED"
+            result["pending_swept"] = swept
+
+        return result
+
     def prepare_deepest_runners_for_tp_breakout(
         self,
         signal_data: Dict[str, Any],
@@ -5248,12 +6953,10 @@ class MT5Executor:
         chart_price: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        v3.1 Pre-TP1 Proactive Runner Breakout Preparation:
-        1. Dynamically selects current (runner_layers, early_layers) from open market_tickets.
-        2. Resets any early_layers back to final_tp (tp_stage="TP1") if a deeper limit filled after an earlier lift.
-        3. When RUNNER_PROACTIVE_TP_LIFT=True and chart_price enters the strict tight TP1 activation zone,
-           lifts ONLY runner_layers' broker TP to TP2 (tp_stage="TP2") so early_layers bank at broker TP1
-           while deepest runner(s) ride through the breakout.
+        Pre-TP1 Proactive Runner Breakout Preparation:
+        1. Assigns/preserves sticky layer roles when PROFIT_RATCHET_ENABLED=True.
+        2. Resets any early_layers back to final_tp unless roles are locked as STAGE2_BANKER/CORE_RUNNER.
+        3. Honors BANK_ALL_AT_TP1 / BANK_SINGLE_LAYER_AT_TP1 and executes strict 2-step SL-first TP2 lift.
         """
         layers = signal_data.get("layers") or {}
         market_tickets = list(signal_data.get("market_tickets") or [])
@@ -5271,8 +6974,19 @@ class MT5Executor:
             offset = float(_cfg("TP_FRONT_RUN_OFFSET", TP_FRONT_RUN_OFFSET)) * (pip_size / 0.10 if pip_size > 0 else 1.0)
             final_tp = round(float(raw_tp1) - offset, digits) if is_buy else round(float(raw_tp1) + offset, digits)
 
-        full_cnt = _int_num(_cfg("RUNNER_DEEPEST_COUNT_FULL", RUNNER_DEEPEST_COUNT_FULL), 1)
-        runner_layers, early_layers = select_dynamic_runners(layers, market_tickets, full_runner_count=full_cnt)
+        ratchet_on = bool(_cfg("PROFIT_RATCHET_ENABLED", PROFIT_RATCHET_ENABLED))
+        tiered_on = bool(_cfg("TIERED_STAGE_BANKING_ENABLED", TIERED_STAGE_BANKING_ENABLED))
+        if ratchet_on and not _is_legacy_3layer_dict(layers) and market_tickets:
+            roles = self.assign_or_preserve_layer_roles(signal_data)
+            open_keys = self._ordered_open_layer_keys(signal_data)
+            runner_layers = [lk for lk in open_keys if roles.get(lk) in ("CORE_RUNNER", "SOLO_RUNNER")]
+            stage2_layers = [lk for lk in open_keys if roles.get(lk) == "STAGE2_BANKER"] if tiered_on else []
+            early_layers = [lk for lk in open_keys if lk not in runner_layers and lk not in stage2_layers]
+        else:
+            full_cnt = _int_num(_cfg("RUNNER_DEEPEST_COUNT_FULL", RUNNER_DEEPEST_COUNT_FULL), 1)
+            runner_layers, early_layers = select_dynamic_runners(layers, market_tickets, full_runner_count=full_cnt)
+            stage2_layers = []
+
         runner_tickets = [
             _int_num(layers[lk].get("ticket"), 0)
             for lk in runner_layers
@@ -5288,7 +7002,7 @@ class MT5Executor:
             signal_data["last_runner_layer"] = runner_layers[-1]
 
         reset_tickets: List[int] = []
-        if final_tp is not None:
+        if final_tp is not None and not signal_data.get("roles_locked"):
             target_tp1 = round(float(final_tp), digits)
             for lk in early_layers:
                 l_info = layers.get(lk)
@@ -5302,16 +7016,21 @@ class MT5Executor:
                         l_info["tp_stage"] = "TP1"
                         reset_tickets.append(lt)
 
+        tick_obj = None
         if live_price is None:
-            tick = self.get_tick(symbol)
-            if tick is not None:
-                cand_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+            tick_obj = self.get_tick(symbol)
+            if tick_obj is not None:
+                cand_px = getattr(tick_obj, "bid", None) if is_buy else getattr(tick_obj, "ask", None)
                 if isinstance(cand_px, (int, float)) and not isinstance(cand_px, bool) and cand_px > 0:
                     live_price = float(cand_px)
                 if chart_price is None:
-                    cand_chart = getattr(tick, "bid", None)
+                    cand_chart = getattr(tick_obj, "bid", None)
                     if isinstance(cand_chart, (int, float)) and not isinstance(cand_chart, bool) and cand_chart > 0:
                         chart_price = float(cand_chart)
+        else:
+            b_px = float(chart_price if chart_price is not None else live_price)
+            a_px = round(b_px + 0.20, digits) if is_buy else float(live_price)
+            tick_obj = SimpleNamespace(bid=b_px, ask=a_px)
         eval_price = chart_price if chart_price is not None else live_price
 
         lifted_tickets: List[int] = []
@@ -5329,7 +7048,9 @@ class MT5Executor:
         max_stage = self._resolve_effective_max_stage(configured_max_stage, tp_levels)
         signal_data["runner_max_tp_stage"] = configured_max_stage
         signal_data["effective_max_stage"] = max_stage
-        if max_stage <= 1:
+        bank_all_tp1 = bool(_cfg("BANK_ALL_AT_TP1", False)) or (max_stage <= 1)
+        bank_single_tp1 = bool(_cfg("BANK_SINGLE_LAYER_AT_TP1", False))
+        if bank_all_tp1 or (bank_single_tp1 and len(market_tickets) == 1):
             proactive = False
         tp2 = tp_levels.get("TP2")
 
@@ -5341,9 +7062,6 @@ class MT5Executor:
             dist_to_tp1 = (float(raw_tp1) - float(eval_price)) if is_buy else (float(eval_price) - float(raw_tp1))
             should_lift_early = dist_to_tp1 <= eff_buf + 1e-9
 
-            # In Gold Calibrated Reversal Guard mode, lift ONLY the deepest runner's broker TP to TP2
-            # early at RUNNER_EARLY_TP_LIFT_PCT (default 70% of TP1) so broker front-run TP (TP1 - $0.50)
-            # never closes a tight scalp before 85% arming is reached (L1-L3 stay at TP1 - $0.50).
             if bool(_cfg("GOLD_REVERSAL_GUARD_ENABLED", GOLD_REVERSAL_GUARD_ENABLED)):
                 sig_entry = self._resolve_signal_primary_entry(signal_data)
                 if sig_entry is not None and sig_entry > 0:
@@ -5356,14 +7074,35 @@ class MT5Executor:
 
             if should_lift_early:
                 target_tp2 = round(float(tp2), digits)
-                for lk in runner_layers:
+                lift_targets = list(runner_layers) + list(stage2_layers)
+                for lk in lift_targets:
                     l_info = layers.get(lk)
                     if not isinstance(l_info, dict):
                         continue
                     lt = _int_num(l_info.get("ticket"), 0)
                     cur_tp = _num(l_info.get("tp"), 0.0)
                     if lt > 0 and (abs(cur_tp - target_tp2) > 1e-6 or l_info.get("tp_stage") != "TP2"):
-                        if self.modify_position_sltp(lt, sl=None, tp=target_tp2):
+                        l_entry = self._resolve_layer_entry(signal_data, lk, l_info) or 0.0
+                        if ratchet_on and l_entry > 0.0 and live_price is not None:
+                            l_mfe = max(0.0, _num(l_info.get("mfe_dollars"), 0.0), (live_price - l_entry) if is_buy else (l_entry - live_price))
+                            t1a_off = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+                            lift_sl = round((l_entry + t1a_off) if is_buy else (l_entry - t1a_off), digits)
+                            l_res = self._lift_ticket_tp_two_step(
+                                signal_data=signal_data,
+                                layer_key=lk,
+                                ticket=lt,
+                                next_tp=target_tp2,
+                                next_tp_stage="TP2",
+                                desired_broker_sl=lift_sl,
+                                entry_price=l_entry,
+                                mfe_exec=l_mfe,
+                                tick=tick_obj,
+                                sym_info=sym_info,
+                                digits=digits,
+                            )
+                            if l_res.get("lifted"):
+                                lifted_tickets.append(lt)
+                        elif self.modify_position_sltp(lt, sl=None, tp=target_tp2):
                             l_info["tp"] = target_tp2
                             l_info["tp_stage"] = "TP2"
                             lifted_tickets.append(lt)
@@ -5372,6 +7111,8 @@ class MT5Executor:
                     for lk in runner_layers
                 ):
                     signal_data["tp_stage"] = "TP2"
+                    if ratchet_on and lifted_tickets:
+                        signal_data["roles_locked"] = True
 
         return {
             "runner_layers": runner_layers,
@@ -5381,26 +7122,87 @@ class MT5Executor:
             "reset_tickets": reset_tickets,
         }
 
+    def _resolve_layer_entry(
+        self,
+        signal_data: Dict[str, Any],
+        layer_key: Optional[str],
+        l_obj: Optional[Dict[str, Any]] = None,
+    ) -> Optional[float]:
+        """
+        Resolve actual fill price of a specific layer, preferring:
+          entry_price / entry / price_open -> target_price -> recorded_entry_price -> L1 market/signal entry.
+        """
+        layers = signal_data.get("layers") or {}
+        if l_obj is None and layer_key and isinstance(layers.get(layer_key), dict):
+            l_obj = layers[layer_key]
+        if isinstance(l_obj, dict):
+            for ek in ("entry_price", "entry", "price_open"):
+                val = l_obj.get(ek)
+                if isinstance(val, numbers.Real) and not isinstance(val, bool) and float(val) > 0.0:
+                    return float(val)
+            rec_entry = signal_data.get("recorded_entry_price")
+            if (
+                layer_key in ("L1", "TOP")
+                and str(l_obj.get("order_type") or "").strip().upper() == "MARKET"
+                and isinstance(rec_entry, numbers.Real)
+                and not isinstance(rec_entry, bool)
+                and float(rec_entry) > 0.0
+            ):
+                return float(rec_entry)
+            tp_px = l_obj.get("target_price")
+            if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0.0:
+                return float(tp_px)
+        return self._resolve_signal_primary_entry(signal_data)
+
     def _resolve_signal_primary_entry(self, signal_data: Dict[str, Any]) -> Optional[float]:
-        """Resolve primary L1 / recorded signal entry price for measuring % progress toward TP1."""
+        """Resolve primary active/recorded signal entry price for measuring % progress toward TP1."""
         direction = (signal_data.get("direction") or "BUY").strip().upper()
         layers = signal_data.get("layers") or {}
+        market_set = {_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0}
+
+        # Prefer actual fill price on currently open shallowest layer first
+        for lk in ("L1", "TOP", "L2", "MID", "L3", "L4", "BOTTOM"):
+            l_obj = layers.get(lk)
+            if not isinstance(l_obj, dict):
+                continue
+            lt = _int_num(l_obj.get("ticket"), 0)
+            st = str(l_obj.get("status") or "").strip().upper()
+            is_open_layer = (lt in market_set) or (st in ("OPEN", "FILLED", "RUNNER"))
+            if is_open_layer:
+                for ek in ("entry_price", "entry", "price_open"):
+                    ev = l_obj.get(ek)
+                    if isinstance(ev, numbers.Real) and not isinstance(ev, bool) and float(ev) > 0:
+                        return float(ev)
+
         rec_entry = signal_data.get("recorded_entry_price")
         if isinstance(rec_entry, numbers.Real) and not isinstance(rec_entry, bool) and float(rec_entry) > 0:
             for lk in ("L1", "TOP"):
                 l_obj = layers.get(lk)
                 if isinstance(l_obj, dict) and str(l_obj.get("order_type") or "").strip().upper() == "MARKET":
                     return float(rec_entry)
+
+        # Open layer target_price before closed L1 target_price
+        for lk in ("L1", "TOP", "L2", "MID", "L3", "L4", "BOTTOM"):
+            l_obj = layers.get(lk)
+            if not isinstance(l_obj, dict):
+                continue
+            lt = _int_num(l_obj.get("ticket"), 0)
+            st = str(l_obj.get("status") or "").strip().upper()
+            if (lt in market_set) or (st in ("OPEN", "FILLED", "RUNNER")):
+                tp_px = l_obj.get("target_price")
+                if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
+                    return float(tp_px)
+
+        for key in ("recorded_entry_price", "initial_price"):
+            val = signal_data.get(key)
+            if isinstance(val, numbers.Real) and not isinstance(val, bool) and float(val) > 0:
+                return float(val)
         for lk in ("L1", "TOP"):
             l_obj = layers.get(lk)
             if isinstance(l_obj, dict):
                 tp_px = l_obj.get("target_price")
                 if isinstance(tp_px, numbers.Real) and not isinstance(tp_px, bool) and float(tp_px) > 0:
                     return float(tp_px)
-        for key in ("recorded_entry_price", "initial_price"):
-            val = signal_data.get(key)
-            if isinstance(val, numbers.Real) and not isinstance(val, bool) and float(val) > 0:
-                return float(val)
         z = signal_data.get("zone")
         if isinstance(z, dict):
             zv = z.get("top") if direction == "BUY" else z.get("bottom")
@@ -6034,6 +7836,8 @@ class MT5Executor:
         signal_data["stage0_zone_protected"] = False
 
         market_tickets = list(signal_data.get("market_tickets") or [])
+        ratchet_on = bool(_cfg("PROFIT_RATCHET_ENABLED", PROFIT_RATCHET_ENABLED))
+        tiered_on = bool(_cfg("TIERED_STAGE_BANKING_ENABLED", TIERED_STAGE_BANKING_ENABLED))
 
         # 1. Pending order cancellation policy
         if _cfg("CANCEL_PENDING_ON_TP1", CANCEL_PENDING_ON_TP1):
@@ -6042,6 +7846,10 @@ class MT5Executor:
             for l_val in layers.values():
                 if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
                     l_val["status"] = "CANCELLED"
+
+        roles: Dict[str, str] = {}
+        if ratchet_on:
+            roles = self.assign_or_preserve_layer_roles(signal_data)
 
         # 2. Dynamic runner vs early layer selection
         full_cnt = _int_num(_cfg("RUNNER_DEEPEST_COUNT_FULL", RUNNER_DEEPEST_COUNT_FULL), 1)
@@ -6096,20 +7904,97 @@ class MT5Executor:
             runner_tickets = []
             runner_layers = []
 
-        # 3. Close early_layers at TP1
+        # v3.6 Tiered Multi-Layer Stage Banking: keep STAGE2_BANKER open past TP1 to aim for TP2
+        stage2_bankers: List[Tuple[str, int]] = []
+        if ratchet_on and tiered_on and not bank_all_tp1 and not (bank_single_tp1 and len(market_tickets) == 1) and max_stage >= 2:
+            s2_ticket_set: Set[int] = set()
+            filtered_early_layers: List[str] = []
+            for lk in early_layers:
+                lv = layers.get(lk)
+                if isinstance(lv, dict) and str(roles.get(lk) or lv.get("role") or "").strip().upper() == "STAGE2_BANKER":
+                    lt = _int_num(lv.get("ticket"), 0)
+                    if lt > 0 and lt in market_tickets:
+                        s2_ticket_set.add(lt)
+                        stage2_bankers.append((lk, lt))
+                        continue
+                filtered_early_layers.append(lk)
+            early_layers = filtered_early_layers
+            early_tickets = [et for et in early_tickets if et not in s2_ticket_set]
+
+        # v3.6 N=1 SOLO_RUNNER partial close at TP1 when volume >= 2 * volume_min (never force-close 0.01)
+        if ratchet_on and len(runner_layers) == 1 and not early_layers and not bank_all_tp1 and not bank_single_tp1 and max_stage >= 2:
+            solo_lk = runner_layers[0]
+            solo_info = layers.get(solo_lk) if isinstance(layers.get(solo_lk), dict) else None
+            solo_tk = _int_num(runner_tickets[0], 0) if runner_tickets else 0
+            if (
+                solo_info is not None
+                and str(roles.get(solo_lk) or solo_info.get("role") or "").strip().upper() == "SOLO_RUNNER"
+                and not solo_info.get("solo_partial_done")
+                and solo_tk > 0
+            ):
+                vol_min, _, vol_step, dec = _extract_symbol_volume_limits(sym_info)
+                cur_vol = _num(solo_info.get("remaining_lot") or solo_info.get("lot"), 0.0)
+                if cur_vol <= 0.0:
+                    if self.dry_run:
+                        cur_vol = _num(self._dry_run_ticket_lots.get(solo_tk), 0.0)
+                    else:
+                        with self._mt5_lock:
+                            s_pos = mt5.positions_get(ticket=solo_tk)
+                        if s_pos:
+                            cur_vol = _num(getattr(s_pos[0], "volume", 0.0), 0.0)
+                if cur_vol + 1e-9 >= 2.0 * vol_min:
+                    partial_vol = max(vol_min, round(cur_vol / 2.0, dec))
+                    p_res = self.close_partial_volume(
+                        solo_tk,
+                        partial_vol,
+                        current_volume=cur_vol,
+                        symbol=symbol,
+                        direction=direction,
+                    )
+                    if p_res.get("ok"):
+                        solo_info["solo_partial_done"] = True
+                        solo_info["remaining_lot"] = p_res.get("remaining_volume")
+                        signal_data["last_partial_bank"] = {
+                            "layer": solo_lk,
+                            "ticket": solo_tk,
+                            "role": "SOLO_RUNNER",
+                            "closed_volume": p_res.get("closed_volume"),
+                            "remaining_volume": p_res.get("remaining_volume"),
+                            "milestone": "TP1",
+                        }
+
+        # 3. Close early_layers at TP1 (FM-10: verify close success or position absence before marking CLOSED)
         banked_tickets: List[int] = []
         for lk in early_layers:
             l_info = layers.get(lk)
             if isinstance(l_info, dict):
                 lt = _int_num(l_info.get("ticket"), 0)
                 if lt > 0 and lt in market_tickets and lt not in banked_tickets:
-                    self.close_market_position(lt)
-                    banked_tickets.append(lt)
-                l_info["status"] = "CLOSED"
+                    closed_ok = bool(self.close_market_position(lt))
+                    if not closed_ok and not self.dry_run:
+                        with self._mt5_lock:
+                            still_open = bool(mt5.positions_get(ticket=lt))
+                        closed_ok = not still_open
+                    if closed_ok:
+                        banked_tickets.append(lt)
+                        l_info["status"] = "CLOSED"
+                        l_info.setdefault("exit_reason_code", "TP1_BANK")
+                    else:
+                        logger.warning(f"TP1 early close incomplete for {lk} #{lt}; keeping open in market_tickets.")
+                elif str(l_info.get("status") or "").strip().upper() == "CLOSED" or lt <= 0:
+                    l_info["status"] = "CLOSED"
         for et in early_tickets:
             if et > 0 and et not in banked_tickets:
-                self.close_market_position(et)
-                banked_tickets.append(et)
+                closed_ok = bool(self.close_market_position(et))
+                if not closed_ok and not self.dry_run:
+                    with self._mt5_lock:
+                        still_open = bool(mt5.positions_get(ticket=et))
+                    closed_ok = not still_open
+                if closed_ok:
+                    banked_tickets.append(et)
+
+        if ratchet_on and (banked_tickets or runner_tickets or stage2_bankers):
+            signal_data["roles_locked"] = True
 
         surviving_tickets = [mt for mt in market_tickets if mt and mt not in banked_tickets]
         runner_ticket: Optional[int] = runner_tickets[-1] if runner_tickets else None
@@ -6273,6 +8158,42 @@ class MT5Executor:
                 prev_ts = signal_data.get("trail_stop")
                 if isinstance(prev_ts, numbers.Real) and not isinstance(prev_ts, bool) and float(prev_ts) > 0.0:
                     stop_cands.append(round(float(prev_ts), digits))
+                if ratchet_on:
+                    s0_sl = signal_data.get("stage0_profit_lock_sl")
+                    if isinstance(s0_sl, numbers.Real) and not isinstance(s0_sl, bool) and float(s0_sl) > 0.0:
+                        stop_cands.append(round(float(s0_sl), digits))
+                    for lk_r in runner_layers:
+                        lv_r = layers.get(lk_r)
+                        if isinstance(lv_r, dict):
+                            for k_r in ("ratchet_sl", "broker_sl", "sl"):
+                                r_v = lv_r.get(k_r)
+                                if isinstance(r_v, numbers.Real) and not isinstance(r_v, bool) and float(r_v) > 0.0:
+                                    r_ent = self._resolve_layer_entry(signal_data, lk_r, lv_r) or r_open
+                                    if r_ent and ((is_buy and float(r_v) >= float(r_ent) - 1e-6) or (not is_buy and float(r_v) <= float(r_ent) + 1e-6)):
+                                        stop_cands.append(round(float(r_v), digits))
+                    if r_open is not None and r_open > 0.0 and trail_peak > 0.0:
+                        pk_mfe = round(max(0.0, (trail_peak - r_open) if is_buy else (r_open - trail_peak)), 6)
+                        tp1_leg_s = (float(raw_tp1) - r_open) if (raw_tp1 is not None and is_buy) else ((r_open - float(raw_tp1)) if raw_tp1 is not None else None)
+                        p_role = (layers.get(runner_layer) or {}).get("role") or ("SOLO_RUNNER" if len(surviving_tickets) == 1 else "CORE_RUNNER")
+                        r_calc = self.compute_ticket_ratchet_levels(
+                            direction=direction,
+                            entry_price=r_open,
+                            mfe_exec=pk_mfe,
+                            tp1_leg=tp1_leg_s,
+                            prog_to_tp1=1.0,
+                            stage=stage,
+                            leg_prog=0.0,
+                            leg_span=None,
+                            atr_val=self.get_m1_atr(symbol),
+                            role=str(p_role),
+                            is_solo=(len(surviving_tickets) == 1),
+                            lift_active=True,
+                            digits=digits,
+                        )
+                        if r_calc.get("broker_sl") is not None:
+                            stop_cands.append(round(float(r_calc["broker_sl"]), digits))
+                        if r_calc.get("tier") and isinstance(layers.get(runner_layer), dict):
+                            layers[runner_layer]["ratchet_tier"] = r_calc["tier"]
                 trail_stop = round(max(stop_cands) if is_buy else min(stop_cands), digits)
 
                 active_stop_source = (
@@ -6314,30 +8235,168 @@ class MT5Executor:
                     if fsm_floor is not None
                     else None
                 )
-                for idx_r, rt in enumerate(runner_tickets):
-                    lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
-                    l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
-                    if self._sync_one_ticket_tp1_trail_sl(
-                        signal_data=signal_data,
-                        ticket=rt,
-                        l_info=l_info,
-                        is_runner=True,
-                        is_buy=is_buy,
-                        desired_broker_sl=clamped_trail_sl,
-                        step_dollars=trail_step_dollars,
-                        extra_tp=target_tp_val,
-                        extra_tp_stage=next_stage_key if target_tp_val is not None else None,
-                        force_sl_sync=True,
-                        fallback_sl=clamped_fb_sl,
-                        tick=tick,
-                        sym_info=sym_info,
-                        digits=digits,
-                    ):
-                        sl_applied_tickets.add(rt)
-                    if l_info is not None:
-                        l_info["status"] = "RUNNER"
+                any_tp_ready = bool(target_tp_val is None)
+                if ratchet_on:
+                    # First ensure N=4 STAGE2_BANKER is green-protected & lifted to TP2 via 2-step SL-first lift
+                    tp2_raw = tp_levels.get("TP2")
+                    tp2_target = round(float(tp2_raw), digits) if tp2_raw is not None else None
+                    for s2_lk, s2_tk in stage2_bankers:
+                        s2_info = layers.get(s2_lk) if isinstance(layers.get(s2_lk), dict) else None
+                        s2_entry = self._resolve_layer_entry(signal_data, s2_lk, s2_info) or r_open or 0.0
+                        s2_exec = live_price if live_price is not None else (float(raw_tp1) if raw_tp1 is not None else s2_entry)
+                        s2_mfe = round(max(_num((s2_info or {}).get("mfe_dollars"), 0.0), (s2_exec - s2_entry) if is_buy else (s2_entry - s2_exec), 0.0), 6)
+                        if s2_info is not None:
+                            s2_info["mfe_dollars"] = s2_mfe
+                            if live_price is not None:
+                                prev_pk2 = s2_info.get("mfe_peak_price")
+                                if prev_pk2 is None or (is_buy and live_price > float(prev_pk2)) or (not is_buy and live_price < float(prev_pk2)):
+                                    s2_info["mfe_peak_price"] = round(live_price, digits)
+                        s2_rat = self.compute_ticket_ratchet_levels(
+                            direction=direction,
+                            entry_price=s2_entry,
+                            mfe_exec=s2_mfe,
+                            tp1_leg=None,
+                            prog_to_tp1=1.0,
+                            stage=stage,
+                            leg_prog=0.0,
+                            leg_span=None,
+                            atr_val=self.get_m1_atr(symbol),
+                            role="STAGE2_BANKER",
+                            is_solo=False,
+                            lift_active=True,
+                            digits=digits,
+                        )
+                        t1a_lock = float(_cfg("RATCHET_TIER1A_LOCK_DOLLARS", RATCHET_TIER1A_LOCK_DOLLARS))
+                        min_s2_sl = round((s2_entry + t1a_lock) if is_buy else (s2_entry - t1a_lock), digits) if s2_entry > 0 else clamped_trail_sl
+                        s2_sl = s2_rat.get("broker_sl") or min_s2_sl
+                        if s2_rat.get("tier") and s2_info is not None:
+                            s2_info["ratchet_tier"] = s2_rat["tier"]
+                        if tp2_target is not None:
+                            s2_lift = self._lift_ticket_tp_two_step(
+                                signal_data=signal_data,
+                                layer_key=s2_lk,
+                                ticket=s2_tk,
+                                next_tp=tp2_target,
+                                next_tp_stage="TP2",
+                                desired_broker_sl=float(s2_sl),
+                                entry_price=s2_entry,
+                                mfe_exec=None,
+                                tick=tick,
+                                sym_info=sym_info,
+                                digits=digits,
+                            )
+                            if s2_lift.get("lifted"):
+                                sl_applied_tickets.add(s2_tk)
+                            else:
+                                s2_sync = self._sync_ticket_ratchet_sl(
+                                    signal_data=signal_data,
+                                    layer_key=s2_lk,
+                                    ticket=s2_tk,
+                                    desired_broker_sl=float(s2_sl),
+                                    force_sync=True,
+                                    tick=tick,
+                                    sym_info=sym_info,
+                                    digits=digits,
+                                )
+                                if s2_sync.get("synced"):
+                                    sl_applied_tickets.add(s2_tk)
+                        else:
+                            s2_sync = self._sync_ticket_ratchet_sl(
+                                signal_data=signal_data,
+                                layer_key=s2_lk,
+                                ticket=s2_tk,
+                                desired_broker_sl=float(s2_sl),
+                                force_sync=True,
+                                tick=tick,
+                                sym_info=sym_info,
+                                digits=digits,
+                            )
+                            if s2_sync.get("synced"):
+                                sl_applied_tickets.add(s2_tk)
+
+                    # Strict 2-Step SL-First TP Lift per runner ticket
+                    for idx_r, rt in enumerate(runner_tickets):
+                        lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                        l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                        l_entry = self._resolve_layer_entry(signal_data, lk, l_info) or r_open or 0.0
+                        if target_tp_val is not None:
+                            lift_res = self._lift_ticket_tp_two_step(
+                                signal_data=signal_data,
+                                layer_key=lk,
+                                ticket=rt,
+                                next_tp=target_tp_val,
+                                next_tp_stage=next_stage_key,
+                                desired_broker_sl=float(clamped_trail_sl),
+                                entry_price=l_entry,
+                                mfe_exec=None,
+                                tick=tick,
+                                sym_info=sym_info,
+                                digits=digits,
+                            )
+                            if lift_res.get("lifted"):
+                                sl_applied_tickets.add(rt)
+                                any_tp_ready = True
+                                if lift_res.get("sl") is not None:
+                                    signal_data["broker_sl"] = lift_res["sl"]
+                            else:
+                                if lift_res.get("already_at_tp"):
+                                    any_tp_ready = True
+                                sl_only = self._sync_ticket_ratchet_sl(
+                                    signal_data=signal_data,
+                                    layer_key=lk,
+                                    ticket=rt,
+                                    desired_broker_sl=float(clamped_trail_sl),
+                                    force_sync=True,
+                                    tick=tick,
+                                    sym_info=sym_info,
+                                    digits=digits,
+                                    floor_lock_sl=clamped_fb_sl,
+                                )
+                                if sl_only.get("synced"):
+                                    sl_applied_tickets.add(rt)
+                        else:
+                            sl_only = self._sync_ticket_ratchet_sl(
+                                signal_data=signal_data,
+                                layer_key=lk,
+                                ticket=rt,
+                                desired_broker_sl=float(clamped_trail_sl),
+                                force_sync=True,
+                                tick=tick,
+                                sym_info=sym_info,
+                                digits=digits,
+                                floor_lock_sl=clamped_fb_sl,
+                            )
+                            if sl_only.get("synced"):
+                                sl_applied_tickets.add(rt)
+                        if l_info is not None:
+                            l_info["status"] = "RUNNER"
+                else:
+                    any_tp_ready = True
+                    for idx_r, rt in enumerate(runner_tickets):
+                        lk = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                        l_info = layers.get(lk) if (lk and isinstance(layers.get(lk), dict)) else None
+                        if self._sync_one_ticket_tp1_trail_sl(
+                            signal_data=signal_data,
+                            ticket=rt,
+                            l_info=l_info,
+                            is_runner=True,
+                            is_buy=is_buy,
+                            desired_broker_sl=clamped_trail_sl,
+                            step_dollars=trail_step_dollars,
+                            extra_tp=target_tp_val,
+                            extra_tp_stage=next_stage_key if target_tp_val is not None else None,
+                            force_sl_sync=True,
+                            fallback_sl=clamped_fb_sl,
+                            tick=tick,
+                            sym_info=sym_info,
+                            digits=digits,
+                        ):
+                            sl_applied_tickets.add(rt)
+                        if l_info is not None:
+                            l_info["status"] = "RUNNER"
             else:
                 r_open = None
+                any_tp_ready = True
                 prev_peak_px = signal_data.get("runner_peak_price")
                 cand_peak = live_price if live_price is not None else raw_tp1
                 if prev_peak_px is not None and cand_peak is not None:
@@ -6347,7 +8406,7 @@ class MT5Executor:
                 floor_price = None
 
             signal_data["last_banked_tickets"] = banked_tickets
-            signal_data["tp_stage"] = next_stage_key if runner_tickets else "TP1"
+            signal_data["tp_stage"] = (next_stage_key if (runner_tickets and any_tp_ready) else "TP1")
             signal_data["runner_max_tp_stage"] = configured_max_stage
             signal_data["effective_max_stage"] = max_stage
             signal_data["soft_tp1_floor"] = floor_price
@@ -6359,7 +8418,7 @@ class MT5Executor:
             signal_data["runner_peak_price"] = new_peak_px
             signal_data["market_tickets"] = surviving_tickets
 
-            if runner_tickets and floor_price is not None:
+            if (not ratchet_on) and runner_tickets and floor_price is not None:
                 self._sync_tp1_trail_broker_sl(
                     signal_data,
                     symbol,
@@ -6694,21 +8753,45 @@ class MT5Executor:
         runner_set = set(runner_tickets)
         closed_now: List[int] = []
 
+        # v3.6 STAGE2_BANKER layers always bank at TP2; fallback legacy mapping handles L2->TP2, L3->TP3
+        targets_to_check: List[Tuple[str, str, Optional[str]]] = []
+        handled_layers: Set[str] = set()
+        for l_name, l_info in layers.items():
+            if not isinstance(l_info, dict):
+                continue
+            role_u = str(l_info.get("role") or "").strip().upper()
+            if role_u == "STAGE2_BANKER":
+                targets_to_check.append((l_name, "TP2", "STAGE2_BANK_TP"))
+                handled_layers.add(l_name)
         for l_name, tp_key in (("L2", "TP2"), ("L3", "TP3")):
+            if l_name in handled_layers:
+                continue
+            targets_to_check.append((l_name, tp_key, None))
+
+        for l_name, tp_key, exit_code in targets_to_check:
             l_info = layers.get(l_name)
             if not isinstance(l_info, dict):
                 continue
-            lt = l_info.get("ticket")
+            lt = _int_num(l_info.get("ticket"), 0)
             tp_val = tp_levels.get(tp_key)
             if not lt or lt in runner_set or lt not in market_tickets or tp_val is None:
                 continue
             hit = (live_price >= float(tp_val)) if is_buy else (live_price <= float(tp_val))
             if hit:
-                self.close_market_position(lt)
-                l_info["status"] = "CLOSED"
-                market_tickets = [t for t in market_tickets if t != lt]
-                closed_now.append(lt)
-                logger.info(f"Backstop auto-closed {l_name} #{lt} at {tp_key}={tp_val} (live={live_price})")
+                closed_ok = bool(self.close_market_position(lt))
+                if not closed_ok and not self.dry_run:
+                    with self._mt5_lock:
+                        still_open = bool(mt5.positions_get(ticket=lt))
+                    closed_ok = not still_open
+                if closed_ok:
+                    l_info["status"] = "CLOSED"
+                    if exit_code:
+                        l_info["exit_reason_code"] = exit_code
+                    market_tickets = [t for t in market_tickets if t != lt]
+                    closed_now.append(lt)
+                    logger.info(f"Backstop auto-closed {l_name} #{lt} at {tp_key}={tp_val} (live={live_price})")
+                else:
+                    logger.warning(f"Backstop close incomplete for {l_name} #{lt} at {tp_key}={tp_val}; keeping open.")
 
         signal_data["market_tickets"] = market_tickets
         signal_data["last_backstop_closed_tickets"] = closed_now
@@ -6745,14 +8828,23 @@ class MT5Executor:
                 to_close = list(r_tickets)
 
             already_closed_once = set(signal_data.get("_closed_tickets_once") or [])
+            actually_closed: List[int] = []
             if close_position:
                 for rt in to_close:
                     if rt in already_closed_once:
+                        actually_closed.append(rt)
                         continue
-                    self.close_market_position(rt)
-                    already_closed_once.add(rt)
+                    closed_ok = bool(self.close_market_position(rt))
+                    if not closed_ok and not self.dry_run:
+                        with self._mt5_lock:
+                            still_open = bool(mt5.positions_get(ticket=rt))
+                        closed_ok = not still_open
+                    if closed_ok:
+                        already_closed_once.add(rt)
+                        actually_closed.append(rt)
                 signal_data["_closed_tickets_once"] = sorted(already_closed_once)
             else:
+                actually_closed = list(to_close)
                 self.invalidate_realized_pnl_cache()
 
             if ceiling_stage is not None:
@@ -6774,41 +8866,49 @@ class MT5Executor:
                     exit_stage=exit_stage,
                 )
 
-            close_set = set(to_close)
+            close_set = set(actually_closed)
             layers = signal_data.get("layers") or {}
             for lk in runner_layers:
                 if lk and isinstance(layers.get(lk), dict):
-                    layers[lk]["status"] = "CLOSED"
+                    lt_r = _int_num(layers[lk].get("ticket"), 0)
+                    if lt_r <= 0 or lt_r in close_set or not close_position:
+                        layers[lk]["status"] = "CLOSED"
             if close_all_market_tickets:
                 for l_val in layers.values():
                     if isinstance(l_val, dict):
                         lt = _int_num(l_val.get("ticket"), 0)
-                        if (lt > 0 and lt in close_set) or str(l_val.get("status") or "").upper() in ("OPEN", "FILLED", "RUNNER"):
+                        if (lt > 0 and lt in close_set) or (lt <= 0 and str(l_val.get("status") or "").upper() in ("OPEN", "FILLED", "RUNNER")):
                             l_val["status"] = "CLOSED"
 
             remaining_mkt = [t for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) not in close_set]
+            remaining_runners = [t for t in r_tickets if t not in close_set] if close_position else []
             signal_data["market_tickets"] = remaining_mkt
-            signal_data["last_runner_tickets"] = list(to_close)
-            signal_data["last_runner_ticket"] = to_close[-1] if to_close else None
+            signal_data["last_runner_tickets"] = list(actually_closed or to_close)
+            signal_data["last_runner_ticket"] = (actually_closed or to_close)[-1] if (actually_closed or to_close) else None
             r_layers_list = [str(lk) for lk in runner_layers if lk]
             if r_layers_list:
                 signal_data["last_runner_layers"] = list(r_layers_list)
                 signal_data["last_runner_layer"] = r_layers_list[-1]
             signal_data["runner_close_reason"] = reason
-            signal_data["runner_tickets"] = []
-            signal_data["runner_ticket"] = None
-            signal_data["runner_layers"] = []
-            signal_data["runner_layer"] = None
-            signal_data["runner_proximity_armed"] = False
-            signal_data["runner_reversal_ticks"] = 0
-            signal_data["tp2_shortfall_armed"] = False
+            if not remaining_runners:
+                signal_data["runner_tickets"] = []
+                signal_data["runner_ticket"] = None
+                signal_data["runner_layers"] = []
+                signal_data["runner_layer"] = None
+                signal_data["runner_proximity_armed"] = False
+                signal_data["runner_reversal_ticks"] = 0
+                signal_data["tp2_shortfall_armed"] = False
 
-            if bool(_cfg("CANCEL_PENDING_ON_TP1", CANCEL_PENDING_ON_TP1)) and signal_data.get("tp1_reached"):
+            if (not remaining_mkt) or (bool(_cfg("CANCEL_PENDING_ON_TP1", CANCEL_PENDING_ON_TP1)) and signal_data.get("tp1_reached")):
                 self.cancel_signal_pending_orders(signal_data)
+                signal_data["pending_tickets"] = []
+                for l_val in layers.values():
+                    if isinstance(l_val, dict) and str(l_val.get("status") or "").strip().upper() == "PENDING":
+                        l_val["status"] = "CANCELLED"
 
             has_open_or_pending = bool(remaining_mkt or signal_data.get("pending_tickets"))
             signal_data["status"] = "BE_APPLIED" if has_open_or_pending else "CLOSED"
-            return False
+            return bool(remaining_runners)
         finally:
             self.end_signal_close(signal_data)
 
@@ -7142,9 +9242,122 @@ class MT5Executor:
             if fsm_floor is not None:
                 signal_data["fsm_floor"] = fsm_floor
             stage_changed = bool(stage != prev_stage or milestone_advanced)
+            ratchet_on = bool(_cfg("PROFIT_RATCHET_ENABLED", PROFIT_RATCHET_ENABLED))
+            ratchet_map: Dict[str, Dict[str, Any]] = {}
+            tier_jump_map: Dict[str, Tuple[bool, bool]] = {}
+            atr_val_cur = self.get_m1_atr(p_symbol)
+            confirm_req = max(1, _int_num(_cfg("REVERSAL_CONFIRM_TICKS", 2), 2))
+            if ratchet_on:
+                signal_data["_last_ratchet_events"] = []
+                signal_data["_last_lift_aborts"] = []
+                roles_map = self.assign_or_preserve_layer_roles(signal_data)
+
+                # TP3 Partial Bank on CORE_RUNNER (0.02 -> 0.01, never force-close 0.01)
+                if ("TP3" in cleared or k >= 4) and not is_spike:
+                    vol_min, _, _, dec = _extract_symbol_volume_limits(sym_info)
+                    for idx_r, rt in enumerate(runner_tickets):
+                        lk_r = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                        lv_r = layers.get(lk_r) if (lk_r and isinstance(layers.get(lk_r), dict)) else None
+                        if lv_r is None:
+                            continue
+                        r_role = str(lv_r.get("role") or roles_map.get(lk_r or "", "CORE_RUNNER")).strip().upper()
+                        if r_role == "CORE_RUNNER" and not lv_r.get("tp3_partial_done"):
+                            cur_vol = _num(lv_r.get("remaining_lot") or lv_r.get("lot"), 0.0)
+                            if cur_vol <= 0.0:
+                                if self.dry_run:
+                                    cur_vol = _num(self._dry_run_ticket_lots.get(rt), 0.0)
+                                else:
+                                    p_obj = live_positions_map.get(rt)
+                                    if p_obj is not None:
+                                        cur_vol = _num(getattr(p_obj, "volume", 0.0), 0.0)
+                            if cur_vol + 1e-9 >= 2.0 * vol_min:
+                                partial_vol = max(vol_min, round(cur_vol / 2.0, dec))
+                                p_res = self.close_partial_volume(
+                                    rt,
+                                    partial_vol,
+                                    current_volume=cur_vol,
+                                    symbol=p_symbol,
+                                    direction=direction,
+                                )
+                                if p_res.get("ok"):
+                                    lv_r["tp3_partial_done"] = True
+                                    lv_r["remaining_lot"] = p_res.get("remaining_volume")
+                                    signal_data["last_partial_bank"] = {
+                                        "layer": lk_r,
+                                        "ticket": rt,
+                                        "role": "CORE_RUNNER",
+                                        "closed_volume": p_res.get("closed_volume"),
+                                        "remaining_volume": p_res.get("remaining_volume"),
+                                        "milestone": "TP3",
+                                    }
+
+                # Per-ticket MFE & Ratchet computation for all open layers
+                leg_prog_cur = 0.0
+                leg_span_cur: Optional[float] = None
+                if 1 <= stage < max_stage:
+                    p_tp = tp_levels.get(f"TP{stage}")
+                    n_tp = tp_levels.get(f"TP{stage + 1}")
+                    if p_tp is not None and n_tp is not None:
+                        leg_span_cur = (float(n_tp) - float(p_tp)) if is_buy else (float(p_tp) - float(n_tp))
+                        if leg_span_cur > 1e-9:
+                            leg_prog_cur = ((chart_price - float(p_tp)) / leg_span_cur) if is_buy else ((float(p_tp) - chart_price) / leg_span_cur)
+
+                open_keys_r = self._ordered_open_layer_keys(signal_data)
+                raw_tp1_r = signal_data.get("raw_tp1") or tp_levels.get("TP1")
+                is_solo_r = len(open_keys_r) == 1
+                for lk_o in open_keys_r:
+                    lv_o = layers.get(lk_o)
+                    if not isinstance(lv_o, dict):
+                        continue
+                    ent_o = self._resolve_layer_entry(signal_data, lk_o, lv_o) or ref_entry or 0.0
+                    if ent_o <= 0.0:
+                        continue
+                    cur_prof_o = round((live_price - ent_o) if is_buy else (ent_o - live_price), 6)
+                    prev_mfe_o = _num(lv_o.get("mfe_dollars"), 0.0)
+                    if not is_spike:
+                        new_mfe_o = round(max(prev_mfe_o, cur_prof_o, 0.0), 6)
+                        if cur_prof_o > prev_mfe_o + 1e-9:
+                            lv_o["virt_ratchet_ticks"] = 0
+                        prev_pk_o = lv_o.get("mfe_peak_price")
+                        if prev_pk_o is None or (is_buy and live_price > float(prev_pk_o)) or (not is_buy and live_price < float(prev_pk_o)):
+                            lv_o["mfe_peak_price"] = round(live_price, digits)
+                        lv_o["mfe_dollars"] = new_mfe_o
+                    else:
+                        new_mfe_o = prev_mfe_o
+                    tp1_leg_o = ((float(raw_tp1_r) - ent_o) if is_buy else (ent_o - float(raw_tp1_r))) if raw_tp1_r is not None else None
+                    prog_tp1_o = (((chart_price - ent_o) / tp1_leg_o) if is_buy else ((ent_o - chart_price) / tp1_leg_o)) if (tp1_leg_o and tp1_leg_o > 1e-9) else 1.0
+                    role_o = str(lv_o.get("role") or roles_map.get(lk_o, "CORE_RUNNER")).strip().upper()
+                    r_res_o = self.compute_ticket_ratchet_levels(
+                        direction=direction,
+                        entry_price=ent_o,
+                        mfe_exec=new_mfe_o,
+                        tp1_leg=tp1_leg_o,
+                        prog_to_tp1=prog_tp1_o,
+                        stage=stage,
+                        leg_prog=leg_prog_cur,
+                        leg_span=leg_span_cur,
+                        atr_val=atr_val_cur,
+                        role=role_o,
+                        is_solo=is_solo_r,
+                        lift_active=False,
+                        digits=digits,
+                    )
+                    ratchet_map[lk_o] = r_res_o
+                    new_tier_o = r_res_o.get("tier")
+                    prev_tier_o = lv_o.get("ratchet_tier")
+                    was_sq_o = bool(lv_o.get("squeeze_active"))
+                    now_sq_o = bool(r_res_o.get("is_squeeze"))
+                    tier_jumped_o = bool(new_tier_o and new_tier_o != prev_tier_o)
+                    sq_started_o = bool(now_sq_o and not was_sq_o)
+                    if new_tier_o:
+                        lv_o["ratchet_tier"] = new_tier_o
+                    if now_sq_o:
+                        lv_o["squeeze_active"] = True
+                    tier_jump_map[lk_o] = (tier_jumped_o, sq_started_o)
 
             # (6) Proactive broker TP lift at >= RUNNER_EARLY_TP_LIFT_PCT (70%) of leg OR proximity buffer (chart space)
             cur_target = tp_levels.get(f"TP{k}")
+            proactive_lift_stage: Optional[str] = None
             if cur_target is not None and bool(_cfg("RUNNER_PROACTIVE_TP_LIFT", RUNNER_PROACTIVE_TP_LIFT)) and k < max_stage:
                 cur_target_f = float(cur_target)
                 anchor = self._resolve_milestone_anchor(signal_data, tp_levels, k, fallback_entry=runner_entry)
@@ -7175,7 +9388,9 @@ class MT5Executor:
                         if needs_tp_lift or not runner_layers:
                             stepped_milestone_tp = float(lift_tp)
                             stepped_milestone_stage = lift_stage
-                        signal_data["tp_stage"] = lift_stage
+                        proactive_lift_stage = lift_stage
+                        if not ratchet_on:
+                            signal_data["tp_stage"] = lift_stage
 
             # (7) Stage tier (mult, min_d, max_d) -> trail_dist, trail_tier_used, atr_stop + Dual-Gate Stage 1 ATR check
             trail_dist, tier_used = self._compute_staged_trail_dist(p_symbol, stage, digits)
@@ -7210,6 +9425,24 @@ class MT5Executor:
                 stop_cands.append(fsm_floor)
             if prev_trail_stop is not None:
                 stop_cands.append(prev_trail_stop)
+            primary_ratchet_sl: Optional[float] = None
+            if ratchet_on:
+                for lk_r in runner_layers:
+                    r_entry_val = ratchet_map.get(lk_r) or {}
+                    r_brk = r_entry_val.get("broker_sl")
+                    if r_brk is not None and float(r_brk) > 0.0:
+                        r_brk_f = round(float(r_brk), digits)
+                        stop_cands.append(r_brk_f)
+                        if primary_ratchet_sl is None or (is_buy and r_brk_f > primary_ratchet_sl) or (not is_buy and r_brk_f < primary_ratchet_sl):
+                            primary_ratchet_sl = r_brk_f
+                    lv_r = layers.get(lk_r)
+                    if isinstance(lv_r, dict):
+                        ent_r = self._resolve_layer_entry(signal_data, lk_r, lv_r) or ref_entry
+                        for rk_sl in ("ratchet_sl", "broker_sl", "sl"):
+                            rv = lv_r.get(rk_sl)
+                            if isinstance(rv, numbers.Real) and not isinstance(rv, bool) and float(rv) > 0.0 and ent_r:
+                                if (is_buy and float(rv) >= float(ent_r) - 1e-6) or (not is_buy and float(rv) <= float(ent_r) + 1e-6):
+                                    stop_cands.append(round(float(rv), digits))
 
             trail_stop = round(max(stop_cands) if is_buy else min(stop_cands), digits)
             signal_data["trail_stop"] = trail_stop
@@ -7217,6 +9450,18 @@ class MT5Executor:
             signal_data["soft_tp1_floor"] = trail_stop
 
             # (9) Tie-breaker for active_stop_source (FSM_FLOOR wins on exact tie fsm_floor == trail_stop)
+            ratchet_tightened = bool(
+                ratchet_on
+                and primary_ratchet_sl is not None
+                and (
+                    (is_buy and primary_ratchet_sl >= trail_stop - 1e-9)
+                    or (not is_buy and primary_ratchet_sl <= trail_stop + 1e-9)
+                )
+                and (
+                    fsm_floor is None
+                    or ((is_buy and primary_ratchet_sl > fsm_floor + 1e-9) or (not is_buy and primary_ratchet_sl < fsm_floor - 1e-9))
+                )
+            )
             active_stop_source = (
                 "FSM_FLOOR"
                 if (
@@ -7226,24 +9471,149 @@ class MT5Executor:
                         or (not is_buy and fsm_floor <= trail_stop + 1e-9)
                     )
                 )
-                else "ATR_TRAIL"
+                else ("PROFIT_RATCHET" if ratchet_tightened else "ATR_TRAIL")
             )
             signal_data["active_stop_source"] = active_stop_source
 
-            # (10) Broker SL/TP sync (immediate on stage change or Stage 1 ATR arming, throttled by TP1_TRAIL_STEP_DOLLARS otherwise)
-            self._sync_tp1_trail_broker_sl(
-                signal_data,
-                p_symbol,
-                direction,
-                float(trail_stop),
-                digits,
-                tick=tick,
-                sym_info=sym_info,
-                runner_tp=stepped_milestone_tp,
-                runner_stage=stepped_milestone_stage,
-                force_sl_sync=bool(stage_changed or just_armed_s1),
-                fallback_sl=fsm_floor,
-            )
+            # (10) Broker SL/TP sync
+            if ratchet_on:
+                # Per-ticket sync on non-runner layers (STAGE2_BANKER, LATE_RECOVERY): never broadcast runner SL!
+                runner_set_all = set(runner_tickets)
+                for lk_o, r_res_o in ratchet_map.items():
+                    if lk_o in runner_layers:
+                        continue
+                    lv_o = layers.get(lk_o)
+                    if not isinstance(lv_o, dict):
+                        continue
+                    lt_o = _int_num(lv_o.get("ticket"), 0)
+                    if lt_o <= 0 or lt_o in runner_set_all:
+                        continue
+                    des_o = r_res_o.get("broker_sl")
+                    tj_o, sq_o = tier_jump_map.get(lk_o, (False, False))
+                    if des_o is not None:
+                        s_o = self._sync_ticket_ratchet_sl(
+                            signal_data=signal_data,
+                            layer_key=lk_o,
+                            ticket=lt_o,
+                            desired_broker_sl=float(des_o),
+                            force_sync=bool(tj_o or sq_o),
+                            tick=tick,
+                            sym_info=sym_info,
+                            digits=digits,
+                        )
+                        tag_o = f"{r_res_o.get('tier')}_SQ" if sq_o else r_res_o.get("tier")
+                        if (tj_o or sq_o) and r_res_o.get("tier") and lv_o.get("last_alerted_tier") != tag_o:
+                            lv_o["last_alerted_tier"] = tag_o
+                            signal_data["_last_ratchet_events"].append({
+                                "type": "SQUEEZE" if sq_o else "TIER_JUMP",
+                                "layer": lk_o,
+                                "role": lv_o.get("role"),
+                                "ticket": lt_o,
+                                "entry_price": self._resolve_layer_entry(signal_data, lk_o, lv_o),
+                                "peak_price": lv_o.get("mfe_peak_price"),
+                                "mfe_dollars": lv_o.get("mfe_dollars"),
+                                "tier": r_res_o.get("tier"),
+                                "broker_sl": s_o.get("sl") or lv_o.get("ratchet_sl") or des_o,
+                            })
+
+                # Per-runner 2-step SL-first TP lift + monotonic broker SL sync
+                step_dol = float(_cfg("TP1_TRAIL_STEP_DOLLARS", TP1_TRAIL_STEP_DOLLARS))
+                for idx_r, rt in enumerate(runner_tickets):
+                    lk_r = runner_layers[idx_r] if idx_r < len(runner_layers) else None
+                    lv_r = layers.get(lk_r) if (lk_r and isinstance(layers.get(lk_r), dict)) else None
+                    l_entry_r = self._resolve_layer_entry(signal_data, lk_r, lv_r) or ref_entry or 0.0
+                    l_mfe_r = _num((lv_r or {}).get("mfe_dollars"), _num(signal_data.get("peak_profit"), 0.0))
+                    r_res_r = ratchet_map.get(lk_r or "", {})
+                    tj_r, sq_r = tier_jump_map.get(lk_r or "", (False, False))
+                    des_r = trail_stop
+                    if r_res_r.get("broker_sl") is not None:
+                        rb_f = round(float(r_res_r["broker_sl"]), digits)
+                        des_r = round(max(des_r, rb_f) if is_buy else min(des_r, rb_f), digits)
+                    lifted_now_r = False
+                    if stepped_milestone_tp is not None and stepped_milestone_stage:
+                        old_tp_r = (lv_r or {}).get("tp")
+                        lift_r = self._lift_ticket_tp_two_step(
+                            signal_data=signal_data,
+                            layer_key=lk_r,
+                            ticket=rt,
+                            next_tp=float(stepped_milestone_tp),
+                            next_tp_stage=stepped_milestone_stage,
+                            desired_broker_sl=float(des_r),
+                            entry_price=l_entry_r,
+                            mfe_exec=l_mfe_r if l_mfe_r > 0.0 else None,
+                            tick=tick,
+                            sym_info=sym_info,
+                            digits=digits,
+                        )
+                        if lift_r.get("lifted"):
+                            lifted_now_r = True
+                            signal_data["tp_stage"] = stepped_milestone_stage
+                            signal_data["_last_ratchet_events"].append({
+                                "type": "TP_LIFT",
+                                "layer": lk_r,
+                                "role": (lv_r or {}).get("role") or "CORE_RUNNER",
+                                "ticket": rt,
+                                "entry_price": l_entry_r,
+                                "peak_price": (lv_r or {}).get("mfe_peak_price") or trail_peak,
+                                "mfe_dollars": l_mfe_r,
+                                "tier": r_res_r.get("tier") or (lv_r or {}).get("ratchet_tier"),
+                                "broker_sl": lift_r.get("sl"),
+                                "old_tp": old_tp_r,
+                                "new_tp": lift_r.get("tp"),
+                                "new_tp_stage": stepped_milestone_stage,
+                            })
+                        elif lift_r.get("already_at_tp"):
+                            signal_data["tp_stage"] = proactive_lift_stage or stepped_milestone_stage
+                        elif lift_r.get("aborted_sl_fail") and lift_r.get("notify_abort"):
+                            signal_data["_last_lift_aborts"].append({
+                                "layer": lk_r,
+                                "ticket": rt,
+                                "desired_sl": des_r,
+                                "retcode": lift_r.get("retcode"),
+                            })
+                    if not lifted_now_r:
+                        s_r = self._sync_ticket_ratchet_sl(
+                            signal_data=signal_data,
+                            layer_key=lk_r,
+                            ticket=rt,
+                            desired_broker_sl=float(des_r),
+                            step_dollars=step_dol,
+                            force_sync=bool(stage_changed or just_armed_s1 or tj_r or sq_r),
+                            tick=tick,
+                            sym_info=sym_info,
+                            digits=digits,
+                            floor_lock_sl=fsm_floor,
+                        )
+                        tag_r = f"{r_res_r.get('tier')}_SQ" if sq_r else r_res_r.get("tier")
+                        if (tj_r or sq_r) and r_res_r.get("tier") and lv_r is not None and lv_r.get("last_alerted_tier") != tag_r:
+                            lv_r["last_alerted_tier"] = tag_r
+                            signal_data["_last_ratchet_events"].append({
+                                "type": "SQUEEZE" if sq_r else "TIER_JUMP",
+                                "layer": lk_r,
+                                "role": lv_r.get("role") or "CORE_RUNNER",
+                                "ticket": rt,
+                                "entry_price": l_entry_r,
+                                "peak_price": lv_r.get("mfe_peak_price") or trail_peak,
+                                "mfe_dollars": l_mfe_r,
+                                "tier": r_res_r.get("tier"),
+                                "broker_sl": s_r.get("sl") or lv_r.get("ratchet_sl") or des_r,
+                                "virt_sl": r_res_r.get("virt_sl"),
+                            })
+            else:
+                # Legacy v3.5 sync path when PROFIT_RATCHET_ENABLED=False
+                self._sync_tp1_trail_broker_sl(
+                    signal_data,
+                    p_symbol,
+                    direction,
+                    float(trail_stop),
+                    digits,
+                    tick=tick,
+                    sym_info=sym_info,
+                    runner_tp=stepped_milestone_tp,
+                    runner_stage=stepped_milestone_stage,
+                    force_sl_sync=bool(stage_changed or just_armed_s1),
+                    fallback_sl=fsm_floor,
+                )
 
             # (11) Exit check (paused during spread spike; otherwise close runner + ALL open layers)
             stop_hit = (live_price <= trail_stop + 1e-9) if is_buy else (live_price >= trail_stop - 1e-9)
@@ -7261,11 +9631,19 @@ class MT5Executor:
                         f"Staged FSM Floor (Stage {stage}, {floor_label}, "
                         f"peak={trail_peak:.{digits}f}, floor={trail_stop:.{digits}f})"
                     )
+                    code_out = active_stop_source
+                elif active_stop_source == "PROFIT_RATCHET":
+                    reason = (
+                        f"Progressive Profit Ratchet SL (Stage {stage}, "
+                        f"peak={trail_peak:.{digits}f}, ratchet_sl={trail_stop:.{digits}f})"
+                    )
+                    code_out = "PROFIT_RATCHET_SL"
                 else:
                     reason = (
                         f"Staged ATR Trail (Stage {stage}, TP1 Trailing Stop, "
                         f"peak={trail_peak:.{digits}f}, stop={trail_stop:.{digits}f})"
                     )
+                    code_out = active_stop_source
                 logger.info(
                     f"Runner {runner_tickets}: {reason} triggered at live={live_price}. "
                     f"Closing runner + all open layers."
@@ -7276,10 +9654,42 @@ class MT5Executor:
                     runner_layers,
                     reason=reason,
                     close_all_market_tickets=True,
-                    exit_reason_code=active_stop_source,
+                    exit_reason_code=code_out,
                     exit_price=live_price,
                     exit_stage=stage,
                 )
+
+            # Near-Target Squeeze 2-tick virtual exit (spread-paused) when virt_sl > trail_stop
+            if ratchet_on and not is_spike and primary_layer and primary_layer in ratchet_map:
+                pr_r = ratchet_map[primary_layer]
+                lv_p = layers.get(primary_layer) if isinstance(layers.get(primary_layer), dict) else None
+                virt_sl_r = pr_r.get("virt_sl")
+                if pr_r.get("is_squeeze") and virt_sl_r is not None and lv_p is not None:
+                    v_f = round(float(virt_sl_r), digits)
+                    tighter_virt = (v_f > trail_stop + 1e-9) if is_buy else (v_f < trail_stop - 1e-9)
+                    if tighter_virt:
+                        v_hit = (live_price <= v_f + 1e-9) if is_buy else (live_price >= v_f - 1e-9)
+                        if v_hit:
+                            vt = _int_num(lv_p.get("virt_ratchet_ticks"), 0) + 1
+                            lv_p["virt_ratchet_ticks"] = vt
+                            if vt >= confirm_req:
+                                reason_sq = (
+                                    f"Near-Target Squeeze Harvest ({pr_r.get('tier')}, Stage {stage}, "
+                                    f"peak={trail_peak:.{digits}f}, virt_sl={v_f:.{digits}f})"
+                                )
+                                logger.info(f"Runner {runner_tickets}: {reason_sq} triggered at live={live_price}.")
+                                return self._finalize_runner_exit(
+                                    signal_data,
+                                    runner_tickets,
+                                    runner_layers,
+                                    reason=reason_sq,
+                                    close_all_market_tickets=True,
+                                    exit_reason_code="PROFIT_RATCHET_SL",
+                                    exit_price=live_price,
+                                    exit_stage=stage,
+                                )
+                        else:
+                            lv_p["virt_ratchet_ticks"] = 0
 
             return True
 
@@ -8097,30 +10507,45 @@ class MT5Executor:
 
         staged_exit_on = bool(_cfg("STAGED_EXIT_ENABLED", STAGED_EXIT_ENABLED))
         is_runner_phase = bool(signal_data.get("status") == "RUNNER_ACTIVE" or signal_data.get("tp1_reached"))
+        has_protected_sl = bool(
+            is_runner_phase
+            or signal_data.get("be_armed")
+            or str(signal_data.get("status") or "").strip().upper() == "BE_APPLIED"
+            or signal_data.get("stage0_profit_lock_active")
+            or signal_data.get("roles_locked")
+        )
+        layers = signal_data.get("layers") or {}
         existing_stops: List[float] = []
-        for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+        for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl", "stage0_profit_lock_sl"):
             sv = signal_data.get(stop_k)
             if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
                 existing_stops.append(round(float(sv), digits))
+        for lv in layers.values():
+            if isinstance(lv, dict):
+                for lsk in ("ratchet_sl", "broker_sl", "be_sl"):
+                    sv = lv.get(lsk)
+                    if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
+                        existing_stops.append(round(float(sv), digits))
+                        has_protected_sl = True
         cur_floor: Optional[float] = (
             (max(existing_stops) if is_buy else min(existing_stops))
             if existing_stops
             else None
         )
-        eff_sl: Optional[float] = cur_floor if (is_runner_phase and cur_floor is not None) else signal_data.get("sl")
+        eff_sl: Optional[float] = cur_floor if (has_protected_sl and cur_floor is not None) else signal_data.get("sl")
         rejected_sl_reason: Optional[str] = None
         sl_updated = False
 
         if new_sl is not None and isinstance(new_sl, numbers.Real) and not isinstance(new_sl, bool) and float(new_sl) > 0:
             cand_sl = round(float(new_sl), digits)
-            enforce_ratchet = bool(ratchet_sl_only or staged_exit_on)
-            if enforce_ratchet and is_runner_phase and cur_floor is not None:
+            enforce_ratchet = bool(ratchet_sl_only or staged_exit_on or has_protected_sl)
+            if enforce_ratchet and has_protected_sl and cur_floor is not None:
                 worse_or_equal = (
                     (is_buy and cand_sl <= float(cur_floor) + 1e-9)
                     or (not is_buy and cand_sl >= float(cur_floor) - 1e-9)
                 )
                 if worse_or_equal:
-                    rejected_sl_reason = f"Ratchet guard preserved existing runner floor ({cur_floor}) over {cand_sl}"
+                    rejected_sl_reason = f"Ratchet guard preserved existing floor ({cur_floor}) over {cand_sl}"
 
             if rejected_sl_reason is None and not self.dry_run and live_px is not None:
                 if (is_buy and cand_sl >= live_px - min_stop_dist) or (not is_buy and cand_sl <= live_px + min_stop_dist):
@@ -8159,7 +10584,6 @@ class MT5Executor:
 
         mod_pos: List[int] = []
         mod_ord: List[int] = []
-        layers = signal_data.get("layers") or {}
         market_tickets = [_int_num(t, 0) for t in (signal_data.get("market_tickets") or []) if _int_num(t, 0) > 0]
         pending_tickets = [_int_num(t, 0) for t in (signal_data.get("pending_tickets") or []) if _int_num(t, 0) > 0]
         configured_max_stage = max(
@@ -8240,8 +10664,12 @@ class MT5Executor:
                     if self.modify_position_sltp(lt, sl=sl_arg, tp=l_tp):
                         if lt not in mod_pos:
                             mod_pos.append(lt)
-                    if l_tp is not None:
-                        l_data["tp"] = l_tp
+                        if sl_arg is not None and sl_updated:
+                            l_data["sl"] = sl_arg
+                            if has_protected_sl:
+                                signal_data["broker_sl"] = sl_arg
+                        if l_tp is not None:
+                            l_data["tp"] = l_tp
 
             m_idx = max(1, min(max_stage, _int_num(signal_data.get("runner_milestone_idx", 1), 1)))
             m_target = tp_levels.get(f"TP{m_idx}")
@@ -8256,7 +10684,9 @@ class MT5Executor:
                     signal_data["runner_reversal_ticks"] = 0
         else:
             handled_tkts = set()
-            sl_arg = eff_sl if sl_updated else signal_data.get("sl")
+            # Never clobber BE / Ratchet / Stage 0 profit-lock SL on TP-only edits (`new_sl is None`)!
+            sl_arg = eff_sl if sl_updated else (None if has_protected_sl else signal_data.get("sl"))
+            non_runner_sl_applied = False
             for l_data in layers.values():
                 if not isinstance(l_data, dict):
                     continue
@@ -8264,28 +10694,46 @@ class MT5Executor:
                 if lt <= 0:
                     continue
                 l_stage = str(l_data.get("tp_stage") or "TP1").strip().upper()
-                l_tp = tp_levels.get("TP2") if l_stage == "TP2" else signal_data.get("final_tp")
+                l_role = str(l_data.get("role") or "").strip().upper()
+                if l_role == "STAGE2_BANKER" or (l_stage == "TP2" and l_role in ("CORE_RUNNER", "SOLO_RUNNER", "STAGE2_BANKER", "")):
+                    l_tp = tp_levels.get("TP2") if l_stage == "TP2" else (tp_levels.get(l_stage) if l_stage in tp_levels else signal_data.get("final_tp"))
+                elif l_stage in tp_levels and l_stage != "TP1" and l_role in ("CORE_RUNNER", "SOLO_RUNNER"):
+                    l_tp = tp_levels.get(l_stage)
+                else:
+                    l_tp = signal_data.get("final_tp")
                 if lt in market_tickets:
                     handled_tkts.add(lt)
-                    if self.modify_position_sltp(lt, sl=sl_arg, tp=l_tp) and lt not in mod_pos:
-                        mod_pos.append(lt)
-                    if l_tp is not None:
-                        l_data["tp"] = l_tp
+                    if self.modify_position_sltp(lt, sl=sl_arg, tp=l_tp):
+                        if lt not in mod_pos:
+                            mod_pos.append(lt)
+                        if sl_arg is not None and sl_updated:
+                            l_data["sl"] = sl_arg
+                            non_runner_sl_applied = True
+                        if l_tp is not None:
+                            l_data["tp"] = l_tp
                 elif lt in pending_tickets:
                     handled_tkts.add(lt)
-                    if self.modify_pending_order_sltp(lt, sl=sl_arg, tp=l_tp) and lt not in mod_ord:
-                        mod_ord.append(lt)
-                    if l_tp is not None:
-                        l_data["tp"] = l_tp
+                    if self.modify_pending_order_sltp(lt, sl=sl_arg, tp=l_tp):
+                        if lt not in mod_ord:
+                            mod_ord.append(lt)
+                        if sl_arg is not None and sl_updated:
+                            l_data["sl"] = sl_arg
+                        if l_tp is not None:
+                            l_data["tp"] = l_tp
 
             for mt in market_tickets:
                 if mt not in handled_tkts:
-                    if self.modify_position_sltp(mt, sl=sl_arg, tp=signal_data.get("final_tp")) and mt not in mod_pos:
-                        mod_pos.append(mt)
+                    if self.modify_position_sltp(mt, sl=sl_arg, tp=signal_data.get("final_tp")):
+                        if mt not in mod_pos:
+                            mod_pos.append(mt)
+                        if sl_arg is not None and sl_updated:
+                            non_runner_sl_applied = True
             for pt in pending_tickets:
                 if pt not in handled_tkts:
                     if self.modify_pending_order_sltp(pt, sl=sl_arg, tp=signal_data.get("final_tp")) and pt not in mod_ord:
                         mod_ord.append(pt)
+            if non_runner_sl_applied and sl_arg is not None and sl_updated and has_protected_sl:
+                signal_data["broker_sl"] = sl_arg
 
             tp1_val = tp_levels.get("TP1")
             if tp1_val is not None and live_px is not None:

@@ -80,6 +80,9 @@ def _reset_runtime(tmp_path, name: str = "v33"):
     main._telegram_reconnect_count = 0
     main.CLOSE_ON_SIGNAL_DELETED = True
     main.CHANNEL_IDS = [-1001234567890]
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    main.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
     state_file = tmp_path / f"{name}_state.json"
     ledger_file = tmp_path / f"{name}_ledger.jsonl"
     main.state_mgr = StateManager(str(state_file))
@@ -295,7 +298,12 @@ async def test_2_channel_prompts_and_replies_adjust_sl_tp1_tp2_tp3(tmp_path, mon
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp_path):
+async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp_path, monkeypatch):
+    import mt5_executor as ex_mod
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
     _reset_runtime(tmp_path, "chan_trail")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
@@ -446,8 +454,12 @@ async def test_4_saved_messages_user_prompts_end_to_end_lifecycle(tmp_path):
     assert len(sig_410["market_tickets"]) == 4
 
     # Target #401 explicitly while #410 is the latest signal!
+    # Wait: #401 already applied /be (be_sl=3895.5), so loosening back to 3886.0 MUST be blocked by v3.6 guard,
+    # whereas tightening SL to 3896.0 succeeds on #401 while #410 stays 3880.0!
     await _send_saved(411, "/sl 3886 #401")
-    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3886.0)
+    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3885.0)
+    await _send_saved(4111, "/sl 3896 #401")
+    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3896.0)
     assert main.state_mgr.get_signal(410, chat_id="me")["sl"] == pytest.approx(3880.0)
 
     # `close 50%` on latest (#410) -> closes 1 market ticket, leaves 3 open
@@ -483,12 +495,12 @@ async def test_4_saved_messages_user_prompts_end_to_end_lifecycle(tmp_path):
     assert main._awaiting_dailywin_input is False
     assert any("20.00" in r for r in ev_ok.replies)
 
-    # Start `dailyloss` prompt, then escape cleanly with `/sl 3887 #401`
+    # Start `dailyloss` prompt, then escape cleanly with `/sl 3897 #401` (forward-only tighten above BE 3896.0)
     await _send_saved(424, "dailyloss")
     assert main._awaiting_dailyloss_input is True
-    await _send_saved(425, "/sl 3887 #401")
+    await _send_saved(425, "/sl 3897 #401")
     assert main._awaiting_dailyloss_input is False
-    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3887.0)
+    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3897.0)
 
 
 # ---------------------------------------------------------------------------

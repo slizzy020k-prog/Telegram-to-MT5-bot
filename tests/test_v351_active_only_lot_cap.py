@@ -279,16 +279,24 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap():
     assert ex2.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.03, "total_lots": 0.08}
 
     # 3. Single-price: below-market LIMIT succeeds at 0.05/0.05; at-market AUTO blocked
-    ex._dry_run_pending_ticket_lots.clear()
-    mk_s1, pd_s1, layers_s1 = ex.execute_4layer_single_price(
-        symbol="XAUUSD.s", direction="BUY", price=3880.0, sl=3865.0, final_tp=3894.5, raw_tp1=3895.0, order_intent="AUTO"
-    )
-    assert mk_s1 == [] and len(pd_s1) == 4 and set(layers_s1.keys()) == {"L1", "L2", "L3", "L4"}
+    import config
+    orig_cons = getattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    try:
+        ex._dry_run_pending_ticket_lots.clear()
+        mk_s1, pd_s1, layers_s1 = ex.execute_4layer_single_price(
+            symbol="XAUUSD.s", direction="BUY", price=3880.0, sl=3865.0, final_tp=3894.5, raw_tp1=3895.0, order_intent="AUTO"
+        )
+        assert mk_s1 == [] and len(pd_s1) == 4 and set(layers_s1.keys()) == {"L1", "L2", "L3", "L4"}
 
-    mk_s2, pd_s2, layers_s2 = ex.execute_4layer_single_price(
-        symbol="XAUUSD.s", direction="BUY", price=3895.0, sl=3875.0, final_tp=3904.5, raw_tp1=3905.0, order_intent="AUTO"
-    )
-    assert mk_s2 == [] and pd_s2 == [] and layers_s2 == {}
+        mk_s2, pd_s2, layers_s2 = ex.execute_4layer_single_price(
+            symbol="XAUUSD.s", direction="BUY", price=3895.0, sl=3875.0, final_tp=3904.5, raw_tp1=3905.0, order_intent="AUTO"
+        )
+        assert mk_s2 == [] and pd_s2 == [] and layers_s2 == {}
+    finally:
+        config.SINGLE_PRICE_CONSOLIDATE_ORDERS = orig_cons
+        ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = orig_cons
 
 
 @pytest.mark.asyncio

@@ -147,6 +147,16 @@ def _sync_signal_aliases(rec: Dict[str, Any], updates: Optional[Dict[str, Any]] 
         if merged_tps:
             rec["tp_levels"] = merged_tps
 
+    layers_map = rec.get("layers")
+    if isinstance(layers_map, dict):
+        for l_data in layers_map.values():
+            if not isinstance(l_data, dict):
+                continue
+            if l_data.get("entry_price") is not None and l_data.get("entry") is None:
+                l_data["entry"] = l_data["entry_price"]
+            elif l_data.get("entry") is not None and l_data.get("entry_price") is None:
+                l_data["entry_price"] = l_data["entry"]
+
     _sync_mt5_order_tickets(rec)
 
 
@@ -452,7 +462,11 @@ class StateManager:
             "pending_tickets": list(pending_tickets or []),
             "mt5_order_tickets": [],
             "accounted_tickets": list(kwargs.get("accounted_tickets") or []),
+            "accounted_deal_tickets": list(kwargs.get("accounted_deal_tickets") or []),
+            "pending_pnl_tickets": copy.deepcopy(kwargs.get("pending_pnl_tickets")) if kwargs.get("pending_pnl_tickets") else {},
             "banked_profit": float(kwargs.get("banked_profit") or 0.0),
+            "roles_locked": bool(kwargs.get("roles_locked", False)),
+            "bank_harvest_layer": kwargs.get("bank_harvest_layer"),
             "zone_completed": zone_completed,
             "sl": sl,
             "raw_tp1": eff_raw_tp1,

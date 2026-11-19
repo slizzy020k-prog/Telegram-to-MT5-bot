@@ -583,10 +583,17 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path):
+async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path, monkeypatch):
     """Verify emoji reactions on old messages (>3m) are ignored and provider 'Tp1 was hit' reply triggers TP1 scaling."""
     from datetime import datetime, timezone, timedelta
+    import config
+    import mt5_executor as ex_mod
     from tests.test_copier_scenarios import MockTelethonEvent
+
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
 
     main.state_mgr = StateManager(tmp_path / "edit_age_state.json")
     main.executor = MT5Executor(dry_run=True)
@@ -1268,7 +1275,7 @@ def test_is_tp1_hit_message_and_parser_true_false_positives():
 
 
 @pytest.mark.asyncio
-async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_standalone_and_watcher(tmp_path):
+async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_standalone_and_watcher(tmp_path, monkeypatch):
     """
     Verify:
     - 'Sell now' / 'Buy now' cancelled with 0 orders if TP1 hit arrives via edit OR short standalone alert.
@@ -1277,7 +1284,14 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
       scales cleanly on TP1 hit via reply, edit, standalone alert, and live watcher price.
     """
     import asyncio
+    import config
+    import mt5_executor as ex_mod
     from tests.test_copier_scenarios import MockTelethonEvent
+
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
 
     main.state_mgr = StateManager(tmp_path / "state_tp1_cancel_all.json")
     main.executor = MT5Executor(dry_run=True)

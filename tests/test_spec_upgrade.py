@@ -118,6 +118,10 @@ def _reset_main(tmp_path, filename: str):
     main._recent_messages.clear()
     main.TRADING_HALTED = False
     main._daily_win_terminate_requested = False
+    import config
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    main.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
     main._daily_loss_terminate_requested = False
     main._daily_loss_locked = False
     main._daily_loss_lock_notified_date = None

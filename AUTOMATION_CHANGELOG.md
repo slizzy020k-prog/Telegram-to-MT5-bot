@@ -1,0 +1,80 @@
+# Telegram MT5 Signal Copier — Automation Changelog
+
+All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, and replay verifications are logged here for historical tracking and git-bisect safety.
+
+---
+
+## [2026-11-19] — v3.6.0 Autonomous Audit, Profit Ratchet Calibration & Production Bug Fixes
+
+- **Baseline Commit:** `4544f7f` (`v3.5.2`)
+- **Target Version:** `v3.6.0` (Rev 2 Progressive Profit Ratchet + M1-ATR Bounded Calibration + Production Fixes A–C)
+- **Verification Status:** `241/241` pytest tests PASS (`0` failures), `simulate.py` PASS (`10/10`), `test_examples.py` PASS (`7/7`), `scripts/ab_replay_proof.py` PASS (`4/4` gates).
+
+### 1. Audit Summary (`XAUUSD.s`, Nov 15–19, 2026)
+
+- **Scope:** Audited `copier.log` (`130,368` lines), `trades_ledger.jsonl` (`35` records), `signals_state.json` (`27` signals), MT5 closed deals (`100` deals), and `3,462` M1 candles (`mt5.copy_rates_range`).
+- **Pre-Entry Zone Invalidation Frequency:** `10 / 24` (`41.7%`) tracked Nov 17–19 signals were cancelled pre-fill (`TP1 Reached Before Zone Entry` / provider delete / manual cancel), leaving `0` market tickets filled (`£0.00` PnL).
+- **Historical TP1–TP4 Continuation Probability (15 filled genuine XAUUSD.s setups):**
+  - **TP1 Hit Rate before SL:** `11 / 15` (`73.3%`)
+  - **TP2 Hit Rate before SL:** `7 / 15` (`46.7%` of all entries; `63.6%` conditional on TP1)
+  - **TP3 Hit Rate before SL:** `6 / 15` (`40.0%` of all entries; `85.7%` conditional on TP2)
+  - **TP4+ Hit Rate before SL:** `4 / 15` (`26.7%` of all entries; `66.7%` conditional on TP3)
+- **Rollover Window Audit (`21:55–23:05 GMT` / `23:55–01:05 MT5 Server UTC+2`):** `0` entries or exits occurred during daily broker rollover.
+- **Recent 6 Core Trades (`Nov 18–19`) Classification:**
+  1. **Msg 13153 (`BUY @ 3730.00`, `GOLD_GUARD` exit `@ 3730.58`, `+£0.44`):** **False Positive / Early Choke** — peaked at `3732.07` (`69%` of `$3.00` TP1 leg), choked on a normal `$1.49` retest wick (`3730.58`), and subsequently rallied to `3758.47` (`+$28.47/oz` MFE, clearing TP1, TP2, TP3, and TP4).
+  2. **Msg 9934 (`SELL @ 3741.70`, `ATR_TRAIL` Stage 1 exit `@ 3740.17`, `+£1.16` MT5 / `£0.00` ledger bug):** **False Positive / Early Choke over full horizon** — cleared TP1 (`3737.0`) at `48.2%` of the TP1→TP2 leg (`3737.67`), stopped at `3740.17` on a `$2.50` ATR trail during a rebound to `3758.47` (which stayed `$8.53` below initial SL `3767.0`), and then collapsed to `3693.40` (`+$48.30/oz` MFE, clearing TP1–TP4). Also exposed the `deal_ticket` vs `deal` ledger PnL bug (`£0.00` recorded instead of `+£1.16`).
+  3. **Msg 13167 (`BUY @ 3750.00`, `GOLD_GUARD` exit `@ 3751.12`, `+£0.85`):** **False Positive / Early Choke (Pre-TP1)** — peaked at `3752.64` (`88%` of `$3.00` TP1 leg), exited at `3751.12` on a `$1.52` dip, and 4 minutes later surged to `3758.47` (clearing TP1 `3753.0`, `+$8.47/oz` MFE) before reversing to SL `3725.0` at `02:53 UTC`.
+  4. **Msg 9937 (`SELL 3738–3743`, `L1 @ 3737.43, L2 @ 3740.26`, `TP1=3725.0`, `BROKER_SL` BE `+£0.56`):** **Mid-Run Profit Giveback** — dropped to `3728.55` (`+$11.12/oz` MFE on L2, `$3.55` shy of wide `$13.84` TP1) and gave back `93%` of floating profit to breakeven. Fixed in `v3.6.0` by `BANK_HARVEST` on L1 + `TIER_3` Profit Ratchet on L2 (`+£5.70` in M1 replay).
+  5. **Msg 9943 (`SELL 3740–3745`, `L1 @ 3739.78, L2 @ 3739.76`, `TP1=3730.0`, `BROKER_SL` BE `+£0.45`):** **Pre-TP1 BE Stop-Out Before Continuation** — reached `3733.49` (`+$6.28/oz` pre-BE MFE), stopped at BE (`3739.47`) on a `$6` bounce, and then dropped to `3726.07` (clearing TP1 `3730.0` and approaching TP2 `3725.0`). Fixed in `v3.6.0` by `BANK_HARVEST` + `TIER_2` Profit Ratchet (`+£5.03` in M1 replay).
+  6. **Msg 9953 (`SELL 3731–3736`, 4 layers `0.05` lots, `TP1=3700.0, SL=3740.0`, `BROKER_SL` `-£25.36`):** **Valid SL Loss** — max MFE was `+$2.65/oz` on L4 (`8.8%` of `$30` TP1 leg) before hitting `SL 3740.0`.
+
+---
+
+### 2. Bounded Parameter Calibration (`config.py` & `.env`)
+
+All primary FSM/ATR/Spread parameters were calibrated strictly within the bounded `±0.05` multiplier / `±$0.25` threshold safety envelope:
+
+| Parameter | Previous (`v3.5.2`) | Calibrated (`v3.6.0`) | Delta | Rationale |
+|---|---:|---:|---:|---|
+| `STAGE1_ATR_ACTIVATION_PCT` | `0.45` | `0.50` | `+0.05` | Prevents premature Stage 1 ATR trail activation at `48.2%` of the TP1→TP2 leg (`Msg 9934`). |
+| `TP1_TRAIL_ATR_MULT` | `1.50` | `1.55` | `+0.05` | Widens dynamic M1-ATR trailing cushion by `+0.05× ATR` so post-TP1 runners survive normal Gold retests. |
+| `TP1_TRAIL_MIN_DOLLARS` | `2.50` | `2.50` | `0.00` | Preserves `$2.50` (`25 pips`) minimum Stage 1 trailing floor. |
+| `ARM_THRESHOLD_PCT` | `0.85` | `0.90` | `+0.05` | Prevents pre-TP1 shortfall guard from arming early at `85–88%` of tight TP1 legs (`Msg 13167`). |
+| `GIVEBACK_PCT` | `0.30` | `0.30` | `0.00` | Retains `30%` peak-giveback ratio after `90%` arming. |
+| `REVERSAL_CONFIRM_TICKS` | `2` | `2` | `0` | Retains 2-tick consecutive confirmation filter against single-tick spread noise. |
+| `MAX_ALLOWED_SPREAD_DOLLARS` | `0.40` | `0.45` | `+$0.05` | Accommodates normal `$0.32–$0.44` PUPrime Gold spread without false spread-spike aborts. |
+| `SINGLE_PRICE_CONSOLIDATE_ORDERS` | `False` (implicit 4x) | `True` | Enabled | Places `1` consolidated order for single-price entries (`Msg 9957`) instead of stacking 4 identical limits. |
+| `PENDING_DUPLICATE_PRICE_TOLERANCE` | N/A | `0.50` | New | Blocks duplicate pending limit/stop signals within `$0.50` of an existing pending order in the same direction. |
+| `PENDING_DUPLICATE_ORDER_TOLERANCE` | N/A | `0.25` | New | Low-level `_place_pending_order` safety guard blocking duplicate pending orders within `$0.25`. |
+| `MAX_TP_DISTANCE_DOLLARS` | N/A | `250.0` | New | Gate 5 sanity cap stripping fat-finger/wrong-side TP typos (`Msg 9919` `TP 4320`). |
+
+---
+
+### 3. Production Bug Fixes (`main.py`, `parser.py`, `mt5_executor.py`)
+
+1. **Fix A — 50% Daily Loss Limit Auto-Reset & Unpause (`main.py`):**
+   - Updated `check_and_enforce_daily_drawdown()`, startup drawdown check, and pre-flight entry hooks (`_handle_new_message_unlocked`, delayed entry, reactivation, message edit, Saved Messages `/trade`) to check `has_open_mkt` (open market positions only, ignoring unfilled pending-only setups like `Msg 13187`).
+   - When `0` open market positions remain after a realized daily loss, the daily loss baseline automatically updates to the current balance (`26.93 GBP`) and unpauses new signals while leaving `Msg 13187`'s 4 pending BUY LIMIT orders (`#153969343, #153969345, #153969346, #153969347`) untouched.
+2. **Fix B1 & B2 — Single-Price Limit Consolidation & Duplicate-Price Pending Guard (`mt5_executor.py`, `main.py`):**
+   - `execute_4layer_single_price` now consolidates to `1` order (`L1`) when `SINGLE_PRICE_CONSOLIDATE_ORDERS=True` and sets `zone_completed=False` so late edits into a 4-layer zone (`Msg 13167`) expand `L2..L4` cleanly.
+   - Added `has_duplicate_pending_order()` and wired it into `_place_pending_order` and `execute_4layer_single_price`.
+3. **Fix B3 — `ACTION_CANCEL_PENDING` Parser & Handler (`parser.py`, `main.py`):**
+   - Added `CANCEL_PENDING_PATTERNS` in Gate 3 (`DELETE SELL LIMIT` Msg `9960`, `Delete buy limit for now everyone` Msg `9910`) emitting `ACTION_CANCEL_PENDING` with `cancel_direction` (`"SELL"` / `"BUY"` / `None`), cancelling only pending orders of the matching direction while preserving open market positions and bare `"delete limit"` -> `ACTION_FULL_CLOSE`.
+4. **Fix B4 — Gate 5 Wrong-Side / Out-of-Range TP Edit Sanity (`parser.py`, `main.py`):**
+   - Enhanced `gate_5_validate_price_sanity` to strip wrong-side / `<$500` / `>$250` TPs from all TP dictionaries/lists (`labeled_tps`, `unlabeled_tps`, `explicit_tps`, `tp_levels`, `raw_tp1..5`, `final_tp`, `proximity_close_price`) and set `tp_valid=False`, eliminating the 5x `retcode=10016 (Invalid stops)` errors seen on `Msg 9919` (`SELL 3728-3732 TP 4320`).
+5. **Fix C — Ledger `deal_ticket` PnL Accounting & `TIER_0T` Pullback Persistence (`main.py`, `mt5_executor.py`):**
+   - Fixed `_account_closed_tickets` in `main.py` to read `ed.get("deal_ticket") if ed.get("deal_ticket") is not None else ed.get("deal")` and persist `accounted_deal_tickets` across `update_signal` calls (fixing the `£0.00` ledger bug on `Msg 9934`).
+   - Fixed `compute_ticket_ratchet_levels` in `mt5_executor.py` to evaluate `peak_prog = max(prog_to_tp1, mfe_exec / tp1_leg)` and gate `TIER_0T` at `>=76%` peak progress so tight-TP1 trades (`Msg 13167`) retain `TIER_0T` on pullbacks while multi-TP runners (`Msg 13153`) lift to `TP2` at `70%` and ride to Stage 2+.
+
+---
+
+### 4. Old-vs-New 12-Trade M1-Bar A/B Replay Proof (`scripts/ab_replay_proof.py`)
+
+| Metric | Actual Live MT5 | Arm A (`4544f7f` v3.5.2) | Arm B (`v3.6.0` Calibrated) | Delta (B − A) |
+|---|---:|---:|---:|---:|
+| **Net PnL across 12 Trades (GBP)** | `£-34.97` | `£+15.62` | `£+24.42` | **`£+8.80`** (`+£59.39` vs Live) |
+| **Tail Loss (`13078 + 9953`)** | `-£48.60` | `£-61.99` | `£-25.09` | **`£+36.90` saved** |
+| **Choke Trio (`13153 + 9934 + 13167`)** | `+£2.45` | `£+7.55` | `£+7.16` | **`+192%` vs Live (`+£4.71`)** |
+| **Trade `13153` Max Stage Reached** | `Stage 0` (`+£0.44`) | `Stage 2` (`+£5.43`) | `Stage 2` (`+£5.43`) | **`+Stage 2` (`+£4.99` vs Live)** |
+| **Mid-Run Givebacks (`9937 + 9943`)** | `+£1.01` (BE) | `+£21.73` | `+£10.73` (`PROFIT_RATCHET_SL`) | **`+£9.72` vs Live BE** |
+| **Rollover Exits (`21:55–23:05 GMT`)** | `0` | `0` | `0` | `0` |

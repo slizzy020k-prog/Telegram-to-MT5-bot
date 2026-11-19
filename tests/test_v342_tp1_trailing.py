@@ -26,9 +26,19 @@ import pytest
 
 import config
 import main
+import mt5_executor as ex_mod
 from mt5_executor import MT5Executor
 from state_manager import StateManager
 from trade_ledger import TradeLedger
+
+
+@pytest.fixture(autouse=True)
+def _pin_v342_baseline(monkeypatch):
+    """Pin pre-v3.6 trailing/banking flags for legacy v3.4.2 tests."""
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
 
 
 def _reset_runtime(tmp_path, name: str = "v342"):
@@ -125,8 +135,8 @@ async def test_ab_buy_and_sell_tp1_trailing_stop_wiggle_holds_rally_ratchets_and
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
 
-    # M1_ATR_14 = 5.0 / 3.0 (~1.6667) -> 1.5 * ATR = $2.50 trail_dist
-    atr_250 = 2.50 / 1.5
+    # M1_ATR_14 = 2.50 / TP1_TRAIL_ATR_MULT -> TP1_TRAIL_ATR_MULT * ATR = $2.50 trail_dist
+    atr_250 = 2.50 / float(config.TP1_TRAIL_ATR_MULT)
 
     # --- PART 1: BUY (entry=3840, TP1=3850, trail_dist=$2.50) ---
     _seed_4layer_signal(msg_id=8401, direction="BUY", entry_top=3840.0, entry_bot=3837.0, sl=3825.0, tp1=3850.0)
@@ -375,7 +385,7 @@ async def test_fg_clean_break_no_tp1_050_choke_hard_ceiling_and_pre_tp1_guard_in
     monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
-    atr_250 = 2.50 / 1.5
+    atr_250 = 2.50 / float(config.TP1_TRAIL_ATR_MULT)
 
     # --- Scenario F: Clean break +5p past TP1 (3850.55) does NOT lock TP1-$0.50 (3849.50)! ---
     _seed_4layer_signal(msg_id=8420, direction="BUY", entry_top=3840.0, entry_bot=3837.0, sl=3825.0, tp1=3850.0, tickets=(8501, 8502, 8503, 8504))

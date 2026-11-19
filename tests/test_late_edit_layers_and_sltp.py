@@ -93,6 +93,10 @@ def _reset_runtime(tmp_path, tag: str = "late_edit"):
     main._daily_loss_locked = False
     main.CLOSE_ON_SIGNAL_DELETED = True
     main.CHANNEL_IDS = [-4369388188, -1004369388188]
+    import config
+    config.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    ex_mod.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
+    main.SINGLE_PRICE_CONSOLIDATE_ORDERS = False
     main.state_mgr = StateManager(str(tmp_path / f"{tag}_state.json"))
     main.trade_ledger = TradeLedger(str(tmp_path / f"{tag}_ledger.jsonl"))
 

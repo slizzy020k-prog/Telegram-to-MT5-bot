@@ -38,6 +38,15 @@ def _tick(bid: float, ask: float = None, spread: float = 0.20) -> SimpleNamespac
     return SimpleNamespace(bid=round(bid, 2), ask=round(ask if ask is not None else (bid + spread), 2), time=1794900000.0)
 
 
+@pytest.fixture(autouse=True)
+def _pin_v34_gold_guard_baseline(monkeypatch):
+    """Pin pre-v3.6 Stage 0 Gold Guard & TP1 banking defaults for legacy v3.4 tests."""
+    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+        monkeypatch.setattr(config, key, False, raising=False)
+        monkeypatch.setattr(ex_mod, key, False, raising=False)
+        monkeypatch.setattr(main, key, False, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_1_single_layer_dynamically_becomes_runner_disables_tp1_shortfall_arms_85pct_and_scales_tp2_to_tp4(tmp_path, monkeypatch):
     """
