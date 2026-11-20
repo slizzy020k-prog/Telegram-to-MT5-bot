@@ -7771,12 +7771,13 @@ class MT5Executor:
           Momentum-gated Dynamic Trailing TP (`TP1 -> TP2 -> ... -> max_stage`).
         - Strictly broker-executed SL/TP via `modify_position_sltp`; NEVER calls `close_market_position`.
         """
+        policy = self._get_dynamic_risk_policy()
         empty_disabled = {
             "enabled": False,
             "paused_by_spread": False,
             "atr": 0.0,
             "timeframe": "M5",
-            "trail_mult": 1.40,
+            "trail_mult": policy.trail_atr_mult,
             "trail_zone": "STANDARD",
             "updated_tickets": [],
             "tp_lifted_tickets": [],
@@ -7788,7 +7789,6 @@ class MT5Executor:
         }
         if not isinstance(signal_data, dict):
             return empty_disabled
-        policy = self._get_dynamic_risk_policy()
         if not policy.trail_enabled:
             return empty_disabled
 
