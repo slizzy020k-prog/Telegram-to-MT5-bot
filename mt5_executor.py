@@ -5873,10 +5873,6 @@ class MT5Executor:
 
         roles_locked = bool(signal_data.get("roles_locked"))
         if not roles_locked:
-            has_pending_limits = bool(signal_data.get("pending_tickets")) or any(
-                isinstance(v, dict) and str(v.get("status") or "").strip().upper() == "PENDING"
-                for v in layers.values()
-            )
             any_be_locked = bool(
                 signal_data.get("be_armed")
                 or str(signal_data.get("status") or "").strip().upper() == "BE_APPLIED"
@@ -5886,7 +5882,8 @@ class MT5Executor:
                 signal_data.get("tp1_reached")
                 or "TP1" in {str(x).strip().upper() for x in (signal_data.get("runner_cleared_milestones") or [])}
             )
-            if (any_be_locked or tp1_cleared) and not (has_pending_limits and not any_be_locked and not tp1_cleared):
+            # roles lock only on BE-lock or TP1-clear, never on a pre-BE TP lift.
+            if any_be_locked or tp1_cleared:
                 if any(
                     isinstance(layers.get(lk), dict)
                     and str(layers[lk].get("tp_stage") or "TP1").strip().upper() != "TP1"
