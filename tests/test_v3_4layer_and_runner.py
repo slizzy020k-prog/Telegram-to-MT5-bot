@@ -748,7 +748,13 @@ def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4(monke
         assert sig["status"] == "RUNNER_ACTIVE"
         assert sig["layers"]["L1"]["status"] == "RUNNER"
         assert sig["runner_milestone_idx"] == 2
-        assert sig["runner_sl_floor"] == pytest.approx(3894.60)
+        # Msg 10196 progressive-trail change: entry 3890.00, live/peak 3900.60 -> MFE $10.60,
+        # which sits in the EXTENDED zone (MFE >= $10.00) where the ATR trail multiplier
+        # tightens from the STANDARD 1.40x to 1.00x. trail_dist = M5 ATR 4.00 x 1.00 = 4.00,
+        # so the runner SL floor is 3900.60 - 4.00 = 3896.60 (the old expectation 3894.60
+        # came from the pre-Upgrade-5 single 1.50x multiplier). The new value is TIGHTER
+        # and is the specified behaviour.
+        assert sig["runner_sl_floor"] == pytest.approx(3896.60)
 
         # Stepped breakout progression: TP2 (3910.60) -> TP3 (3920.60) -> TP4 (3930.10)
         with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
@@ -855,6 +861,10 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
 
+    # Pin the STANDARD-zone ATR trail multiplier to the specified 1.40 (not the .env
+    # override) so the trailed-SL expectation below is anchored to the spec.
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.40, raising=False)
+
     alerts = []
     orig_notify = main.notify_saved_messages
     main.notify_saved_messages = AsyncMock(side_effect=lambda msg: alerts.append(msg))
@@ -900,7 +910,7 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
             spy_close = MagicMock()
             main.executor.close_market_position = spy_close
 
-            # Surge to 3899.75 ($9.75 profit, 97.5% of TP1!) -> activates BE lock & trails SL to 3893.75, sweeps pending
+            # Surge to 3899.75 ($9.75 profit, 97.5% of TP1!) -> activates BE lock & trails SL to 3894.15, sweeps pending
             for px in (3899.75, 3898.45, 3898.40):
                 with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
                     await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
@@ -908,7 +918,14 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
             assert cur_sig["status"] == "ACTIVE"
             assert cur_sig["pending_tickets"] == []
             assert cur_sig["layers"]["L1"]["be_locked"] is True
-            assert cur_sig["layers"]["L1"]["sl"] == pytest.approx(3893.75)
+            # Msg 10196: peak 3899.75 - entry 3890.00 = MFE $9.75, which is BELOW the $10.00
+            # EXTENDED boundary, so this is the STANDARD zone. The STANDARD zone uses
+            # 1.40 x M5 ATR (floor $2.50), i.e. trail_dist = 4.00 x 1.40 = 5.60, so the
+            # trailed SL is 3899.75 - 5.60 = 3894.15. The previous expectation 3893.75
+            # came from the .env override DYNAMIC_ATR_TRAIL_MULT=1.50 (4.00 x 1.50 = 6.00);
+            # the multiplier is now pinned to the specified 1.40 below so the number is
+            # anchored to the spec rather than to a value that happened to be in .env.
+            assert cur_sig["layers"]["L1"]["sl"] == pytest.approx(3894.15)
 
             # Mid-candle pullback to 3896.70 (above SL) triggers ZERO virtual market closes!
             with patch.object(main.executor, "get_tick", return_value=_make_tick(3896.70, 3896.90)):

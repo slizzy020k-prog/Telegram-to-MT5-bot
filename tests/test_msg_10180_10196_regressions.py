@@ -1,0 +1,710 @@
+"""
+Regression suite for the Msg 10180 / Msg 10196 production audit fixes.
+
+Msg 10180 (state-machine / role integrity):
+  * stub -> zone edit must apply ADAPTIVE ATR scaling and persist the snapshot
+  * the deepest (L4) fill must be promoted to CORE_RUNNER, never L1
+  * a pre-BE TP1->TP2 lift must NOT lock roles (forward-only guard stays open)
+  * the TP1 -> TP2 ATR-proximity lift needs >=50 % leg progress unless be_locked
+  * the monotonic TP sanitizer must drop the 3437 typo and keep TP1..TPn contiguous
+
+Msg 10196 (chatter guard + progressive ATR trail + BE protection):
+  * future-tense chatter ("gonna ... soon") must never reach the order path
+  * the progressive trail ladder must tighten STANDARD -> EXTENDED -> HOME_RUN
+  * the ATR trail ratchet must never move the SL backwards
+  * "close worst / hold layers" must not overwrite a BANK_TP1 target with TP3
+  * "close worst / hold layers" must skip a layer inside the broker stops level
+
+All tests are deterministic: no wall-clock, no network, no live MT5 connection.
+"""
+
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+import config
+import dynamic_risk
+import main
+import mt5_executor as ex_mod
+import parser
+from mt5_executor import MT5Executor
+from state_manager import StateManager
+from trade_ledger import TradeLedger
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+CHAT_ID = -1004369388188
+
+
+def _make_tick(bid: float, ask: float, ts: float = 1794886034.0) -> SimpleNamespace:
+    return SimpleNamespace(bid=bid, ask=ask, time=ts)
+
+
+def _sym_info(digits: int = 2, point: float = 0.01, stops_level: int = 50) -> SimpleNamespace:
+    return SimpleNamespace(
+        digits=digits,
+        point=point,
+        spread=20,
+        trade_mode=4,
+        filling_mode=2,
+        visible=True,
+        trade_stops_level=stops_level,
+        trade_freeze_level=0,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+    )
+
+
+def _reset_runtime(tmp_path, tag: str) -> None:
+    for k in list(main._pending_sell_now_tasks.keys()):
+        main._cancel_delayed_sell_now(k)
+    main._pending_task_chats.clear()
+    main._recent_messages.clear()
+    main._recent_message_texts.clear()
+    main._deleted_messages.clear()
+    main._signal_locks.clear()
+    main._runner_save_throttle_ts.clear()
+    main.TRADING_HALTED = False
+    main.CLOSE_ON_SIGNAL_DELETED = True
+    main.state_mgr = StateManager(str(tmp_path / f"{tag}_state.json"))
+    main.trade_ledger = TradeLedger(str(tmp_path / f"{tag}_ledger.jsonl"))
+
+
+class FakeMsg:
+    def __init__(self, msg_id, text, reply_to_msg_id=None, date=None, edit_date=None):
+        self.id = msg_id
+        self.message = text
+        self.raw_text = text
+        self.reply_to_msg_id = reply_to_msg_id
+        self.reply_to = None
+        self.forward = None
+        self.fwd_from = None
+        self.out = False
+        self.date = date or datetime.now(timezone.utc)
+        self.edit_date = edit_date
+
+
+class FakeEvent:
+    def __init__(self, msg_id, text, chat_id=CHAT_ID, reply_to=None, date=None, edit_date=None):
+        self.message = FakeMsg(msg_id, text, reply_to_msg_id=reply_to, date=date, edit_date=edit_date)
+        self.chat_id = chat_id
+        self.is_private = False
+        self.is_reply = reply_to is not None
+        self.replies = []
+
+    async def reply(self, txt: str):
+        self.replies.append(txt)
+
+
+def _pin_progressive_trail_policy(monkeypatch) -> None:
+    """Pin the spec ladder (1.40 / 1.00 @ $10 / 0.80 @ $18, floor $2.50, cap $12.00)."""
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.40, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MULT", 1.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MULT", 0.80, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Msg 10180 - 1. stub -> zone edit applies ADAPTIVE ATR scaling
+# ---------------------------------------------------------------------------
+
+async def _drive_stub_to_zone_edit(tmp_path, monkeypatch, msg_id=9401):
+    """
+    Set up a bare "Buy xauusd now" stub signal, edit it into a full zone
+    (SL + TP1..TP5) and run the real edit handler.
+
+    Returns (signal, scale_calls) where scale_calls records every
+    apply_dynamic_atr_sl_tp invocation made by the edit path.
+    """
+    monkeypatch.setattr(config, "DYNAMIC_SLTP_MODE", "ADAPTIVE", raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_SLTP_ENABLED", True, raising=False)
+
+    _reset_runtime(tmp_path, "stub_zone")
+    main.executor = MT5Executor(dry_run=True)
+    main.executor.connect()
+
+    stub_text = "Buy xauusd now"
+    zone_text = (
+        "Buy xauusd 3895-3887\n\n"
+        "Sl 3880\n"
+        "Tp 3900\nTp 3910\nTp 3920\nTp 3930\nTp 3940"
+    )
+
+    # The stub: an instant-now market entry with the synthetic fallback TP ladder that
+    # the copier attaches to an unpriced "now" signal (no zone, no dynamic-risk snapshot).
+    main.state_mgr.create_signal(
+        message_id=msg_id,
+        chat_id=CHAT_ID,
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layers={
+            "L1": {
+                "lot": 0.01,
+                "target_price": None,
+                "tp": 3899.50,
+                "tp_stage": "TP1",
+                "ticket": 4001,
+                "order_type": "MARKET",
+                "status": "OPEN",
+            }
+        },
+        market_tickets=[4001],
+        pending_tickets=[],
+        zone=None,
+        zone_completed=False,
+        is_zone=False,
+        is_instant_now=True,
+        max_orders=1,
+        sl=None,
+        raw_tp1=3900.0,
+        raw_tp2=3910.0,
+        raw_tp3=3920.0,
+        raw_tp4=3930.0,
+        raw_tp5=3940.0,
+        tp_levels={"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+        final_tp=3899.50,
+        fallback_tp_applied=True,
+        initial_price=3891.00,
+        recorded_entry_price=3891.00,
+        raw_text=stub_text,
+        timestamp=(datetime.now(timezone.utc) - timedelta(minutes=4)).isoformat(),
+    )
+
+    live_tick = _make_tick(3892.00, 3892.20)
+    scale_calls = []
+    orig_scale = main.executor.apply_dynamic_atr_sl_tp
+
+    def _spy_scale(*args, **kwargs):
+        scale_calls.append(kwargs)
+        return orig_scale(*args, **kwargs)
+
+    evt_edit = FakeEvent(
+        msg_id,
+        zone_text,
+        chat_id=CHAT_ID,
+        date=datetime.now(timezone.utc) - timedelta(minutes=4),
+        edit_date=datetime.now(timezone.utc),
+    )
+
+    with patch.object(main, "notify_saved_messages", new_callable=AsyncMock), patch.object(
+        main.executor, "get_tick", return_value=live_tick
+    ), patch.object(main.executor, "get_atr", return_value=8.00), patch.object(
+        main.executor, "apply_dynamic_atr_sl_tp", side_effect=_spy_scale
+    ), patch.object(main.executor, "modify_position_sltp", return_value=True), patch.object(
+        main.executor, "place_limit_order", return_value=4102
+    ):
+        await main.handle_message_edited(evt_edit)
+
+    sig = main.state_mgr.get_signal(msg_id, chat_id=CHAT_ID)
+    assert sig is not None, "the edited stub signal must still exist"
+    return sig, scale_calls, zone_text
+
+
+def _assert_stub_edit_scaled_like_a_fresh_signal(sig, scale_calls, zone_text):
+    """Shared assertions for the stub -> zone edit scaling behaviour."""
+
+    # 1) The edit was routed through the ATR scaler exactly once ...
+    assert len(scale_calls) == 1, f"expected one apply_dynamic_atr_sl_tp call, got {len(scale_calls)}"
+    # 2) ... with usable anchors ...
+    assert scale_calls[0]["sl_anchor"] > 0.0 and scale_calls[0]["tp_anchor"] > 0.0
+    dr = sig.get("dynamic_risk")
+    assert isinstance(dr, dict) and dr.get("applied") is True, f"dynamic_risk not applied: {dr}"
+    assert dr.get("mode") == "ADAPTIVE", f"expected ADAPTIVE mode, got {dr.get('mode')}"
+    # 3) ... and the scaled snapshot is persisted on the signal.
+    assert sig.get("edit_dynamic_risk_scaled") is True
+
+    # 4) Equivalence: the anchors used by the edit are exactly the anchors the fresh
+    #    zone path uses, and therefore the scaled levels are identical.
+    parsed = parser.parse_message(zone_text, is_edit=True, live_price=3892.00)
+    assert parsed is not None and parsed.zone is not None
+    fresh_sl_anchor, fresh_tp_anchor = main.executor.compute_zone_atr_anchors(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        zone=parsed.zone,
+        final_tp=parsed.final_tp,
+        raw_tp1=parsed.raw_tp1,
+        pip_size=0.10,
+        digits=2,
+    )
+    assert scale_calls[0]["sl_anchor"] == pytest.approx(fresh_sl_anchor)
+    assert scale_calls[0]["tp_anchor"] == pytest.approx(fresh_tp_anchor)
+
+    with patch.object(main.executor, "get_atr", return_value=8.00):
+        fresh_snap = main.executor.apply_dynamic_atr_sl_tp(
+            symbol="XAUUSD.s",
+            direction="BUY",
+            sl_anchor=fresh_sl_anchor,
+            tp_anchor=fresh_tp_anchor,
+            sl=parsed.sl,
+            raw_tp1=parsed.raw_tp1,
+            tp_levels=parsed.tp_levels,
+            final_tp=parsed.final_tp,
+            pip_size=0.10,
+            digits=2,
+        )
+    assert fresh_snap["applied"] is True
+    # The edit must land on exactly the same scaled levels as a fresh signal.
+    assert sig["sl"] == pytest.approx(fresh_snap["sl"])
+    assert sig["raw_tp1"] == pytest.approx(fresh_snap["raw_tp1"])
+    assert sig["final_tp"] == pytest.approx(fresh_snap["final_tp"])
+    # Sanity: the scaling really did move the levels (ATR 8.00 -> vol_ratio 1.75).
+    assert fresh_snap["vol_ratio"] == pytest.approx(1.75)
+    assert fresh_snap["raw_tp1"] != pytest.approx(parsed.raw_tp1)
+
+
+@pytest.mark.asyncio
+async def test_stub_edit_to_zone_applies_adaptive_atr_scaling(tmp_path, monkeypatch):
+    """
+    A bare "Buy xauusd now" stub edited into a full zone (SL + TP1..TP5) must be routed
+    through apply_dynamic_atr_sl_tp in ADAPTIVE mode, and the edit must scale the
+    levels EXACTLY like an identical fresh zone signal.
+
+    Equivalence anchor: MT5Executor.compute_zone_atr_anchors is the single source of
+    truth for the zone ATR anchors (shared with execute_4layer_zone), so the edit path
+    and the fresh-signal path must agree on (sl_anchor, tp_anchor) and therefore on the
+    scaled SL / TP1 / final TP.
+
+    Regression guard: this test also fails loudly (NameError inside the edit handler) if
+    main.py ever stops importing TP1_CLOSE_PROXIMITY_PIPS again - see
+    test_main_imports_tp1_close_proximity_pips.
+    """
+    sig, scale_calls, zone_text = await _drive_stub_to_zone_edit(tmp_path, monkeypatch)
+    _assert_stub_edit_scaled_like_a_fresh_signal(sig, scale_calls, zone_text)
+
+
+def test_main_imports_tp1_close_proximity_pips():
+    """
+    Regression guard for the production bug found by this suite: the stub -> zone edit
+    path recomputes the proximity-close price from TP1_CLOSE_PROXIMITY_PIPS
+    (main.py, in the Upgrade-4 ADAPTIVE scaling block), but main.py originally never
+    imported that constant, so ANY edit that actually applied ATR scaling died with
+    NameError before the scaled levels were persisted.
+
+    The constant lives in config.py; main.py must import it.
+    """
+    assert hasattr(main, "TP1_CLOSE_PROXIMITY_PIPS"), (
+        "main.py must import TP1_CLOSE_PROXIMITY_PIPS: the stub->zone edit path uses it "
+        "to recompute the scaled proximity-close price, and an undefined name there "
+        "aborts the whole edit with NameError"
+    )
+    assert main.TP1_CLOSE_PROXIMITY_PIPS == config.TP1_CLOSE_PROXIMITY_PIPS
+
+
+# ---------------------------------------------------------------------------
+# Msg 10180 - 2. the deepest fill becomes CORE_RUNNER (never L1)
+# ---------------------------------------------------------------------------
+
+def test_l4_deep_fill_is_promoted_to_core_runner_not_l1():
+    """With L1..L4 all filled, CORE_RUNNER is the deepest/best fill (L4), not L1."""
+    ex = MT5Executor(dry_run=True)
+    sig = {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "layers": {
+            "L1": {"lot": 0.01, "target_price": 3895.00, "tp": 3899.50, "tp_stage": "TP1", "ticket": 101, "order_type": "MARKET", "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3892.33, "tp": 3899.50, "tp_stage": "TP1", "ticket": 102, "order_type": "LIMIT", "status": "OPEN"},
+            "L3": {"lot": 0.01, "target_price": 3889.67, "tp": 3899.50, "tp_stage": "TP1", "ticket": 103, "order_type": "LIMIT", "status": "OPEN"},
+            "L4": {"lot": 0.02, "target_price": 3887.00, "tp": 3899.50, "tp_stage": "TP1", "ticket": 104, "order_type": "LIMIT", "status": "FILLED"},
+        },
+        "market_tickets": [101, 102, 103, 104],
+        "pending_tickets": [],
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+    }
+    roles = ex.assign_or_preserve_layer_roles(sig)
+
+    assert roles["L4"] == "CORE_RUNNER", f"deepest fill must be CORE_RUNNER, got {roles}"
+    assert roles["L1"] != "CORE_RUNNER"
+    assert sig["runner_layers"] == ["L4"], f"runner must be L4, got {sig.get('runner_layers')}"
+    assert "LATE_RECOVERY" not in roles.values(), f"no layer may be demoted to LATE_RECOVERY: {roles}"
+
+
+# ---------------------------------------------------------------------------
+# Msg 10180 - 3. a premature TP lift must not lock the roles
+# ---------------------------------------------------------------------------
+
+def test_premature_tp_lift_does_not_lock_roles():
+    """
+    A TP1 -> TP2 lift that happens BEFORE the BE lock must not set roles_locked,
+    so a later "Extend SL" edit is not blocked by the forward-only SL guard.
+    """
+    ex = MT5Executor(dry_run=True)
+    sig = {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "layers": {
+            # L1 was lifted to TP2 by ATR proximity while TP1 has NOT been cleared and
+            # no BE lock has been applied.
+            "L1": {"lot": 0.01, "target_price": 3895.00, "tp": 3910.00, "tp_stage": "TP2", "ticket": 101, "order_type": "MARKET", "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3892.33, "tp": 3899.50, "tp_stage": "TP1", "ticket": 102, "order_type": "LIMIT", "status": "PENDING"},
+            "L3": {"lot": 0.01, "target_price": 3889.67, "tp": 3899.50, "tp_stage": "TP1", "ticket": 103, "order_type": "LIMIT", "status": "PENDING"},
+            "L4": {"lot": 0.02, "target_price": 3887.00, "tp": 3899.50, "tp_stage": "TP1", "ticket": 104, "order_type": "LIMIT", "status": "PENDING"},
+        },
+        "market_tickets": [101],
+        "pending_tickets": [102, 103, 104],
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+    }
+
+    ex.assign_or_preserve_layer_roles(sig)
+    assert sig.get("roles_locked") in (None, False), (
+        f"a pre-BE TP lift must not lock roles, got roles_locked={sig.get('roles_locked')}"
+    )
+
+    # The forward-only SL guard must therefore still accept an "Extend SL" edit.
+    candidate_sl = 3880.0
+    resolved = main._resolve_edit_layer_sl(sig, sig["layers"]["L1"], candidate_sl, "BUY")
+    assert resolved == pytest.approx(candidate_sl), (
+        "a pre-BE TP lift must not block a later SL edit"
+    )
+
+    # Control: once the roles ARE locked (BE lock / TP1 cleared), the same edit IS blocked.
+    locked_sig = dict(sig)
+    locked_sig["roles_locked"] = True
+    locked_sig["layers"] = {"L1": dict(sig["layers"]["L1"], sl=3890.00)}
+    assert main._resolve_edit_layer_sl(locked_sig, locked_sig["layers"]["L1"], candidate_sl, "BUY") is None
+
+
+# ---------------------------------------------------------------------------
+# Msg 10180 - 4. TP1 -> TP2 lift needs 50 % leg progress unless be_locked
+# ---------------------------------------------------------------------------
+
+def test_tp1_lift_requires_50pct_progress_or_be_locked(monkeypatch):
+    """compute_dynamic_tp_step refuses the TP1 -> TP2 ATR-proximity lift below 50 % progress."""
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", 0.50, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75, raising=False)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
+
+    tp_levels = {"TP1": 110.0, "TP2": 120.0, "TP3": 130.0}
+
+    def _step(live_price, be_locked):
+        return dynamic_risk.compute_dynamic_tp_step(
+            direction="BUY",
+            entry_price=100.0,
+            live_price=live_price,
+            peak_price=live_price,
+            atr=12.0,
+            tp_levels=tp_levels,
+            current_stage_idx=1,
+            max_stage=3,
+            cleared_milestones=[],
+            policy=policy,
+            digits=2,
+            stops_buffer=0.0,
+            be_locked=be_locked,
+        )
+
+    # 40 % of the TP1 leg (entry 100 -> TP1 110); price 104 is 6.0 away from TP1 which is
+    # inside the ATR-proximity window (0.50 x ATR 12.0 = 6.0).
+    below = _step(104.0, False)
+    assert below["should_lift"] is False, f"TP1 lift must be refused below 50 % progress: {below}"
+    assert below["target_stage_name"] == "TP1"
+
+    # Same situation but the layer is BE-locked -> the lift is allowed.
+    allowed_be = _step(104.0, True)
+    assert allowed_be["should_lift"] is True, f"BE-locked layer may lift: {allowed_be}"
+    assert allowed_be["target_stage_name"] == "TP2"
+    assert allowed_be["target_tp"] == pytest.approx(120.0)
+
+    # Exactly 50 % of the leg -> allowed without a BE lock (threshold is inclusive).
+    at_threshold = _step(105.0, False)
+    assert at_threshold["should_lift"] is True, f"50 % progress must lift: {at_threshold}"
+    assert at_threshold["target_stage_name"] == "TP2"
+
+
+# ---------------------------------------------------------------------------
+# Msg 10180 - 5. monotonic TP sanitizer drops the 3437 typo
+# ---------------------------------------------------------------------------
+
+def test_monotonic_sanitizer_drops_3437_typo():
+    """SELL [3568, 3555, 3437, 3520, 3500] -> kept [3568, 3555, 3520, 3500], dropped [3437]."""
+    kept, dropped = parser.sanitize_monotonic_tps([3568.0, 3555.0, 3437.0, 3520.0, 3500.0], direction="SELL")
+    assert kept == [3568.0, 3555.0, 3520.0, 3500.0]
+    assert dropped == [3437.0]
+
+    labeled = {"TP1": 3568.0, "TP2": 3555.0, "TP3": 3437.0, "TP4": 3520.0, "TP5": 3500.0}
+    clean, dropped_lab = parser._sanitize_labeled_tps_monotonic(labeled, "SELL")
+    assert dropped_lab == [3437.0]
+    # Strictly ordered and contiguously labelled TP1..TP4.
+    assert clean == {"TP1": 3568.0, "TP2": 3555.0, "TP3": 3520.0, "TP4": 3500.0}
+    assert list(clean.keys()) == ["TP1", "TP2", "TP3", "TP4"]
+    prices = [clean[k] for k in sorted(clean, key=lambda s: int(s[2:]))]
+    assert prices == sorted(prices, reverse=True), "a SELL ladder must stay strictly descending"
+
+    # The stage-preserving view keeps the provider stage identity (a TP2 stays a TP2).
+    stages, _ = parser._sanitize_labeled_tps_monotonic_stages({"TP2": 3900.0, "TP4": 3880.0}, "SELL")
+    assert stages == {"TP2": 3900.0, "TP4": 3880.0}
+
+
+# ---------------------------------------------------------------------------
+# Msg 10196 - 6. future-tense chatter is ignored
+# ---------------------------------------------------------------------------
+
+def test_future_tense_gonna_chatter_is_ignored():
+    """Future-tense chatter must never be classified as a trade-management action."""
+    chatter = "I'm gonna go breakeven early and close worst soon"
+    assert parser.parse_message(chatter) is None
+    assert parser.gate_3_classify_trade_management(chatter, is_reply=True) is None
+
+    # Same management wording, but without the future-tense token -> still a command.
+    cmd = "close worst entries now and hold layers"
+    action = parser.parse_message(cmd)
+    assert action is not None, "the plain command must still parse"
+    assert action.management_action == "ACTION_CLOSE_WORST_HOLD_LAYERS"
+    assert parser.gate_3_classify_trade_management(cmd, is_reply=True).management_action == (
+        "ACTION_CLOSE_WORST_HOLD_LAYERS"
+    )
+
+    # The very same command prefixed with a future-tense token is dropped.
+    assert parser.parse_message("I'm gonna close worst entries now and hold layers") is None
+
+
+# ---------------------------------------------------------------------------
+# Msg 10196 - 7. progressive trail zones
+# ---------------------------------------------------------------------------
+
+def test_progressive_trail_tightening_zones(monkeypatch):
+    """MFE < $10 -> 1.40x STANDARD; $10..$18 -> 1.00x EXTENDED; >= $18 -> 0.80x HOME_RUN."""
+    _pin_progressive_trail_policy(monkeypatch)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
+
+    assert dynamic_risk.select_progressive_trail_mult(0.00, policy) == (1.40, "STANDARD")
+    assert dynamic_risk.select_progressive_trail_mult(9.99, policy) == (1.40, "STANDARD")
+    assert dynamic_risk.select_progressive_trail_mult(10.00, policy) == (1.00, "EXTENDED")
+    assert dynamic_risk.select_progressive_trail_mult(17.99, policy) == (1.00, "EXTENDED")
+    assert dynamic_risk.select_progressive_trail_mult(18.00, policy) == (0.80, "HOME_RUN")
+    assert dynamic_risk.select_progressive_trail_mult(100.00, policy) == (0.80, "HOME_RUN")
+
+    def _trail(entry, mfe, atr):
+        peak = entry + mfe
+        return dynamic_risk.compute_dynamic_atr_trail_stop(
+            direction="BUY",
+            entry_price=entry,
+            live_price=peak,
+            prev_peak=peak,
+            current_sl=0.0,
+            atr=atr,
+            policy=policy,
+            digits=2,
+        )
+
+    # M5 ATR 4.00 -> trail_dist = 4.00 x zone multiplier.
+    std = _trail(3850.0, 5.00, 4.00)
+    assert std["trail_zone"] == "STANDARD" and std["trail_mult"] == pytest.approx(1.40)
+    assert std["trail_dist"] == pytest.approx(5.60)
+
+    ext = _trail(3850.0, 12.00, 4.00)
+    assert ext["trail_zone"] == "EXTENDED" and ext["trail_mult"] == pytest.approx(1.00)
+    assert ext["trail_dist"] == pytest.approx(4.00)
+
+    home = _trail(3850.0, 20.00, 4.00)
+    assert home["trail_zone"] == "HOME_RUN" and home["trail_mult"] == pytest.approx(0.80)
+    assert home["trail_dist"] == pytest.approx(3.20)
+
+    # The $2.50 floor is honoured in EVERY zone (ATR 0.50 x mult would be below it).
+    for mfe, zone, mult in ((5.00, "STANDARD", 1.40), (12.00, "EXTENDED", 1.00), (20.00, "HOME_RUN", 0.80)):
+        res = _trail(3850.0, mfe, 0.50)
+        assert res["trail_zone"] == zone
+        assert res["trail_mult"] == pytest.approx(mult)
+        assert res["trail_dist"] == pytest.approx(2.50), f"{zone} must honour the $2.50 floor"
+
+
+# ---------------------------------------------------------------------------
+# Msg 10196 - 8. the trail never moves the SL backwards
+# ---------------------------------------------------------------------------
+
+def test_progressive_trail_never_moves_sl_backwards(monkeypatch):
+    """The ATR trail ratchet is monotonic forward across all three zone transitions."""
+    _pin_progressive_trail_policy(monkeypatch)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
+
+    entry = 3850.0
+    atr = 4.00
+    prev_sl = None
+    prev_mult = None
+    # The trail only arms once MFE >= trail_activation_mult (1.00) x ATR (4.00) = $4.00.
+    for step in range(16, 301):
+        mfe = step * 0.25
+        peak = entry + mfe
+        res = dynamic_risk.compute_dynamic_atr_trail_stop(
+            direction="BUY",
+            entry_price=entry,
+            live_price=peak,
+            prev_peak=peak,
+            current_sl=0.0,
+            atr=atr,
+            policy=policy,
+            digits=2,
+        )
+        assert res["trail_armed"] is True
+        assert res["atr_sl"] is not None
+        if prev_sl is not None:
+            assert res["atr_sl"] >= prev_sl - 1e-9, (
+                f"ATR trail moved backwards at MFE={mfe}: {res['atr_sl']} < {prev_sl}"
+            )
+            assert res["trail_mult"] <= prev_mult + 1e-9, (
+                f"zone multiplier increased at MFE={mfe}: {res['trail_mult']} > {prev_mult}"
+            )
+        prev_sl = res["atr_sl"]
+        prev_mult = res["trail_mult"]
+
+    # Explicitly pin the three zone transitions on the BUY side.
+    at_standard = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY", entry_price=entry, live_price=3859.99, prev_peak=3859.99,
+        current_sl=0.0, atr=atr, policy=policy, digits=2,
+    )
+    at_extended = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY", entry_price=entry, live_price=3860.00, prev_peak=3860.00,
+        current_sl=0.0, atr=atr, policy=policy, digits=2,
+    )
+    at_homerun = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY", entry_price=entry, live_price=3868.00, prev_peak=3868.00,
+        current_sl=0.0, atr=atr, policy=policy, digits=2,
+    )
+    assert at_standard["trail_zone"] == "STANDARD"
+    assert at_extended["trail_zone"] == "EXTENDED"
+    assert at_homerun["trail_zone"] == "HOME_RUN"
+    assert at_standard["atr_sl"] < at_extended["atr_sl"] < at_homerun["atr_sl"]
+
+
+# ---------------------------------------------------------------------------
+# Msg 10196 - 9/10. "close worst / hold layers" BE protection
+# ---------------------------------------------------------------------------
+
+def _mt5_mocks(positions, tick, sym_info=None):
+    sym_obj = sym_info or _sym_info()
+
+    def _positions_get(*args, **kwargs):
+        ticket = kwargs.get("ticket")
+        if ticket is not None:
+            return [p for p in positions if p.ticket == ticket]
+        return list(positions)
+
+    return [
+        patch.object(ex_mod.mt5, "symbol_info", return_value=sym_obj),
+        patch.object(ex_mod.mt5, "symbol_select", return_value=True),
+        patch.object(ex_mod.mt5, "symbol_info_tick", return_value=tick),
+        patch.object(ex_mod.mt5, "positions_get", side_effect=_positions_get),
+        patch.object(ex_mod.mt5, "last_error", return_value=(1, "OK")),
+    ]
+
+
+def _position(ticket, price_open, profit, sl=0.0, tp=0.0, price_current=0.0, pos_type=0):
+    return SimpleNamespace(
+        ticket=ticket,
+        price_open=price_open,
+        price_current=price_current or price_open,
+        profit=profit,
+        sl=sl,
+        tp=tp,
+        type=pos_type,
+        volume=0.01,
+        symbol="XAUUSD.s",
+    )
+
+
+def test_close_worst_hold_layers_does_not_overwrite_bank_tp1_with_tp3():
+    """
+    "close worst / hold layers" may only move the worst entry to BE; it must never
+    push that (BANK_TP1) layer broker TP forward to TP3.
+    """
+    ex = MT5Executor(dry_run=True)
+    ex.dry_run = False
+
+    tick = _make_tick(3900.00, 3900.20)
+    positions = [
+        _position(701, 3895.00, profit=25.0, sl=3890.00, tp=3904.50),
+        _position(702, 3892.00, profit=10.0, sl=3887.00, tp=3901.50),
+        # Worst entry: its broker TP is still the BANK_TP1 target (TP1 = 3904.50).
+        _position(703, 3890.00, profit=-20.0, sl=3885.00, tp=3904.50),
+    ]
+
+    modify_calls = []
+
+    def _spy_modify(ticket, sl=None, tp=None):
+        modify_calls.append((ticket, sl, tp))
+        return True
+
+    mocks = _mt5_mocks(positions, tick)
+    with patch.object(ex, "modify_position_sltp", side_effect=_spy_modify):
+        for p in mocks:
+            p.start()
+        try:
+            result = ex.apply_breakeven_worst_hold_layers(
+                market_tickets=[701, 702, 703],
+                symbol="XAUUSD.s",
+                direction="BUY",
+                be_offset_pips=5.0,
+                raw_tp3=3920.0,
+            )
+        finally:
+            for p in mocks:
+                p.stop()
+
+    assert result["be_tickets"] == [703]
+    assert result["held_tickets"] == [701, 702]
+    assert result["failed_be_tickets"] == []
+
+    assert len(modify_calls) == 1
+    ticket, sl, tp = modify_calls[0]
+    assert ticket == 703
+    # The SL moved to breakeven ...
+    assert sl == pytest.approx(3890.50)
+    # ... but the TP is the untouched BANK_TP1 target, NOT the TP3 that was offered.
+    assert tp == pytest.approx(3904.50)
+    assert tp != pytest.approx(3920.0)
+
+
+def test_close_worst_hold_layers_rejects_underwater_be_move():
+    """
+    A worst entry whose BE stop sits inside the broker stops level is skipped, the
+    reason is reported, and no modify_position_sltp call is made for it.
+    """
+    ex = MT5Executor(dry_run=True)
+    ex.dry_run = False
+
+    # Live bid 3900.50; the worst entry opened at 3900.40 -> BE SL 3900.90 is above the
+    # market and only 0.40 away, i.e. inside trade_stops_level (50 pts * 0.01 = 0.50).
+    tick = _make_tick(3900.50, 3900.70)
+    positions = [
+        _position(801, 3895.00, profit=25.0, sl=3890.00, tp=3904.50),
+        _position(802, 3892.00, profit=10.0, sl=3887.00, tp=3901.50),
+        _position(803, 3900.40, profit=-20.0, sl=3895.00, tp=3904.50),
+    ]
+
+    modify_calls = []
+    mocks = _mt5_mocks(positions, tick)
+    with patch.object(ex, "modify_position_sltp", side_effect=lambda **kw: modify_calls.append(kw) or True):
+        for p in mocks:
+            p.start()
+        try:
+            result = ex.apply_breakeven_worst_hold_layers(
+                market_tickets=[801, 802, 803],
+                symbol="XAUUSD.s",
+                direction="BUY",
+                be_offset_pips=5.0,
+                raw_tp3=3920.0,
+            )
+        finally:
+            for p in mocks:
+                p.stop()
+
+    assert result["be_tickets"] == []
+    assert result["held_tickets"] == [801, 802]
+    assert len(result["failed_be_tickets"]) == 1
+    failed_ticket, reason = result["failed_be_tickets"][0]
+    assert failed_ticket == 803
+    assert "stops_level" in reason, f"the rejection must carry a reason: {reason!r}"
+    # No broker call for the skipped layer.
+    assert modify_calls == [], f"no SL/TP modification may be sent for a rejected layer: {modify_calls}"
