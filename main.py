@@ -4754,7 +4754,6 @@ async def _handle_trade_management_action(
         )
 
     elif action in ("ACTION_CLOSE_WORST_HOLD_LAYERS", "CLOSE_WORST_HOLD_LAYERS"):
-        raw_tp3 = target_signal.get("raw_tp3")
         res = await _mt5_call(
             executor.apply_breakeven_worst_hold_layers,
             market_tickets=market_tickets,
@@ -5998,8 +5997,31 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         if was_fallback_tp:
             merged_tp_levels = dict(parsed.tp_levels)
         else:
-            merged_tp_levels = dict(base_existing_tps)
-            merged_tp_levels.update(parsed.tp_levels)
+            candidate_tp_levels = dict(base_existing_tps)
+            candidate_tp_levels.update(parsed.tp_levels)
+            # Never-loosen guard (Qwen review MAJOR 2): an unlabelled-only TP edit on a
+            # live signal used to be applied as a raw dict.update, which could push live
+            # take-profits backwards. If the new ladder would loosen any live stage, route
+            # it through the protected merge (which drops the offending prices and keeps the
+            # live ladder); a safe update that loosens nothing is applied as before.
+            _is_buy_dir = str(direction).upper() == "BUY"
+            _would_loosen = any(
+                (candidate_tp_levels[k] < base_existing_tps[k] - 1e-9)
+                if _is_buy_dir
+                else (candidate_tp_levels[k] > base_existing_tps[k] + 1e-9)
+                for k in base_existing_tps
+                if k in candidate_tp_levels
+            )
+            if _would_loosen:
+                merged_tp_levels = merge_tp_levels_for_active_signal(
+                    base_existing_tps,
+                    parsed_labeled,
+                    parsed_unlabeled,
+                    direction=direction,
+                    pip_size=pip_size,
+                )
+            else:
+                merged_tp_levels = candidate_tp_levels
     else:
         merged_tp_levels = dict(base_existing_tps)
 

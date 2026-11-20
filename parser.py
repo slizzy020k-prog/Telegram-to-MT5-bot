@@ -353,14 +353,22 @@ def compute_zone_4tiers(
 def _longest_monotonic_indices(
     tps: Sequence[float],
     direction: str = "BUY",
+    weights: Optional[Sequence[float]] = None,
 ) -> Tuple[List[int], List[int]]:
     """
     Compute kept and dropped indices using exact Longest Strictly Monotonic Subsequence DP
     (strictly ascending for BUY, strictly descending for SELL).
-    Primary score: maximum subsequence length.
-    Tie-breaker 1: minimum total span abs(seq[-1] - seq[0]).
-    Tie-breaker 2: minimum max adjacent gap max(abs(seq[i] - seq[i-1])).
-    Tie-breaker 3: earliest index tuple (keeps valid TP1).
+
+    Weighting rule: every stage carries weight 1 by default, so the primary score is the
+    total weight of the surviving path (descending). With all weights equal to 1 this is
+    identical to "maximum subsequence length", so callers that pass no weights keep their
+    exact previous behaviour. A caller may pass a higher weight for a stage that must
+    outrank the others (e.g. an explicitly edited TP stage), and the weights must be
+    positive.
+    Tie-breaker 1: longer path.
+    Tie-breaker 2: minimum total span abs(seq[-1] - seq[0]).
+    Tie-breaker 3: minimum max adjacent gap max(abs(seq[i] - seq[i-1])).
+    Tie-breaker 4: earliest index tuple (keeps valid TP1).
     """
     if not tps:
         return [], []
@@ -369,46 +377,59 @@ def _longest_monotonic_indices(
     if n <= 1:
         return [0], []
 
+    if weights is None:
+        wts = [1.0] * n
+    else:
+        wts = [float(w) for w in weights]
+        if len(wts) != n:
+            raise ValueError("weights must have the same length as tps")
+        if any(w <= 0 for w in wts):
+            raise ValueError("weights must be positive")
+
     is_buy = (direction or "BUY").upper() == "BUY"
 
     def _is_step_valid(prev: float, curr: float) -> bool:
         return (curr > prev) if is_buy else (curr < prev)
 
-    # L[i] = length of longest strictly monotonic subsequence ending at index i
-    L = [1] * n
+    # W[i] = maximum total weight of a strictly monotonic subsequence ending at index i
+    W = list(wts)
     for i in range(n):
         for j in range(i):
-            if _is_step_valid(vals[j], vals[i]):
-                if L[j] + 1 > L[i]:
-                    L[i] = L[j] + 1
+            if _is_step_valid(vals[j], vals[i]) and W[j] + wts[i] > W[i]:
+                W[i] = W[j] + wts[i]
 
-    max_len = max(L)
-    if max_len == n:
+    max_weight = max(W)
+    total_weight = sum(wts)
+    if abs(max_weight - total_weight) <= 1e-9:
+        # Every stage fits: the whole sequence is already strictly monotonic.
         return list(range(n)), []
 
     all_paths: List[List[int]] = []
 
-    def _backtrack(curr_idx: int, rem_len: int, current_path: List[int]) -> None:
-        if rem_len == 1:
+    def _backtrack(curr_idx: int, current_path: List[int]) -> None:
+        # current_path holds the indices AFTER curr_idx, in reverse order.
+        rest = W[curr_idx] - wts[curr_idx]
+        if rest <= 1e-9:
             all_paths.append([curr_idx] + current_path)
             return
         curr_val = vals[curr_idx]
         for prev_idx in range(curr_idx):
-            if L[prev_idx] == rem_len - 1 and _is_step_valid(vals[prev_idx], curr_val):
-                _backtrack(prev_idx, rem_len - 1, [curr_idx] + current_path)
+            if _is_step_valid(vals[prev_idx], curr_val) and abs(W[prev_idx] - rest) <= 1e-9:
+                _backtrack(prev_idx, [curr_idx] + current_path)
 
     for i in range(n):
-        if L[i] == max_len:
-            _backtrack(i, max_len, [])
+        if abs(W[i] - max_weight) <= 1e-9:
+            _backtrack(i, [])
 
     if not all_paths:
         return list(range(n)), []
 
-    def _score_path(p: List[int]) -> Tuple[float, float, Tuple[int, ...]]:
+    def _score_path(p: List[int]) -> Tuple[float, float, float, float, Tuple[int, ...]]:
         subseq = [vals[idx] for idx in p]
         span = abs(subseq[-1] - subseq[0])
         max_gap = max((abs(subseq[k] - subseq[k - 1]) for k in range(1, len(subseq))), default=0.0)
-        return (span, max_gap, tuple(p))
+        total_weight_p = sum(wts[idx] for idx in p)
+        return (-total_weight_p, -float(len(p)), span, max_gap, tuple(p))
 
     best_path = min(all_paths, key=_score_path)
     kept_set = set(best_path)
@@ -500,8 +521,10 @@ def _sanitize_labeled_tps_monotonic_stages(
     Stage-preserving variant of :func:`_sanitize_labeled_tps_monotonic`.
 
     Same Longest Strictly Monotonic Subsequence DP, but the surviving stages keep the
-    provider's original TPn keys (a TP2 stays a TP2). Re-numbering is only applied when the
-    ladder starts at TP1, where re-numbering cannot shift a later stage onto TP1.
+    provider's original TPn keys (a TP2 stays a TP2). Re-numbering is only applied when it
+    is safe, i.e. when the ladder starts at TP1 *and* the original TP1 survived the DP.
+    When the original TP1 was dropped as out-of-order, the survivors keep their original
+    stage labels (the result may then be non-contiguous, e.g. TP2 + TP4).
 
     Downstream merges of live signals rely on this: shifting TP2 into TP1 would move the
     first take-profit target of an already-running trade (see
@@ -523,7 +546,8 @@ def _sanitize_labeled_tps_monotonic_stages(
     kept_prices = [raw_prices[i] for i in kept_idx]
 
     starts_at_tp1 = (parsed_items[0][0] == 1)
-    if starts_at_tp1:
+    tp1_survived = 0 in kept_idx
+    if starts_at_tp1 and tp1_survived:
         clean_labeled = {f"TP{i + 1}": kept_prices[i] for i in range(len(kept_prices))}
     else:
         clean_labeled = {parsed_items[i][1]: parsed_items[i][2] for i in kept_idx}
@@ -564,6 +588,383 @@ def derive_tp_levels(
     return {f"TP{i + 1}": base[i] for i in range(5)}
 
 
+def _finalize_tp_ladder(
+    merged: Dict[str, float],
+    explicit_labeled: Dict[str, float],
+    updated_stages: List[int],
+    direction: str,
+    pip_size: float,
+    steps: Sequence[float],
+    digits: int,
+    log_drops: bool = True,
+) -> None:
+    """
+    Complete a merged TP ladder in place.
+
+    1. Every missing or non-monotonic stage above an updated stage is re-derived from the
+       step ladder (this is what fills TP4/TP5 once an edited TP3 is honoured).
+    2. The populated stages are then made strictly ordered again. A stage that was
+       explicitly updated in this merge is never moved; a pre-existing stage that was
+       displaced by such an update is re-derived, and if it cannot be placed between its
+       neighbours, the stale pre-existing stage above it is displaced instead.
+    """
+    is_buy = (direction or "BUY").upper() == "BUY"
+    sign = 1.0 if is_buy else -1.0
+    fixed = {int(i) for i in updated_stages}
+    for k in explicit_labeled:
+        if k.startswith("TP") and k[2:].isdigit():
+            fixed.add(int(k[2]))
+
+    def _ordered(lower: float, upper: float) -> bool:
+        return (upper > lower) if is_buy else (upper < lower)
+
+    def _derive_missing() -> None:
+        for idx in range(2, 6):
+            key = f"TP{idx}"
+            prev_key = f"TP{idx - 1}"
+            if prev_key not in merged:
+                continue
+            prev_val = merged[prev_key]
+            step = steps[idx - 2]
+            if key in explicit_labeled or idx in updated_stages:
+                continue
+            cur_val = merged.get(key)
+            is_non_monotonic = (
+                cur_val is None
+                or (is_buy and cur_val <= prev_val)
+                or (not is_buy and cur_val >= prev_val)
+            )
+            if is_non_monotonic:
+                merged[key] = round(prev_val + sign * step * pip_size, digits)
+
+    _derive_missing()
+
+    for _ in range(3):
+        violated = False
+        for idx in range(4, 0, -1):
+            key = f"TP{idx}"
+            nxt_key = f"TP{idx + 1}"
+            if key not in merged or nxt_key not in merged:
+                continue
+            cur_val = merged[key]
+            nxt_val = merged[nxt_key]
+            if _ordered(cur_val, nxt_val):
+                continue
+            violated = True
+            if (idx + 1) not in fixed:
+                # The stage above is a stale pre-existing stage: displace it, the step
+                # ladder re-derives it below the stage underneath.
+                del merged[nxt_key]
+                continue
+            if idx in fixed:
+                if log_drops:
+                    logger.warning(
+                        "TP ladder: stage %s (%.2f) and the explicitly updated stage %s (%.2f) "
+                        "cannot both stay in a strictly ordered ladder.",
+                        key,
+                        cur_val,
+                        nxt_key,
+                        nxt_val,
+                    )
+                return
+            step = steps[idx - 1] if (idx - 1) < len(steps) else float(DEFAULT_TP_STEP_PIPS)
+            new_val = round(nxt_val - sign * step * pip_size, digits)
+            prev_val = merged.get(f"TP{idx - 1}")
+            if prev_val is not None and not _ordered(prev_val, new_val):
+                if log_drops:
+                    logger.warning(
+                        "TP ladder: cannot re-order stage %s (%.2f) below %s (%.2f) without "
+                        "breaking the stage underneath.",
+                        key,
+                        cur_val,
+                        nxt_key,
+                        nxt_val,
+                    )
+                return
+            merged[key] = new_val
+        if not violated:
+            break
+        _derive_missing()
+
+
+def _collect_explicit_tp_edits(
+    labeled_tps: Optional[Dict[str, float]],
+    digits: int,
+) -> List[Tuple[int, float]]:
+    """
+    Parse the provider's explicit 'TP1'..'TP5' edits into an ordered list of
+    (stage index, price) pairs. The last edit for a stage wins and keeps the
+    position of that stage in the provider's message.
+    """
+    edits: Dict[int, float] = {}
+    if not isinstance(labeled_tps, dict):
+        return []
+    for raw_k, raw_v in labeled_tps.items():
+        if raw_v is None:
+            continue
+        k_str = str(raw_k).strip().upper()
+        if k_str.startswith("TP") and len(k_str) == 3 and k_str[2].isdigit():
+            idx = int(k_str[2])
+        elif k_str.isdigit():
+            idx = int(k_str)
+        else:
+            continue
+        if not (1 <= idx <= 5):
+            continue
+        try:
+            fv = round(float(raw_v), digits)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            edits.pop(idx, None)
+            edits[idx] = fv
+    return list(edits.items())
+
+
+def _collect_unlabeled_tp_values(
+    unlabeled_tps: Sequence[float],
+    digits: int,
+) -> List[float]:
+    """Parse the provider's unlabeled TP prices (positive numbers only)."""
+    values: List[float] = []
+    if not unlabeled_tps:
+        return values
+    for raw_v in unlabeled_tps:
+        if raw_v is None:
+            continue
+        try:
+            fv = round(float(raw_v), digits)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            values.append(fv)
+    return values
+
+
+def _assign_unlabeled_tp_stages(
+    unlabeled_values: Sequence[float],
+    explicit_labeled: Dict[str, float],
+) -> List[Tuple[int, float]]:
+    """
+    Assign the provider's unlabeled TP prices to consecutive free stages, starting at
+    the bottom of the ladder. A stage the provider labelled explicitly is skipped.
+
+    The assignment is the provider's order-independent "next free stage" rule: it
+    never depends on the prices themselves, only on the stages that are already
+    labelled. Returns (stage index, price) pairs.
+    """
+    assignments: List[Tuple[int, float]] = []
+    stage_cursor = 1
+    for fv in unlabeled_values:
+        while stage_cursor <= 5 and f"TP{stage_cursor}" in explicit_labeled:
+            stage_cursor += 1
+        if stage_cursor > 5:
+            break
+        assignments.append((stage_cursor, fv))
+        stage_cursor += 1
+    return assignments
+
+
+def _merge_tp_ladder_core(
+    preexisting: Dict[str, float],
+    labeled_edits: Sequence[Tuple[int, float]],
+    unlabeled_values: Sequence[float],
+    direction: str,
+    pip_size: float,
+    steps: Sequence[float],
+    digits: int,
+    log_drops: bool = True,
+    unlabeled_assignments: Optional[Sequence[Tuple[int, float]]] = None,
+) -> Tuple[Dict[str, float], List[int]]:
+    """
+    Merge the accepted provider edits into the pre-existing ladder, enforce strict
+    monotonicity across the populated stages and re-derive the missing stages.
+
+    `unlabeled_assignments` pins the unlabeled prices to the stages they were
+    assigned to. It is used by the unlabeled validation gate, where a price that was
+    dropped must not let the remaining prices slide down into the freed stage. When
+    it is None the prices are assigned to the consecutive free stages (unchanged
+    behaviour).
+
+    Returns the merged ladder and the stages that still carry a provider-authored
+    value (an explicitly edited stage plus every stage filled from the unlabeled
+    prices).
+    """
+    merged: Dict[str, float] = dict(preexisting)
+
+    explicit_labeled: Dict[str, float] = {}
+    updated_stages: List[int] = []
+    for idx, fv in labeled_edits:
+        key = f"TP{idx}"
+        explicit_labeled[key] = fv
+        merged[key] = fv
+        updated_stages.append(idx)
+
+    if unlabeled_values or unlabeled_assignments:
+        if unlabeled_assignments is None:
+            unlabeled_assignments = _assign_unlabeled_tp_stages(
+                unlabeled_values, explicit_labeled
+            )
+        for stage_idx, fv in unlabeled_assignments:
+            key = f"TP{stage_idx}"
+            merged[key] = fv
+            updated_stages.append(stage_idx)
+
+    if not merged:
+        return {}, updated_stages
+
+    # Enforce strict monotonicity across populated stages before re-deriving missing slots.
+    # A stage that was explicitly updated in this merge carries weight 10, every other
+    # (pre-existing) stage carries weight 1. Ten dominates any possible difference in the
+    # number of pre-existing stages (at most four), so an explicit edit always outranks the
+    # stale ladder it conflicts with; the conflicting pre-existing stage is the one that
+    # gets dropped and re-derived below.
+    present_stage_keys = [f"TP{i}" for i in range(1, 6) if f"TP{i}" in merged]
+    if len(present_stage_keys) >= 2:
+        stage_prices = [merged[k] for k in present_stage_keys]
+        stage_weights = [
+            10.0 if int(k[2]) in updated_stages else 1.0 for k in present_stage_keys
+        ]
+        kept_idx, dropped_idx = _longest_monotonic_indices(
+            stage_prices, direction=direction, weights=stage_weights
+        )
+        for idx in dropped_idx:
+            k = present_stage_keys[idx]
+            price = merged[k]
+            idx_num = int(k[2])
+            was_updated = (k in explicit_labeled) or (idx_num in updated_stages)
+            del merged[k]
+            if k in explicit_labeled:
+                del explicit_labeled[k]
+            if idx_num in updated_stages:
+                updated_stages.remove(idx_num)
+            if not log_drops:
+                continue
+            if was_updated:
+                logger.warning(
+                    "TP merge: explicitly updated stage %s (%.2f) conflicts with the live TP "
+                    "ladder and was dropped; it is re-derived from the step ladder.",
+                    k,
+                    price,
+                )
+            else:
+                logger.warning(
+                    "TP merge: pre-existing stage %s (%.2f) was displaced by an updated stage "
+                    "and dropped; it is re-derived from the step ladder.",
+                    k,
+                    price,
+                )
+
+    is_buy = (direction or "BUY").upper() == "BUY"
+    sign = 1.0 if is_buy else -1.0
+
+    # If TP1 is missing (e.g. existing_tps was empty and only TP2+ was supplied), back-fill down to TP1
+    if "TP1" not in merged:
+        first_present = min(int(k[2]) for k in merged if k.startswith("TP") and k[2:].isdigit())
+        for idx in range(first_present - 1, 0, -1):
+            step = steps[idx - 1]
+            merged[f"TP{idx}"] = round(merged[f"TP{idx + 1}"] - sign * step * pip_size, digits)
+
+    _finalize_tp_ladder(
+        merged,
+        explicit_labeled=explicit_labeled,
+        updated_stages=updated_stages,
+        direction=direction,
+        pip_size=pip_size,
+        steps=steps,
+        digits=digits,
+        log_drops=log_drops,
+    )
+
+    return {f"TP{i}": merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged}, updated_stages
+
+
+def _validate_merged_tp_ladder(
+    merged: Dict[str, float],
+    preexisting: Dict[str, float],
+    edited_stages: Sequence[int],
+    direction: str,
+    authored_prices: Optional[Sequence[float]] = None,
+) -> Tuple[bool, str]:
+    """
+    Check the two invariants that every provider-driven merge must satisfy.
+
+    P1: no stage the provider did NOT author may move against the trade
+        direction (a lower TP on a BUY, a higher TP on a SELL).
+    P2: the merged ladder must be strictly monotonic.
+
+    `edited_stages` names the stages the provider labelled explicitly ("TP2": ...).
+    `authored_prices` switches to the unlabeled path, where the provider submitted
+    PRICES and not stages. There a stage that still carries one of the submitted
+    prices is provider-authored (P1), but the stage it lands on is this module's own
+    assignment - so a live take-profit is never pushed backwards, not even to carry a
+    submitted price. Only a stage the provider labelled explicitly may move anywhere.
+
+    Returns (ok, reason). The reason names the offending stage and its price.
+    """
+    is_buy = (direction or "BUY").upper() == "BUY"
+    labeled_stages = {int(i) for i in edited_stages}
+    submitted: Optional[List[float]] = None
+    if authored_prices is None:
+        # The provider named the stages: an edited stage may move anywhere.
+        exempt = set(labeled_stages)
+        subject = "the unedited stage"
+    else:
+        # The provider named PRICES, not stages: a stage that carries one of the
+        # submitted prices is provider-authored.
+        submitted = [float(p) for p in authored_prices]
+        exempt = {
+            i
+            for i in range(1, 6)
+            if merged.get(f"TP{i}") is not None
+            and any(abs(float(merged[f"TP{i}"]) - p) <= 1e-9 for p in submitted)
+        }
+        subject = "the stage"
+
+    for i in range(1, 6):
+        key = f"TP{i}"
+        prev_val = preexisting.get(key)
+        if prev_val is None:
+            continue
+        cur_val = merged.get(key)
+        if cur_val is None:
+            continue
+        moved_back = (cur_val < prev_val - 1e-9) if is_buy else (cur_val > prev_val + 1e-9)
+        if not moved_back:
+            continue
+        if submitted is None:
+            if i in exempt:
+                # The provider named this stage itself: it may move anywhere.
+                continue
+        else:
+            if i in labeled_stages:
+                # The provider labelled this stage explicitly: it may move anywhere.
+                continue
+            if i in exempt:
+                # The provider named a PRICE, not this stage: the stage it lands on
+                # is this module's own assignment, so a live take-profit must never
+                # be pushed backwards - not even to carry one of the submitted prices.
+                return False, (
+                    f"honouring it would push {subject} {key} backwards from "
+                    f"{prev_val:.2f} to {cur_val:.2f}; a live take-profit must never "
+                    f"move backwards"
+                )
+        return False, (
+            f"honouring it would push {subject} {key} backwards from "
+            f"{prev_val:.2f} to {cur_val:.2f}"
+        )
+
+    values = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+    for prev_val, cur_val in zip(values, values[1:]):
+        ordered = (cur_val > prev_val) if is_buy else (cur_val < prev_val)
+        if not ordered:
+            return False, (
+                f"the merged ladder would not be strictly ordered "
+                f"({prev_val:.2f} -> {cur_val:.2f})"
+            )
+    return True, ""
+
+
 def merge_tp_levels_for_active_signal(
     existing_tps: Optional[Dict[str, float]],
     labeled_tps: Optional[Dict[str, float]] = None,
@@ -576,82 +977,20 @@ def merge_tp_levels_for_active_signal(
     Merge labeled_tps ('TP1'..'TP5') and unlabeled_tps into existing_tps for an active signal.
     Preserves untouched stages (e.g. TP1 stays intact when 'TP2 3918 TP3 3930' arrives)
     and re-derives missing or non-monotonic stages above updated stages up to TP5.
+
+    An explicitly edited stage is honoured only when it can be placed without pushing an
+    UNEDITED stage backwards (against the trade direction) and the merged ladder stays
+    strictly ordered. An edit that cannot be placed that way is an out-of-order provider
+    typo: it is dropped with a WARNING and the pre-existing ladder is kept unchanged.
+
+    The same ruling applies to the unlabeled prices: they are assigned to the
+    consecutive free stages (starting at the bottom) and each of them is honoured only
+    when it can be placed without pushing a stage the provider did not author
+    backwards and while the merged ladder stays strictly ordered. A price that cannot
+    be placed that way is dropped with a WARNING; its stage falls back to the live
+    ladder's value and the remaining prices keep the stages they were assigned to.
     """
     digits = _decimals_for_pip(pip_size)
-    merged: Dict[str, float] = {}
-    if isinstance(existing_tps, dict):
-        for i in range(1, 6):
-            k = f"TP{i}"
-            v = existing_tps.get(k)
-            if v is not None:
-                try:
-                    fv = float(v)
-                    if fv > 0:
-                        merged[k] = round(fv, digits)
-                except (TypeError, ValueError):
-                    pass
-
-    explicit_labeled: Dict[str, float] = {}
-    updated_stages: List[int] = []
-    if isinstance(labeled_tps, dict):
-        for raw_k, raw_v in labeled_tps.items():
-            if raw_v is None:
-                continue
-            k_str = str(raw_k).strip().upper()
-            if k_str.startswith("TP") and len(k_str) == 3 and k_str[2].isdigit():
-                idx = int(k_str[2])
-            elif k_str.isdigit():
-                idx = int(k_str)
-            else:
-                continue
-            if 1 <= idx <= 5:
-                try:
-                    fv = round(float(raw_v), digits)
-                    if fv > 0:
-                        key = f"TP{idx}"
-                        explicit_labeled[key] = fv
-                        merged[key] = fv
-                        updated_stages.append(idx)
-                except (TypeError, ValueError):
-                    pass
-
-    if unlabeled_tps:
-        stage_cursor = 1
-        for raw_v in unlabeled_tps:
-            if raw_v is None:
-                continue
-            try:
-                fv = round(float(raw_v), digits)
-            except (TypeError, ValueError):
-                continue
-            if fv <= 0:
-                continue
-            while stage_cursor <= 5 and f"TP{stage_cursor}" in explicit_labeled:
-                stage_cursor += 1
-            if stage_cursor > 5:
-                break
-            key = f"TP{stage_cursor}"
-            merged[key] = fv
-            updated_stages.append(stage_cursor)
-            stage_cursor += 1
-
-    if not merged:
-        return {}
-
-    # Enforce strict monotonicity across populated stages before re-deriving missing slots
-    present_stage_keys = [f"TP{i}" for i in range(1, 6) if f"TP{i}" in merged]
-    if len(present_stage_keys) >= 2:
-        stage_prices = [merged[k] for k in present_stage_keys]
-        kept_idx, dropped_idx = _longest_monotonic_indices(stage_prices, direction=direction)
-        for idx in dropped_idx:
-            k = present_stage_keys[idx]
-            del merged[k]
-            if k in explicit_labeled:
-                del explicit_labeled[k]
-            idx_num = int(k[2])
-            if idx_num in updated_stages:
-                updated_stages.remove(idx_num)
-
     steps = (
         [float(s) for s in step_pips]
         if step_pips is not None
@@ -660,32 +999,160 @@ def merge_tp_levels_for_active_signal(
     while len(steps) < 4:
         steps.append(float(DEFAULT_TP_STEP_PIPS))
 
-    is_buy = (direction or "BUY").upper() == "BUY"
-    sign = 1.0 if is_buy else -1.0
+    preexisting: Dict[str, float] = {}
+    if isinstance(existing_tps, dict):
+        for i in range(1, 6):
+            k = f"TP{i}"
+            v = existing_tps.get(k)
+            if v is not None:
+                try:
+                    fv = float(v)
+                    if fv > 0:
+                        preexisting[k] = round(fv, digits)
+                except (TypeError, ValueError):
+                    pass
 
-    # If TP1 is missing (e.g. existing_tps was empty and only TP2+ was supplied), back-fill down to TP1
-    if "TP1" not in merged:
-        first_present = min(int(k[2]) for k in merged if k.startswith("TP") and k[2:].isdigit())
-        for idx in range(first_present - 1, 0, -1):
-            step = steps[idx - 1]
-            merged[f"TP{idx}"] = round(merged[f"TP{idx + 1}"] - sign * step * pip_size, digits)
+    labeled_edits = _collect_explicit_tp_edits(labeled_tps, digits)
+    unlabeled_values = _collect_unlabeled_tp_values(unlabeled_tps, digits)
 
-    for idx in range(2, 6):
-        key = f"TP{idx}"
-        prev_val = merged[f"TP{idx - 1}"]
-        step = steps[idx - 2]
-        if key in explicit_labeled or idx in updated_stages:
-            continue
-        cur_val = merged.get(key)
-        is_non_monotonic = (
-            cur_val is None
-            or (is_buy and cur_val <= prev_val)
-            or (not is_buy and cur_val >= prev_val)
+    # No edit at all: never touch the live ladder. A no-edit merge must not move any
+    # stage, and in particular must never push a live take-profit backwards. (Running
+    # the DP sanitizer here would re-derive a malformed pre-existing ladder and could
+    # loosen a live stage, which the never-loosen rule forbids.)
+    if not labeled_edits and not unlabeled_values:
+        return dict(preexisting)
+
+    # Ruling: an explicitly edited stage may be honoured only if it can be placed
+    # without pushing an UNEDITED stage backwards. Every candidate edit is merged on a
+    # trial basis and is only kept when the trial satisfies both invariants (P1 and P2);
+    # otherwise the edit is an out-of-order provider typo and is dropped with a WARNING,
+    # leaving the pre-existing ladder intact.
+    accepted_edits: List[Tuple[int, float]] = []
+    for idx, price in labeled_edits:
+        trial_edits = accepted_edits + [(idx, price)]
+        trial_merged, trial_updated = _merge_tp_ladder_core(
+            preexisting,
+            trial_edits,
+            unlabeled_values,
+            direction=direction,
+            pip_size=pip_size,
+            steps=steps,
+            digits=digits,
+            log_drops=False,
         )
-        if is_non_monotonic:
-            merged[key] = round(prev_val + sign * step * pip_size, digits)
+        placeable, reason = _validate_merged_tp_ladder(
+            trial_merged, preexisting, trial_updated, direction
+        )
+        if placeable and trial_merged.get(f"TP{idx}") != price:
+            # The edit did not survive the merge (it conflicts with another accepted
+            # edit), so honouring it would mean rewriting the ladder.
+            placeable = False
+            reason = (
+                "it conflicts with the live TP ladder or with another accepted edit, "
+                "so it cannot be honoured without rewriting the ladder"
+            )
+        if placeable:
+            accepted_edits = trial_edits
+        else:
+            logger.warning(
+                "TP merge: explicitly updated stage TP%d (%.2f) was dropped; %s. The live TP "
+                "ladder is kept unchanged.",
+                idx,
+                price,
+                reason,
+            )
 
-    return {f"TP{i}": merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged}
+    # Ruling (unlabeled path): the same rule, applied to the prices the provider
+    # submitted without a stage label. The prices keep the stage they were assigned to
+    # (consecutive free stages, starting at the bottom); every candidate price is
+    # merged on a trial basis and is only kept when the trial satisfies both
+    # invariants (P1 and P2). A price that cannot be placed that way is an
+    # out-of-order provider typo: it is dropped with a WARNING and its stage falls
+    # back to the live ladder's value. The remaining prices are NOT slid down into
+    # the freed stage.
+    accepted_unlabeled: List[Tuple[int, float]] = []
+    if unlabeled_values:
+        unlabeled_assignments = _assign_unlabeled_tp_stages(
+            unlabeled_values,
+            {f"TP{idx}": price for idx, price in accepted_edits},
+        )
+        for stage, price in unlabeled_assignments:
+            trial_unlabeled = accepted_unlabeled + [(stage, price)]
+            trial_merged, _ = _merge_tp_ladder_core(
+                preexisting,
+                accepted_edits,
+                (),
+                direction=direction,
+                pip_size=pip_size,
+                steps=steps,
+                digits=digits,
+                log_drops=False,
+                unlabeled_assignments=trial_unlabeled,
+            )
+            authored_prices = [p for _, p in accepted_edits] + [
+                p for _, p in trial_unlabeled
+            ]
+            placeable, reason = _validate_merged_tp_ladder(
+                trial_merged,
+                preexisting,
+                [idx for idx, _ in accepted_edits],
+                direction,
+                authored_prices=authored_prices,
+            )
+            if placeable:
+                accepted_unlabeled = trial_unlabeled
+            else:
+                logger.warning(
+                    "TP merge: unlabeled TP price %.2f (stage TP%d) was dropped; %s. The "
+                    "stage falls back to the live ladder's value.",
+                    price,
+                    stage,
+                    reason,
+                )
+
+    # Every submitted edit was rejected: keep the live ladder exactly as it is. Running
+    # the core merge here with no accepted edits would re-run the DP sanitizer on a
+    # malformed pre-existing ladder and could push a live take-profit backwards, which
+    # the never-loosen rule forbids (Qwen scoped re-review residual MAJOR).
+    if not accepted_edits and not accepted_unlabeled:
+        return dict(preexisting)
+
+    merged, _ = _merge_tp_ladder_core(
+        preexisting,
+        accepted_edits,
+        (),
+        direction=direction,
+        pip_size=pip_size,
+        steps=steps,
+        digits=digits,
+        unlabeled_assignments=accepted_unlabeled,
+    )
+
+    if unlabeled_values:
+        # Safety net: the merged ladder must satisfy both invariants. It normally does,
+        # because every accepted price was validated on a trial merge; when it does
+        # not (e.g. the accepted edits and the live ladder disagree on their own),
+        # the live ladder is kept unchanged.
+        authored_prices = [p for _, p in accepted_edits] + [
+            p for _, p in accepted_unlabeled
+        ]
+        ok, reason = _validate_merged_tp_ladder(
+            merged,
+            preexisting,
+            [idx for idx, _ in accepted_edits],
+            direction,
+            authored_prices=authored_prices,
+        )
+        if not ok:
+            logger.warning(
+                "TP merge: the merged TP ladder was rejected (%s); the live TP ladder is "
+                "kept unchanged.",
+                reason,
+            )
+            # Keep the live ladder exactly as it is. Re-running the core merge with no
+            # edits would sanitize a malformed ladder and could loosen a live stage.
+            return dict(preexisting)
+    return merged
 
 
 def _extract_sl(text: str) -> Optional[float]:

@@ -18,6 +18,8 @@ Msg 10196 (chatter guard + progressive ATR trail + BE protection):
 All tests are deterministic: no wall-clock, no network, no live MT5 connection.
 """
 
+import logging
+import random
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -346,10 +348,14 @@ def test_premature_tp_lift_does_not_lock_roles():
         "layers": {
             # L1 was lifted to TP2 by ATR proximity while TP1 has NOT been cleared and
             # no BE lock has been applied.
-            "L1": {"lot": 0.01, "target_price": 3895.00, "tp": 3910.00, "tp_stage": "TP2", "ticket": 101, "order_type": "MARKET", "status": "OPEN"},
-            "L2": {"lot": 0.01, "target_price": 3892.33, "tp": 3899.50, "tp_stage": "TP1", "ticket": 102, "order_type": "LIMIT", "status": "PENDING"},
-            "L3": {"lot": 0.01, "target_price": 3889.67, "tp": 3899.50, "tp_stage": "TP1", "ticket": 103, "order_type": "LIMIT", "status": "PENDING"},
-            "L4": {"lot": 0.02, "target_price": 3887.00, "tp": 3899.50, "tp_stage": "TP1", "ticket": 104, "order_type": "LIMIT", "status": "PENDING"},
+            # The layers carry production-like roles on purpose: the auto-lock guard in
+            # assign_or_preserve_layer_roles only fires for a layer whose tp_stage is not
+            # TP1 *and* whose role is not empty, so a role-less fixture would let this
+            # test pass on the broken (pre-fix) code as well.
+            "L1": {"lot": 0.01, "target_price": 3895.00, "tp": 3910.00, "tp_stage": "TP2", "role": "CORE_RUNNER", "ticket": 101, "order_type": "MARKET", "status": "OPEN"},
+            "L2": {"lot": 0.01, "target_price": 3892.33, "tp": 3899.50, "tp_stage": "TP1", "role": "BANK_TP1", "ticket": 102, "order_type": "LIMIT", "status": "PENDING"},
+            "L3": {"lot": 0.01, "target_price": 3889.67, "tp": 3899.50, "tp_stage": "TP1", "role": "BANK_TP1", "ticket": 103, "order_type": "LIMIT", "status": "PENDING"},
+            "L4": {"lot": 0.02, "target_price": 3887.00, "tp": 3899.50, "tp_stage": "TP1", "role": "BANK_TP1", "ticket": 104, "order_type": "LIMIT", "status": "PENDING"},
         },
         "market_tickets": [101],
         "pending_tickets": [102, 103, 104],
@@ -708,3 +714,624 @@ def test_close_worst_hold_layers_rejects_underwater_be_move():
     assert "stops_level" in reason, f"the rejection must carry a reason: {reason!r}"
     # No broker call for the skipped layer.
     assert modify_calls == [], f"no SL/TP modification may be sent for a rejected layer: {modify_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Fix wave - I-1: an explicit TP edit on a live signal must never be discarded
+# ---------------------------------------------------------------------------
+
+def test_explicit_tp_edit_on_live_signal_is_not_discarded():
+    """
+    A TP edit on a running signal is the provider's current intent and must be honoured.
+    The strict-monotonicity enforcement may only displace the stale pre-existing stage
+    that conflicts with the edit - never the edit itself.
+    """
+    existing = {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0}
+    step = 100.0  # pips; 100 pips * 0.10 pip size = 10.00 per stage
+    cases = [
+        # (explicit edit, expected merged ladder)
+        (
+            {"TP3": 3950.0},
+            {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3950.0, "TP4": 3960.0, "TP5": 3970.0},
+        ),
+        (
+            {"TP1": 3960.0},
+            {"TP1": 3960.0, "TP2": 3970.0, "TP3": 3980.0, "TP4": 3990.0, "TP5": 4000.0},
+        ),
+        (
+            {"TP2": 3950.0},
+            {"TP1": 3900.0, "TP2": 3950.0, "TP3": 3960.0, "TP4": 3970.0, "TP5": 3980.0},
+        ),
+        (
+            {"TP5": 3960.0},
+            {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3960.0},
+        ),
+        (
+            {"TP1": 3850.0},
+            {"TP1": 3850.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+        ),
+    ]
+    for edit, expected in cases:
+        merged = parser.merge_tp_levels_for_active_signal(
+            dict(existing),
+            edit,
+            direction="BUY",
+            pip_size=0.10,
+            step_pips=[step, step, step, step],
+        )
+        assert merged == expected, (
+            f"explicit TP edit {edit} was not honoured: got {merged}, expected {expected}"
+        )
+        prices = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+        assert prices == sorted(prices), (
+            f"the merged TP ladder must stay strictly ordered: {merged}"
+        )
+
+    # The same five edits mirrored onto a SELL ladder (the ladder descends).
+    sell_existing = {
+        "TP1": 3900.0, "TP2": 3890.0, "TP3": 3880.0, "TP4": 3870.0, "TP5": 3860.0,
+    }
+    sell_cases = [
+        (
+            {"TP3": 3850.0},
+            {"TP1": 3900.0, "TP2": 3890.0, "TP3": 3850.0, "TP4": 3840.0, "TP5": 3830.0},
+        ),
+        (
+            {"TP1": 3840.0},
+            {"TP1": 3840.0, "TP2": 3830.0, "TP3": 3820.0, "TP4": 3810.0, "TP5": 3800.0},
+        ),
+        (
+            {"TP2": 3850.0},
+            {"TP1": 3900.0, "TP2": 3850.0, "TP3": 3840.0, "TP4": 3830.0, "TP5": 3820.0},
+        ),
+        (
+            {"TP5": 3840.0},
+            {"TP1": 3900.0, "TP2": 3890.0, "TP3": 3880.0, "TP4": 3870.0, "TP5": 3840.0},
+        ),
+        (
+            {"TP1": 3960.0},
+            {"TP1": 3960.0, "TP2": 3890.0, "TP3": 3880.0, "TP4": 3870.0, "TP5": 3860.0},
+        ),
+    ]
+    for edit, expected in sell_cases:
+        merged = parser.merge_tp_levels_for_active_signal(
+            dict(sell_existing),
+            edit,
+            direction="SELL",
+            pip_size=0.10,
+            step_pips=[step, step, step, step],
+        )
+        assert merged == expected, (
+            f"explicit SELL TP edit {edit} was not honoured: got {merged}, "
+            f"expected {expected}"
+        )
+        prices = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+        assert prices == sorted(prices, reverse=True), (
+            f"the merged SELL TP ladder must stay strictly ordered: {merged}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fix wave - M-1: the stage-preserving view must not relabel TP2 onto TP1
+# ---------------------------------------------------------------------------
+
+def test_stage_preserving_view_never_relabels_tp2_onto_tp1():
+    """
+    The stage-preserving view keeps the provider's original stage labels, so a TP1 that
+    the sanitizer drops can never shift the original TP2 onto TP1.
+    """
+    stages, dropped = parser._sanitize_labeled_tps_monotonic_stages(
+        {"TP1": 4000.0, "TP2": 3900.0, "TP3": 3910.0, "TP4": 3950.0},
+        "BUY",
+    )
+    assert "TP1" not in stages, f"TP1 must not be re-used for another stage: {stages}"
+    assert stages == {"TP2": 3900.0, "TP3": 3910.0, "TP4": 3950.0}
+    assert dropped == [4000.0]
+
+# ---------------------------------------------------------------------------
+# Fix wave round 2 - an explicit TP edit may never rewrite an UNEDITED stage
+# ---------------------------------------------------------------------------
+
+def test_out_of_order_explicit_tp_edit_is_dropped(caplog):
+    """
+    An explicit edit that can only be honoured by pushing an UNEDITED stage backwards
+    is an out-of-order provider typo: it must be dropped with a WARNING that names the
+    stage and its price, leaving the live ladder untouched.
+    """
+    existing = {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0}
+    step = [100.0, 100.0, 100.0, 100.0]
+    cases = [
+        ({"TP3": 3895.0}, "TP3", 3895.0),   # below TP1 - would rewrite TP1/TP2 downwards
+        ({"TP2": 3899.0}, "TP2", 3899.0),   # below TP1 - would rewrite TP1 downwards
+    ]
+    for edit, stage, price in cases:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="copier.parser"):
+            merged = parser.merge_tp_levels_for_active_signal(
+                dict(existing),
+                edit,
+                direction="BUY",
+                pip_size=0.10,
+                step_pips=step,
+            )
+        assert merged == existing, (
+            f"the out-of-order edit {edit} must not rewrite the live ladder: got {merged}"
+        )
+        warnings = [
+            rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING
+        ]
+        assert warnings, f"dropping {edit} must be logged"
+        assert any(
+            stage in message and f"{price:.2f}" in message for message in warnings
+        ), f"the warning must name the dropped stage and its price: {warnings}"
+
+
+def test_single_explicit_edit_never_rewrites_an_unedited_stage_backwards(caplog):
+    """
+    Property test over 10 000 randomised single-edit merges.
+
+    P1 - no UNEDITED stage ever moves against the trade direction: a stage the
+         provider did not explicitly edit keeps a value >= its pre-existing value on a
+         BUY (<= on a SELL). Only the explicitly edited stage is exempt.
+    P2 - the merged ladder is strictly ordered, or the edit was dropped with a
+         WARNING and the pre-existing ladder was kept unchanged.
+    """
+    rng = random.Random(20251120)
+    step = [100.0, 100.0, 100.0, 100.0]
+
+    with caplog.at_level(logging.WARNING, logger="copier.parser"):
+        for case in range(10000):
+            direction = "BUY" if rng.random() < 0.5 else "SELL"
+            sign = 1.0 if direction == "BUY" else -1.0
+            n_stages = rng.randint(1, 5)
+            base_price = rng.uniform(3000.0, 4000.0)
+            gap = rng.uniform(1.0, 60.0)
+            existing = {
+                f"TP{i + 1}": round(base_price + sign * i * gap, 2) for i in range(n_stages)
+            }
+            stage = rng.randint(1, 5)
+            low = min(existing.values())
+            high = max(existing.values())
+            mode = rng.random()
+            if mode < 0.34:
+                # below the ladder range (against the trade direction)
+                price = round(
+                    (low - rng.uniform(0.1, 120.0))
+                    if direction == "BUY"
+                    else (high + rng.uniform(0.1, 120.0)),
+                    2,
+                )
+            elif mode < 0.67:
+                # inside the ladder range
+                price = round(rng.uniform(low, high), 2)
+            else:
+                # above the ladder range
+                price = round(
+                    (high + rng.uniform(0.1, 120.0))
+                    if direction == "BUY"
+                    else (low - rng.uniform(0.1, 120.0)),
+                    2,
+                )
+            edit = {f"TP{stage}": price}
+
+            caplog.clear()
+            merged = parser.merge_tp_levels_for_active_signal(
+                dict(existing),
+                edit,
+                direction=direction,
+                pip_size=0.10,
+                step_pips=step,
+            )
+            context = (
+                f"case {case}: direction={direction} existing={existing} "
+                f"edit={edit} merged={merged}"
+            )
+
+            # P1 - no unedited stage moves against the trade direction.
+            for i in range(1, 6):
+                key = f"TP{i}"
+                if i == stage:
+                    continue  # the explicitly edited stage is exempt
+                previous = existing.get(key)
+                if previous is None:
+                    continue
+                current = merged.get(key)
+                if current is None:
+                    continue
+                if direction == "BUY":
+                    assert current >= previous - 1e-9, (
+                        f"P1 violated: the unedited stage {key} moved backwards from "
+                        f"{previous} to {current} ({context})"
+                    )
+                else:
+                    assert current <= previous + 1e-9, (
+                        f"P1 violated: the unedited stage {key} moved backwards from "
+                        f"{previous} to {current} ({context})"
+                    )
+
+            # P2 - the merged ladder is strictly ordered, or the edit was dropped.
+            prices = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+            ordered = (
+                all(b > a for a, b in zip(prices, prices[1:]))
+                if direction == "BUY"
+                else all(b < a for a, b in zip(prices, prices[1:]))
+            )
+            honoured = merged.get(f"TP{stage}") == price
+            if not ordered:
+                baseline = parser.merge_tp_levels_for_active_signal(
+                    dict(existing),
+                    None,
+                    direction=direction,
+                    pip_size=0.10,
+                    step_pips=step,
+                )
+                assert merged == baseline, (
+                    f"P2 violated: the ladder is not ordered and the edit was not "
+                    f"dropped ({context})"
+                )
+                assert not honoured, (
+                    f"P2 violated: the edit was honoured but the ladder is not ordered "
+                    f"({context})"
+                )
+            if not honoured:
+                # every drop must be logged, naming the stage and its price
+                warnings = [
+                    rec.getMessage()
+                    for rec in caplog.records
+                    if rec.levelno >= logging.WARNING
+                ]
+                assert any(
+                    f"TP{stage}" in message and f"{price:.2f}" in message
+                    for message in warnings
+                ), (
+                    f"the dropped edit must be logged with its stage and price: "
+                    f"{warnings} ({context})"
+                )
+
+
+def test_conflicting_explicit_tp_edits_keep_at_most_one(caplog):
+    """
+    Two explicit edits that contradict each other cannot both survive: at most one is
+    honoured, the other is dropped with a WARNING instead of rewriting the ladder.
+    """
+    existing = {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0}
+    step = [100.0, 100.0, 100.0, 100.0]
+    cases = [
+        {"TP2": 3950.0, "TP3": 3900.0},   # the second edit sits below the first
+        {"TP3": 3950.0, "TP2": 3960.0},   # the second edit sits above the first
+    ]
+    for edit in cases:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="copier.parser"):
+            merged = parser.merge_tp_levels_for_active_signal(
+                dict(existing),
+                edit,
+                direction="BUY",
+                pip_size=0.10,
+                step_pips=step,
+            )
+        prices = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+        assert prices == sorted(prices), (
+            f"the merged TP ladder must stay strictly ordered: {merged}"
+        )
+        honoured = [k for k, v in edit.items() if merged.get(k) == v]
+        assert len(honoured) <= 1, (
+            f"at most one of two conflicting edits may survive: {edit} -> {merged}"
+        )
+        warnings = [
+            rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING
+        ]
+        assert warnings, f"a conflicting edit must be logged: {edit}"
+
+
+
+# ---------------------------------------------------------------------------
+# Fix wave round 3 - an unlabeled TP edit may never rewrite a live stage backwards
+# ---------------------------------------------------------------------------
+
+def test_measured_unlabeled_tp_edit_never_rewrites_a_live_stage_backwards(caplog):
+    """
+    The measured case: a live ladder TP1 3518.47 / TP2 3536.26 / TP3 3554.06 (BUY)
+    and an unlabeled edit [3577.20, 3494.47, 3544.83].
+
+    The merge used to rewrite TP1 downwards to 3484.47 (-34.00), which can put a
+    broker take-profit below the entry price and close the live position at a loss.
+    The merged ladder must not move any live stage against the trade direction and
+    must stay strictly ordered; every price that cannot be placed that way is
+    dropped with a WARNING that names it.
+    """
+    existing = {"TP1": 3518.47, "TP2": 3536.26, "TP3": 3554.06}
+    submitted = [3577.20, 3494.47, 3544.83]
+    step = [100.0, 100.0, 100.0, 100.0]
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="copier.parser"):
+        merged = parser.merge_tp_levels_for_active_signal(
+            dict(existing),
+            None,
+            submitted,
+            direction="BUY",
+            pip_size=0.10,
+            step_pips=step,
+        )
+
+    # No live stage may be rewritten against the trade direction.
+    for key, previous in existing.items():
+        current = merged.get(key)
+        assert current is not None, f"the stage {key} must survive: {merged}"
+        assert current >= previous - 1e-9, (
+            f"the stage {key} was rewritten backwards from {previous} to {current}: "
+            f"{merged}"
+        )
+
+    # The merged ladder must stay strictly ordered.
+    ladder = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+    assert ladder == sorted(ladder), f"the merged ladder must stay ordered: {merged}"
+
+    # Every price that could not be placed is dropped with a WARNING naming it.
+    warnings = [
+        rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING
+    ]
+    assert warnings, f"a dropped price must be logged: {submitted} -> {merged}"
+    for idx, price in enumerate(submitted):
+        stage = f"TP{idx + 1}"
+        honoured = merged.get(stage) is not None and abs(merged[stage] - price) <= 1e-9
+        if not honoured:
+            assert any(f"{price:.2f}" in message for message in warnings), (
+                f"the dropped price {price:.2f} must be logged: {warnings}"
+            )
+
+
+def test_unlabelled_tp_edit_never_rewrites_an_unedited_stage_backwards(caplog):
+    """
+    Property test over 10 000 randomised unlabeled merges.
+
+    P1 - no stage that does not carry one of the submitted prices may move against
+         the trade direction: it keeps a value >= its pre-existing value on a BUY
+         (<= on a SELL).
+    P2 - the merged ladder is strictly ordered, or a submitted price was dropped
+         with a WARNING and the pre-existing ladder was kept unchanged.
+
+    An unlabeled price is also never allowed to push a live take-profit backwards:
+    the stage a submitted price lands on is the assignment this module makes (the
+    consecutive free stages, from the bottom), so honouring such a price would
+    loosen the broker take-profit.
+    """
+    rng = random.Random(20251121)
+    step = [100.0, 100.0, 100.0, 100.0]
+
+    with caplog.at_level(logging.WARNING, logger="copier.parser"):
+        for case in range(10000):
+            direction = "BUY" if rng.random() < 0.5 else "SELL"
+            sign = 1.0 if direction == "BUY" else -1.0
+            n_stages = rng.randint(1, 5)
+            base_price = rng.uniform(3000.0, 4000.0)
+            gap = rng.uniform(1.0, 60.0)
+            existing = {
+                f"TP{i + 1}": round(base_price + sign * i * gap, 2) for i in range(n_stages)
+            }
+            low = min(existing.values())
+            high = max(existing.values())
+            n_prices = rng.randint(1, 3)
+            submitted = []
+            for _ in range(n_prices):
+                mode = rng.random()
+                if mode < 0.34:
+                    # below the ladder range (against the trade direction)
+                    price = round(
+                        (low - rng.uniform(0.1, 120.0))
+                        if direction == "BUY"
+                        else (high + rng.uniform(0.1, 120.0)),
+                        2,
+                    )
+                elif mode < 0.67:
+                    # inside the ladder range
+                    price = round(rng.uniform(low, high), 2)
+                else:
+                    # above the ladder range
+                    price = round(
+                        (high + rng.uniform(0.1, 120.0))
+                        if direction == "BUY"
+                        else (low - rng.uniform(0.1, 120.0)),
+                        2,
+                    )
+                submitted.append(price)
+
+            caplog.clear()
+            merged = parser.merge_tp_levels_for_active_signal(
+                dict(existing),
+                None,
+                submitted,
+                direction=direction,
+                pip_size=0.10,
+                step_pips=step,
+            )
+            context = (
+                f"case {case}: direction={direction} existing={existing} "
+                f"submitted={submitted} merged={merged}"
+            )
+
+            # P1 - a stage that carries none of the submitted prices is not
+            # provider-authored and must not move against the trade direction.
+            for i in range(1, 6):
+                key = f"TP{i}"
+                previous = existing.get(key)
+                if previous is None:
+                    continue
+                current = merged.get(key)
+                if current is None:
+                    continue
+                if any(abs(current - price) <= 1e-9 for price in submitted):
+                    continue  # the stage carries a submitted price
+                if direction == "BUY":
+                    assert current >= previous - 1e-9, (
+                        f"P1 violated: the stage {key} moved backwards from "
+                        f"{previous} to {current} ({context})"
+                    )
+                else:
+                    assert current <= previous + 1e-9, (
+                        f"P1 violated: the stage {key} moved backwards from "
+                        f"{previous} to {current} ({context})"
+                    )
+
+            # A live take-profit is never loosened: an unlabeled price is only
+            # honoured when it does not push the live stage backwards.
+            for i in range(1, 6):
+                key = f"TP{i}"
+                previous = existing.get(key)
+                if previous is None:
+                    continue
+                current = merged.get(key)
+                if current is None:
+                    continue
+                if direction == "BUY":
+                    assert current >= previous - 1e-9, (
+                        f"a live take-profit was loosened: the stage {key} moved "
+                        f"backwards from {previous} to {current} ({context})"
+                    )
+                else:
+                    assert current <= previous + 1e-9, (
+                        f"a live take-profit was loosened: the stage {key} moved "
+                        f"backwards from {previous} to {current} ({context})"
+                    )
+
+            # P2 - the merged ladder is strictly ordered, or a price was dropped
+            # with a WARNING and the pre-existing ladder was kept unchanged.
+            ladder = [merged[f"TP{i}"] for i in range(1, 6) if f"TP{i}" in merged]
+            ordered = (
+                all(b > a for a, b in zip(ladder, ladder[1:]))
+                if direction == "BUY"
+                else all(b < a for a, b in zip(ladder, ladder[1:]))
+            )
+            warnings = [
+                rec.getMessage()
+                for rec in caplog.records
+                if rec.levelno >= logging.WARNING
+            ]
+            if not ordered:
+                baseline = parser.merge_tp_levels_for_active_signal(
+                    dict(existing),
+                    None,
+                    direction=direction,
+                    pip_size=0.10,
+                    step_pips=step,
+                )
+                assert merged == baseline, (
+                    f"P2 violated: the ladder is not ordered and the prices were not "
+                    f"dropped ({context})"
+                )
+                assert warnings, (
+                    f"P2 violated: the ladder is not ordered and nothing was logged "
+                    f"({context})"
+                )
+
+            # Every price that did not survive must be logged with its price.
+            for idx, price in enumerate(submitted):
+                stage = f"TP{idx + 1}"
+                honoured = (
+                    merged.get(stage) is not None
+                    and abs(merged[stage] - price) <= 1e-9
+                )
+                if not honoured:
+                    assert any(f"{price:.2f}" in message for message in warnings), (
+                        f"the dropped price {price:.2f} must be logged with its "
+                        f"price: {warnings} ({context})"
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Qwen-review bypass fixes: every live TP-edit path must use the protected merge
+# ---------------------------------------------------------------------------
+
+def _live_sig_for_adjust(ladder):
+    return {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "RUNNER_ACTIVE",
+        "tp_levels": dict(ladder),
+        "raw_tp1": ladder.get("TP1"),
+        "raw_tp2": ladder.get("TP2"),
+        "raw_tp3": ladder.get("TP3"),
+        "market_tickets": [],
+        "pending_tickets": [],
+        "layers": {},
+    }
+
+
+def test_adjust_active_signal_sl_tp_never_loosens_a_live_tp_unlabelled():
+    """
+    Qwen CRITICAL 1: adjust_active_signal_sl_tp used to run its own inline TP merge that
+    bypassed the protected parser merge, so an unlabelled price could push a live
+    take-profit backwards. It must now route through the protected merge: the offending
+    prices are dropped, no live stage moves backwards, and the ladder stays ordered.
+    """
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    live = {"TP1": 3518.47, "TP2": 3536.26, "TP3": 3554.06}
+    sig = _live_sig_for_adjust(live)
+    ex.adjust_active_signal_sl_tp(sig, unlabeled_tps=[3577.20, 3494.47, 3544.83])
+    out = sig["tp_levels"]
+    for k, v in live.items():
+        assert out[k] >= v - 1e-9, f"live stage {k} was loosened: {v} -> {out[k]}"
+    vals = [out[f"TP{i}"] for i in range(1, 6)]
+    assert all(vals[i] < vals[i + 1] for i in range(4)), f"ladder not ordered: {out}"
+
+
+def test_adjust_active_signal_sl_tp_labelled_edit_stays_ordered():
+    """A labelled TP edit through the executor must keep the ladder strictly ordered."""
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    live = {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0}
+    sig = _live_sig_for_adjust(live)
+    # TP3 = 3895 sits below TP2 and cannot be placed without breaking order: it must be
+    # dropped and the live ladder kept, never persisted as a non-monotonic ladder.
+    ex.adjust_active_signal_sl_tp(sig, labeled_tps={"TP3": 3895.0})
+    out = sig["tp_levels"]
+    vals = [out[f"TP{i}"] for i in range(1, 6)]
+    assert all(vals[i] < vals[i + 1] for i in range(4)), f"ladder not ordered: {out}"
+    for k, v in live.items():
+        assert out[k] >= v - 1e-9, f"live stage {k} was loosened: {v} -> {out[k]}"
+
+
+def test_no_edit_merge_never_moves_a_live_stage_backwards():
+    """
+    Qwen MAJOR 3: a merge with NO edit must never touch the live ladder. On a malformed
+    pre-existing ladder the old DP sanitizer could re-derive a stage backwards (loosening
+    a live take-profit). The no-edit path must return the ladder unchanged.
+    """
+    malformed = {"TP1": 3750.38, "TP2": 3791.28, "TP3": 3755.61}
+    out = parser.merge_tp_levels_for_active_signal(
+        dict(malformed), None, None, direction="BUY", pip_size=0.10
+    )
+    assert out == malformed, f"no-edit merge must not touch the live ladder: {out}"
+    # And the same for a well-formed ladder, both directions.
+    for direction, ladder in (
+        ("BUY", {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0}),
+        ("SELL", {"TP1": 3920.0, "TP2": 3910.0, "TP3": 3900.0}),
+    ):
+        out = parser.merge_tp_levels_for_active_signal(
+            dict(ladder), None, None, direction=direction, pip_size=0.10
+        )
+        assert out == ladder, f"no-edit merge changed a well-formed ladder: {out}"
+
+
+def test_all_rejected_edits_on_malformed_ladder_keep_the_live_ladder():
+    """
+    Qwen scoped re-review residual MAJOR: on a malformed pre-existing ladder, an edit whose
+    every submitted price/label is rejected must still keep the live ladder unchanged. The
+    final merge must not re-run the DP sanitizer with no accepted edits and thereby push a
+    live take-profit backwards.
+    """
+    malformed = {"TP1": 3500.0, "TP2": 3600.0, "TP3": 3550.0}
+    for kwargs in (
+        {"unlabeled_tps": [3400.0]},
+        {"labeled_tps": {"TP2": 3400.0}},
+    ):
+        out = parser.merge_tp_levels_for_active_signal(
+            dict(malformed), direction="BUY", pip_size=0.10, **kwargs
+        )
+        assert out == malformed, (
+            f"all-rejected edits must keep the live ladder unchanged, got {out} for {kwargs}"
+        )
+        for k, v in malformed.items():
+            assert out[k] >= v - 1e-9, f"live stage {k} was loosened: {v} -> {out[k]}"

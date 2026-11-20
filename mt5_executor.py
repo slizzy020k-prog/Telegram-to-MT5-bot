@@ -100,7 +100,7 @@ from config import (
     TRAIL_DISTANCE_PIPS,
     TRAIL_STEP_PIPS,
 )
-from parser import ZoneInfo, compute_zone_4tiers, derive_tp_levels
+from parser import ZoneInfo, compute_zone_4tiers, derive_tp_levels, merge_tp_levels_for_active_signal
 from dynamic_risk import (
     DynamicRiskPolicy,
     compute_atr_fallback_sl_distance,
@@ -6458,6 +6458,9 @@ class MT5Executor:
                 if closed_ok:
                     banked_tickets.append(et)
 
+        # Roles lock here only because this is the TP1 breakout path: the handler marks
+        # TP1 cleared (tp1_reached / runner_cleared_milestones) in the same call chain, which
+        # satisfies the "roles lock only on BE-lock or TP1-clear" rule.
         if banked_tickets or runner_tickets or stage2_bankers:
             signal_data["roles_locked"] = True
 
@@ -7182,50 +7185,18 @@ class MT5Executor:
         ]
 
         if clean_labeled or clean_unlabeled:
-            for k, v in clean_labeled.items():
-                tp_levels[k] = v
-
-            u_idx = 0
-            for stage_num in range(1, 6):
-                if u_idx >= len(clean_unlabeled):
-                    break
-                sk = f"TP{stage_num}"
-                if sk in clean_labeled:
-                    continue
-                tp_levels[sk] = clean_unlabeled[u_idx]
-                clean_labeled[sk] = clean_unlabeled[u_idx]
-                u_idx += 1
-
-            steps = [
-                float(_cfg("TP2_STEP_PIPS", TP2_STEP_PIPS)),
-                float(_cfg("TP3_STEP_PIPS", TP3_STEP_PIPS)),
-                float(_cfg("TP4_STEP_PIPS", TP4_STEP_PIPS)),
-                float(_cfg("TP5_STEP_PIPS", TP5_STEP_PIPS)),
-            ]
-            sign = 1.0 if is_buy else -1.0
-
-            if tp_levels.get("TP1") is None:
-                for stage_num in range(2, 6):
-                    higher = tp_levels.get(f"TP{stage_num}")
-                    if higher is not None:
-                        back_steps = sum(steps[: stage_num - 1]) * pip_size
-                        tp_levels["TP1"] = round(float(higher) - sign * back_steps, digits)
-                        break
-
-            for stage_num in range(2, 6):
-                sk = f"TP{stage_num}"
-                prev_val = tp_levels.get(f"TP{stage_num - 1}")
-                cur_val = tp_levels.get(sk)
-                step_dist = steps[stage_num - 2] * pip_size
-                if prev_val is not None:
-                    is_monotonic = (cur_val is not None) and (
-                        (is_buy and float(cur_val) > float(prev_val))
-                        or (not is_buy and float(cur_val) < float(prev_val))
-                    )
-                    if sk not in clean_labeled and not is_monotonic:
-                        tp_levels[sk] = round(float(prev_val) + sign * step_dist, digits)
-                    elif cur_val is None:
-                        tp_levels[sk] = round(float(prev_val) + sign * step_dist, digits)
+            # Route through the single protected merge so a TP edit can never push a
+            # live take-profit backwards and the ladder always stays strictly ordered.
+            # The previous inline merge overwrote stages directly and promoted unlabelled
+            # assignments to "labelled", which bypassed the monotonicity repair and the
+            # never-loosen guard (Qwen review CRITICAL 1).
+            tp_levels = merge_tp_levels_for_active_signal(
+                tp_levels,
+                clean_labeled,
+                clean_unlabeled,
+                direction=direction,
+                pip_size=pip_size,
+            )
 
             signal_data["tp_levels"] = dict(tp_levels)
             for i in range(1, 6):
