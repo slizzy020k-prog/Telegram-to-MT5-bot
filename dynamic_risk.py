@@ -87,7 +87,15 @@ def _norm_choice(val: Any, default: str, choices: Tuple[str, ...]) -> str:
 
 
 def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
-    """Read dynamic ATR SL/TP and Primary Dynamic ATR Engine settings from config."""
+    """Read dynamic ATR SL/TP and Primary Dynamic ATR Engine settings from config.
+
+    The progressive trail ladder is normalised rather than rejected: if a user configures an
+    inverted pair (EXTENDED_MFE > HOMERUN_MFE) the two thresholds are reordered so that
+    trail_extended_mfe_dollars <= trail_homerun_mfe_dollars always holds. This mirrors
+    config.validate_dynamic_risk_pairs(), which swaps the same pair at import time, while
+    startup_checks._validate_dynamic_risk_config treats any residual inversion as a fatal
+    startup error -- so an inverted ladder never reaches the engine.
+    """
     sl_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_SL_MIN_DOLLARS", 4.50), 4.50))
     sl_hi = max(sl_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_SL_MAX_DOLLARS", 35.00), 35.00))
     tp_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_TP_MIN_DOLLARS", 2.50), 2.50))
@@ -437,7 +445,21 @@ def compute_dynamic_tp_step(
 
 
 def select_progressive_trail_mult(mfe_dollars: float, policy: DynamicRiskPolicy) -> Tuple[float, str]:
-    """Select progressive ATR trailing multiplier and zone based on MFE dollars."""
+    """Select the progressive ATR trailing multiplier and zone for a given MFE (open profit in $).
+
+    Zones, keyed on MFE measured from the peak:
+        STANDARD -> MFE <  trail_extended_mfe_dollars -> trail_atr_mult
+        EXTENDED -> MFE >= trail_extended_mfe_dollars -> trail_extended_atr_mult
+        HOME_RUN -> MFE >= trail_homerun_mfe_dollars -> trail_homerun_atr_mult
+
+    The zone thresholds are inclusive at the tabulated boundaries ($10.00 and $18.00 by default).
+
+    Forward-only invariant: MFE is measured from a monotonically non-decreasing peak, so the zone
+    can only advance STANDARD -> EXTENDED -> HOME_RUN. The min(...) guard keeps the effective
+    multiplier non-increasing even when a user configures an aggressive base multiplier, so
+    trail_dist is non-increasing and atr_sl = peak - sign * trail_dist can only ever move
+    forward. The trail therefore never loosens a stop.
+    """
     mfe_f = max(0.0, _safe_float(mfe_dollars, 0.0))
     if mfe_f + 1e-9 >= policy.trail_homerun_mfe_dollars:
         return (min(policy.trail_atr_mult, policy.trail_extended_atr_mult, policy.trail_homerun_atr_mult), "HOME_RUN")
@@ -478,6 +500,7 @@ def compute_dynamic_atr_trail_stop(
             "stop_source": None,
             "atr": round(atr_f, 4),
             "mfe_dollars": 0.0,
+            # Trail disabled or ATR invalid: no zone is in effect, so report the base ladder.
             "trail_mult": round(policy.trail_atr_mult, 4),
             "trail_zone": "STANDARD",
         }
@@ -528,8 +551,8 @@ def compute_dynamic_atr_trail_stop(
             "stop_source": None,
             "atr": round(atr_f, 4),
             "mfe_dollars": round(max(0.0, mfe), 4),
-            "trail_mult": round(policy.trail_atr_mult, 4),
-            "trail_zone": "STANDARD",
+            "trail_mult": round(eff_mult, 4),
+            "trail_zone": trail_zone,
         }
 
     _, stop_source, raw_sl = min(
