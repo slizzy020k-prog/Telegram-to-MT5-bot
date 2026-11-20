@@ -54,44 +54,23 @@ def _tick(bid: float, ask: Optional[float] = None, spread: float = 0.20) -> Simp
 
 @pytest.fixture(autouse=True)
 def _pin_v352_defaults(monkeypatch):
-    """Pin deterministic v3.5.2 config & module globals regardless of local `.env`."""
+    """Pin deterministic config & module globals regardless of local `.env`."""
     defaults = {
-        "STAGED_EXIT_ENABLED": True,
-        "PROFIT_RATCHET_ENABLED": False,
+        "DYNAMIC_ATR_SLTP_ENABLED": True,
+        "DYNAMIC_SLTP_MODE": "ADAPTIVE",
+        "DYNAMIC_ATR_TRAIL_ENABLED": True,
+        "DYNAMIC_ATR_TP_TRAIL_ENABLED": True,
         "TIERED_STAGE_BANKING_ENABLED": False,
         "BE_OFFSET_PIPS": 5.0,
         "BE_AFTER_TP1": True,
         "RUNNER_MAX_TP_STAGE": 5,
         "RUNNER_CLEAN_BREAK_PIPS": 5.0,
-        "RUNNER_EARLY_TP_LIFT_PCT": 0.70,
-        "RUNNER_PROACTIVE_TP_LIFT": True,
         "RUNNER_DEEPEST_COUNT_FULL": 1,
-        "GOLD_REVERSAL_GUARD_ENABLED": True,
-        "ARM_THRESHOLD_PCT": 0.85,
-        "GIVEBACK_PCT": 0.30,
-        "MIN_GOLD_PULLBACK_DOLLARS": 1.50,
-        "ATR_NOISE_FLOOR_MULT": 0.35,
-        "HARD_GIVEBACK_CEILING_DOLLARS": 3.50,
-        "MAX_GIVEBACK_DOLLARS": 4.50,
-        "REVERSAL_CONFIRM_TICKS": 2,
-        "STAGE0_PROFIT_LOCK_ENABLED": True,
-        "STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS": 1.20,
-        "STAGE0_PROFIT_LOCK_OFFSET_PIPS": 5.0,
-        "CANCEL_PENDING_ON_STAGE0_LOCK_EXIT": True,
-        "STAGE1_ATR_ACTIVATION_PCT": 0.45,
-        "TP1_TRAIL_ENABLED": True,
-        "TP1_TRAIL_ATR_MULT": 1.5,
-        "TP1_TRAIL_MIN_DOLLARS": 2.50,
-        "TP1_TRAIL_MAX_DOLLARS": 3.50,
-        "TP1_TRAIL_STEP_DOLLARS": 0.25,
-        "TP1_TOUCH_BANK_ENABLED": True,
-        "TP1_TOUCH_BANK_BUFFER_PIPS": 12.0,
         "BANK_ALL_AT_TP1": False,
         "BANK_SINGLE_LAYER_AT_TP1": False,
         "CANCEL_PENDING_ON_TP1": True,
         "MAX_ALLOWED_SPREAD_DOLLARS": 0.40,
         "ADAPTIVE_SPREAD_CEILING_DOLLARS": 0.80,
-        "DAILY_LOSS_PAUSE_ENABLED": False,
         "MARKET_EXEC_BUFFER_PIPS": 15.0,
     }
     for key, val in defaults.items():
@@ -160,47 +139,10 @@ def _make_sell_9934_signal(ex: MT5Executor) -> Dict[str, Any]:
     }
 
 
-def test_01_incident_9934_dual_gate_stage1_atr_and_sell_bid_ask_spread_parity(tmp_path):
-    """Incident 9934: Holds fsm_floor until >=45% of TP1->TP2 on Bid; ATR operates in Ask space."""
-    ex = _setup_runtime(tmp_path, "t01_9934")
-    ex._dry_run_m1_atr = 2.50 / 1.5  # Stage 1 ATR trail distance = $2.50
-    sig = _make_sell_9934_signal(ex)
-
-    # TP1 touch on chart (Bid=3737.00), wide Ask=3737.52 ($0.52 spread)
-    with patch.object(ex, "get_tick", return_value=_tick(3737.00, 3737.52)):
-        runner_t = ex.handle_tp1_scaling_and_select_runner(sig)
-
-    assert runner_t == 153877174
-    assert sig["runner_cleared_milestones"] == ["TP1"]
-    assert sig["runner_milestone_idx"] == 2
-    assert sig["stage1_atr_armed"] is False
-    assert sig["fsm_floor"] == pytest.approx(3741.20)
-    assert sig["trail_stop"] == pytest.approx(3741.20)
-    assert sig["broker_sl"] == pytest.approx(3741.20)
-
-    # Reproduces 9934 bounce: Ask=3740.17 previously choked runner; now holds under fsm_floor!
-    for b, a in ((3737.15, 3737.67), (3739.65, 3740.17)):
-        with patch.object(ex, "get_tick", return_value=_tick(b, a)):
-            assert ex.manage_designated_runner(sig) is True
-            assert sig["stage1_atr_armed"] is False
-            assert sig["trail_stop"] == pytest.approx(3741.20)
-
-    # Drops to Bid=3733.80 (3.20 / 7.00 = 45.7% >= 45% of TP1->TP2): Stage 1 ATR arms!
-    with patch.object(ex, "get_tick", return_value=_tick(3733.80, 3734.32)):
-        assert ex.manage_designated_runner(sig) is True
-
-    assert sig["stage1_atr_armed"] is True
-    assert sig["chart_peak"] == pytest.approx(3733.80)
-    assert sig["trail_peak"] == pytest.approx(3734.32)
-    assert sig["trail_stop"] == pytest.approx(3736.82)  # min(3741.20, 3734.32 + 2.50)
-    assert sig["broker_sl"] == pytest.approx(3736.82)
-
-
 @pytest.mark.asyncio
 async def test_02_incident_13153_wide_zone_and_unfilled_layers_protection(tmp_path):
     """Incident 13153: Protects 1 market + resting L2-L4 limit zone from premature exit/lift."""
     ex = _setup_runtime(tmp_path, "t02_13153")
-    # Case 2a: Sub-lock profit with resting L2-L4 limits -> Reversal Guard NEVER liquidates L1 or cancels L2-L4!
     layers = {
         "L1": {"lot": 0.01, "target_price": 3738.0, "tp": 3736.8, "tp_stage": "TP1", "ticket": 2001, "order_type": "MARKET", "status": "OPEN"},
         "L2": {"lot": 0.01, "target_price": 3741.33, "tp": 3730.0, "tp_stage": "TP2", "ticket": 2002, "order_type": "SELL_LIMIT", "status": "PENDING"},
@@ -231,183 +173,23 @@ async def test_02_incident_13153_wide_zone_and_unfilled_layers_protection(tmp_pa
         status="ACTIVE",
     )
 
-    # Near miss toward TP1 followed by bounce back toward L2 limit -> must NOT liquidate L1!
+    # Near miss toward TP1 followed by bounce back toward L2 limit -> must NOT liquidate L1 or sweep limits!
     for b in (3736.65, 3738.10, 3738.20, 3738.30):
-        res = ex.evaluate_gold_reversal_guard(sig, _tick(b, b + 0.20))
-        assert res["triggered"] is False
+        res = ex.evaluate_dynamic_atr_engine(sig, _tick(b, b + 0.20))
+        assert res.get("pending_swept") == []
     assert sig["pending_tickets"] == [2002, 2003, 2004]
+    assert sig["layers"]["L1"]["status"] == "OPEN"
 
-    # Case 2b: Tight $3.00 TP1 leg (<=$4.00 tight-scalp rule) with resting L2-L4 limits ->
-    # has_unfilled_zone_layers prevents premature tight-scalp early arming & liquidation!
+    # Case 2b: Tight $3.00 TP1 leg with resting L2-L4 limits -> limits preserved
     sig_wide = dict(sig)
     sig_wide["raw_tp1"] = 3735.0
     sig_wide["final_tp"] = 3735.5
     sig_wide["layers"] = {k: dict(v) for k, v in layers.items()}
     sig_wide["layers"]["L1"]["tp"] = 3735.5
     sig_wide["tp_levels"] = {"TP1": 3735.0, "TP2": 3730.0, "TP3": 3715.0, "TP4": 3700.0, "TP5": 3650.0}
-    sig_wide["reversal_guard_armed"] = False
-    res_early = ex.evaluate_gold_reversal_guard(sig_wide, _tick(3735.95, 3736.15))  # ~68% progress
-    assert res_early["armed"] is False
-    assert res_early["triggered"] is False
+    res_early = ex.evaluate_dynamic_atr_engine(sig_wide, _tick(3735.95, 3736.15))
+    assert res_early.get("pending_swept") == []
     assert sig_wide["pending_tickets"] == [2002, 2003, 2004]
-
-
-@pytest.mark.asyncio
-async def test_03_incident_13167_stage0_profit_lock_and_two_tick_confirm(tmp_path):
-    """Incident 13167: 2-tick hysteresis + Stage 0 BE+5p Profit-Lock virtual backstop."""
-    ex = _setup_runtime(tmp_path, "t03_13167")
-    ex._dry_run_ticket_lots[3001] = 0.02
-    sig = main.state_mgr.create_signal(
-        message_id=13167,
-        chat_id=-1003712081715,
-        symbol="XAUUSD.s",
-        direction="BUY",
-        sl=3785.0,
-        layers={
-            "L1": {"lot": 0.02, "target_price": 3800.0, "tp": 3805.5, "tp_stage": "TP1", "ticket": 3001, "order_type": "MARKET", "status": "OPEN"},
-        },
-        market_tickets=[3001],
-        pending_tickets=[],
-        final_tp=3805.5,
-        raw_tp1=3806.0,
-        raw_tp2=3810.0,
-        tp_levels={"TP1": 3806.0, "TP2": 3810.0, "TP3": 3820.0, "TP4": 3830.0, "TP5": 3840.0},
-        recorded_entry_price=3800.0,
-        initial_price=3800.0,
-        status="ACTIVE",
-    )
-
-    with patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
-        # 1. Rally to 3805.20 (86.7% of $6 leg; +$5.20 profit >= $1.20) -> Stage 0 Profit Lock BE+5p = 3800.50!
-        with patch.object(ex, "get_tick", return_value=_tick(3805.20)):
-            await main._process_pre_tp1_or_backstop_tick("13167", main.state_mgr.get_signal(13167))
-
-        s_armed = main.state_mgr.get_signal(13167)
-        assert s_armed["reversal_guard_armed"] is True
-        assert s_armed["stage0_profit_lock_active"] is True
-        assert s_armed["stage0_profit_lock_sl"] == pytest.approx(3800.50)
-
-        # 2. Single noise pullback tick to 3802.00 ($3.20 pullback, 61.5%) -> Tick 1 does NOT exit!
-        with patch.object(ex, "get_tick", return_value=_tick(3802.00)):
-            await main._process_pre_tp1_or_backstop_tick("13167", main.state_mgr.get_signal(13167))
-        assert main.state_mgr.get_signal(13167)["status"] == "ACTIVE"
-        assert main.state_mgr.get_signal(13167)["reversal_guard_ticks"] == 1
-
-        # 3. Bounce reset: tick back to 3803.90 (pullback $1.30 < $1.50 floor) resets confirm counter!
-        with patch.object(ex, "get_tick", return_value=_tick(3803.90)):
-            await main._process_pre_tp1_or_backstop_tick("13167", main.state_mgr.get_signal(13167))
-        assert main.state_mgr.get_signal(13167)["reversal_guard_ticks"] == 0
-
-        # 4. Drop past locked floor (3800.40 <= 3800.50): triggers Stage 0 Profit-Lock immediately on tick 1!
-        with patch.object(ex, "get_tick", return_value=_tick(3800.40)):
-            await main._process_pre_tp1_or_backstop_tick("13167", main.state_mgr.get_signal(13167))
-
-        s_closed = main.state_mgr.get_signal(13167)
-        assert s_closed["status"] == "CLOSED"
-        assert s_closed["exit_reason_code"] == "STAGE0_PROFIT_LOCK"
-        assert s_closed["market_tickets"] == []
-        assert s_closed["pending_tickets"] == []
-
-        # 5. Clean signal 13168: 2 consecutive confirming pullback ticks above lock SL -> closes on tick 2!
-        ex._dry_run_ticket_lots[3003] = 0.02
-        main.state_mgr.create_signal(
-            message_id=13168,
-            chat_id=-1003712081715,
-            symbol="XAUUSD.s",
-            direction="BUY",
-            sl=3785.0,
-            layers={
-                "L1": {"lot": 0.02, "target_price": 3800.0, "tp": 3805.5, "tp_stage": "TP1", "ticket": 3003, "order_type": "MARKET", "status": "OPEN"},
-            },
-            market_tickets=[3003],
-            pending_tickets=[],
-            final_tp=3805.5,
-            raw_tp1=3806.0,
-            raw_tp2=3810.0,
-            tp_levels={"TP1": 3806.0, "TP2": 3810.0, "TP3": 3820.0, "TP4": 3830.0, "TP5": 3840.0},
-            recorded_entry_price=3800.0,
-            initial_price=3800.0,
-            status="ACTIVE",
-        )
-        with patch.object(ex, "get_tick", return_value=_tick(3805.20)):
-            await main._process_pre_tp1_or_backstop_tick("13168", main.state_mgr.get_signal(13168))
-        with patch.object(ex, "get_tick", return_value=_tick(3802.00)):
-            await main._process_pre_tp1_or_backstop_tick("13168", main.state_mgr.get_signal(13168))
-            assert main.state_mgr.get_signal(13168)["status"] == "ACTIVE"
-            assert main.state_mgr.get_signal(13168)["reversal_guard_ticks"] == 1
-            await main._process_pre_tp1_or_backstop_tick("13168", main.state_mgr.get_signal(13168))
-
-        s_guard_closed = main.state_mgr.get_signal(13168)
-        assert s_guard_closed["status"] == "CLOSED"
-        assert s_guard_closed["exit_reason_code"] == "GOLD_GUARD"
-
-
-def test_04_failed_breakout_70_to_85_cliff_gap_and_5_dollar_hard_ceiling(tmp_path, monkeypatch):
-    """Cliff-Gap Catch #1 (TP2 lifted & final_tp hit <85%) + $5.00 hard peak-profit ceiling."""
-    ex = _setup_runtime(tmp_path, "t04_cliff")
-    monkeypatch.setattr(config, "STAGE0_PROFIT_LOCK_ENABLED", False)
-    monkeypatch.setattr(ex_mod, "STAGE0_PROFIT_LOCK_ENABLED", False)
-
-    # Part A: Cliff-Gap Catch #1 — $3.00 leg where final_tp=3802.50 is 83.3% (< 85% arm threshold!),
-    # L1 closed at final_tp leaving L4 lifted to tp_stage="TP2" reaching final_tp -> arms cleanly!
-    ex._dry_run_ticket_lots[4001] = 0.01
-    ex._dry_run_ticket_lots[4002] = 0.02
-    sig_cliff = {
-        "symbol": "XAUUSD.s",
-        "direction": "BUY",
-        "sl": 3785.0,
-        "layers": {
-            "L1": {"lot": 0.01, "target_price": 3800.0, "tp": 3802.5, "tp_stage": "TP1", "ticket": 4001, "order_type": "MARKET", "status": "OPEN"},
-            "L4": {"lot": 0.02, "target_price": 3800.0, "tp": 3802.5, "tp_stage": "TP1", "ticket": 4002, "order_type": "MARKET", "status": "OPEN"},
-        },
-        "market_tickets": [4001, 4002],
-        "pending_tickets": [],
-        "final_tp": 3802.5,
-        "raw_tp1": 3803.0,
-        "tp_levels": {"TP1": 3803.0, "TP2": 3810.0, "TP3": 3820.0, "TP4": 3830.0, "TP5": 3840.0},
-        "recorded_entry_price": 3800.0,
-        "initial_price": 3800.0,
-        "status": "ACTIVE",
-    }
-    lift = ex.prepare_deepest_runners_for_tp_breakout(sig_cliff, live_price=3802.15, chart_price=3802.15)
-    assert 4002 in lift.get("lifted_tickets", [])
-    assert sig_cliff["layers"]["L4"]["tp_stage"] == "TP2"
-
-    # Simulate L1 closing at final_tp=3802.50 (83.3% < 85%), leaving L4 open at tp_stage=="TP2"
-    sig_cliff["layers"]["L1"]["status"] = "CLOSED"
-    sig_cliff["market_tickets"] = [4002]
-    res_cliff = ex.evaluate_gold_reversal_guard(sig_cliff, _tick(3802.52))
-    assert sig_cliff["reversal_guard_armed"] is True
-    assert res_cliff["armed"] is True
-
-    # Pullback from 3802.52 to 3800.90 ($1.62 >= $1.50 & 64% >= 30%) -> 2 ticks triggers exit!
-    assert ex.evaluate_gold_reversal_guard(sig_cliff, _tick(3800.90))["triggered"] is False
-    assert ex.evaluate_gold_reversal_guard(sig_cliff, _tick(3800.90))["triggered"] is True
-
-    # Part B: $5.00 hard ceiling overrides wide ATR noise floor when peak_profit >= $5.00
-    ex._dry_run_ticket_lots[4003] = 0.01
-    ex._dry_run_m1_atr = 18.0  # Huge ATR -> 0.35 * 18.0 = $6.30 (> $5.00 hard ceiling!)
-    sig_ceil = {
-        "symbol": "XAUUSD.s",
-        "direction": "BUY",
-        "sl": 3785.0,
-        "layers": {
-            "L1": {"lot": 0.01, "target_price": 3800.0, "tp": 3811.5, "ticket": 4003, "order_type": "MARKET", "status": "OPEN"},
-        },
-        "market_tickets": [4003],
-        "pending_tickets": [],
-        "raw_tp1": 3812.0,
-        "tp_levels": {"TP1": 3812.0, "TP2": 3822.0, "TP3": 3832.0, "TP4": 3842.0, "TP5": 3852.0},
-        "recorded_entry_price": 3800.0,
-        "initial_price": 3800.0,
-        "status": "ACTIVE",
-    }
-    res_peak = ex.evaluate_gold_reversal_guard(sig_ceil, _tick(3810.50))  # 87.5%, peak_profit=$10.50
-    assert res_peak["triggered"] is False
-    # Drop $5.20 to 3805.30: < $6.30 ATR noise floor, yet >= $3.50 hard ceiling -> triggers immediately!
-    r1 = ex.evaluate_gold_reversal_guard(sig_ceil, _tick(3805.30))
-    assert r1["triggered"] is True
-    assert r1["hard_ceiling_triggered"] is True
 
 
 @pytest.mark.asyncio
@@ -593,39 +375,6 @@ async def test_08_single_pass_parsing_and_signal_lock_release_before_notify(tmp_
     assert all(locked is False for locked in lock_states_inside_notify)
 
 
-def test_09_sell_bid_ask_chart_vs_exec_parity_in_runner_and_stage0(tmp_path):
-    """SELL milestones/TP-lifts respond to chart Bid while trail stops/SL use exec Ask."""
-    ex = _setup_runtime(tmp_path, "t09_bid_ask")
-    ex._dry_run_ticket_lots[9001] = 0.01
-    ex._dry_run_ticket_lots[9002] = 0.02
-    sig = {
-        "symbol": "XAUUSD.s",
-        "direction": "SELL",
-        "sl": 3760.0,
-        "layers": {
-            "L1": {"lot": 0.01, "target_price": 3745.0, "tp": 3740.5, "ticket": 9001, "order_type": "MARKET", "status": "OPEN"},
-            "L4": {"lot": 0.02, "target_price": 3745.0, "tp": 3740.5, "ticket": 9002, "order_type": "MARKET", "status": "OPEN"},
-        },
-        "market_tickets": [9001, 9002],
-        "pending_tickets": [],
-        "raw_tp1": 3740.0,
-        "raw_tp2": 3730.0,
-        "raw_tp3": 3720.0,
-        "raw_tp4": 3710.0,
-        "raw_tp5": 3700.0,
-        "tp_levels": {"TP1": 3740.0, "TP2": 3730.0, "TP3": 3720.0, "TP4": 3710.0, "TP5": 3700.0},
-        "recorded_entry_price": 3745.0,
-        "initial_price": 3745.0,
-        "status": "ACTIVE",
-    }
-
-    # Chart Bid=3741.20 is 76% of 3745->3740 leg, while Ask=3742.00 ($0.80 spread) is only 60% (<70%)!
-    # Because chart_price = Bid is used for milestone/70% lift checks, L4 lifts to TP2!
-    lift = ex.prepare_deepest_runners_for_tp_breakout(sig, live_price=3742.00, chart_price=3741.20)
-    assert 9002 in lift.get("lifted_tickets", [])
-    assert sig["layers"]["L4"]["tp"] == pytest.approx(3730.0)
-
-
 def test_10_pnl_deal_history_retry_cached_profit_fallback_and_layer_persistence(tmp_path):
     """Deals require exit_deals; ~0.15s retry catches exit deal; missing falls back to cache."""
     ex = _setup_runtime(tmp_path, "t10_pnl")
@@ -695,15 +444,24 @@ async def test_11_tp1_telegram_alert_format_and_hud_open_lots_accuracy(tmp_path,
 
 
 def test_12_v352_config_defaults_and_safety_invariants():
-    """Reloaded config defaults pass staged validation with valid v3.5.2 bounds."""
-    assert isinstance(config.REVERSAL_CONFIRM_TICKS, int) and config.REVERSAL_CONFIRM_TICKS >= 1
-    assert isinstance(config.STAGE0_PROFIT_LOCK_ENABLED, bool)
-    assert config.STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS > 0
-    assert isinstance(config.CANCEL_PENDING_ON_STAGE0_LOCK_EXIT, bool)
-    assert 0.0 <= config.STAGE1_ATR_ACTIVATION_PCT <= 1.0
-    assert config.STAGE0_PROFIT_LOCK_OFFSET_PIPS >= 0.0
-    tiers = config.validate_staged_trail_tiers()
-    assert isinstance(tiers, dict) and set(tiers.keys()) == {1, 2, 3, 4}
-    # Ensure reloading config module executes without NameError on BE_OFFSET_PIPS ordering
+    """Config defaults and invariants for Pure Dynamic ATR Engine."""
+    assert config.DYNAMIC_ATR_SLTP_ENABLED is True
+    assert config.DYNAMIC_SLTP_MODE == "ADAPTIVE"
+    assert config.DYNAMIC_SL_MIN_DOLLARS == 4.50
+    assert config.DYNAMIC_SL_MAX_DOLLARS == 35.00
+    assert config.DYNAMIC_TP_MIN_DOLLARS == 2.50
+    assert config.DYNAMIC_TP_MAX_DOLLARS == 50.00
+    assert config.DYNAMIC_ATR_TRAIL_ENABLED is True
+    assert config.DYNAMIC_ATR_TRAIL_MIN_DOLLARS == 2.50
+    assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == 12.00
+    assert config.DYNAMIC_ATR_TRAIL_STEP_DOLLARS == 0.25
+    assert config.DYNAMIC_ATR_BE_ACTIVATION_MULT == 0.75
+    assert config.DYNAMIC_ATR_BE_MIN_MFE_DOLLARS == 3.50
+    assert config.DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS == 0.50
+    assert config.DYNAMIC_ATR_TP_TRAIL_ENABLED is True
+    assert config.DYNAMIC_ATR_TP_LIFT_ATR_MULT == 0.50
+    assert config.DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT == 0.75
+    assert hasattr(config, "validate_dynamic_risk_pairs")
+    config.validate_dynamic_risk_pairs()
     reloaded = importlib.reload(config)
-    assert hasattr(reloaded, "STAGE0_PROFIT_LOCK_OFFSET_PIPS")
+    assert hasattr(reloaded, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS")

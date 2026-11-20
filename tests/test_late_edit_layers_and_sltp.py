@@ -270,11 +270,7 @@ async def test_late_edit_after_3_minutes_adds_layers_and_replaces_fallback_tp_an
         assert all(sig["layers"][f"L{i}"]["tp"] == pytest.approx(3863.50) for i in range(1, 5))
         assert (5001, 3830.0, 3863.50) in mod_pos_calls
 
-        # 3) Stale shortfall_armed from synthetic fallback TP1 was reset so next tick does NOT false-close!
-        assert sig["shortfall_armed"] is False
-        assert sig["shortfall_reversal_ticks"] == 0
-        assert sig["peak_price"] is None
-
+        # 3) Pure Dynamic ATR Engine: zero virtual closes on ticks!
         with patch.object(main.executor, "get_tick", return_value=tick_edit):
             await main._process_pre_tp1_or_backstop_tick("9710", main.state_mgr.get_signal(9710, chat_id=-1004369388188))
         sig_after_tick = main.state_mgr.get_signal(9710, chat_id=-1004369388188)

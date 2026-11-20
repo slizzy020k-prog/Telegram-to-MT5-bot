@@ -88,9 +88,10 @@ def test_sell_3layer_tp1_scaling_all_cases():
 
 
 def test_sell_runner_virtual_floor_and_tp2_target():
-    """Verify SELL runner behavior for virtual floor hit, TP2 hit, and trailing SL."""
+    """Verify SELL runner behavior: pullbacks trigger zero virtual closes, and milestones clear cleanly."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
+    executor._dry_run_atr = 2.00
 
     sig_data = {
         "runner_ticket": 701,
@@ -100,23 +101,36 @@ def test_sell_runner_virtual_floor_and_tp2_target():
         "soft_tp1_floor": 3880.50,
         "raw_tp1": 3880.0,
         "raw_tp2": 3860.0,
+        "tp_levels": {"TP1": 3880.0, "TP2": 3860.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 701,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3885.0,
+                "sl": 3895.0,
+                "tp": 3880.0,
+            }
+        },
         "market_tickets": [701],
         "status": "RUNNER_ACTIVE",
     }
 
-    # 1. Price rises to 3880.60 (above floor 3880.50) -> Virtual floor triggered
+    # 1. Price rises to 3880.60 (pullback above 3880.50) -> Zero virtual close!
     mock_tick_floor = MagicMock()
     mock_tick_floor.ask = 3880.60
     mock_tick_floor.bid = 3880.30
 
-    with patch.object(executor, "get_tick", return_value=mock_tick_floor):
+    with patch.object(executor, "get_tick", return_value=mock_tick_floor), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close:
         still_active = executor.manage_designated_runner(sig_data)
 
-    assert still_active is False
-    assert sig_data["status"] == "CLOSED"
-    assert sig_data["runner_ticket"] is None
+    assert still_active is True
+    assert spy_close.call_count == 0
+    assert sig_data["status"] == "RUNNER_ACTIVE"
+    assert sig_data["runner_ticket"] == 701
 
-    # 2. Reset and test TP2 reached
+    # 2. Test TP2 reached -> Pure Dynamic ATR Engine trails SL without virtual market close
     sig_data2 = {
         "runner_ticket": 702,
         "runner_layer": "BOTTOM",
@@ -125,6 +139,17 @@ def test_sell_runner_virtual_floor_and_tp2_target():
         "soft_tp1_floor": 3880.50,
         "raw_tp1": 3880.0,
         "raw_tp2": 3860.0,
+        "tp_levels": {"TP1": 3880.0, "TP2": 3860.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 702,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3885.0,
+                "sl": 3895.0,
+                "tp": 3860.0,
+            }
+        },
         "market_tickets": [702],
         "status": "RUNNER_ACTIVE",
     }
@@ -132,18 +157,22 @@ def test_sell_runner_virtual_floor_and_tp2_target():
     mock_tick_tp2.ask = 3859.80  # Below raw_tp2 3860.0
     mock_tick_tp2.bid = 3859.50
 
-    with patch.object(executor, "get_tick", return_value=mock_tick_tp2):
+    with patch.object(executor, "get_tick", return_value=mock_tick_tp2), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close2:
         still_active2 = executor.manage_designated_runner(sig_data2)
 
-    assert still_active2 is False
-    assert sig_data2["status"] == "CLOSED"
-    assert sig_data2["runner_ticket"] is None
+    assert still_active2 is True
+    assert spy_close2.call_count == 0
+    assert sig_data2["status"] == "RUNNER_ACTIVE"
+    assert sig_data2["broker_sl"] < 3870.0  # Trailed down deeply into profit
+    assert sig_data2["tp1_reached"] is True
 
 
 def test_buy_runner_tp2_reached():
-    """Verify BUY runner closes at market when live price touches or passes TP2."""
+    """Verify BUY runner trails SL towards TP2 without early virtual market close."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
+    executor._dry_run_atr = 2.00
 
     sig_data = {
         "runner_ticket": 801,
@@ -153,6 +182,17 @@ def test_buy_runner_tp2_reached():
         "soft_tp1_floor": 3899.50,
         "raw_tp1": 3900.0,
         "raw_tp2": 3910.0,
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 801,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3895.0,
+                "sl": 3880.0,
+                "tp": 3910.0,
+            }
+        },
         "market_tickets": [801],
         "status": "RUNNER_ACTIVE",
     }
@@ -162,12 +202,15 @@ def test_buy_runner_tp2_reached():
     mock_tick.bid = 3910.20
     mock_tick.ask = 3910.50
 
-    with patch.object(executor, "get_tick", return_value=mock_tick):
+    with patch.object(executor, "get_tick", return_value=mock_tick), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close:
         still_active = executor.manage_designated_runner(sig_data)
 
-    assert still_active is False
-    assert sig_data["status"] == "CLOSED"
-    assert sig_data["runner_ticket"] is None
+    assert still_active is True
+    assert spy_close.call_count == 0
+    assert sig_data["status"] == "RUNNER_ACTIVE"
+    assert sig_data["broker_sl"] >= 3905.0  # Trailed SL protects gains
+    assert sig_data["tp1_reached"] is True
 
 
 def test_limit_order_fallback_sl_when_none():
@@ -414,9 +457,10 @@ async def test_sell_now_delay_timer_and_failed_order_skips_state(tmp_path):
 
 
 def test_runner_holds_past_tp2_to_tp3_when_hold_past_tp2_set():
-    """When hold_past_tp2 is True and raw_tp3 is set, runner does not close early at raw_tp2."""
+    """When raw_tp3 is set, runner holds past TP2 and trails with zero virtual closes."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
+    executor._dry_run_atr = 2.00
 
     sig = {
         "runner_ticket": 805,
@@ -427,6 +471,17 @@ def test_runner_holds_past_tp2_to_tp3_when_hold_past_tp2_set():
         "raw_tp1": 3900.0,
         "raw_tp2": 3910.0,
         "raw_tp3": 3925.0,
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3925.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 805,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3895.0,
+                "sl": 3880.0,
+                "tp": 3910.0,
+            }
+        },
         "hold_past_tp2": True,
         "market_tickets": [805],
         "status": "RUNNER_ACTIVE",
@@ -439,14 +494,18 @@ def test_runner_holds_past_tp2_to_tp3_when_hold_past_tp2_set():
     with patch.object(executor, "get_tick", return_value=mock_tick_mid):
         assert executor.manage_designated_runner(sig) is True
         assert sig["status"] == "RUNNER_ACTIVE"
+        assert sig["tp2_reached"] is True
 
-    # Price reaches 3925.20 (>= TP3 3925.0) -> closes at market!
+    # Price reaches 3925.20 (>= TP3 3925.0) -> Pure Dynamic ATR Engine trails SL tightly without early market close
     mock_tick_tp3 = MagicMock()
     mock_tick_tp3.bid = 3925.20
     mock_tick_tp3.ask = 3925.50
-    with patch.object(executor, "get_tick", return_value=mock_tick_tp3):
-        assert executor.manage_designated_runner(sig) is False
-        assert sig["status"] == "CLOSED"
+    with patch.object(executor, "get_tick", return_value=mock_tick_tp3), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close:
+        assert executor.manage_designated_runner(sig) is True
+        assert spy_close.call_count == 0
+        assert sig["status"] == "RUNNER_ACTIVE"
+        assert sig["broker_sl"] >= 3920.0  # Trailed SL protects $25 gain
         assert sig["tp2_reached"] is True
 
 
@@ -592,7 +651,7 @@ async def test_old_message_edit_reaction_ignored_and_tp1_reply_scales(tmp_path, 
     import mt5_executor as ex_mod
     from tests.test_copier_scenarios import MockTelethonEvent
 
-    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+    for key in ("TIERED_STAGE_BANKING_ENABLED",):
         monkeypatch.setattr(config, key, False, raising=False)
         monkeypatch.setattr(ex_mod, key, False, raising=False)
         monkeypatch.setattr(main, key, False, raising=False)
@@ -1294,7 +1353,7 @@ async def test_tp1_hit_cancels_delayed_now_and_unfilled_zone_via_reply_edit_stan
     import mt5_executor as ex_mod
     from tests.test_copier_scenarios import MockTelethonEvent
 
-    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+    for key in ("TIERED_STAGE_BANKING_ENABLED",):
         monkeypatch.setattr(config, key, False, raising=False)
         monkeypatch.setattr(ex_mod, key, False, raising=False)
         monkeypatch.setattr(main, key, False, raising=False)

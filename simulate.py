@@ -10,7 +10,9 @@ from unittest.mock import MagicMock, patch
 _SIM_TEMP_DIR = tempfile.TemporaryDirectory(prefix="xauusd_copier_sim_")
 _SIM_DIR = Path(_SIM_TEMP_DIR.name)
 os.environ["DRY_RUN"] = "true"
-os.environ["STAGED_EXIT_ENABLED"] = "true"
+os.environ["DYNAMIC_ATR_SLTP_ENABLED"] = "true"
+os.environ["DYNAMIC_ATR_TRAIL_ENABLED"] = "true"
+os.environ["DYNAMIC_ATR_TP_TRAIL_ENABLED"] = "true"
 os.environ["LOG_FILE_PATH"] = str(_SIM_DIR / "sim_copier.log")
 os.environ["STATE_FILE_PATH"] = str(_SIM_DIR / "sim_signals_state.json")
 os.environ["TRADES_LEDGER_PATH"] = str(_SIM_DIR / "sim_trades_ledger.jsonl")
@@ -79,9 +81,13 @@ async def run_simulation() -> None:
     print("=" * 72)
     print(f"  Temp Isolation Dir : {_SIM_DIR}")
     print(f"  Dry-Run Enforced   : {config.DRY_RUN}")
-    print(f"  Staged Exit Mode   : {config.STAGED_EXIT_ENABLED}")
+    print(
+        f"  Dynamic ATR Engine : SLTP={config.DYNAMIC_ATR_SLTP_ENABLED} | "
+        f"Trail={config.DYNAMIC_ATR_TRAIL_ENABLED} | TPLift={config.DYNAMIC_ATR_TP_TRAIL_ENABLED}"
+    )
     assert config.DRY_RUN is True
-    assert config.STAGED_EXIT_ENABLED is True
+    assert config.DYNAMIC_ATR_SLTP_ENABLED is True
+    assert config.DYNAMIC_ATR_TRAIL_ENABLED is True
     assert Path(config.LOG_FILE_PATH).parent == _SIM_DIR
     assert Path(config.STATE_FILE_PATH).parent == _SIM_DIR
     assert Path(config.TRADES_LEDGER_PATH).parent == _SIM_DIR
@@ -192,100 +198,114 @@ async def run_simulation() -> None:
     print("  [OK] Delayed 'Buy now' converted cleanly to 4-layer Zone (4 orders, 0.05 lots).")
 
     # -----------------------------------------------------------------------
-    # STEP 6: Dynamic Multi-Layer Scaling (N=1 Single-Layer + N=4 Multi-Layer)
+    # STEP 6: Pure Dynamic ATR Engine Scaling (N=1 Single-Layer + N=4 Multi-Layer)
     # -----------------------------------------------------------------------
-    print("\n[STEP 6] Testing Dynamic Runner Scaling (N=1 -> L1 & N=4 -> L4) + Anti-Choke Guard...")
-    # [6a] Single-layer (N=1): only L1 filled -> L1 dynamically becomes deepest runner & scales TP1->TP4
-    sig_single = {
-        "symbol": config.DEFAULT_SYMBOL,
-        "direction": "BUY",
-        "recorded_entry_price": 3890.0,
-        "layers": {
-            "L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9501, "order_type": "MARKET", "status": "OPEN"},
-            "L2": {"lot": 0.01, "target_price": 3888.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9502, "order_type": "LIMIT", "status": "PENDING"},
-        },
-        "market_tickets": [9501],
-        "pending_tickets": [9502],
-        "final_tp": 3899.5,
-        "raw_tp1": 3900.0,
-        "raw_tp2": 3910.0,
-        "raw_tp3": 3920.0,
-        "raw_tp4": 3930.0,
-        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
-    }
-    main.executor.prepare_deepest_runners_for_tp_breakout(sig_single, live_price=3899.30)
-    assert sig_single["layers"]["L1"]["tp"] == 3910.0
-    with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-        rt_1 = main.executor.handle_tp1_scaling_and_select_runner(sig_single)
-    assert rt_1 == 9501 and sig_single["runner_layers"] == ["L1"] and sig_single["last_banked_tickets"] == []
-    for px in (3910.60, 3920.60):
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-            assert main.executor.manage_designated_runner(sig_single) is True
-    if config.RUNNER_MAX_TP_STAGE >= 5:
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.60, 3930.80)):
-            assert main.executor.manage_designated_runner(sig_single) is True
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(3940.10, 3940.30)):
-            assert main.executor.manage_designated_runner(sig_single) is False
-        assert sig_single["tp5_reached"] is True and sig_single["status"] == "CLOSED"
-        print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP5!")
-    else:
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
-            assert main.executor.manage_designated_runner(sig_single) is False
-        assert sig_single["tp4_reached"] is True and sig_single["status"] == "CLOSED"
-        print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP3->TP4!")
+    print("\n[STEP 6] Testing Pure Dynamic ATR Engine (N=1 -> L1 & N=4 -> L4) + Broker SL/TP Trails...")
+    main.executor._dry_run_atr = 2.0  # M5 ATR = $2.00 -> trail_dist = 1.5*2.0 = $3.00, TP lift <= $1.00
+    try:
+        # [6a] Single-layer (N=1): only L1 filled -> L1 dynamically becomes solo runner & lifts TP1->TP5
+        sig_single = {
+            "symbol": config.DEFAULT_SYMBOL,
+            "direction": "BUY",
+            "recorded_entry_price": 3890.0,
+            "layers": {
+                "L1": {"lot": 0.01, "target_price": 3890.0, "entry_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9501, "order_type": "MARKET", "status": "OPEN"},
+                "L2": {"lot": 0.01, "target_price": 3888.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 9502, "order_type": "LIMIT", "status": "PENDING"},
+            },
+            "market_tickets": [9501],
+            "pending_tickets": [9502],
+            "final_tp": 3899.5,
+            "raw_tp1": 3900.0,
+            "raw_tp2": 3910.0,
+            "raw_tp3": 3920.0,
+            "raw_tp4": 3930.0,
+            "tp_levels": {"TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0},
+        }
+        main.executor.prepare_deepest_runners_for_tp_breakout(sig_single, live_price=3899.30)
+        assert sig_single["layers"]["L1"]["tp"] == 3910.0
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+            rt_1 = main.executor.handle_tp1_scaling_and_select_runner(sig_single)
+        assert rt_1 == 9501 and sig_single["runner_layers"] == ["L1"] and sig_single["last_banked_tickets"] == []
+        for px in (3910.60, 3920.60, 3930.60):
+            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                assert main.executor.manage_designated_runner(sig_single) is True
+        if config.RUNNER_MAX_TP_STAGE >= 5:
+            assert sig_single["layers"]["L1"]["tp"] == 3940.0 and sig_single["tp_stage"] == "TP5"
+            assert sig_single["fsm_floor"] == 3920.0 and sig_single["broker_sl"] == 3927.60
+            print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1), lifted TP2->TP5 & trailed SL=3927.60!")
+        else:
+            assert sig_single["layers"]["L1"]["tp"] == 3930.0 and sig_single["tp_stage"] == "TP4"
+            print("  [6a] Single-Layer (N=1): L1 dynamically promoted (0 closed at TP1) and scaled TP2->TP4!")
 
-    # [6b] Full 4-layer trade: L1..L3 bank at TP1, L4 runner scales TP2->TP3 with Anti-Choke noise immunity
-    all_tickets = []
-    for k in ("L1", "L2", "L3", "L4"):
-        layers[k]["status"] = "OPEN"
-        layers[k]["order_type"] = "MARKET"
-        all_tickets.append(layers[k]["ticket"])
-    sig3["market_tickets"] = list(all_tickets)
-    sig3["pending_tickets"] = []
-    main.state_mgr.update_signal(
-        20003,
-        {"layers": layers, "market_tickets": list(all_tickets), "pending_tickets": []},
-        chat_id=evt3.chat_id,
-    )
-    for t_id in all_tickets:
-        main.executor._dry_run_pending_ticket_lots.pop(t_id, None)
-        if isinstance(getattr(main.executor, "_dry_run_pending_orders", None), dict):
-            main.executor._dry_run_pending_orders.pop(t_id, None)
+        # [6b] Full 4-layer trade: L1..L2 bank at TP1, L3 STAGE2_BANKER -> TP2, L4 CORE_RUNNER trails SL/TP
+        all_tickets = []
+        for k in ("L1", "L2", "L3", "L4"):
+            layers[k]["status"] = "OPEN"
+            layers[k]["order_type"] = "MARKET"
+            layers[k]["entry_price"] = layers[k]["target_price"]
+            all_tickets.append(layers[k]["ticket"])
+        sig3["market_tickets"] = list(all_tickets)
+        sig3["pending_tickets"] = []
+        main.state_mgr.update_signal(
+            20003,
+            {"layers": layers, "market_tickets": list(all_tickets), "pending_tickets": []},
+            chat_id=evt3.chat_id,
+        )
+        for t_id in all_tickets:
+            main.executor._dry_run_pending_ticket_lots.pop(t_id, None)
+            if isinstance(getattr(main.executor, "_dry_run_pending_orders", None), dict):
+                main.executor._dry_run_pending_orders.pop(t_id, None)
 
-    with patch.object(main.executor, "get_tick", return_value=_make_tick(3898.20, 3898.40)):
-        runner_t = main.executor.handle_tp1_scaling_and_select_runner(sig3)
-    assert runner_t == layers["L4"]["ticket"]
-    assert sig3["status"] == "RUNNER_ACTIVE"
-    assert sig3["runner_layer"] == "L4"
-    # v3.6 Tiered Stage Banking: L1 & L2 closed at TP1, L3 (STAGE2_BANKER -> TP2) & L4 (CORE_RUNNER) stay open
-    assert all(sig3["layers"][lk]["status"] == "CLOSED" for lk in ("L1", "L2"))
-    assert sig3["layers"]["L3"]["status"] != "CLOSED" and sig3["layers"]["L3"]["tp"] == 3910.0
-    assert sig3["market_tickets"] == [layers["L3"]["ticket"], runner_t]
-    assert sig3["layers"]["L4"]["tp"] == 3910.0
-    print(f"  [6b] TP1 Scaling v3.6 (N=4): L1..L2 banked, L3 STAGE2_BANKER -> TP2=3910.0, L4 #{runner_t} active -> TP2=3910.0.")
+        with patch.object(main.executor, "get_tick", return_value=_make_tick(3898.20, 3898.40)):
+            runner_t = main.executor.handle_tp1_scaling_and_select_runner(sig3)
+        assert runner_t == layers["L4"]["ticket"]
+        assert sig3["status"] == "RUNNER_ACTIVE"
+        assert sig3["runner_layer"] == "L4"
+        # Tiered Stage Banking: L1 & L2 closed at TP1, L3 (STAGE2_BANKER -> TP2) & L4 (CORE_RUNNER) stay open
+        assert all(sig3["layers"][lk]["status"] == "CLOSED" for lk in ("L1", "L2"))
+        assert sig3["layers"]["L3"]["status"] != "CLOSED" and sig3["layers"]["L3"]["tp"] == 3910.0
+        assert sig3["market_tickets"] == [layers["L3"]["ticket"], runner_t]
+        assert sig3["layers"]["L4"]["tp"] == 3910.0
+        print(f"  [6b] TP1 Scaling (N=4): L1..L2 banked, L3 STAGE2_BANKER -> TP2=3910.0, L4 #{runner_t} active -> TP2=3910.0.")
 
-    # Clean breakthrough past TP1 -> TP2, then 6-pip micro-noise near TP2 must NOT choke L4!
-    for px in (3900.60, 3909.30, 3908.70, 3910.60):
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-            assert main.executor.manage_designated_runner(sig3) is True
-    assert sig3["layers"]["L3"]["status"] == "CLOSED"
-    assert sig3["market_tickets"] == [runner_t]
-    assert "TP2" in sig3["runner_cleared_milestones"]
-    assert sig3["runner_milestone_name"] == "TP3"
-    assert sig3["layers"]["L4"]["tp"] == 3920.0
-    print(f"  [6c] L3 STAGE2_BANKER banked at TP2, ignored 6p micro-noise & stepped to {sig3['runner_milestone_name']}, floor={sig3['runner_sl_floor']}.")
+        # Clean breakthrough past TP1 -> TP2, then 6-pip micro-noise near TP2 must NOT choke L4!
+        for px in (3900.60, 3909.30, 3908.70, 3910.60):
+            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                assert main.executor.manage_designated_runner(sig3) is True
+        assert "TP2" in sig3["runner_cleared_milestones"]
+        assert sig3["runner_milestone_name"] == "TP3"
+        assert sig3["layers"]["L4"]["tp"] == 3920.0
+        assert sig3["broker_sl"] >= 3907.60
+        print(f"  [6c] Pure Dynamic ATR Engine ignored 6p micro-noise, stepped L4 -> {sig3['runner_milestone_name']}, broker_sl={sig3['broker_sl']}.")
 
-    # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD, then drop below trail stop (3915.20) Banks It!
-    for px in (3919.20, 3919.80, 3918.50):
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-            assert main.executor.manage_designated_runner(sig3) is True
-    with patch.object(main.executor, "get_tick", return_value=_make_tick(3915.20, 3915.40)):
-        still_running = main.executor.manage_designated_runner(sig3)
-    assert still_running is False
-    assert sig3["layers"]["L4"]["status"] == "CLOSED"
-    assert sig3["market_tickets"] == [] and sig3["status"] == "CLOSED"
-    assert any(k in (sig3.get("runner_close_reason") or "") for k in ("TP1 Trailing Stop", "Gold Reversal Guard", "Progressive Profit Ratchet SL", "Near-Target Squeeze", "Staged"))
-    print(f"  [6d] Confirmed TP1 Trailing Stop near TP3 (held $1.30 wick, banked on trail stop): {sig3['runner_close_reason']}.")
+        # Simulate L3 STAGE2_BANKER auto-banked at broker TP2 (3910.0) on MT5
+        sig3["layers"]["L3"]["status"] = "CLOSED"
+        sig3["layers"]["L3"]["exit_reason_code"] = "STAGE2_BANK_TP"
+        sig3["market_tickets"] = [runner_t]
+
+        # Approach TP3 (3920.0): $1.30 normal Gold wick (3919.80 -> 3918.50) MUST HOLD with zero virtual close
+        for px in (3919.20, 3919.80, 3918.50):
+            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                assert main.executor.manage_designated_runner(sig3) is True
+        assert sig3["layers"]["L4"]["dynamic_atr_trail_sl"] == 3916.80
+        assert sig3["broker_sl"] == 3916.80
+        # Broker SL hit on MT5 at 3916.80 -> classified as DYNAMIC_ATR_TRAIL_SL!
+        ex_code_l4 = main._classify_deal_exit_code(
+            sig3, runner_t, sig3["layers"]["L4"], {"reason": "SL", "exit_price": sig3["broker_sl"]}
+        )
+        assert ex_code_l4 == "DYNAMIC_ATR_TRAIL_SL"
+        sig3["layers"]["L4"]["status"] = "CLOSED"
+        sig3["layers"]["L4"]["exit_reason_code"] = ex_code_l4
+        sig3["market_tickets"] = []
+        sig3["runner_tickets"] = []
+        sig3["runner_ticket"] = None
+        sig3["status"] = "CLOSED"
+        sig3["exit_reason_code"] = ex_code_l4
+        sig3["exit_price"] = 3916.80
+        sig3["runner_close_reason"] = f"Dynamic ATR Trail SL Hit ({sig3['broker_sl']})"
+        print(f"  [6d] Confirmed Dynamic ATR Trail SL near TP3 (held $1.30 wick, trailed SL={sig3['broker_sl']}): {sig3['runner_close_reason']} [{ex_code_l4}].")
+    finally:
+        main.executor._dry_run_atr = None
 
     main.state_mgr.update_signal(20003, sig3, chat_id=evt3.chat_id)
     ledger_rec = main.trade_ledger.record_closed_signal(
@@ -373,35 +393,36 @@ async def run_simulation() -> None:
     assert sig_p["raw_tp1"] == 3900.0 and sig_p["raw_tp2"] == 3914.0 and sig_p["raw_tp3"] == 3926.0
     print(f"  [8b] Adjusted SL -> {sig_p['sl']}, TP2 -> {sig_p['raw_tp2']}, TP3 -> {sig_p['raw_tp3']} (TP1 preserved at {sig_p['raw_tp1']}).")
 
-    # [8c] Trail & Step TP1 -> TP2 -> TP3 via prompts ("TP1 hit", "trail tp2", "/sl 3912", "/tp3 3928")
+    # [8c] Trail & Step TP1 -> TP2 -> TP3 via prompts ("TP1 hit", "trail tp2", "/sl 3912" [blocked], "/sl 3913", "/tp3 3928")
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.20, 3900.40)):
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20013, text="TP1 hit", chat_id="me"))
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["status"] == "RUNNER_ACTIVE" and sig_p["tp_stage"] == "TP2"
-    assert sig_p["fsm_floor"] == round(3895.0 + config.BE_OFFSET_PIPS * 0.10, 2)
-    assert sig_p["trail_stop"] >= sig_p["fsm_floor"]
-    assert sig_p["runner_sl_floor"] == sig_p["trail_stop"]
+    assert sig_p["broker_sl"] == round(3895.0 + config.DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS, 2)
+    assert sig_p["runner_sl_floor"] == sig_p["broker_sl"]
 
     with patch.object(main.executor, "get_tick", return_value=_make_tick(3914.40, 3914.60)):
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20014, text="trail tp2", chat_id="me"))
         sig_mid_trail = main.state_mgr.get_signal(20010, chat_id="me")
-        assert sig_mid_trail["fsm_floor"] == 3900.0
-        assert sig_mid_trail["trail_stop"] == 3910.65
+        assert sig_mid_trail["tp_stage"] == "TP3"
+        assert sig_mid_trail["runner_sl_floor"] == 3912.50
+        assert sig_mid_trail["broker_sl"] == 3912.50
         await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20015, text="/sl 3912", chat_id="me"))
-        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20016, text="/tp3 3928", chat_id="me"))
+        assert main.state_mgr.get_signal(20010, chat_id="me")["broker_sl"] == 3912.50  # Forward-only SL protected!
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20016, text="/sl 3913", chat_id="me"))
+        await main.handle_saved_messages_command(MockTelethonEvent(msg_id=20017, text="/tp3 3928", chat_id="me"))
     sig_p = main.state_mgr.get_signal(20010, chat_id="me")
     assert sig_p["tp_stage"] == "TP3"
-    assert sig_p["sl"] == 3912.0
-    assert sig_p["fsm_floor"] == 3900.0
-    assert sig_p["trail_stop"] == 3912.0
-    assert sig_p["runner_sl_floor"] == 3912.0
-    assert sig_p["broker_sl"] == 3912.0
+    assert sig_p["sl"] == 3913.0
+    assert sig_p["trail_stop"] == 3913.0
+    assert sig_p["runner_sl_floor"] == 3913.0
+    assert sig_p["broker_sl"] == 3913.0
     assert sig_p["raw_tp3"] == 3928.0
     assert sig_p["layers"]["L1"]["tp"] == 3928.0
     print(
         f"  [8c] Stepped TP1 -> TP2 -> TP3: stage={sig_p['tp_stage']}, SL={sig_p['sl']}, "
-        f"fsm_floor={sig_p['fsm_floor']}, trail_stop={sig_p['trail_stop']}, "
-        f"runner_sl_floor={sig_p['runner_sl_floor']}, broker TP={sig_p['layers']['L1']['tp']}!"
+        f"trail_stop={sig_p['trail_stop']}, runner_sl_floor={sig_p['runner_sl_floor']}, "
+        f"broker TP={sig_p['layers']['L1']['tp']}!"
     )
 
     # -----------------------------------------------------------------------
@@ -436,7 +457,6 @@ async def run_simulation() -> None:
         tp_levels={"TP1": 3863.25, "TP2": 3873.25, "TP3": 3883.25, "TP4": 3893.25, "TP5": 3903.25},
         final_tp=3862.75,
         fallback_tp_applied=True,
-        shortfall_armed=True,
         peak_price=3862.50,
         initial_price=3858.56,
         recorded_entry_price=3858.56,
@@ -457,7 +477,7 @@ async def run_simulation() -> None:
     assert set(sig_late["layers"].keys()) == {"L1", "L2", "L3", "L4"}
     assert len(sig_late["market_tickets"]) + len(sig_late["pending_tickets"]) == 4
     assert sig_late["sl"] == 3830.0 and sig_late["raw_tp1"] == 3864.0 and sig_late["final_tp"] == 3863.50
-    assert sig_late["fallback_tp_applied"] is False and sig_late["shortfall_armed"] is False
+    assert sig_late["fallback_tp_applied"] is False
     print(
         f"  [OK] Late 4m edit expanded 1 -> 4 layers ({[sig_late['layers'][f'L{i}']['lot'] for i in range(1, 5)]}), "
         f"replaced synthetic TP1 -> {sig_late['raw_tp1']}, and set SL -> {sig_late['sl']}!"

@@ -233,22 +233,8 @@ TP5_STEP_PIPS: float = _env_float(
     "TP5_STEP_PIPS", DEFAULT_TP_STEP_PIPS, min_val=1.0, max_val=2000.0, positive_only=True
 )
 
-# Dynamic Multi-Layer Active Runner Scaling & Gold Calibrated Peak-Profit Giveback Guard ("Bank It")
-GOLD_REVERSAL_GUARD_ENABLED: bool = _env_bool("GOLD_REVERSAL_GUARD_ENABLED", False)
-ARM_THRESHOLD_PCT: float = _env_float("ARM_THRESHOLD_PCT", 0.90, min_val=0.10, max_val=0.99)
-GIVEBACK_PCT: float = _env_float("GIVEBACK_PCT", 0.30, min_val=0.05, max_val=0.95)
-MIN_GOLD_PULLBACK_DOLLARS: float = _env_float(
-    "MIN_GOLD_PULLBACK_DOLLARS", 1.50, min_val=0.10, max_val=50.0, positive_only=True
-)
-REVERSAL_CONFIRM_TICKS: int = _env_int("REVERSAL_CONFIRM_TICKS", 2, min_val=1, max_val=10)
-STAGE0_PROFIT_LOCK_ENABLED: bool = _env_bool("STAGE0_PROFIT_LOCK_ENABLED", True)
-STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS: float = _env_float(
-    "STAGE0_MIN_PROFIT_TO_LOCK_DOLLARS", 1.20, min_val=0.20, max_val=50.0, positive_only=True
-)
-CANCEL_PENDING_ON_STAGE0_LOCK_EXIT: bool = _env_bool("CANCEL_PENDING_ON_STAGE0_LOCK_EXIT", True)
-ATR_NOISE_FLOOR_MULT: float = _env_float("ATR_NOISE_FLOOR_MULT", 0.35, min_val=0.0, max_val=5.0)
+# Active Runner Defaults, Spread Guards & Breakeven Policy (Pure Dynamic ATR Engine)
 M1_ATR_PERIOD: int = _env_int("M1_ATR_PERIOD", 14, min_val=2, max_val=200)
-MAX_GIVEBACK_DOLLARS: float = _env_float("MAX_GIVEBACK_DOLLARS", 4.50, min_val=0.0, max_val=200.0)
 MAX_ALLOWED_SPREAD_DOLLARS: float = _env_float(
     "MAX_ALLOWED_SPREAD_DOLLARS", 0.45, min_val=0.05, max_val=20.0, positive_only=True
 )
@@ -258,35 +244,9 @@ ADAPTIVE_SPREAD_CEILING_DOLLARS: float = _env_float(
 ADAPTIVE_SPREAD_MULTIPLIER: float = _env_float(
     "ADAPTIVE_SPREAD_MULTIPLIER", 1.50, min_val=1.0, max_val=5.0, positive_only=True
 )
-RUNNER_EARLY_TP_LIFT_PCT: float = _env_float("RUNNER_EARLY_TP_LIFT_PCT", 0.70, min_val=0.10, max_val=0.99)
-RUNNER_CONTINUOUS_TRAIL_ENABLED: bool = _env_bool("RUNNER_CONTINUOUS_TRAIL_ENABLED", False)
 
 RUNNER_DEEPEST_COUNT_FULL: int = _env_int("RUNNER_DEEPEST_COUNT_FULL", 1, min_val=1, max_val=2)
 RUNNER_MAX_TP_STAGE: int = _env_int("RUNNER_MAX_TP_STAGE", 5, min_val=1, max_val=5)
-RUNNER_PROACTIVE_TP_LIFT: bool = _env_bool("RUNNER_PROACTIVE_TP_LIFT", True)
-RUNNER_PROXIMITY_MODE: str = _env_choice("RUNNER_PROXIMITY_MODE", "PIPS", ("PIPS", "PCT", "BOTH"))
-RUNNER_PROXIMITY_BUFFER_PIPS: float = _env_float(
-    "RUNNER_PROXIMITY_BUFFER_PIPS", 10.0, min_val=0.0, max_val=500.0
-)
-RUNNER_PROXIMITY_BUFFER_PCT: float = _env_float(
-    "RUNNER_PROXIMITY_BUFFER_PCT", 0.05, min_val=0.0, max_val=10.0
-)
-RUNNER_MAX_MIDRANGE_RATIO: float = _env_float(
-    "RUNNER_MAX_MIDRANGE_RATIO", 0.35, min_val=0.05, max_val=0.95
-)
-RUNNER_REVERSAL_PULLBACK_PIPS: float = _env_float(
-    "RUNNER_REVERSAL_PULLBACK_PIPS", 12.0, min_val=0.0, max_val=500.0
-)
-RUNNER_REVERSAL_PULLBACK_PCT: float = _env_float(
-    "RUNNER_REVERSAL_PULLBACK_PCT", 0.02, min_val=0.0, max_val=10.0
-)
-RUNNER_REVERSAL_CONFIRM_TICKS: int = _env_int(
-    "RUNNER_REVERSAL_CONFIRM_TICKS", 2, min_val=1, max_val=10
-)
-RUNNER_REVERSAL_CANDLE_CONFIRM: bool = _env_bool("RUNNER_REVERSAL_CANDLE_CONFIRM", False)
-RUNNER_CLEAN_BREAK_PIPS: float = _env_float(
-    "RUNNER_CLEAN_BREAK_PIPS", 5.0, min_val=0.0, max_val=200.0
-)
 
 # TP1 Scaling, Breakeven & Pending Order Policy
 BANK_ALL_AT_TP1: bool = _env_bool("BANK_ALL_AT_TP1", False)
@@ -300,20 +260,14 @@ BE_LAYERS: List[str] = [
     if str(item).strip()
 ] or list(_default_be_layers)
 BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 5.0, min_val=0.0, max_val=50.0)
-STAGE0_PROFIT_LOCK_OFFSET_PIPS: float = _env_float(
-    "STAGE0_PROFIT_LOCK_OFFSET_PIPS", BE_OFFSET_PIPS, min_val=0.0, max_val=100.0
-)
 
-# Legacy runner / pre-TP1 shortfall thresholds (calibrated v3.1 anti-choke defaults)
+# Manual /trail, /be, entry proximity & deprecated shortfall compatibility constants
 TP1_LOCK_BUFFER: float = _env_float("TP1_LOCK_BUFFER", 0.50, min_val=0.0, max_val=50.0)
 TRAIL_DISTANCE_PIPS: float = _env_float("TRAIL_DISTANCE_PIPS", 15.0, min_val=0.0, max_val=500.0)
 TRAIL_STEP_PIPS: float = _env_float("TRAIL_STEP_PIPS", 5.0, min_val=0.0, max_val=200.0)
 TP2_SHORTFALL_ARM_PIPS: float = _env_float("TP2_SHORTFALL_ARM_PIPS", 20.0, min_val=0.0, max_val=500.0)
 TP2_SHORTFALL_PULLBACK_PIPS: float = _env_float("TP2_SHORTFALL_PULLBACK_PIPS", 8.0, min_val=0.0, max_val=200.0)
 NO_TP2_SURGE_ARM_PIPS: float = _env_float("NO_TP2_SURGE_ARM_PIPS", 40.0, min_val=0.0, max_val=500.0)
-SHORTFALL_ARM_PIPS: float = _env_float("SHORTFALL_ARM_PIPS", 8.0, min_val=0.0, max_val=500.0)
-SHORTFALL_PULLBACK_PIPS: float = _env_float("SHORTFALL_PULLBACK_PIPS", 20.0, min_val=0.0, max_val=200.0)
-SHORTFALL_CONFIRM_TICKS: int = _env_int("SHORTFALL_CONFIRM_TICKS", 3, min_val=1, max_val=10)
 TP1_CLOSE_PROXIMITY_PIPS: int = _env_int("TP1_CLOSE_PROXIMITY_PIPS", 20, min_val=0, max_val=500)
 
 # Stop-Loss, Entry Protection & Risk Caps
@@ -463,139 +417,8 @@ LOCK_FILE_PATH: Path = Path(os.getenv("LOCK_FILE_PATH") or str(BASE_DIR / "copie
 
 
 # ===========================================================================
-# v3.4.1 TP1-TOUCH BANK SYSTEM & HARD GIVEBACK CEILING
+# BROKER COMPLIANCE, SPREAD GUARDS & ACCOUNTING HYGIENE
 # ===========================================================================
-TP1_TOUCH_BANK_ENABLED: bool = _env_bool("TP1_TOUCH_BANK_ENABLED", True)
-TP1_TOUCH_BANK_BUFFER_PIPS: float = _env_float(
-    "TP1_TOUCH_BANK_BUFFER_PIPS", 12.0, min_val=1.0, max_val=100.0
-)
-HARD_GIVEBACK_CEILING_DOLLARS: float = _env_float(
-    "HARD_GIVEBACK_CEILING_DOLLARS", 3.50, min_val=0.50, max_val=50.0
-)
-
-
-# ===========================================================================
-# v3.5.0 STAGED GOLD RUNNER EXIT ARCHITECTURE (reuses v3.4.2 Stage 1 keys)
-# ===========================================================================
-STAGED_EXIT_ENABLED: bool = _env_bool("STAGED_EXIT_ENABLED", True)
-
-# Stage 1 (TP1 cleared) — reuses v3.4.2 keys for .env compatibility
-TP1_TRAIL_ENABLED: bool = _env_bool("TP1_TRAIL_ENABLED", True)
-TP1_TRAIL_ATR_MULT: float = _env_float("TP1_TRAIL_ATR_MULT", 1.55, min_val=0.1, max_val=20.0)
-TP1_TRAIL_MIN_DOLLARS: float = _env_float("TP1_TRAIL_MIN_DOLLARS", 2.50, min_val=0.10, max_val=100.0)
-TP1_TRAIL_MAX_DOLLARS: float = _env_float("TP1_TRAIL_MAX_DOLLARS", 3.50, min_val=0.10, max_val=100.0)
-TP1_TRAIL_STEP_DOLLARS: float = _env_float("TP1_TRAIL_STEP_DOLLARS", 0.25, min_val=0.01, max_val=20.0)
-STAGE1_ATR_ACTIVATION_PCT: float = _env_float(
-    "STAGE1_ATR_ACTIVATION_PCT", 0.50, min_val=0.0, max_val=1.0
-)
-
-# Stage 2 (TP2 cleared)
-TRAIL_TP2_ATR_MULT: float = _env_float("TRAIL_TP2_ATR_MULT", 2.0, min_val=0.1, max_val=20.0)
-TRAIL_TP2_MIN: float = _env_float("TRAIL_TP2_MIN", 3.00, min_val=0.10, max_val=100.0)
-TRAIL_TP2_MAX: float = _env_float("TRAIL_TP2_MAX", 4.50, min_val=0.10, max_val=100.0)
-
-# Stage 3 (TP3 cleared)
-TRAIL_TP3_ATR_MULT: float = _env_float("TRAIL_TP3_ATR_MULT", 2.5, min_val=0.1, max_val=20.0)
-TRAIL_TP3_MIN: float = _env_float("TRAIL_TP3_MIN", 4.00, min_val=0.10, max_val=100.0)
-TRAIL_TP3_MAX: float = _env_float("TRAIL_TP3_MAX", 6.00, min_val=0.10, max_val=100.0)
-
-# Stage 4 (TP4 cleared — active between TP4 and TP5; RUNNER_MAX_TP_STAGE defaults to 5)
-TRAIL_TP4_ATR_MULT: float = _env_float("TRAIL_TP4_ATR_MULT", 3.0, min_val=0.1, max_val=20.0)
-TRAIL_TP4_MIN: float = _env_float("TRAIL_TP4_MIN", 5.00, min_val=0.10, max_val=100.0)
-TRAIL_TP4_MAX: float = _env_float("TRAIL_TP4_MAX", 8.00, min_val=0.10, max_val=100.0)
-
-_STAGED_TRAIL_TIER_KEYS: Dict[int, Tuple[str, str, str]] = {
-    1: ("TP1_TRAIL_ATR_MULT", "TP1_TRAIL_MIN_DOLLARS", "TP1_TRAIL_MAX_DOLLARS"),
-    2: ("TRAIL_TP2_ATR_MULT", "TRAIL_TP2_MIN", "TRAIL_TP2_MAX"),
-    3: ("TRAIL_TP3_ATR_MULT", "TRAIL_TP3_MIN", "TRAIL_TP3_MAX"),
-    4: ("TRAIL_TP4_ATR_MULT", "TRAIL_TP4_MIN", "TRAIL_TP4_MAX"),
-}
-
-
-def validate_staged_trail_tiers(
-    tiers: Optional[Dict[int, Tuple[float, float, float]]] = None,
-    *,
-    update_globals: Optional[bool] = None,
-    emit_warnings: bool = True,
-) -> Dict[int, Tuple[float, float, float]]:
-    """
-    Validate and normalize the 4 staged ATR trail tiers (Stage 1 -> 2 -> 3 -> 4).
-
-    - When `tiers` is None, reads current module globals dynamically (respecting runtime
-      `monkeypatch.setattr(config, ...)`). If any tier has `min > max`, swaps them,
-      emits `_cfg_logger.warning(...)`, and updates the module globals (when
-      `update_globals` is True; defaults to True when `tiers is None`, False otherwise).
-    - When `tiers` is passed explicitly, validates/normalizes the passed dict without
-      mutating module globals (unless `update_globals=True` is explicitly passed).
-    - If tiers do not widen monotonically across consecutive stages (`atr_mult`, `min`,
-      `max` non-decreasing from Stage 1 -> 2 -> 3 -> 4), emits `_cfg_logger.warning(...)`
-      without crashing or altering the values.
-    - Returns normalized dict `{1: (mult, min_d, max_d), 2: ..., 3: ..., 4: ...}`.
-    """
-    g = globals()
-    if tiers is None:
-        raw_tiers: Dict[int, Tuple[float, float, float]] = {
-            stage: (float(g[mult_k]), float(g[min_k]), float(g[max_k]))
-            for stage, (mult_k, min_k, max_k) in _STAGED_TRAIL_TIER_KEYS.items()
-        }
-    else:
-        raw_tiers = {
-            int(stage): (float(vals[0]), float(vals[1]), float(vals[2]))
-            for stage, vals in tiers.items()
-        }
-
-    do_update = (tiers is None) if update_globals is None else bool(update_globals)
-    normalized: Dict[int, Tuple[float, float, float]] = {}
-
-    for stage in sorted(raw_tiers.keys()):
-        mult_f, min_f, max_f = raw_tiers[stage]
-        if min_f > max_f:
-            orig_min, orig_max = min_f, max_f
-            min_f, max_f = max_f, min_f
-            if emit_warnings:
-                _cfg_logger.warning(
-                    f"Staged trail Stage {stage} has min ({orig_min:.2f}) > max ({orig_max:.2f}); "
-                    f"swapped to min={min_f:.2f}, max={max_f:.2f}."
-                )
-            if do_update and stage in _STAGED_TRAIL_TIER_KEYS:
-                _, min_k, max_k = _STAGED_TRAIL_TIER_KEYS[stage]
-                g[min_k] = min_f
-                g[max_k] = max_f
-        normalized[stage] = (mult_f, min_f, max_f)
-
-    ordered_stages = sorted(normalized.keys())
-    for prev_s, cur_s in zip(ordered_stages, ordered_stages[1:]):
-        prev_mult, prev_min, prev_max = normalized[prev_s]
-        cur_mult, cur_min, cur_max = normalized[cur_s]
-        narrowed: List[str] = []
-        if cur_mult < prev_mult - 1e-9:
-            narrowed.append(f"atr_mult ({prev_mult:.2f} -> {cur_mult:.2f})")
-        if cur_min < prev_min - 1e-9:
-            narrowed.append(f"min (${prev_min:.2f} -> ${cur_min:.2f})")
-        if cur_max < prev_max - 1e-9:
-            narrowed.append(f"max (${prev_max:.2f} -> ${cur_max:.2f})")
-        if narrowed and emit_warnings:
-            _cfg_logger.warning(
-                f"Staged trail tiers do not widen from Stage {prev_s} to Stage {cur_s}: "
-                f"{', '.join(narrowed)} (keeping configured values)."
-            )
-
-    if do_update:
-        g["STAGED_TRAIL_TIERS"] = dict(normalized)
-    return normalized
-
-
-STAGED_TRAIL_TIERS: Dict[int, Tuple[float, float, float]] = validate_staged_trail_tiers()
-
-
-# ===========================================================================
-# v3.6.0 PROGRESSIVE PROFIT RATCHET + HIGHER-TP STAGED BANKING
-# ===========================================================================
-PROFIT_RATCHET_ENABLED: bool = _env_bool("PROFIT_RATCHET_ENABLED", True)
-PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED: bool = _env_bool("PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED", False)
-RATCHET_BROKER_STEP_DOLLARS: float = _env_float(
-    "RATCHET_BROKER_STEP_DOLLARS", 0.25, min_val=0.05, max_val=10.0, positive_only=True
-)
 STOP_LEVEL_SAFETY_BUFFER_DOLLARS: float = _env_float(
     "STOP_LEVEL_SAFETY_BUFFER_DOLLARS", 0.05, min_val=0.0, max_val=5.0
 )
@@ -605,139 +428,17 @@ HARD_MAX_SPREAD_DOLLARS: float = _env_float(
 MIN_VALID_SPREAD_DOLLARS: float = _env_float(
     "MIN_VALID_SPREAD_DOLLARS", 0.05, min_val=0.0, max_val=5.0
 )
-
-# Ratchet Tiers (Stage 0 -> Stage 5 + Near-Target Squeeze)
-RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS: float = _env_float(
-    "RATCHET_TIGHT_TP1_MAX_LEG_DOLLARS", 3.50, min_val=0.50, max_val=20.0, positive_only=True
-)
-RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIGHT_TP1_MIN_MFE_DOLLARS", 2.00, min_val=0.50, max_val=20.0, positive_only=True
-)
-RATCHET_TIGHT_TP1_LOCK_PCT: float = _env_float(
-    "RATCHET_TIGHT_TP1_LOCK_PCT", 0.40, min_val=0.10, max_val=0.90
-)
-RATCHET_LIFT_MIN_MFE_DOLLARS: float = _env_float(
-    "RATCHET_LIFT_MIN_MFE_DOLLARS", 1.50, min_val=0.20, max_val=20.0, positive_only=True
-)
-RATCHET_TIER1A_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER1A_MFE_DOLLARS", 3.50, min_val=0.50, max_val=20.0, positive_only=True
-)
-RATCHET_TIER1A_LOCK_DOLLARS: float = _env_float(
-    "RATCHET_TIER1A_LOCK_DOLLARS", 0.50, min_val=0.10, max_val=10.0, positive_only=True
-)
-RATCHET_TIER1B_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER1B_MFE_DOLLARS", 4.25, min_val=0.50, max_val=20.0, positive_only=True
-)
-RATCHET_TIER1B_LOCK_DOLLARS: float = _env_float(
-    "RATCHET_TIER1B_LOCK_DOLLARS", 0.75, min_val=0.10, max_val=10.0, positive_only=True
-)
-RATCHET_TIER2_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER2_MFE_DOLLARS", 5.00, min_val=1.00, max_val=30.0, positive_only=True
-)
-RATCHET_TIER2_RETENTION_PCT: float = _env_float(
-    "RATCHET_TIER2_RETENTION_PCT", 0.30, min_val=0.10, max_val=0.90
-)
-RATCHET_TIER2_MIN_LOCK_DOLLARS: float = _env_float(
-    "RATCHET_TIER2_MIN_LOCK_DOLLARS", 1.50, min_val=0.20, max_val=20.0, positive_only=True
-)
-RATCHET_TIER2_MIN_CUSHION: float = _env_float(
-    "RATCHET_TIER2_MIN_CUSHION", 3.50, min_val=0.50, max_val=20.0, positive_only=True
-)
-RATCHET_TIER2_MAX_CUSHION: float = _env_float(
-    "RATCHET_TIER2_MAX_CUSHION", 4.00, min_val=0.50, max_val=25.0, positive_only=True
-)
-RATCHET_TIER3_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER3_MFE_DOLLARS", 8.00, min_val=1.00, max_val=50.0, positive_only=True
-)
-RATCHET_TIER3_RETENTION_PCT: float = _env_float(
-    "RATCHET_TIER3_RETENTION_PCT", 0.55, min_val=0.10, max_val=0.95
-)
-RATCHET_TIER3_MIN_CUSHION: float = _env_float(
-    "RATCHET_TIER3_MIN_CUSHION", 3.50, min_val=0.50, max_val=25.0, positive_only=True
-)
-RATCHET_TIER3_MAX_CUSHION: float = _env_float(
-    "RATCHET_TIER3_MAX_CUSHION", 4.25, min_val=0.50, max_val=30.0, positive_only=True
-)
-RATCHET_TIER4_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER4_MFE_DOLLARS", 15.00, min_val=2.00, max_val=100.0, positive_only=True
-)
-RATCHET_TIER4_RETENTION_PCT: float = _env_float(
-    "RATCHET_TIER4_RETENTION_PCT", 0.68, min_val=0.10, max_val=0.95
-)
-RATCHET_TIER4_MIN_CUSHION: float = _env_float(
-    "RATCHET_TIER4_MIN_CUSHION", 3.75, min_val=0.50, max_val=30.0, positive_only=True
-)
-RATCHET_TIER4_MAX_CUSHION: float = _env_float(
-    "RATCHET_TIER4_MAX_CUSHION", 5.00, min_val=0.50, max_val=40.0, positive_only=True
-)
-RATCHET_TIER5_MFE_DOLLARS: float = _env_float(
-    "RATCHET_TIER5_MFE_DOLLARS", 25.00, min_val=5.00, max_val=200.0, positive_only=True
-)
-RATCHET_TIER5_RETENTION_PCT: float = _env_float(
-    "RATCHET_TIER5_RETENTION_PCT", 0.78, min_val=0.10, max_val=0.98
-)
-RATCHET_TIER5_MIN_CUSHION: float = _env_float(
-    "RATCHET_TIER5_MIN_CUSHION", 4.50, min_val=0.50, max_val=40.0, positive_only=True
-)
-RATCHET_TIER5_MAX_CUSHION: float = _env_float(
-    "RATCHET_TIER5_MAX_CUSHION", 6.00, min_val=0.50, max_val=50.0, positive_only=True
-)
-RATCHET_STAGE4_RETENTION_PCT: float = _env_float(
-    "RATCHET_STAGE4_RETENTION_PCT", 0.85, min_val=0.10, max_val=0.98
-)
-RATCHET_STAGE4_MIN_CUSHION: float = _env_float(
-    "RATCHET_STAGE4_MIN_CUSHION", 3.00, min_val=0.50, max_val=30.0, positive_only=True
-)
-RATCHET_STAGE4_MAX_CUSHION: float = _env_float(
-    "RATCHET_STAGE4_MAX_CUSHION", 4.50, min_val=0.50, max_val=40.0, positive_only=True
-)
-PEAK_HARVEST_ARM_PCT: float = _env_float(
-    "PEAK_HARVEST_ARM_PCT", 0.85, min_val=0.50, max_val=0.99
-)
-PEAK_HARVEST_CUSHION_MULT: float = _env_float(
-    "PEAK_HARVEST_CUSHION_MULT", 0.65, min_val=0.20, max_val=1.00
-)
-PEAK_HARVEST_MIN_BROKER_CUSHION: float = _env_float(
-    "PEAK_HARVEST_MIN_BROKER_CUSHION", 2.75, min_val=0.50, max_val=20.0, positive_only=True
-)
-PEAK_HARVEST_MIN_VIRT_CUSHION: float = _env_float(
-    "PEAK_HARVEST_MIN_VIRT_CUSHION", 2.25, min_val=0.50, max_val=20.0, positive_only=True
-)
-PEAK_HARVEST_MAX_CUSHION: float = _env_float(
-    "PEAK_HARVEST_MAX_CUSHION", 3.50, min_val=0.50, max_val=25.0, positive_only=True
-)
-
-# Pre-TP1 BANK_HARVEST, Tiered Waterfall & Pending Order Hygiene
-BANK_HARVEST_ENABLED: bool = _env_bool("BANK_HARVEST_ENABLED", False)
-BANK_HARVEST_ARM_MFE_DOLLARS: float = _env_float(
-    "BANK_HARVEST_ARM_MFE_DOLLARS", 5.00, min_val=1.00, max_val=50.0, positive_only=True
-)
-BANK_HARVEST_ALT_ARM_PCT: float = _env_float(
-    "BANK_HARVEST_ALT_ARM_PCT", 0.80, min_val=0.30, max_val=0.99
-)
-BANK_HARVEST_ALT_MIN_MFE_DOLLARS: float = _env_float(
-    "BANK_HARVEST_ALT_MIN_MFE_DOLLARS", 2.50, min_val=0.50, max_val=20.0, positive_only=True
-)
-BANK_HARVEST_PULLBACK_ATR_MULT: float = _env_float(
-    "BANK_HARVEST_PULLBACK_ATR_MULT", 1.15, min_val=0.20, max_val=5.0, positive_only=True
-)
-BANK_HARVEST_PULLBACK_MIN: float = _env_float(
-    "BANK_HARVEST_PULLBACK_MIN", 1.75, min_val=0.50, max_val=20.0, positive_only=True
-)
-BANK_HARVEST_PULLBACK_MAX: float = _env_float(
-    "BANK_HARVEST_PULLBACK_MAX", 2.50, min_val=0.50, max_val=25.0, positive_only=True
-)
-BANK_HARVEST_BROKER_CUSHION_DOLLARS: float = _env_float(
-    "BANK_HARVEST_BROKER_CUSHION_DOLLARS", 2.50, min_val=0.50, max_val=25.0, positive_only=True
-)
 TIERED_STAGE_BANKING_ENABLED: bool = _env_bool("TIERED_STAGE_BANKING_ENABLED", True)
 CANCEL_PENDING_ON_BE: bool = _env_bool("CANCEL_PENDING_ON_BE", True)
 CANCEL_PENDING_ON_PROFIT_LOCK: bool = _env_bool("CANCEL_PENDING_ON_PROFIT_LOCK", True)
 PENDING_PNL_BACKFILL_MAX_SECONDS: float = _env_float(
     "PENDING_PNL_BACKFILL_MAX_SECONDS", 60.0, min_val=5.0, max_val=600.0, positive_only=True
 )
+STAGE1_ATR_ACTIVATION_PCT: float = _env_float(
+    "STAGE1_ATR_ACTIVATION_PCT", 0.50, min_val=0.0, max_val=1.0
+)
 
-# v3.6.0+ Pending Order Consolidation, Duplicate Guard & TP Sanity (Fix B)
+# Pending Order Consolidation, Duplicate Guard & TP Sanity
 SINGLE_PRICE_CONSOLIDATE_ORDERS: bool = _env_bool("SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
 PENDING_DUPLICATE_PRICE_TOLERANCE: float = _env_float(
     "PENDING_DUPLICATE_PRICE_TOLERANCE", 0.50, min_val=0.0, max_val=20.0
@@ -750,7 +451,7 @@ MAX_TP_DISTANCE_DOLLARS: float = _env_float(
 )
 
 # ===========================================================================
-# DYNAMIC RISK MANAGEMENT (ATR-SCALED SL/TP & OPTIONAL ATR TRAILING STOP)
+# PURE DYNAMIC ATR ENGINE (ATR-SCALED SL/TP, BE LOCK & TRAILING SL/TP)
 # ===========================================================================
 DYNAMIC_ATR_SLTP_ENABLED: bool = _env_bool("DYNAMIC_ATR_SLTP_ENABLED", True)
 DYNAMIC_SLTP_MODE: str = _env_choice(
@@ -779,7 +480,7 @@ DYNAMIC_SL_MAX_DOLLARS: float = _env_float(
     "DYNAMIC_SL_MAX_DOLLARS", 35.00, min_val=0.50, max_val=500.0, positive_only=True
 )
 DYNAMIC_TP_MIN_DOLLARS: float = _env_float(
-    "DYNAMIC_TP_MIN_DOLLARS", 2.00, min_val=0.20, max_val=200.0, positive_only=True
+    "DYNAMIC_TP_MIN_DOLLARS", 2.50, min_val=0.20, max_val=200.0, positive_only=True
 )
 DYNAMIC_TP_MAX_DOLLARS: float = _env_float(
     "DYNAMIC_TP_MAX_DOLLARS", 50.00, min_val=0.50, max_val=500.0, positive_only=True
@@ -791,8 +492,8 @@ DYNAMIC_SLTP_SCALE_MAX: float = _env_float(
     "DYNAMIC_SLTP_SCALE_MAX", 1.75, min_val=0.50, max_val=5.0, positive_only=True
 )
 
-# Optional Dynamic ATR Trailing Stop (OFF by default; toggle live via /atrtrail)
-DYNAMIC_ATR_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TRAIL_ENABLED", False)
+# Primary Dynamic ATR Trailing Stop, BE Lock & Dynamic Trailing TP
+DYNAMIC_ATR_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TRAIL_ENABLED", True)
 DYNAMIC_ATR_TRAIL_TIMEFRAME: str = _env_choice(
     "DYNAMIC_ATR_TRAIL_TIMEFRAME", "M5", ("M1", "M5", "M15", "H1")
 )
@@ -803,7 +504,7 @@ DYNAMIC_ATR_TRAIL_ACTIVATION_MULT: float = _env_float(
     "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, min_val=0.0, max_val=20.0
 )
 DYNAMIC_ATR_TRAIL_MIN_DOLLARS: float = _env_float(
-    "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 1.50, min_val=0.20, max_val=100.0, positive_only=True
+    "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50, min_val=0.20, max_val=100.0, positive_only=True
 )
 DYNAMIC_ATR_TRAIL_MAX_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00, min_val=0.50, max_val=200.0, positive_only=True
@@ -811,20 +512,28 @@ DYNAMIC_ATR_TRAIL_MAX_DOLLARS: float = _env_float(
 DYNAMIC_ATR_TRAIL_STEP_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, min_val=0.05, max_val=20.0, positive_only=True
 )
+DYNAMIC_ATR_BE_ACTIVATION_MULT: float = _env_float(
+    "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75, min_val=0.0, max_val=20.0
+)
+DYNAMIC_ATR_BE_MIN_MFE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50, min_val=0.0, max_val=50.0
+)
+DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50, min_val=0.0, max_val=10.0
+)
+DYNAMIC_ATR_TP_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
+DYNAMIC_ATR_TP_LIFT_ATR_MULT: float = _env_float(
+    "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50, min_val=0.05, max_val=5.0, positive_only=True
+)
+DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT: float = _env_float(
+    "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75, min_val=0.10, max_val=0.99
+)
 
 
-def validate_ratchet_cushion_pairs() -> None:
-    """Ensure all v3.6 min/max cushion, pullback, and dynamic risk pairs satisfy min <= max."""
+def validate_dynamic_risk_pairs() -> None:
+    """Ensure all dynamic risk min/max pairs satisfy min <= max."""
     g = globals()
     pairs = (
-        ("RATCHET_TIER2_MIN_CUSHION", "RATCHET_TIER2_MAX_CUSHION"),
-        ("RATCHET_TIER3_MIN_CUSHION", "RATCHET_TIER3_MAX_CUSHION"),
-        ("RATCHET_TIER4_MIN_CUSHION", "RATCHET_TIER4_MAX_CUSHION"),
-        ("RATCHET_TIER5_MIN_CUSHION", "RATCHET_TIER5_MAX_CUSHION"),
-        ("RATCHET_STAGE4_MIN_CUSHION", "RATCHET_STAGE4_MAX_CUSHION"),
-        ("BANK_HARVEST_PULLBACK_MIN", "BANK_HARVEST_PULLBACK_MAX"),
-        ("PEAK_HARVEST_MIN_BROKER_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
-        ("PEAK_HARVEST_MIN_VIRT_CUSHION", "PEAK_HARVEST_MAX_CUSHION"),
         ("DYNAMIC_SL_MIN_DOLLARS", "DYNAMIC_SL_MAX_DOLLARS"),
         ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
         ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
@@ -837,4 +546,4 @@ def validate_ratchet_cushion_pairs() -> None:
             g[min_k], g[max_k] = mx, mn
 
 
-validate_ratchet_cushion_pairs()
+validate_dynamic_risk_pairs()

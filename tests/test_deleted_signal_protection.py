@@ -236,8 +236,6 @@ async def test_2_runner_active_trade_deleted_mid_run(tmp_path):
             "runner_layer": "L4",
             "runner_layers": ["L4"],
             "runner_current_milestone": "TP3",
-            "runner_proximity_armed": True,
-            "runner_reversal_ticks": 1,
             "banked_profit": 3.75,
             "accounted_tickets": [96001, 96002, 96003],
         },
@@ -255,8 +253,6 @@ async def test_2_runner_active_trade_deleted_mid_run(tmp_path):
     assert sig["runner_tickets"] == []
     assert sig["runner_layer"] is None
     assert sig["runner_layers"] == []
-    assert sig["runner_proximity_armed"] is False
-    assert sig["runner_reversal_ticks"] == 0
     assert sig["market_tickets"] == []
     assert sig["banked_profit"] == pytest.approx(46.00)  # 3.75 banked + 42.25 runner
     assert sig["ledger_recorded"] is True

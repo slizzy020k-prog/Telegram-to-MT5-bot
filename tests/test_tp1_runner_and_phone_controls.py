@@ -190,9 +190,10 @@ def test_tp1_scaling_full_zone_fill_case_c():
 
 
 def test_manage_designated_runner_virtual_tp1_floor():
-    """Test Virtual TP1 Floor: If price drops back to TP1 - 0.50, closes runner immediately at market."""
+    """Test Pure Dynamic ATR Engine: Mid-candle pullback below TP1 triggers ZERO virtual market closes."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
+    executor._dry_run_atr = 2.00
 
     sig_data = {
         "runner_ticket": 303,
@@ -202,43 +203,66 @@ def test_manage_designated_runner_virtual_tp1_floor():
         "soft_tp1_floor": 3899.50,
         "raw_tp1": 3900.0,
         "raw_tp2": 3910.0,
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 303,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3895.0,
+                "sl": 3880.0,
+                "tp": 3910.0,
+            }
+        },
         "market_tickets": [303],
         "status": "RUNNER_ACTIVE",
     }
 
-    # Price drops to 3899.40 (below floor 3899.50)
+    # Price drops to 3899.40 (below pre-v3.6 virtual floor 3899.50)
     mock_tick = MagicMock()
     mock_tick.bid = 3899.40
     mock_tick.ask = 3899.70
 
-    with patch.object(executor, "get_tick", return_value=mock_tick):
+    with patch.object(executor, "get_tick", return_value=mock_tick), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close:
         still_active = executor.manage_designated_runner(sig_data)
 
-    assert still_active is False
-    assert sig_data["status"] == "CLOSED"
-    assert sig_data["runner_ticket"] is None
+    assert still_active is True
+    assert spy_close.call_count == 0
+    assert sig_data["status"] == "RUNNER_ACTIVE"
+    assert sig_data["runner_ticket"] == 303
 
 
 def test_manage_designated_runner_tp2_shortfall_guard():
-    """Test TP2 Shortfall Guard: Surges near TP2 (within $2.00) then drops $0.80 -> instant close."""
+    """Test Pure Dynamic ATR Engine: Pullback near TP2 triggers ZERO virtual market closes."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
+    executor._dry_run_atr = 2.00
 
     sig_data = {
         "runner_ticket": 303,
         "runner_layer": "BOTTOM",
         "symbol": DEFAULT_SYMBOL,
         "direction": "BUY",
-        "soft_tp1_floor": 3899.50,
         "raw_tp1": 3900.0,
         "raw_tp2": 3910.0,
+        "tp_levels": {"TP1": 3900.0, "TP2": 3910.0},
+        "layers": {
+            "BOTTOM": {
+                "ticket": 303,
+                "status": "RUNNER",
+                "role": "CORE_RUNNER",
+                "entry_price": 3895.0,
+                "sl": 3880.0,
+                "tp": 3900.0,
+            }
+        },
         "runner_peak_price": 3900.0,
-        "tp2_shortfall_armed": False,
         "market_tickets": [303],
         "status": "RUNNER_ACTIVE",
     }
 
-    # 1. Price climbs to 3908.50 (within 20 pips of TP2 3910.00) -> Arms guard
+    # 1. Price climbs to 3908.50 (within 0.50*ATR of TP2 3910.00)
     mock_tick_surge = MagicMock()
     mock_tick_surge.bid = 3908.50
     mock_tick_surge.ask = 3908.80
@@ -247,20 +271,21 @@ def test_manage_designated_runner_tp2_shortfall_guard():
         active1 = executor.manage_designated_runner(sig_data)
 
     assert active1 is True
-    assert sig_data["tp2_shortfall_armed"] is True
-    assert sig_data["runner_peak_price"] == 3908.50
+    assert sig_data["status"] == "RUNNER_ACTIVE"
 
-    # 2. Price rolls over to 3907.60 (dropped 0.90 >= 0.80 pullback) -> Triggers instant bank!
+    # 2. Price rolls over to 3907.60 (dropped 0.90) -> Zero virtual close, runner stays active!
     mock_tick_drop = MagicMock()
     mock_tick_drop.bid = 3907.60
     mock_tick_drop.ask = 3907.90
 
-    with patch.object(executor, "get_tick", return_value=mock_tick_drop):
+    with patch.object(executor, "get_tick", return_value=mock_tick_drop), \
+         patch.object(executor, "close_market_position", wraps=executor.close_market_position) as spy_close:
         active2 = executor.manage_designated_runner(sig_data)
 
-    assert active2 is False
-    assert sig_data["status"] == "CLOSED"
-    assert sig_data["runner_ticket"] is None
+    assert active2 is True
+    assert spy_close.call_count == 0
+    assert sig_data["status"] == "RUNNER_ACTIVE"
+    assert sig_data["runner_ticket"] == 303
 
 
 @pytest.mark.asyncio
@@ -295,16 +320,15 @@ async def test_saved_messages_commands():
     mock_event.message.message = "/sim_shortfall"
     await main.handle_saved_messages_command(mock_event)
     reply_text = mock_event.reply.call_args[0][0]
-    assert "Near-Miss Protection" in reply_text
-    assert "3899.20" in reply_text
-    assert "SHORTFALL GUARD TRIGGERS INSTANTLY" in reply_text
+    assert "TP1 Shortfall Guard Retired" in reply_text
+    assert "Pure Dynamic ATR Engine Active" in reply_text
 
     # 5. /sim_trail 3
     mock_event.message.message = "/sim_trail 3"
     await main.handle_saved_messages_command(mock_event)
     reply_text = mock_event.reply.call_args[0][0]
-    assert "Runner Trailing & TP2 Guard" in reply_text
-    assert "Virtual TP1 Floor: `3899.50`" in reply_text
+    assert "Pure Dynamic ATR Engine Simulation" in reply_text
+    assert "Zero virtual closes" in reply_text
 
     # 6. /status
     mock_event.message.message = "/status"

@@ -90,83 +90,130 @@ def test_float_cap_live_patch(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 5. ATR trailing: _compute_tp1_trail_dist clamps output to [min, max]
+# 5. ATR trailing: compute_dynamic_atr_trail_stop clamps trail_dist to [$2.50, max]
 # ---------------------------------------------------------------------------
 def test_atr_trail_dist_clamps_to_range(monkeypatch):
-    monkeypatch.setattr(config, "TP1_TRAIL_ATR_MULT", 1.5)
-    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
-    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
-    ex = _make_executor()
+    import dynamic_risk
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
 
-    # Patch get_m1_atr to return a very large value (should clamp to max)
-    monkeypatch.setattr(ex, "get_m1_atr", lambda sym: 10.0)
-    dist_high = ex._compute_tp1_trail_dist("XAUUSD.s", digits=2)
-    assert dist_high == 3.00, f"Expected clamped to max=3.00, got {dist_high}"
+    # ATR=10.0 -> 1.5 * 10 = 15.0 clamped to max=12.00
+    res_high = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3850.0,
+        live_price=3860.0,
+        prev_peak=3860.0,
+        current_sl=3840.0,
+        atr=10.0,
+        policy=policy,
+        digits=2,
+    )
+    assert res_high["trail_dist"] == 12.00, f"Expected clamped to max=12.00, got {res_high['trail_dist']}"
 
-    # Patch get_m1_atr to return a very small value (should clamp to min)
-    monkeypatch.setattr(ex, "get_m1_atr", lambda sym: 0.1)
-    dist_low = ex._compute_tp1_trail_dist("XAUUSD.s", digits=2)
-    assert dist_low == 2.00, f"Expected clamped to min=2.00, got {dist_low}"
-
-    # Fallback: ATR unavailable → returns midpoint
-    monkeypatch.setattr(ex, "get_m1_atr", lambda sym: None)
-    dist_fallback = ex._compute_tp1_trail_dist("XAUUSD.s", digits=2)
-    assert dist_fallback == 2.50, f"Expected midpoint fallback=2.50, got {dist_fallback}"
+    # ATR=0.5 -> 1.5 * 0.5 = 0.75 clamped to min=$2.50 floor
+    res_low = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3850.0,
+        live_price=3860.0,
+        prev_peak=3860.0,
+        current_sl=3840.0,
+        atr=0.5,
+        policy=policy,
+        digits=2,
+    )
+    assert res_low["trail_dist"] == 2.50, f"Expected clamped to min=$2.50 floor, got {res_low['trail_dist']}"
 
 
 # ---------------------------------------------------------------------------
-# 6. ATR trailing: trail_stop ratchets forward-only (never moves back against trade)
+# 6. ATR trailing: compute_dynamic_atr_trail_stop ratchets forward-only
 # ---------------------------------------------------------------------------
 def test_atr_trail_ratchets_forward_only(monkeypatch):
-    monkeypatch.setattr(config, "TP1_TRAIL_ATR_MULT", 1.5)
-    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
-    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
-    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 0.0)
-    ex = _make_executor()
-    monkeypatch.setattr(ex, "get_m1_atr", lambda sym: 1.5)  # trail_dist = 2.25
+    import dynamic_risk
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
 
-    signal_data: dict = {}
-
-    # First tick at 3850 (just touched TP1)
-    peak1, dist1, stop1 = ex._update_tp1_trail_state(
-        signal_data, "XAUUSD.s", "BUY", 3850.0, 0.10, 2
+    # First tick at 3850 (entry=3840, peak=3850, atr=2.0 -> trail_dist = max(3.0, 2.50) = 3.0)
+    # raw cand = 3850 - 3.0 = 3847.0
+    r1 = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3840.0,
+        live_price=3850.0,
+        prev_peak=3850.0,
+        current_sl=3835.0,
+        atr=2.0,
+        policy=policy,
+        digits=2,
     )
-    assert stop1 == round(3850.0 - 2.25, 2), f"Initial trail_stop wrong: {stop1}"
+    assert r1["should_update"] is True
+    stop1 = r1["candidate_sl"]
+    assert stop1 == 3847.0, f"Initial candidate_sl wrong: {stop1}"
 
-    # Second tick — price moves up to 3853
-    peak2, dist2, stop2 = ex._update_tp1_trail_state(
-        signal_data, "XAUUSD.s", "BUY", 3853.0, 0.10, 2
+    # Second tick — price moves up to 3853 (peak=3853)
+    r2 = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3840.0,
+        live_price=3853.0,
+        prev_peak=3853.0,
+        current_sl=stop1,
+        atr=2.0,
+        policy=policy,
+        digits=2,
     )
-    assert stop2 > stop1, f"Trail stop should ratchet up with price: {stop2} <= {stop1}"
+    assert r2["should_update"] is True
+    stop2 = r2["candidate_sl"]
+    assert stop2 == 3850.0, f"Trail stop should ratchet up with price: {stop2} <= {stop1}"
+    assert stop2 > stop1
 
-    # Third tick — price pulls back to 3851 (still above new stop)
-    peak3, dist3, stop3 = ex._update_tp1_trail_state(
-        signal_data, "XAUUSD.s", "BUY", 3851.0, 0.10, 2
+    # Third tick — price pulls back to 3851 (peak remains 3853, current_sl=3850.0)
+    r3 = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3840.0,
+        live_price=3851.0,
+        prev_peak=3853.0,
+        current_sl=stop2,
+        atr=2.0,
+        policy=policy,
+        digits=2,
     )
-    assert stop3 == stop2, f"Trail stop must NOT move backwards on a pullback: {stop3} != {stop2}"
-    assert peak3 == peak2, f"Trail peak must NOT move backwards: {peak3} != {peak2}"
+    # On pullback, peak is still 3853, so candidate_sl is still 3850.0 -> no forward progress
+    assert r3["should_update"] is False
+    assert r3["candidate_sl"] == stop2, f"Trail stop must NOT move backwards on a pullback: {r3['candidate_sl']} != {stop2}"
+    assert r3["peak_price"] == 3853.0, f"Trail peak must NOT move backwards: {r3['peak_price']}"
 
 
 # ---------------------------------------------------------------------------
-# 7. ATR trailing: trail_stop honours breakeven floor
+# 7. ATR trailing: candidate_sl honours breakeven floor from entry
 # ---------------------------------------------------------------------------
 def test_atr_trail_respects_breakeven_floor(monkeypatch):
-    monkeypatch.setattr(config, "TP1_TRAIL_ATR_MULT", 1.5)
-    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
-    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
-    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 5.0)  # 5 pip BE offset
-    ex = _make_executor()
-    monkeypatch.setattr(ex, "get_m1_atr", lambda sym: 1.5)
+    import dynamic_risk
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50)
+    policy = dynamic_risk.read_dynamic_risk_policy(config)
 
-    # Entry at 3840.0 — BE floor = 3840 + (5 * 0.10) = 3840.50
-    signal_data = {"recorded_entry_price": 3840.0}
-
-    # Price only 0.1 above TP1 (3841.0 say); trail_dist=2.25 → raw cand_stop = 3838.75
-    # But BE floor = 3840.50 → trail_stop must be >= 3840.50
-    _, _, stop = ex._update_tp1_trail_state(
-        signal_data, "XAUUSD.s", "BUY", 3841.0, 0.10, 2
+    # Entry at 3840.0 — BE floor = 3840 + 0.50 = 3840.50
+    # Price reaches 3843.50 (MFE = $3.50 >= be_min_mfe_dollars 3.50)
+    # With ATR=4.0, raw atr_sl = 3843.50 - 6.00 = 3837.50 (< entry!)
+    # But BE lock is armed -> candidate_sl must be at least BE floor 3840.50!
+    r = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3840.0,
+        live_price=3843.50,
+        prev_peak=3843.50,
+        current_sl=3830.0,
+        atr=4.0,
+        policy=policy,
+        digits=2,
     )
-    be_floor = round(3840.0 + 5.0 * 0.10, 2)  # 3840.50
-    assert stop >= be_floor, (
-        f"Trail stop {stop} must not go below BE floor {be_floor}"
-    )
+    assert r["be_armed"] is True
+    be_floor = 3840.50
+    assert r["candidate_sl"] >= be_floor, f"Candidate SL {r['candidate_sl']} must not go below BE floor {be_floor}"
+    assert r["stop_source"] == "BE_LOCK"

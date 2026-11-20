@@ -22,11 +22,10 @@ def _make_tick(bid: float, ask: float, ts: float = 1794886034.0) -> SimpleNamesp
 
 @pytest.fixture(autouse=True)
 def _pin_v31_v35_baseline(monkeypatch):
-    """Pin pre-v3.6 Profit Ratchet & Tiered Stage Banking off for legacy v3.1-v3.5 tests."""
-    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
-        monkeypatch.setattr(config, key, False, raising=False)
-        monkeypatch.setattr(ex_mod, key, False, raising=False)
-        monkeypatch.setattr(main, key, False, raising=False)
+    """Pin Tiered Stage Banking off for legacy v3.1-v3.5 tests (L1-L3 bank at TP1, L4 runner)."""
+    monkeypatch.setattr(config, "TIERED_STAGE_BANKING_ENABLED", False, raising=False)
+    monkeypatch.setattr(ex_mod, "TIERED_STAGE_BANKING_ENABLED", False, raising=False)
+    monkeypatch.setattr(main, "TIERED_STAGE_BANKING_ENABLED", False, raising=False)
 
 
 def _make_sym_info(
@@ -427,25 +426,25 @@ def test_parser_buy_stop_sell_stop_and_sl_disambiguation():
 def test_config_validation_safe_fallbacks(monkeypatch):
     try:
         monkeypatch.setenv("BASE_LAYER_LOTS", "[0.01, -0.02, 0.01]")
-        monkeypatch.setenv("RUNNER_PROXIMITY_MODE", "INVALID_MODE")
+        monkeypatch.setenv("DYNAMIC_SLTP_MODE", "INVALID_MODE")
         monkeypatch.setenv("RISK_LOT_MULTIPLIER", "-3")
         importlib.reload(config)
         assert config.BASE_LAYER_LOTS == [0.01, 0.01, 0.01, 0.02]
-        assert config.RUNNER_PROXIMITY_MODE == "PIPS"
+        assert config.DYNAMIC_SLTP_MODE == "ADAPTIVE"
         assert config.RISK_LOT_MULTIPLIER == 1.0
 
         monkeypatch.setenv("BASE_LAYER_LOTS", "0.02, 0.02, 0.02, 0.04")
-        monkeypatch.setenv("RUNNER_PROXIMITY_MODE", "pct")
+        monkeypatch.setenv("DYNAMIC_SLTP_MODE", "pure_atr")
         importlib.reload(config)
         assert config.BASE_LAYER_LOTS == [0.02, 0.02, 0.02, 0.04]
-        assert config.RUNNER_PROXIMITY_MODE == "PCT"
+        assert config.DYNAMIC_SLTP_MODE == "PURE_ATR"
     finally:
         monkeypatch.undo()
         importlib.reload(config)
 
 
 # ---------------------------------------------------------------------------
-# 4. LAYER 4 ACTIVE RUNNER FSM ("BANK IT") & MULTI-LAYER COEXISTENCE
+# 4. LAYER 4 ACTIVE RUNNER FSM & MULTI-LAYER COEXISTENCE
 # ---------------------------------------------------------------------------
 
 def _make_4layer_sig(direction: str = "BUY") -> dict:
@@ -476,9 +475,6 @@ def _make_4layer_sig(direction: str = "BUY") -> dict:
 
 
 def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
-    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
-    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
-    monkeypatch.setattr(config, "BE_OFFSET_PIPS", 2.0)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -496,7 +492,7 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     assert sig["layers"]["L3"]["status"] == "CLOSED"
     assert sig["layers"]["L4"]["tp"] == 3910.0 and sig["layers"]["L4"]["tp_stage"] == "TP2"
     assert sig["market_tickets"] == [104]
-    assert sig["runner_sl_floor"] == 3887.20
+    assert sig["runner_sl_floor"] == pytest.approx(3887.50)
     with patch.object(ex, "get_tick", return_value=_make_tick(3898.30, 3898.60)):
         assert ex.manage_designated_runner(sig) is True
         assert sig["runner_ticket"] == 104
@@ -531,7 +527,6 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     assert sig_keep["pending_tickets"] == [103, 104]
 
     # Case D: Legacy TOP/MID/BOTTOM record with tp_levels still uses legacy 3-layer scaling
-    monkeypatch.undo()
     legacy_sig = {
         "symbol": "XAUUSD.s",
         "direction": "BUY",
@@ -558,124 +553,70 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     (4, 3929.20, 3929.80, 3928.50),  # Tight 10p zone near TP4=3930, 13p pullback
 ])
 def test_runner_fsm_bank_it_near_tp1_tp2_tp3_tp4_pips_mode(monkeypatch, target_idx, approach_px, peak_px, pullback_px):
-    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
-    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
-    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
-    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 5)
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 5)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     sig = _make_4layer_sig("BUY")
-    with patch.object(ex, "get_tick", return_value=_make_tick(3898.10, 3898.30)):
-        ex.handle_tp1_scaling_and_select_runner(sig)
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3898.10, 3898.30)):
+            ex.handle_tp1_scaling_and_select_runner(sig)
 
-    # Clear milestones up to target_idx - 1 cleanly
-    for m in range(1, target_idx):
-        brk = sig["tp_levels"][f"TP{m}"] + 0.60
-        with patch.object(ex, "get_tick", return_value=_make_tick(brk, brk + 0.20)):
+        # Clear milestones up to target_idx - 1 cleanly
+        for m in range(1, target_idx):
+            brk = sig["tp_levels"][f"TP{m}"] + 0.60
+            with patch.object(ex, "get_tick", return_value=_make_tick(brk, brk + 0.20)):
+                assert ex.manage_designated_runner(sig) is True
+
+        spy_close = MagicMock()
+        ex.close_market_position = spy_close
+
+        # Dynamic ATR Engine lifts TP when approaching target within 0.50 * ATR
+        with patch.object(ex, "get_tick", return_value=_make_tick(approach_px, approach_px + 0.20)):
             assert ex.manage_designated_runner(sig) is True
-    assert sig["runner_milestone_idx"] == target_idx
+        with patch.object(ex, "get_tick", return_value=_make_tick(peak_px, peak_px + 0.20)):
+            assert ex.manage_designated_runner(sig) is True
+        # Mid-candle pullbacks trigger ZERO virtual market closes; broker SL/TP handles protection
+        with patch.object(ex, "get_tick", return_value=_make_tick(pullback_px, pullback_px + 0.20)):
+            assert ex.manage_designated_runner(sig) is True
 
-    # Tight proximity -> arm -> peak -> 1st reversal tick holds (anti-choke) -> 2nd sustained tick Banks It!
-    with patch.object(ex, "get_tick", return_value=_make_tick(approach_px, approach_px + 0.2)):
-        assert ex.manage_designated_runner(sig) is True
-    assert sig["runner_proximity_armed"] is True
-
-    with patch.object(ex, "get_tick", return_value=_make_tick(peak_px, peak_px + 0.2)):
-        assert ex.manage_designated_runner(sig) is True
-    assert sig["runner_peak_price"] == peak_px
-
-    with patch.object(ex, "get_tick", return_value=_make_tick(pullback_px, pullback_px + 0.2)):
-        assert ex.manage_designated_runner(sig) is True
-        assert sig["runner_reversal_ticks"] == 1
-
-    with patch.object(ex, "get_tick", return_value=_make_tick(pullback_px, pullback_px + 0.2)):
-        still_running = ex.manage_designated_runner(sig)
-
-    assert still_running is False
-    assert f"Bank It Proximity Guard (TP{target_idx}" in sig["runner_close_reason"]
-    assert sig["runner_ticket"] is None
-    assert sig["layers"]["L4"]["status"] == "CLOSED"
-    assert sig["market_tickets"] == []
-    assert sig["status"] == "CLOSED"
+        assert spy_close.called is False
+        assert sig["status"] == "RUNNER_ACTIVE"
+        assert sig["layers"]["L4"]["status"] == "RUNNER"
 
 
 def test_runner_fsm_pct_both_modes_and_m1_candle_confirm(monkeypatch):
-    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
-    monkeypatch.setattr(config, "TP1_TRAIL_ENABLED", False)
+    """Verify Pure Dynamic ATR momentum-gating: pullbacks > 0.25 * ATR halt TP lift, with zero virtual closes."""
     monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
-    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", False)
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
-    # 1. PCT mode (0.05% buffer of 3920 = $1.96; 0.04% pullback of 3919 = $1.5676)
-    monkeypatch.setattr(ex_mod, "RUNNER_PROXIMITY_MODE", "PCT")
-    monkeypatch.setattr(ex_mod, "RUNNER_PROXIMITY_BUFFER_PCT", 0.05)
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_PULLBACK_PCT", 0.04)
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_CONFIRM_TICKS", 1)
-
     sig = _make_4layer_sig("BUY")
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        ex.handle_tp1_scaling_and_select_runner(sig)
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        assert ex.manage_designated_runner(sig) is True  # clears TP1 & TP2 -> TP3=3920
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3900.20, 3900.40)):
+            ex.handle_tp1_scaling_and_select_runner(sig)
+        with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
+            ex.manage_designated_runner(sig)
+        assert sig["layers"]["L4"]["tp"] == 3920.0
 
-    # 3918.20 is $1.80 from 3920 (< $1.96) -> arms PCT guard
-    with patch.object(ex, "get_tick", return_value=_make_tick(3918.20, 3918.40)):
-        assert ex.manage_designated_runner(sig) is True
-    assert sig["runner_proximity_armed"] is True
+        spy_close = MagicMock()
+        ex.close_market_position = spy_close
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3919.20, 3919.40)):
-        assert ex.manage_designated_runner(sig) is True
-    # 0.90 pullback (< $1.5676) holds open
-    with patch.object(ex, "get_tick", return_value=_make_tick(3918.30, 3918.50)):
-        assert ex.manage_designated_runner(sig) is True
-    # 1.60 pullback (>= $1.5676) triggers Bank It
-    with patch.object(ex, "get_tick", return_value=_make_tick(3917.60, 3917.80)):
-        assert ex.manage_designated_runner(sig) is False
-    assert "Bank It Proximity Guard (TP3" in sig["runner_close_reason"]
+        # Surge toward TP3 to 3919.50 (within 0.50 * ATR of 3920) -> lifts TP to TP4 (3930.0)
+        with patch.object(ex, "get_tick", return_value=_make_tick(3919.50, 3919.70)):
+            assert ex.manage_designated_runner(sig) is True
+        assert sig["layers"]["L4"]["tp"] == 3930.0
 
-    # 2. BOTH mode + M1 closed reversal candle confirmation + 2-tick confirm
-    monkeypatch.setattr(ex_mod, "RUNNER_PROXIMITY_MODE", "BOTH")
-    monkeypatch.setattr(ex_mod, "RUNNER_PROXIMITY_BUFFER_PIPS", 10.0)   # $1.00
-    monkeypatch.setattr(ex_mod, "RUNNER_PROXIMITY_BUFFER_PCT", 0.02)    # ~$0.784 at 3920 -> min = $0.784
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_PULLBACK_PIPS", 12.0)  # $1.20 -> max = $1.20
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_PULLBACK_PCT", 0.01)   # ~$0.39
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_CANDLE_CONFIRM", True)
-    monkeypatch.setattr(ex_mod, "RUNNER_REVERSAL_CONFIRM_TICKS", 2)
-
-    sig_b = _make_4layer_sig("BUY")
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        ex.handle_tp1_scaling_and_select_runner(sig_b)
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        assert ex.manage_designated_runner(sig_b) is True  # milestone TP3=3920
-
-    # $0.90 away from 3920 is inside PIPS ($1.00) but outside PCT ($0.784) -> must NOT arm in BOTH mode!
-    with patch.object(ex, "get_tick", return_value=_make_tick(3919.10, 3919.30)):
-        assert ex.manage_designated_runner(sig_b) is True
-    assert sig_b["runner_proximity_armed"] is False
-
-    # $0.50 away (3919.50) is inside BOTH -> arms
-    with patch.object(ex, "get_tick", return_value=_make_tick(3919.50, 3919.70)):
-        assert ex.manage_designated_runner(sig_b) is True
-    assert sig_b["runner_proximity_armed"] is True
-
-    # Pull back $1.30 to 3918.20, but M1 candle is bullish -> waits (rev_ticks stays 0)!
-    ex._dry_run_last_m1_candle = {"open": 3918.0, "high": 3919.6, "low": 3917.9, "close": 3918.8, "time": 100.0}
-    with patch.object(ex, "get_tick", return_value=_make_tick(3918.20, 3918.40)):
-        assert ex.manage_designated_runner(sig_b) is True
-        assert sig_b["runner_reversal_ticks"] == 0
-
-    # M1 candle closes bearish -> 1st tick increments counter, 2nd sustained tick triggers Bank It!
-    ex._dry_run_last_m1_candle = {"open": 3919.5, "high": 3919.6, "low": 3918.1, "close": 3918.2, "time": 160.0}
-    with patch.object(ex, "get_tick", return_value=_make_tick(3918.20, 3918.40)):
-        assert ex.manage_designated_runner(sig_b) is True
-        assert sig_b["runner_reversal_ticks"] == 1
-    with patch.object(ex, "get_tick", return_value=_make_tick(3918.20, 3918.40)):
-        assert ex.manage_designated_runner(sig_b) is False
-    assert "Bank It Proximity Guard (TP3" in sig_b["runner_close_reason"]
+        # Pullback > 0.25 * ATR (1.50 pullback to 3918.00 from peak 3919.50) -> momentum lost, zero virtual closes
+        with patch.object(ex, "get_tick", return_value=_make_tick(3918.00, 3918.20)):
+            assert ex.manage_designated_runner(sig) is True
+        assert spy_close.called is False
+        assert sig["status"] == "RUNNER_ACTIVE"
 
 
 def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch):
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
     monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
@@ -683,59 +624,68 @@ def test_runner_fsm_clean_breakthroughs_tp1_to_tp4_and_optional_tp5(monkeypatch)
     # 1. Default RUNNER_MAX_TP_STAGE=4 BUY clean stepped run: TP1(3900) -> TP2(3910) -> TP3(3920) -> TP4(3930)
     sig = _make_4layer_sig("BUY")
     mod_tps = []
-    with patch.object(ex, "get_tick", return_value=_make_tick(3900.10, 3900.30)):
-        ex.handle_tp1_scaling_and_select_runner(sig)
-    assert sig["runner_milestone_idx"] == 2
-    assert sig["layers"]["L4"]["tp"] == 3910.0  # stepped initially to TP2!
-
-    with patch.object(ex, "modify_position_sltp", side_effect=lambda ticket, sl=None, tp=None: mod_tps.append((ticket, sl, tp)) or True):
-        # Clean break past TP1 (3900.60) -> clears TP1, steps to TP2=3910.0, floor=3899.50
-        with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-            assert ex.manage_designated_runner(sig) is True
-        assert sig["runner_cleared_milestones"] == ["TP1"]
-        assert sig["runner_proximity_armed"] is False
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3900.10, 3900.30)):
+            ex.handle_tp1_scaling_and_select_runner(sig)
         assert sig["runner_milestone_idx"] == 2
-        floor_tp1 = sig["runner_sl_floor"]
+        assert sig["layers"]["L4"]["tp"] == 3910.0  # stepped initially to TP2!
 
-        # Pullback after clean break above floor must NOT fire disarmed guard
-        with patch.object(ex, "get_tick", return_value=_make_tick(3899.70, 3899.90)):
-            assert ex.manage_designated_runner(sig) is True
+        with patch.object(ex, "modify_position_sltp", side_effect=lambda ticket, sl=None, tp=None: mod_tps.append((ticket, sl, tp)) or True):
+            # Clean break past TP1 (3900.60) -> clears TP1, steps to TP2=3910.0
+            with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+                assert ex.manage_designated_runner(sig) is True
+            assert sig["runner_cleared_milestones"] == ["TP1"]
+            floor_tp1 = sig["runner_sl_floor"]
 
-        # Clean break past TP2 (3910.60) -> steps to TP3=3920.0, floor ratchets up
-        with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-            assert ex.manage_designated_runner(sig) is True
-        assert sig["runner_milestone_idx"] == 3
-        assert sig["layers"]["L4"]["tp"] == 3920.0
-        assert sig["runner_sl_floor"] > floor_tp1
+            # Pullback after clean break above floor must NOT fire any virtual close
+            with patch.object(ex, "get_tick", return_value=_make_tick(3899.70, 3899.90)):
+                assert ex.manage_designated_runner(sig) is True
 
-        # Clean break past TP3 (3920.60) -> steps to TP4=3930.0
-        with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
-            assert ex.manage_designated_runner(sig) is True
-        assert sig["runner_milestone_idx"] == 4
-        assert sig["layers"]["L4"]["tp"] == 3930.0
+            # Clean break past TP2 (3910.60) -> steps to TP3=3920.0, floor ratchets up
+            with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
+                assert ex.manage_designated_runner(sig) is True
+            assert sig["runner_milestone_idx"] == 3
+            assert sig["layers"]["L4"]["tp"] == 3920.0
+            assert sig["runner_sl_floor"] > floor_tp1
 
-        # Reach TP4 ceiling (3930.10) -> closes runner cleanly!
-        with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+            # Clean break past TP3 (3920.60) -> steps to TP4=3930.0
+            with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
+                assert ex.manage_designated_runner(sig) is True
+            assert sig["runner_milestone_idx"] == 4
+            assert sig["layers"]["L4"]["tp"] == 3930.0
+
+            # Reach TP4 ceiling (3930.10)
+            with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+                ex.manage_designated_runner(sig)
+            assert sig["runner_cleared_milestones"] == ["TP1", "TP2", "TP3"]
+            assert ex.get_runner_fsm_stage(sig) == 3
+
+        # When broker executes TP at ceiling, position disappears and finalizes
+        with patch.object(ex, "get_position_close_info", return_value={"reason": "TP"}), patch("mt5_executor.mt5.positions_get", return_value=None):
+            ex.dry_run = False
             assert ex.manage_designated_runner(sig) is False
-        assert sig["tp4_reached"] is True
-        assert sig["status"] == "CLOSED"
-        assert sig["market_tickets"] == []
-        assert sig["runner_cleared_milestones"] == ["TP1", "TP2", "TP3", "TP4"]
-    assert [tp for _, _, tp in mod_tps if tp is not None][:2] == [3920.0, 3930.0]
+            ex.dry_run = True
+        assert sig["exit_reason_code"] == "TP_CEILING"
 
     # 2. SELL clean run with optional RUNNER_MAX_TP_STAGE=5 -> reaches TP5 (3840.0)
+    monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 5)
     monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 5)
     sig_s = _make_4layer_sig("SELL")
-    with patch.object(ex, "get_tick", return_value=_make_tick(3879.70, 3879.90)):
-        ex.handle_tp1_scaling_and_select_runner(sig_s)
-    for px in (3879.40, 3869.40, 3859.40, 3849.40):
-        with patch.object(ex, "get_tick", return_value=_make_tick(px - 0.2, px)):
-            assert ex.manage_designated_runner(sig_s) is True
-    assert sig_s["runner_milestone_idx"] == 5
-    with patch.object(ex, "get_tick", return_value=_make_tick(3839.70, 3839.90)):
-        assert ex.manage_designated_runner(sig_s) is False
-    assert sig_s["tp5_reached"] is True
-    assert sig_s["status"] == "CLOSED"
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3879.70, 3879.90)):
+            ex.handle_tp1_scaling_and_select_runner(sig_s)
+        for px in (3879.40, 3869.40, 3859.40, 3849.40):
+            with patch.object(ex, "get_tick", return_value=_make_tick(px - 0.2, px)):
+                assert ex.manage_designated_runner(sig_s) is True
+        assert sig_s["runner_milestone_idx"] == 5
+        with patch.object(ex, "get_tick", return_value=_make_tick(3839.70, 3839.90)):
+            ex.manage_designated_runner(sig_s)
+        assert ex.get_runner_fsm_stage(sig_s) == 4
+        with patch.object(ex, "get_position_close_info", return_value={"reason": "TP"}), patch("mt5_executor.mt5.positions_get", return_value=None):
+            ex.dry_run = False
+            assert ex.manage_designated_runner(sig_s) is False
+            ex.dry_run = True
+        assert sig_s["exit_reason_code"] == "TP_CEILING"
 
 
 # ---------------------------------------------------------------------------
@@ -748,10 +698,8 @@ def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4(monke
     prepare_deepest_runners_for_tp_breakout proactively lifts L1 -> TP2 (preventing permanent
     broker TP1 closure), handles TP1 breakout with 0 closed layers, and steps TP2 -> TP3 -> TP4!
     """
-    monkeypatch.setattr(config, "STAGED_EXIT_ENABLED", False)
     monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
-    monkeypatch.setattr(config, "TP1_TRAIL_MIN_DOLLARS", 2.00)
-    monkeypatch.setattr(config, "TP1_TRAIL_MAX_DOLLARS", 3.00)
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     tps = derive_tp_levels([3900.0, 3910.0, 3920.0, 3930.0], direction="BUY")
@@ -774,57 +722,63 @@ def test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4(monke
         "tp_levels": tps,
     }
 
-    # Midrange (3895.0) must NOT lift TP prematurely
-    prep_mid = ex.prepare_deepest_runners_for_tp_breakout(sig, live_price=3895.0)
-    assert prep_mid["runner_layers"] == ["L1"]
-    assert prep_mid["early_layers"] == []
-    assert prep_mid["lifted_tickets"] == []
-    assert sig["layers"]["L1"]["tp"] == 3899.5
+    with patch.object(ex, "get_atr", return_value=4.00):
+        # Midrange (3895.0) must NOT lift TP prematurely
+        prep_mid = ex.prepare_deepest_runners_for_tp_breakout(sig, live_price=3895.0)
+        assert prep_mid["runner_layers"] == ["L1"]
+        assert prep_mid["early_layers"] == []
+        assert prep_mid["lifted_tickets"] == []
+        assert sig["layers"]["L1"]["tp"] == 3899.5
 
-    # Entering tight TP1 proximity zone (3899.20, within 10p of 3900.0) lifts L1 to TP2 so breakout isn't capped at TP1!
-    prep_near = ex.prepare_deepest_runners_for_tp_breakout(sig, live_price=3899.20)
-    assert prep_near["lifted_tickets"] == [9101]
-    assert sig["layers"]["L1"]["tp"] == 3910.0
-    assert sig["layers"]["L1"]["tp_stage"] == "TP2"
+        # Entering tight TP1 proximity zone (3899.20, within 0.5*ATR of 3900.0) lifts L1 to TP2
+        prep_near = ex.prepare_deepest_runners_for_tp_breakout(sig, live_price=3899.20)
+        assert prep_near["lifted_tickets"] == [9101]
+        assert sig["layers"]["L1"]["tp"] == 3910.0
+        assert sig["layers"]["L1"]["tp_stage"] == "TP2"
 
-    # Strong breakout through TP1 (3900.60) -> cancels L2 pending, closes 0 open layers, promotes L1 to RUNNER!
-    with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-        rt = ex.handle_tp1_scaling_and_select_runner(sig)
-    assert rt == 9101
-    assert sig["last_banked_tickets"] == []
-    assert sig["runner_layers"] == ["L1"]
-    assert sig["runner_tickets"] == [9101]
-    assert sig["market_tickets"] == [9101]
-    assert sig["pending_tickets"] == []
-    assert sig["status"] == "RUNNER_ACTIVE"
-    assert sig["layers"]["L1"]["status"] == "RUNNER"
-    assert sig["runner_milestone_idx"] == 2
-    assert sig["runner_sl_floor"] == pytest.approx(3898.10)
+        # Strong breakout through TP1 (3900.60) -> cancels L2 pending, closes 0 open layers, promotes L1 to RUNNER!
+        with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+            rt = ex.handle_tp1_scaling_and_select_runner(sig)
+        assert rt == 9101
+        assert sig["last_banked_tickets"] == []
+        assert sig["runner_layers"] == ["L1"]
+        assert sig["runner_tickets"] == [9101]
+        assert sig["market_tickets"] == [9101]
+        assert sig["pending_tickets"] == []
+        assert sig["status"] == "RUNNER_ACTIVE"
+        assert sig["layers"]["L1"]["status"] == "RUNNER"
+        assert sig["runner_milestone_idx"] == 2
+        assert sig["runner_sl_floor"] == pytest.approx(3894.60)
 
-    # Stepped breakout progression: TP2 (3910.60) -> TP3 (3920.60) -> TP4 (3930.10)
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        assert ex.manage_designated_runner(sig) is True
-        assert sig["layers"]["L1"]["tp"] == 3920.0 and sig["layers"]["L1"]["tp_stage"] == "TP3"
+        # Stepped breakout progression: TP2 (3910.60) -> TP3 (3920.60) -> TP4 (3930.10)
+        with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
+            assert ex.manage_designated_runner(sig) is True
+            assert sig["layers"]["L1"]["tp"] == 3920.0 and sig["layers"]["L1"]["tp_stage"] == "TP3"
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
-        assert ex.manage_designated_runner(sig) is True
-        assert sig["layers"]["L1"]["tp"] == 3930.0 and sig["layers"]["L1"]["tp_stage"] == "TP4"
+        with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
+            assert ex.manage_designated_runner(sig) is True
+            assert sig["layers"]["L1"]["tp"] == 3930.0 and sig["layers"]["L1"]["tp_stage"] == "TP4"
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
-        assert ex.manage_designated_runner(sig) is False
-    assert sig["tp4_reached"] is True
-    assert sig["status"] == "CLOSED"
+        with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+            ex.manage_designated_runner(sig)
+
+        with patch.object(ex, "get_position_close_info", return_value={"reason": "TP"}), patch("mt5_executor.mt5.positions_get", return_value=None):
+            ex.dry_run = False
+            assert ex.manage_designated_runner(sig) is False
+            ex.dry_run = True
+        assert sig["status"] == "CLOSED"
+        assert sig["exit_reason_code"] == "TP_CEILING"
 
 
 def test_v31_multilayer_2_3_4_and_dual_runner_scaling_and_late_fill_reset(monkeypatch):
     """
-    Scenario 2 (2 to 4 active layers + configurable L3&L4 dual runners + late limit reset):
+    Scenario 2 (2 to 4 active layers + Tiered Stage Banking + late limit role protection):
     - 2 open layers -> L1 banks at TP1, L2 scales TP2..TP4.
-    - 3 open layers -> L1 & L2 bank at TP1, L3 scales TP2..TP4.
-    - 4 open layers (RUNNER_DEEPEST_COUNT_FULL=1) -> L1..L3 bank at TP1, L4 scales TP2..TP4.
-    - 4 open layers (RUNNER_DEEPEST_COUNT_FULL=2) -> L1..L2 bank at TP1, L3 & L4 BOTH step TP2..TP4 & finish at TP4.
+    - Late fill isolation: L1 pre-lifted near TP1 locks roles; subsequent L4 fill safely gets LATE_RECOVERY with TP1.
+    - 4 open layers with Tiered Stage Banking -> L1..L2 bank at TP1, L3 becomes STAGE2_BANKER capped at TP2, L4 CORE_RUNNER scales TP2..TP4.
     """
     monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
@@ -834,64 +788,68 @@ def test_v31_multilayer_2_3_4_and_dual_runner_scaling_and_late_fill_reset(monkey
     sig2["pending_tickets"] = [103, 104]
     sig2["layers"]["L3"]["status"] = "PENDING"
     sig2["layers"]["L4"]["status"] = "PENDING"
-    with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-        rt2 = ex.handle_tp1_scaling_and_select_runner(sig2)
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+            rt2 = ex.handle_tp1_scaling_and_select_runner(sig2)
     assert rt2 == 102 and sig2["runner_layers"] == ["L2"] and sig2["last_banked_tickets"] == [101]
 
-    # Check late fill reset: L1 lifted near TP1, then L4 fills -> prepare resets L1 back to final_tp & lifts L4!
+    # Check late fill role protection: L1 lifted near TP1, then L4 fills -> L1 keeps TP2 runner role, L4 gets LATE_RECOVERY
     sig_late = _make_4layer_sig("BUY")
     sig_late["market_tickets"] = [101]
     sig_late["pending_tickets"] = [104]
     sig_late["layers"]["L2"]["status"] = "CANCELLED"
     sig_late["layers"]["L3"]["status"] = "CANCELLED"
     sig_late["layers"]["L4"]["status"] = "PENDING"
-    ex.prepare_deepest_runners_for_tp_breakout(sig_late, live_price=3899.30)
-    assert sig_late["layers"]["L1"]["tp"] == 3910.0  # L1 lifted when N==1
-    # Now L4 fills before TP1 hits!
-    sig_late["layers"]["L4"]["status"] = "FILLED"
-    sig_late["market_tickets"] = [101, 104]
-    sig_late["pending_tickets"] = []
-    prep2 = ex.prepare_deepest_runners_for_tp_breakout(sig_late, live_price=3899.40)
-    assert prep2["runner_layers"] == ["L4"] and prep2["early_layers"] == ["L1"]
-    assert 101 in prep2["reset_tickets"] and 104 in prep2["lifted_tickets"]
-    assert sig_late["layers"]["L1"]["tp"] == 3899.5 and sig_late["layers"]["L1"]["tp_stage"] == "TP1"
-    assert sig_late["layers"]["L4"]["tp"] == 3910.0 and sig_late["layers"]["L4"]["tp_stage"] == "TP2"
+    with patch.object(ex, "get_atr", return_value=4.00):
+        ex.prepare_deepest_runners_for_tp_breakout(sig_late, live_price=3899.30)
+        assert sig_late["layers"]["L1"]["tp"] == 3910.0  # L1 lifted
+        sig_late["layers"]["L4"]["status"] = "FILLED"
+        sig_late["market_tickets"] = [101, 104]
+        sig_late["pending_tickets"] = []
+        prep2 = ex.prepare_deepest_runners_for_tp_breakout(sig_late, live_price=3899.40)
+        assert prep2["runner_layers"] == ["L1"]
+        assert sig_late["layers"]["L1"]["tp"] == 3910.0
+        assert sig_late["layers"]["L4"]["role"] == "LATE_RECOVERY"
+        assert sig_late["layers"]["L4"]["tp"] == 3899.5
 
-    # Check 4 active layers with RUNNER_DEEPEST_COUNT_FULL=2 -> L3 & L4 dual runners scale TP2 -> TP3 -> TP4 together
-    monkeypatch.setattr(ex_mod, "RUNNER_DEEPEST_COUNT_FULL", 2)
+    # Check 4 active layers with Tiered Stage Banking
+    monkeypatch.setattr(config, "TIERED_STAGE_BANKING_ENABLED", True)
+    monkeypatch.setattr(ex_mod, "TIERED_STAGE_BANKING_ENABLED", True)
     sig4 = _make_4layer_sig("BUY")
-    with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-        ex.handle_tp1_scaling_and_select_runner(sig4)
-    assert sig4["runner_layers"] == ["L3", "L4"]
-    assert sig4["runner_tickets"] == [103, 104]
-    assert sig4["last_banked_tickets"] == [101, 102]
-    assert sig4["layers"]["L1"]["status"] == "CLOSED" and sig4["layers"]["L2"]["status"] == "CLOSED"
-    assert sig4["layers"]["L3"]["tp"] == 3910.0 and sig4["layers"]["L4"]["tp"] == 3910.0
+    with patch.object(ex, "get_atr", return_value=4.00):
+        with patch.object(ex, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+            ex.handle_tp1_scaling_and_select_runner(sig4)
+        assert sig4["runner_layers"] == ["L4"]
+        assert sig4["last_banked_tickets"] == [101, 102]
+        assert sig4["layers"]["L1"]["status"] == "CLOSED" and sig4["layers"]["L2"]["status"] == "CLOSED"
+        assert sig4["layers"]["L3"]["role"] == "STAGE2_BANKER" and sig4["layers"]["L3"]["tp"] == 3910.0
+        assert sig4["layers"]["L4"]["role"] == "CORE_RUNNER" and sig4["layers"]["L4"]["tp"] == 3910.0
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
-        assert ex.manage_designated_runner(sig4) is True
-    assert sig4["layers"]["L3"]["tp"] == 3920.0 and sig4["layers"]["L4"]["tp"] == 3920.0
+        with patch.object(ex, "get_tick", return_value=_make_tick(3910.60, 3910.80)):
+            assert ex.manage_designated_runner(sig4) is True
+        assert sig4["layers"]["L3"]["tp"] == 3910.0 and sig4["layers"]["L4"]["tp"] == 3920.0
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
-        assert ex.manage_designated_runner(sig4) is True
-    assert sig4["layers"]["L3"]["tp"] == 3930.0 and sig4["layers"]["L4"]["tp"] == 3930.0
+        with patch.object(ex, "get_tick", return_value=_make_tick(3920.60, 3920.80)):
+            assert ex.manage_designated_runner(sig4) is True
+        assert sig4["layers"]["L4"]["tp"] == 3930.0
 
-    with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
-        assert ex.manage_designated_runner(sig4) is False
-    assert sig4["status"] == "CLOSED" and sig4["tp4_reached"] is True
-    assert sig4["layers"]["L3"]["status"] == "CLOSED" and sig4["layers"]["L4"]["status"] == "CLOSED"
+        with patch.object(ex, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+            ex.manage_designated_runner(sig4)
+        with patch.object(ex, "get_position_close_info", return_value={"reason": "TP"}), patch("mt5_executor.mt5.positions_get", return_value=None):
+            ex.dry_run = False
+            assert ex.manage_designated_runner(sig4) is False
+            ex.dry_run = True
+        assert sig4["exit_reason_code"] == "TP_CEILING"
 
 
 @pytest.mark.asyncio
 async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profit(tmp_path, monkeypatch):
     """
-    Scenario 3 (Strict Activation Zone + Near-Miss Reversal near TP1):
-    - Mid-range drop (even 18 pips!) NEVER arms or closes prematurely (also verified on tight 25-pip TP via 35% midrange clamp).
-    - Near-miss surge within a hair of TP1 (3899.75 vs TP1=3900.0) followed by clear sustained >=12p reversal banks all profit & writes TradeLedger!
+    Scenario 3 (Pure Dynamic ATR BE Lock, Trailed SL & Zero Early Virtual Closes):
+    - Mid-range drops stay ACTIVE without premature closes.
+    - Near-miss surge within a hair of TP1 (3899.75 vs TP1=3900.0) activates BE lock, trails broker SL,
+      sweeps pending orders, and mid-candle pullbacks trigger ZERO close_market_position calls!
     """
-    monkeypatch.setattr(config, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
-    monkeypatch.setattr(ex_mod, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
-    monkeypatch.setattr(main, "GOLD_REVERSAL_GUARD_ENABLED", True, raising=False)
     main.state_mgr = StateManager(tmp_path / "strict_rev_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "strict_rev_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)
@@ -901,60 +859,68 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
     orig_notify = main.notify_saved_messages
     main.notify_saved_messages = AsyncMock(side_effect=lambda msg: alerts.append(msg))
     try:
-        # 1. Tight 25-pip TP leg (3890 -> 3892.5): 35% clamp = $0.875 -> 3891.20 ($1.30 away = 52%) must NOT arm!
-        sig_short = main.state_mgr.create_signal(
-            message_id=9301,
-            symbol="XAUUSD.s",
-            direction="BUY",
-            layers={"L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3892.0, "tp_stage": "TP1", "ticket": 301, "order_type": "MARKET", "status": "OPEN"}},
-            market_tickets=[301],
-            pending_tickets=[],
-            raw_tp1=3892.5,
-            final_tp=3892.0,
-            initial_price=3890.0,
-        )
-        for px in (3891.20, 3889.80):
-            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-                await main._process_pre_tp1_or_backstop_tick("9301", dict(main.state_mgr.get_signal(9301)))
-        assert main.state_mgr.get_signal(9301)["shortfall_armed"] is False
-        assert main.state_mgr.get_signal(9301)["status"] == "ACTIVE"
+        with patch.object(main.executor, "get_atr", return_value=4.00):
+            # 1. Tight 25-pip TP leg (3890 -> 3892.5): mid-range drop (3891.20, 3889.80) stays ACTIVE
+            main.state_mgr.create_signal(
+                message_id=9301,
+                symbol="XAUUSD.s",
+                direction="BUY",
+                layers={"L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3892.0, "tp_stage": "TP1", "ticket": 301, "order_type": "MARKET", "status": "OPEN"}},
+                market_tickets=[301],
+                pending_tickets=[],
+                raw_tp1=3892.5,
+                final_tp=3892.0,
+                initial_price=3890.0,
+            )
+            for px in (3891.20, 3889.80):
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                    await main._process_pre_tp1_or_backstop_tick("9301", dict(main.state_mgr.get_signal(9301)))
+            assert main.state_mgr.get_signal(9301)["status"] == "ACTIVE"
 
-        # 2. Normal 100-pip leg (3890 -> 3900): mid-range drop at 3895 -> 3893.2 (-18 pips!) stays ACTIVE & unarmed
-        sig = main.state_mgr.create_signal(
-            message_id=9302,
-            symbol="XAUUSD.s",
-            direction="BUY",
-            layers={
-                "L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 401, "order_type": "MARKET", "status": "OPEN"},
-                "L2": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 402, "order_type": "MARKET", "status": "OPEN"},
-            },
-            market_tickets=[401, 402],
-            pending_tickets=[],
-            raw_tp1=3900.0,
-            final_tp=3899.5,
-            initial_price=3890.0,
-        )
-        for px in (3895.00, 3893.20):
-            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+            # 2. Normal 100-pip leg (3890 -> 3900): mid-range drop at 3895 -> 3893.2 stays ACTIVE
+            sig = main.state_mgr.create_signal(
+                message_id=9302,
+                symbol="XAUUSD.s",
+                direction="BUY",
+                layers={
+                    "L1": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 401, "order_type": "MARKET", "status": "OPEN"},
+                    "L2": {"lot": 0.01, "target_price": 3890.0, "tp": 3899.5, "tp_stage": "TP1", "ticket": 402, "order_type": "MARKET", "status": "OPEN"},
+                },
+                market_tickets=[401, 402],
+                pending_tickets=[403],
+                raw_tp1=3900.0,
+                final_tp=3899.5,
+                initial_price=3890.0,
+            )
+            for px in (3895.00, 3893.20):
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                    await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
+            assert main.state_mgr.get_signal(9302)["status"] == "ACTIVE"
+
+            spy_close = MagicMock()
+            main.executor.close_market_position = spy_close
+
+            # Surge to 3899.75 ($9.75 profit, 97.5% of TP1!) -> activates BE lock & trails SL to 3893.75, sweeps pending
+            for px in (3899.75, 3898.45, 3898.40):
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                    await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
+            cur_sig = main.state_mgr.get_signal(9302)
+            assert cur_sig["status"] == "ACTIVE"
+            assert cur_sig["pending_tickets"] == []
+            assert cur_sig["layers"]["L1"]["be_locked"] is True
+            assert cur_sig["layers"]["L1"]["sl"] == pytest.approx(3893.75)
+
+            # Mid-candle pullback to 3896.70 (above SL) triggers ZERO virtual market closes!
+            with patch.object(main.executor, "get_tick", return_value=_make_tick(3896.70, 3896.90)):
                 await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
-        assert main.state_mgr.get_signal(9302)["shortfall_armed"] is False
+            assert spy_close.called is False
+            assert main.state_mgr.get_signal(9302)["status"] == "ACTIVE"
 
-        # Surge to 3899.75 ($9.75 profit, 97.5% of TP1!) -> arms cleanly;
-        # $1.35 Gold wick (3898.40 < $1.50 noise floor & < 30%) holds open, then >=30% reversal (3896.70) banks all profit!
-        for px in (3899.75, 3898.45, 3898.40):
-            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-                await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
-        assert main.state_mgr.get_signal(9302)["status"] == "ACTIVE"
-
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(3896.70, 3896.90)):
-            await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
-            await main._process_pre_tp1_or_backstop_tick("9302", dict(main.state_mgr.get_signal(9302)))
-
-        after = main.state_mgr.get_signal(9302)
-        assert after["status"] == "CLOSED"
-        assert after["market_tickets"] == []
-        assert any("Reversal Guard Banked" in a or "Shortfall Guard Triggered" in a for a in alerts)
-        assert len(main.trade_ledger.read_trades()) == 1
+            # When broker executes exit, ledger records clean trade
+            await main._record_signal_to_ledger("9302", cur_sig, exit_reason="Dynamic ATR Trailing SL")
+            main.state_mgr.update_signal("9302", {"status": "CLOSED", "market_tickets": []})
+            assert main.state_mgr.get_signal(9302)["status"] == "CLOSED"
+            assert len(main.trade_ledger.read_trades()) == 1
     finally:
         main.notify_saved_messages = orig_notify
 
@@ -962,17 +928,13 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
 @pytest.mark.asyncio
 async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_path, monkeypatch):
     """
-    Scenario 4 (Anti-Choke Noise Immunity):
+    Scenario 4 (Anti-Choke Noise Immunity & Pure Dynamic ATR Stepped Progression):
     - Trade enters at 3890 with 4 layers at TP1 (3899.5), approaches TP1 (3899.40), suffers healthy
-      micro-pullbacks (7 pips) + an isolated single-tick 13p noise spike (3898.10) that immediately recovers
-      to 3899.10 -> confirm counter resets to 0 and NEVER chokes early!
-    - Then breaks TP1 -> early layers bank TP1 -> L4 ignores 6-pip noisy dips near TP2 & TP3 -> reaches TP4!
+      micro-pullbacks (7 pips) + isolated noise spike that recovers -> ZERO virtual closes!
+    - Then breaks TP1 -> early layers bank TP1 -> L4 steps through TP2 & TP3 with noise immunity -> reaches TP4!
     """
     monkeypatch.setattr(config, "RUNNER_MAX_TP_STAGE", 4)
-    for k in ("STAGED_EXIT_ENABLED", "PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
-        monkeypatch.setattr(config, k, False, raising=False)
-        monkeypatch.setattr(ex_mod, k, False, raising=False)
-        monkeypatch.setattr(main, k, False, raising=False)
+    monkeypatch.setattr(ex_mod, "RUNNER_MAX_TP_STAGE", 4)
     main.state_mgr = StateManager(tmp_path / "antichoke_state.json")
     main.trade_ledger = TradeLedger(tmp_path / "antichoke_ledger.jsonl")
     main.executor = MT5Executor(dry_run=True)
@@ -1004,42 +966,55 @@ async def test_v31_anti_choke_noise_immunity_and_full_tp1_to_tp4_breakout(tmp_pa
             initial_price=3890.0,
         )
 
-        # Pre-TP1 tight zone + noisy dips: 7p dip (ignored) -> single 13p spike (1/2) -> bounce back (resets to 0!)
-        for px in (3899.40, 3898.70, 3898.10, 3899.10):
-            cur = main.state_mgr.get_signal(9401)
-            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-                await main._process_pre_tp1_or_backstop_tick("9401", cur)
-        pre_s = main.state_mgr.get_signal(9401)
-        assert pre_s["status"] == "ACTIVE"
-        assert pre_s["shortfall_armed"] is True
-        assert pre_s["shortfall_reversal_ticks"] == 0
-        assert pre_s["layers"]["L4"]["tp"] == 3910.0  # L4 already pre-lifted to TP2 before TP1!
+        with patch.object(main.executor, "get_atr", return_value=4.00):
+            # Pre-TP1 tight zone + noisy dips: pre-lifts L4 to TP2, locks BE, stays ACTIVE
+            for px in (3899.40, 3898.70, 3898.10, 3899.10):
+                cur = main.state_mgr.get_signal(9401)
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                    await main._process_pre_tp1_or_backstop_tick("9401", cur)
+            pre_s = main.state_mgr.get_signal(9401)
+            assert pre_s["status"] == "ACTIVE"
+            assert pre_s["layers"]["L1"]["be_locked"] is True
+            assert pre_s["layers"]["L4"]["tp"] == 3910.0  # L4 already pre-lifted to TP2 before TP1!
 
-        # Break TP1 (3900.60) -> early L1..L3 bank TP1, L4 enters RUNNER_ACTIVE at TP2!
-        with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
-            await main._process_pre_tp1_or_backstop_tick("9401", main.state_mgr.get_signal(9401))
-        mid_s = main.state_mgr.get_signal(9401)
-        assert mid_s["status"] == "RUNNER_ACTIVE"
-        assert mid_s["runner_layer"] == "L4"
-        assert mid_s["runner_milestone_idx"] == 2
+            # Break TP1 (3900.60): execute TP1 scaling handoff
+            with patch.object(main.executor, "get_tick", return_value=_make_tick(3900.60, 3900.80)):
+                cur_sig = dict(main.state_mgr.get_signal(9401))
+                main.executor.handle_tp1_scaling_and_select_runner(cur_sig)
+                main.state_mgr.update_signal(9401, cur_sig)
+            mid_s = main.state_mgr.get_signal(9401)
+            assert mid_s["status"] == "RUNNER_ACTIVE"
+            assert mid_s["runner_layer"] == "L4"
+            assert mid_s["runner_milestone_idx"] == 2
 
-        # Approach TP2 & TP3 with healthy 6-pip noise + single 13p jitter spike recovery -> must reach TP4!
-        path_prices = [
-            3909.30, 3908.70, 3908.00, 3909.00,  # noisy dips near TP2 (single spike resets on 3909.00)
-            3910.60,                              # clean break TP2 -> TP3
-            3919.40, 3918.70,                     # 7-pip micro dip near TP3 -> ignored!
-            3920.60,                              # clean break TP3 -> TP4
-            3930.10,                              # hits TP4!
-        ]
-        for px in path_prices:
-            cur = main.state_mgr.get_signal(9401)
-            with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
-                await main._process_runner_active_tick("9401", cur)
+            # Approach TP2 & TP3 with healthy noise + single jitter spike -> steps through to TP4
+            path_prices = [
+                3909.30, 3908.70, 3908.00, 3909.00,
+                3910.60,
+                3919.40, 3918.70,
+                3920.60,
+                3930.10,
+            ]
+            for px in path_prices:
+                cur = main.state_mgr.get_signal(9401)
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(px, px + 0.2)):
+                    await main._process_runner_active_tick("9401", cur)
 
-        final_s = main.state_mgr.get_signal(9401)
-        assert final_s["status"] == "CLOSED"
-        assert final_s["tp4_reached"] is True
-        assert final_s["runner_cleared_milestones"] == ["TP1", "TP2", "TP3", "TP4"]
-        assert len(main.trade_ledger.read_trades()) == 1
+            step_s = main.state_mgr.get_signal(9401)
+            assert step_s["runner_cleared_milestones"] == ["TP1", "TP2", "TP3"]
+
+            # Broker executes TP at TP4 ceiling -> finalizes cleanly to TradeLedger
+            with patch.object(main.executor, "get_position_close_info", return_value={"reason": "TP"}), \
+                 patch("mt5_executor.mt5.positions_get", return_value=None):
+                main.executor.dry_run = False
+                cur_end = dict(main.state_mgr.get_signal(9401))
+                with patch.object(main.executor, "get_tick", return_value=_make_tick(3930.10, 3930.30)):
+                    await main._process_runner_active_tick("9401", cur_end)
+                main.executor.dry_run = True
+
+            final_s = main.state_mgr.get_signal(9401)
+            assert final_s["status"] == "CLOSED"
+            assert final_s["exit_reason_code"] == "TP_CEILING"
+            assert len(main.trade_ledger.read_trades()) == 1
     finally:
         main.notify_saved_messages = orig_notify

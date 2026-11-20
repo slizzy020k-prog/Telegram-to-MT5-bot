@@ -368,12 +368,6 @@ def _validate_lots_and_orders(cfg: Any, errors: List[str], warnings: List[str]) 
 
 
 def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[str]) -> None:
-    mode = str(getattr(cfg, "RUNNER_PROXIMITY_MODE", "PIPS")).strip().upper()
-    if mode not in ("PIPS", "PCT", "BOTH"):
-        errors.append(
-            f"RUNNER_PROXIMITY_MODE must be one of ('PIPS', 'PCT', 'BOTH'), got {mode!r}."
-        )
-
     deepest_count = getattr(cfg, "RUNNER_DEEPEST_COUNT_FULL", 1)
     if isinstance(deepest_count, bool) or not isinstance(deepest_count, int) or not (1 <= deepest_count <= 2):
         errors.append(
@@ -386,36 +380,7 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"RUNNER_MAX_TP_STAGE must be an integer in [1, 5], got {max_tp_stage!r}."
         )
 
-    confirm_ticks = getattr(cfg, "RUNNER_REVERSAL_CONFIRM_TICKS", 2)
-    if isinstance(confirm_ticks, bool) or not isinstance(confirm_ticks, int) or confirm_ticks < 1:
-        errors.append(
-            f"RUNNER_REVERSAL_CONFIRM_TICKS must be an integer >= 1, got {confirm_ticks!r}."
-        )
-
-    midrange_ratio = getattr(cfg, "RUNNER_MAX_MIDRANGE_RATIO", 0.35)
-    if not _is_finite_number(midrange_ratio) or not (0.0 < float(midrange_ratio) <= 1.0):
-        errors.append(
-            f"RUNNER_MAX_MIDRANGE_RATIO must be in (0, 1], got {midrange_ratio!r}."
-        )
-
-    for bool_flag in (
-        "GOLD_REVERSAL_GUARD_ENABLED",
-        "PROFIT_RATCHET_ENABLED",
-        "BANK_HARVEST_ENABLED",
-        "PROFIT_RATCHET_VIRTUAL_CLOSE_ENABLED",
-    ):
-        if hasattr(cfg, bool_flag):
-            flag_val = getattr(cfg, bool_flag)
-            if not isinstance(flag_val, bool):
-                errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
-
-    for ratio_name in ("ARM_THRESHOLD_PCT", "GIVEBACK_PCT", "RUNNER_EARLY_TP_LIFT_PCT"):
-        if hasattr(cfg, ratio_name):
-            r_val = getattr(cfg, ratio_name)
-            if not _is_finite_number(r_val) or not (0.0 < float(r_val) < 1.0):
-                errors.append(f"{ratio_name} must be in (0, 1), got {r_val!r}.")
-
-    for pos_guard_field in ("MIN_GOLD_PULLBACK_DOLLARS", "MAX_ALLOWED_SPREAD_DOLLARS", "ADAPTIVE_SPREAD_CEILING_DOLLARS"):
+    for pos_guard_field in ("MAX_ALLOWED_SPREAD_DOLLARS", "ADAPTIVE_SPREAD_CEILING_DOLLARS"):
         if hasattr(cfg, pos_guard_field):
             p_val = getattr(cfg, pos_guard_field)
             if not _is_finite_number(p_val) or float(p_val) <= 0.0:
@@ -435,13 +400,6 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
         "TRAIL_DISTANCE_PIPS",
         "TRAIL_STEP_PIPS",
         "MIN_SL_BUFFER_PIPS",
-        "RUNNER_PROXIMITY_BUFFER_PIPS",
-        "RUNNER_PROXIMITY_BUFFER_PCT",
-        "RUNNER_REVERSAL_PULLBACK_PIPS",
-        "RUNNER_REVERSAL_PULLBACK_PCT",
-        "RUNNER_CLEAN_BREAK_PIPS",
-        "SHORTFALL_ARM_PIPS",
-        "SHORTFALL_PULLBACK_PIPS",
         "CATCHUP_WINDOW_SECONDS",
         "CATCHUP_MAX_MESSAGES",
         "CATCHUP_MARKET_MAX_AGE_SECONDS",
@@ -503,23 +461,10 @@ def _validate_tp_and_runner_buffers(cfg: Any, errors: List[str], warnings: List[
             f"TRAIL_STEP_PIPS ({trail_step}) exceeds TRAIL_DISTANCE_PIPS ({trail_dist}); broker SL will trail infrequently."
         )
 
-    prox_pips = getattr(cfg, "RUNNER_PROXIMITY_BUFFER_PIPS", 20.0)
-    front_run = getattr(cfg, "TP_FRONT_RUN_OFFSET", 0.50)
-    if (
-        mode in ("PIPS", "BOTH")
-        and _is_finite_number(prox_pips)
-        and _is_finite_number(front_run)
-        and float(prox_pips) > 0
-        and float(front_run) > float(prox_pips) * 0.10
-    ):
-        warnings.append(
-            f"TP_FRONT_RUN_OFFSET ({front_run}) exceeds RUNNER_PROXIMITY_BUFFER_PIPS ({prox_pips} pips)."
-        )
-
 
 def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
-    """Validate Dynamic Risk Management (ATR SL/TP & ATR Trailing Stop) fields."""
-    for bool_flag in ("DYNAMIC_ATR_SLTP_ENABLED", "DYNAMIC_ATR_TRAIL_ENABLED"):
+    """Validate Pure Dynamic ATR Engine (SL/TP, BE Lock & Trailing SL/TP) fields."""
+    for bool_flag in ("DYNAMIC_ATR_SLTP_ENABLED", "DYNAMIC_ATR_TRAIL_ENABLED", "DYNAMIC_ATR_TP_TRAIL_ENABLED"):
         if hasattr(cfg, bool_flag):
             flag_val = getattr(cfg, bool_flag)
             if not isinstance(flag_val, bool):
@@ -536,9 +481,15 @@ def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
     atr_period = getattr(cfg, "DYNAMIC_ATR_PERIOD", 14)
     if isinstance(atr_period, bool) or not isinstance(atr_period, int) or not (2 <= atr_period <= 200):
         errors.append(f"DYNAMIC_ATR_PERIOD must be an integer in [2, 200], got {atr_period!r}.")
-    act_mult = getattr(cfg, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00)
-    if not _is_finite_number(act_mult) or float(act_mult) < 0.0:
-        errors.append(f"DYNAMIC_ATR_TRAIL_ACTIVATION_MULT must be >= 0, got {act_mult!r}.")
+    for non_neg_field in (
+        "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT",
+        "DYNAMIC_ATR_BE_ACTIVATION_MULT",
+        "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS",
+        "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS",
+    ):
+        val = getattr(cfg, non_neg_field, 0.0)
+        if not _is_finite_number(val) or float(val) < 0.0:
+            errors.append(f"{non_neg_field} must be >= 0, got {val!r}.")
     for pos_field in (
         "DYNAMIC_ATR_BASELINE_DOLLARS",
         "DYNAMIC_SL_ATR_MULT",
@@ -554,10 +505,14 @@ def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
         "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
         "DYNAMIC_ATR_TRAIL_STEP_DOLLARS",
+        "DYNAMIC_ATR_TP_LIFT_ATR_MULT",
     ):
         val = getattr(cfg, pos_field, 1.0)
         if not _is_finite_number(val) or float(val) <= 0.0:
             errors.append(f"{pos_field} must be > 0, got {val!r}.")
+    prog_pct = getattr(cfg, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75)
+    if not _is_finite_number(prog_pct) or not (0.0 < float(prog_pct) < 1.0):
+        errors.append(f"DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT must be in (0, 1), got {prog_pct!r}.")
     for lo_field, hi_field in (
         ("DYNAMIC_SL_MIN_DOLLARS", "DYNAMIC_SL_MAX_DOLLARS"),
         ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),

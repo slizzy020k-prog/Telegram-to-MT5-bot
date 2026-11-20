@@ -14,23 +14,29 @@ _DEFAULT_LEDGER_PATH = Path(
 )
 _FILLED_LAYER_STATUSES = {"OPEN", "FILLED", "RUNNER", "BANKED"}
 _TERMINAL_UNFILLED_STATUSES = {"CANCELLED", "EXPIRED", "ABORTED"}
-_CANONICAL_EXIT_REASON_CODES = {
-    "GOLD_GUARD",
-    "SHORTFALL_BASE",
-    "FSM_FLOOR",
-    "ATR_TRAIL",
+VALID_EXIT_REASON_CODES = {
+    "DYNAMIC_ATR_TRAIL_SL",
+    "DYNAMIC_ATR_TP",
+    "BE_SL",
+    "INITIAL_SL",
+    "TP1_BANK",
+    "STAGE2_BANK_TP",
     "TP_CEILING",
     "BROKER_SL",
     "MANUAL",
+    "PARTIAL_BANK",
+    "ATR_TRAIL",
+    "FSM_FLOOR",
+    "TRAILED_SL",
+    # Legacy aliases preserved for parsing historical ledger entries
+    "GOLD_GUARD",
+    "SHORTFALL_BASE",
     "BANK_HARVEST",
     "BANK_HARVEST_SL",
     "PROFIT_RATCHET_SL",
-    "BE_SL",
     "STAGE0_PROFIT_LOCK",
-    "STAGE2_BANK_TP",
-    "PARTIAL_BANK",
-    "TRAILED_SL",
 }
+_CANONICAL_EXIT_REASON_CODES = VALID_EXIT_REASON_CODES
 
 
 def _is_num(val: Any) -> bool:
@@ -92,22 +98,40 @@ def _infer_exit_stage(signal_data: Dict[str, Any]) -> int:
     return min(4, max(1, cleared_stage, idx_stage))
 
 
-def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> str:
-    """Resolve canonical v3.5.0 exit_reason_code or preserve descriptive unmapped reason."""
-    raw_code = signal_data.get("exit_reason_code")
+def normalize_exit_reason_code(
+    exit_reason: Any,
+    signal_data: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve canonical exit_reason_code (preserving legacy codes for older ledger entries)."""
+    sig = signal_data if isinstance(signal_data, dict) else {}
+    raw_code = sig.get("exit_reason_code")
     if isinstance(raw_code, str) and raw_code.strip():
         up_code = raw_code.strip().upper()
-        if up_code in _CANONICAL_EXIT_REASON_CODES:
+        if up_code in VALID_EXIT_REASON_CODES:
             return up_code
 
-    text = f"{exit_reason or ''} {signal_data.get('runner_close_reason') or ''}".strip()
+    text = f"{exit_reason or ''} {sig.get('runner_close_reason') or ''}".strip()
     low = text.lower()
     up = str(exit_reason or "").strip().upper()
 
-    if up in _CANONICAL_EXIT_REASON_CODES:
+    if up in VALID_EXIT_REASON_CODES:
         return up
-    if "signal deleted" in low or signal_data.get("deleted_from_chat"):
+    if "signal deleted" in low or sig.get("deleted_from_chat"):
         return str(exit_reason or "Signal Deleted")
+    if (
+        "dynamic_atr_trail_sl" in low
+        or "dynamic atr trail sl" in low
+        or "dynamic atr trailing" in low
+        or "dynamic_atr_trail" in low
+        or "dynamic atr trail" in low
+    ):
+        return "DYNAMIC_ATR_TRAIL_SL"
+    if (
+        "dynamic_atr_tp" in low
+        or "dynamic atr tp" in low
+        or "dynamic trailing tp" in low
+    ):
+        return "DYNAMIC_ATR_TP"
     if "bank_harvest_sl" in low or "bank harvest sl" in low:
         return "BANK_HARVEST_SL"
     if "bank_harvest" in low or "bank harvest" in low:
@@ -118,10 +142,14 @@ def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> st
         return "STAGE0_PROFIT_LOCK"
     if "stage2_bank_tp" in low or "stage 2 bank" in low:
         return "STAGE2_BANK_TP"
+    if "tp1_bank" in low or "tp1 bank" in low:
+        return "TP1_BANK"
     if "partial_bank" in low or "partial bank" in low:
         return "PARTIAL_BANK"
-    if "be_sl" in low or "breakeven stop" in low or "breakeven sl" in low:
+    if "be_sl" in low or "be_lock" in low or "breakeven stop" in low or "breakeven sl" in low:
         return "BE_SL"
+    if "initial_sl" in low or "initial sl" in low:
+        return "INITIAL_SL"
     if "gold reversal guard" in low or "gold_guard" in low:
         return "GOLD_GUARD"
     if "shortfall" in low:
@@ -161,6 +189,11 @@ def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> st
     if isinstance(raw_code, str) and raw_code.strip():
         return raw_code.strip()
     return str(exit_reason or "CLOSED")
+
+
+def _infer_exit_reason_code(signal_data: Dict[str, Any], exit_reason: str) -> str:
+    """Resolve canonical exit_reason_code or preserve descriptive unmapped reason."""
+    return normalize_exit_reason_code(exit_reason, signal_data=signal_data)
 
 
 def _resolve_ref_entry(signal_data: Dict[str, Any], is_buy: bool) -> Optional[float]:

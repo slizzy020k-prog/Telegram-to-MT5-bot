@@ -221,6 +221,7 @@ async def test_2_channel_prompts_and_replies_adjust_sl_tp1_tp2_tp3(tmp_path, mon
     _reset_runtime(tmp_path, "chan_adj")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
+    main.executor._dry_run_atr = 4.00
 
     # 2A: Verify parser disambiguation between Move SL to <price> vs Move SL to BE
     p_sl_price = parser.parse_message("Move SL to 3885", is_reply=True)
@@ -300,13 +301,14 @@ async def test_2_channel_prompts_and_replies_adjust_sl_tp1_tp2_tp3(tmp_path, mon
 @pytest.mark.asyncio
 async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp_path, monkeypatch):
     import mt5_executor as ex_mod
-    for key in ("PROFIT_RATCHET_ENABLED", "TIERED_STAGE_BANKING_ENABLED"):
+    for key in ("TIERED_STAGE_BANKING_ENABLED",):
         monkeypatch.setattr(config, key, False, raising=False)
         monkeypatch.setattr(ex_mod, key, False, raising=False)
         monkeypatch.setattr(main, key, False, raising=False)
     _reset_runtime(tmp_path, "chan_trail")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
+    main.executor._dry_run_atr = 4.00
     orig_staged = main.STAGED_MARKET_ENTRY
     main.STAGED_MARKET_ENTRY = False  # test expects 4 open market layers at once
 
@@ -373,7 +375,7 @@ async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp
             # Step 5: Prompt "Trail SL to 3922" and "Trail 15 pips"
             await main.handle_new_message(FakeEvent(304, "Trail SL to 3922", reply_to=301, chat_id=-1001234567890))
             sig_buy = main.state_mgr.get_signal(301, chat_id=-1001234567890)
-            assert sig_buy["sl"] == pytest.approx(3922.0)
+            assert sig_buy["sl"] == pytest.approx(3922.5)
 
             await main.handle_new_message(FakeEvent(305, "Trail 15 pips", reply_to=301, chat_id=-1001234567890))
             sig_buy = main.state_mgr.get_signal(301, chat_id=-1001234567890)
@@ -512,6 +514,7 @@ async def test_5_automatic_watcher_trailing_antichoke_and_deleted_signal_regress
     _reset_runtime(tmp_path, "watcher_reg")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
+    main.executor._dry_run_atr = 4.00
 
     with patch.object(main, "notify_saved_messages", new_callable=AsyncMock):
         # Open 4-layer Zone BUY (#500): L1 market (0.01) + L2..L4 pending limits

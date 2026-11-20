@@ -123,53 +123,6 @@ async def test_bank_single_layer_at_tp1(tmp_path, monkeypatch):
     assert sig["last_banked_tickets"] == [4101]
 
 
-def test_tight_scalp_reversal_guard_arming(monkeypatch):
-    import mt5_executor as _mt5_mod
-    monkeypatch.setattr(config, "STAGE0_PROFIT_LOCK_ENABLED", False)
-    if hasattr(_mt5_mod, "STAGE0_PROFIT_LOCK_ENABLED"):
-        monkeypatch.setattr(_mt5_mod, "STAGE0_PROFIT_LOCK_ENABLED", False)
-    """
-    Verify Gold Scalp Arming Calibration on short TP1 leg (<= $4.00):
-    Signal: Entry 3842.0, TP1 3844.5 ($2.50 leg).
-    Price 3844.06 gives $2.06 profit (82.4% progress) -> MUST ARM!
-    Reversal from 3844.06 to 3842.80 gives $1.26 giveback (61.2% giveback >= 30% AND >= $1.125 floor) -> MUST TRIGGER!
-    """
-    executor = MT5Executor(dry_run=True)
-    executor.connect()
-
-    sig = {
-        "symbol": "XAUUSD.s",
-        "direction": "BUY",
-        "layers": {
-            "L1": {"lot": 0.01, "target_price": 3842.0, "ticket": 5001, "status": "OPEN"},
-        },
-        "market_tickets": [5001],
-        "runner_layers": ["L1"],
-        "runner_ticket": 5001,
-        "raw_tp1": 3844.5,
-        "tp_levels": {"TP1": 3844.5, "TP2": 3855.0},
-        "recorded_entry_price": 3842.0,
-        "initial_price": 3842.0,
-    }
-
-    # At price 3844.06 (82.4% of leg, profit=$2.06 >= $1.50):
-    t_peak = _tick(3844.06)
-    res_arm = executor.evaluate_gold_reversal_guard(sig, t_peak)
-    assert res_arm["armed"] is True
-    assert sig.get("reversal_guard_armed") is True
-    assert sig.get("peak_profit") == pytest.approx(2.06)
-
-    # Reversal to 3842.50: giveback = $1.56 >= floor ($1.50) and >= 30% giveback -> 2 confirming ticks!
-    t_pullback = _tick(3842.50)
-    res_tick1 = executor.evaluate_gold_reversal_guard(sig, t_pullback)
-    assert res_tick1["armed"] is True
-    assert res_tick1["triggered"] is False
-    res_trigger = executor.evaluate_gold_reversal_guard(sig, t_pullback)
-    assert res_trigger["armed"] is True
-    assert res_trigger["triggered"] is True
-    assert res_trigger["pullback_dollars"] == pytest.approx(1.56)
-
-
 @pytest.mark.asyncio
 async def test_telegram_bank_command_on_runner_active(tmp_path):
     """

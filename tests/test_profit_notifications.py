@@ -53,11 +53,11 @@ def test_tp1_scaling_records_banked_tickets():
 
 
 def test_runner_close_stores_last_runner_ticket_and_reason():
-    """manage_designated_runner stores last_runner_ticket and runner_close_reason on close."""
+    """manage_designated_runner stores last_runner_ticket and runner_close_reason on broker close."""
     executor = MT5Executor(dry_run=True)
     executor.connect()
 
-    # Test TP2 reached
+    # Active tick near TP2: Pure Dynamic ATR Engine keeps runner active (zero virtual closes!)
     sig = {
         "runner_ticket": 801,
         "runner_layer": "BOTTOM",
@@ -77,12 +77,9 @@ def test_runner_close_stores_last_runner_ticket_and_reason():
     with patch.object(executor, "get_tick", return_value=mock_tick):
         still_active = executor.manage_designated_runner(sig)
 
-    assert still_active is False
-    assert sig["last_runner_ticket"] == 801
-    assert sig["tp2_reached"] is True
-    assert "TP2 Reached" in sig["runner_close_reason"]
+    assert still_active is True  # Zero virtual close on tick!
 
-    # Test Virtual TP1 floor
+    # Active tick during pullback below soft floor: Pure Dynamic ATR Engine keeps runner active (zero virtual closes!)
     sig2 = {
         "runner_ticket": 802,
         "runner_layer": "MID",
@@ -102,9 +99,18 @@ def test_runner_close_stores_last_runner_ticket_and_reason():
     with patch.object(executor, "get_tick", return_value=mock_tick2):
         still_active2 = executor.manage_designated_runner(sig2)
 
-    assert still_active2 is False
-    assert sig2["last_runner_ticket"] == 802
-    assert "Virtual TP1 Floor" in sig2["runner_close_reason"]
+    assert still_active2 is True  # Zero virtual close on pullback!
+
+    # When position actually closes on broker (e.g. SL or TP hit in live mode):
+    executor_live = MT5Executor(dry_run=False)
+    import mt5_executor as ex_mod
+    with patch.object(ex_mod.mt5, "positions_get", return_value=[]), \
+         patch.object(executor_live, "get_position_close_info", return_value={"reason": "SL"}):
+        still_active_closed = executor_live.manage_designated_runner(sig)
+
+    assert still_active_closed is False
+    assert sig["last_runner_ticket"] == 801
+    assert "Trailed Stop Loss Hit" in sig["runner_close_reason"]
 
 
 def test_get_position_closed_profit_dry_run():
