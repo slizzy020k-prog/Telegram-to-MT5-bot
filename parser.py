@@ -437,19 +437,10 @@ def sanitize_monotonic_tps(
     return [vals[i] for i in kept_indices], [vals[i] for i in dropped_indices]
 
 
-def _sanitize_labeled_tps_monotonic(
-    labeled_tps: Dict[str, float],
-    direction: str = "BUY",
-) -> Tuple[Dict[str, float], List[float]]:
-    """
-    Sanitize labeled TP dictionary using exact Longest Strictly Monotonic Subsequence DP
-    over stages ordered by TP1..TP5. Drops out-of-order typo stages and cleanly re-numbers/keeps valid stages.
-    """
-    if not labeled_tps:
-        return {}, []
-
+def _labeled_tp_items(labeled_tps: Dict[str, float]) -> List[Tuple[int, str, float]]:
+    """Parse a labelled TP dictionary into (stage_index, canonical_label, price) tuples, ordered by stage."""
     parsed_items: List[Tuple[int, str, float]] = []
-    for k, v in labeled_tps.items():
+    for k, v in (labeled_tps or {}).items():
         if v is None:
             continue
         k_str = str(k).strip().upper()
@@ -466,11 +457,62 @@ def _sanitize_labeled_tps_monotonic(
                     parsed_items.append((idx, f"TP{idx}", fv))
             except (TypeError, ValueError):
                 pass
+    parsed_items.sort(key=lambda x: x[0])
+    return parsed_items
 
+
+def _sanitize_labeled_tps_monotonic(
+    labeled_tps: Dict[str, float],
+    direction: str = "BUY",
+) -> Tuple[Dict[str, float], List[float]]:
+    """
+    Sanitize labeled TP dictionary using exact Longest Strictly Monotonic Subsequence DP
+    over stages ordered by TP1..TP5. Drops out-of-order typo stages and re-numbers the
+    surviving stages.
+
+    Invariant: the surviving stages are strictly ordered and contiguously labelled from
+    TP1 (TP1..TPn). A sanitized ladder can therefore never expose a gap (e.g. TP2 + TP4
+    with TP3 missing) nor a stage priced on the wrong side of its neighbour.
+
+    Use :func:`_sanitize_labeled_tps_monotonic_stages` when the provider's original stage
+    identity must be preserved (live-signal merges must never shift TP2 into TP1).
+
+    Returns (labeled_tps, dropped_prices).
+    """
+    parsed_items = _labeled_tp_items(labeled_tps)
     if not parsed_items:
         return {}, []
 
-    parsed_items.sort(key=lambda x: x[0])
+    raw_prices = [item[2] for item in parsed_items]
+    kept_idx, dropped_idx = _longest_monotonic_indices(raw_prices, direction=direction)
+    kept_prices = [raw_prices[i] for i in kept_idx]
+    dropped_prices = [raw_prices[i] for i in dropped_idx]
+
+    clean_labeled = {f"TP{i + 1}": kept_prices[i] for i in range(len(kept_prices))}
+    return clean_labeled, dropped_prices
+
+
+def _sanitize_labeled_tps_monotonic_stages(
+    labeled_tps: Dict[str, float],
+    direction: str = "BUY",
+) -> Tuple[Dict[str, float], List[float]]:
+    """
+    Stage-preserving variant of :func:`_sanitize_labeled_tps_monotonic`.
+
+    Same Longest Strictly Monotonic Subsequence DP, but the surviving stages keep the
+    provider's original TPn keys (a TP2 stays a TP2). Re-numbering is only applied when the
+    ladder starts at TP1, where re-numbering cannot shift a later stage onto TP1.
+
+    Downstream merges of live signals rely on this: shifting TP2 into TP1 would move the
+    first take-profit target of an already-running trade (see
+    `merge_tp_levels_for_active_signal`, which back-fills a missing TP1 itself).
+
+    Returns (labeled_tps, dropped_prices).
+    """
+    parsed_items = _labeled_tp_items(labeled_tps)
+    if not parsed_items:
+        return {}, []
+
     raw_prices = [item[2] for item in parsed_items]
     kept_idx, dropped_idx = _longest_monotonic_indices(raw_prices, direction=direction)
 
@@ -742,6 +784,8 @@ class SignalAction(dict):
                 return self.get("explicit_tps") or []
             if name == "labeled_tps":
                 return self.get("labeled_tps") or {}
+            if name == "labeled_tps_stages":
+                return self.get("labeled_tps_stages") or {}
             if name == "unlabeled_tps":
                 return self.get("unlabeled_tps") or []
             if name == "broker_symbol":
@@ -972,7 +1016,17 @@ def gate_3_classify_trade_management(
                 return True
         return False
 
-    # Reject future-tense conversational chatter before trade management classification
+    # Reject future-tense conversational chatter BEFORE any trade-management
+    # classification (in particular before ACTION_CLOSE_WORST_HOLD_LAYERS below), so a
+    # comment like "I'm gonna go breakeven early and close worst soon" can never reach the
+    # order-modification path.
+    #
+    # Trade-off (deliberate, per the Msg 10196 directive "ignore messages containing
+    # future-tense phrasing"): this is a blunt reject, so a genuine command that merely
+    # mentions one of the tokens is dropped too (e.g. the reply "close worst entries, might
+    # want tp2"). The blunt behaviour is kept on purpose; the rejection is always logged
+    # (never silent), and genuine commands that contain none of the tokens
+    # (e.g. "close worst entries now and hold layers") are unaffected.
     if _FUTURE_TENSE_CHATTER_RE.search(lower):
         logger.info(f"Gate 3: Rejected future-tense chatter message | text={text!r}")
         return None
@@ -1582,16 +1636,21 @@ def gate_4_extract_signal(
                 if d not in all_monotonic_dropped:
                     all_monotonic_dropped.append(d)
 
+    # "labeled_tps" holds the sanitized ladder re-numbered TP1..TPn (strictly ordered,
+    # contiguously labelled). "labeled_tps_stages" keeps the provider's original stage
+    # identity (a TP2 stays a TP2) and is what live-signal merges must consume.
+    labeled_tps_stages: Dict[str, float] = {}
     if labeled_tps:
         sanitized_labeled, dropped_lab = _sanitize_labeled_tps_monotonic(labeled_tps, direction=direction)
+        labeled_tps_stages, _ = _sanitize_labeled_tps_monotonic_stages(labeled_tps, direction=direction)
         if dropped_lab:
             logger.warning(
                 f"Gate 4: Dropped non-monotonic labeled TP typos on {direction}: {dropped_lab} from {labeled_tps}"
             )
-            labeled_tps = sanitized_labeled
             for d in dropped_lab:
                 if d not in all_monotonic_dropped:
                     all_monotonic_dropped.append(d)
+        labeled_tps = sanitized_labeled
 
     raw_sl = _extract_sl(text)
     has_valid_targets = bool(explicit_tps) or (raw_sl is not None and 500.0 <= raw_sl < 100000.0)
@@ -1688,6 +1747,7 @@ def gate_4_extract_signal(
         "sl_valid": False,
         "explicit_tps": explicit_tps,
         "labeled_tps": labeled_tps,
+        "labeled_tps_stages": labeled_tps_stages,
         "unlabeled_tps": unlabeled_tps,
         "tp_levels": tp_levels,
         "raw_tp1": raw_tp1,
@@ -1759,7 +1819,9 @@ def gate_5_validate_price_sanity(
 
     # Validate & sanitize ALL TP fields before checking SL (runs even when raw_sl is None)
     max_tp_dist = float(MAX_TP_DISTANCE_DOLLARS)
-    raw_labeled_tps = dict(action.get("labeled_tps") or {})
+    # Stage-preserving labelled TPs (provider's original TPn keys) are the source of truth
+    # here; "labeled_tps" only holds the re-numbered TP1..TPn view of the same prices.
+    raw_labeled_tps = dict(action.get("labeled_tps_stages") or action.get("labeled_tps") or {})
     raw_unlabeled_tps = list(action.get("unlabeled_tps") or [])
     raw_explicit_tps = list(action.get("explicit_tps") or [])
     raw_tp_levels = dict(action.get("tp_levels") or {})
@@ -1831,13 +1893,20 @@ def gate_5_validate_price_sanity(
             mono_dropped_g5.extend(d_unl5)
             logger.warning(f"Gate 5 Sanity Check: Stripped non-monotonic unlabeled TPs on {direction}: {d_unl5}")
 
+    # Two views of the same labelled prices:
+    #   labeled_tps_contiguous -> strictly ordered, contiguously labelled TP1..TPn
+    #   labeled_tps_stage_view  -> provider's original stage keys (TP2 stays TP2)
+    labeled_tps_contiguous: Dict[str, float] = {}
+    labeled_tps_stage_view: Dict[str, float] = dict(valid_labeled)
     if valid_labeled:
-        san_lab5, d_lab5 = _sanitize_labeled_tps_monotonic(valid_labeled, direction=direction)
+        labeled_tps_contiguous, d_lab5 = _sanitize_labeled_tps_monotonic(valid_labeled, direction=direction)
+        labeled_tps_stage_view, _ = _sanitize_labeled_tps_monotonic_stages(valid_labeled, direction=direction)
         if d_lab5:
-            valid_labeled = san_lab5
             any_tp_stripped = True
             mono_dropped_g5.extend(d_lab5)
             logger.warning(f"Gate 5 Sanity Check: Stripped non-monotonic labeled TPs on {direction}: {d_lab5}")
+    action["labeled_tps"] = labeled_tps_contiguous
+    action["labeled_tps_stages"] = labeled_tps_stage_view
 
     if mono_dropped_g5:
         existing_mono = list(action.get("monotonic_dropped_tps") or [])
@@ -1848,7 +1917,6 @@ def gate_5_validate_price_sanity(
 
     if any_tp_stripped:
         action["invalid_explicit_tps"] = list(raw_explicit_tps or raw_unlabeled_tps or raw_labeled_tps.values())
-        action["labeled_tps"] = valid_labeled
         action["unlabeled_tps"] = valid_unlabeled
         action["explicit_tps"] = valid_explicit
         rebuilt_tp_levels = derive_tp_levels(valid_explicit, direction=direction) if valid_explicit else {}
