@@ -113,7 +113,6 @@ from parser import (
     merge_tp_levels_for_active_signal,
     gate_3_classify_trade_management,
     derive_tp_levels,
-    compute_zone_4tiers,
 )
 from mt5_executor import MT5Executor
 from state_manager import StateManager, _chat_ids_match
@@ -5967,7 +5966,13 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         if isinstance(existing_signal.get("tp_levels"), dict) and existing_signal.get("tp_levels")
         else _resolve_signal_tps_dict(existing_signal)
     )
-    parsed_labeled = getattr(parsed, "labeled_tps", None) or {}
+    # Stage-preserving labelled TPs (provider's original TPn keys, e.g. a TP2 stays a TP2)
+    # so a TP2/TP3-only edit never shifts into TP1 on an already-running signal.
+    parsed_labeled = (
+        getattr(parsed, "labeled_tps_stages", None)
+        or getattr(parsed, "labeled_tps", None)
+        or {}
+    )
     parsed_unlabeled = getattr(parsed, "unlabeled_tps", None) or []
     has_new_explicit_tps = bool(
         parsed_labeled or parsed_unlabeled or (isinstance(parsed.tp_levels, dict) and parsed.tp_levels)
@@ -6355,14 +6360,43 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         is_buy_dir = str(direction).upper() == "BUY"
         sl_anchor = 0.0
         tp_anchor = 0.0
-        if parsed.zone:
-            sl_anchor = float(parsed.zone.bottom if is_buy_dir else parsed.zone.top)
-            tp_anchor = float(parsed.zone.top if is_buy_dir else parsed.zone.bottom)
+        # Anchor convention MUST mirror the fresh-signal path. The executor owns the formula
+        # (MT5Executor.compute_zone_atr_anchors, also used by execute_4layer_zone): sl_anchor
+        # is the extreme of the raw AND front-run-shifted zone tiers, tp_anchor is the
+        # front-run-shifted L1 tier price. Anchoring on the raw zone edge instead (as this
+        # block used to) made an edit scale SL/TP differently from an identical fresh signal
+        # on the same zone.
+        edit_zone: Any = None
+        if parsed.zone is not None:
+            edit_zone = parsed.zone
         elif isinstance(existing_signal.get("zone"), dict):
             ez = existing_signal["zone"]
-            sl_anchor = float(ez.get("bottom", 0.0) if is_buy_dir else ez.get("top", 0.0))
-            tp_anchor = float(ez.get("top", 0.0) if is_buy_dir else ez.get("bottom", 0.0))
-        else:
+            try:
+                edit_zone = {
+                    "top": float(ez["top"]),
+                    "bottom": float(ez["bottom"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                edit_zone = None
+        fn_anchors = getattr(executor, "compute_zone_atr_anchors", None)
+        if edit_zone is not None and callable(fn_anchors):
+            try:
+                sl_anchor, tp_anchor = fn_anchors(
+                    symbol=symbol,
+                    direction=direction,
+                    zone=edit_zone,
+                    final_tp=new_tp,
+                    raw_tp1=raw_tp1,
+                    pip_size=pip_size,
+                    digits=2,
+                )
+            except Exception as exc:  # defensive: tier math must never abort the edit
+                logger.warning(
+                    f"Edit ATR scaling: zone anchor computation failed ({exc}); falling back to L1 entry"
+                )
+                sl_anchor = 0.0
+                tp_anchor = 0.0
+        if sl_anchor <= 0.0 or tp_anchor <= 0.0:
             l1_entry = existing_signal.get("recorded_entry_price")
             if not _is_num(l1_entry) and isinstance(layers.get("L1"), dict):
                 l1_entry = layers["L1"].get("entry_price") or layers["L1"].get("target_price")

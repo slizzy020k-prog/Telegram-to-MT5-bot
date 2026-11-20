@@ -2365,6 +2365,102 @@ class MT5Executor:
 
         return market_tickets, pending_tickets, layers_data
 
+    def _resolve_zone_raw_tiers(
+        self,
+        direction: str,
+        zone: Any,
+        digits: int,
+    ) -> Dict[str, float]:
+        """Return the raw (pre front-run) tier prices of a zone, keyed L1..L4."""
+        direction_norm = (direction or "BUY").strip().upper()
+        if hasattr(zone, "get_tiers"):
+            return dict(zone.get_tiers(direction_norm))
+        if isinstance(zone, dict):
+            return dict(compute_zone_4tiers(zone["top"], zone["bottom"], direction_norm, digits=digits))
+        return dict(compute_zone_4tiers(zone.top, zone.bottom, direction_norm, digits=digits))
+
+    def _resolve_zone_tiers(
+        self,
+        symbol: str,
+        direction: str,
+        zone: Any,
+        final_tp: Optional[float],
+        raw_tp1: Optional[float],
+        pip_size: float,
+        digits: int,
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Return (raw_tiers, front_run_tiers) for a zone entry."""
+        direction_norm = (direction or "BUY").strip().upper()
+        raw_tiers = self._resolve_zone_raw_tiers(direction_norm, zone, digits)
+        tiers = {
+            k: self._apply_limit_entry_front_run(
+                symbol=symbol,
+                direction=direction_norm,
+                target_price=float(v),
+                final_tp=final_tp,
+                raw_tp1=raw_tp1,
+                pip_size=pip_size,
+                digits=digits,
+            )
+            for k, v in raw_tiers.items()
+        }
+        return raw_tiers, tiers
+
+    @staticmethod
+    def _zone_anchors_from_tiers(
+        direction: str,
+        raw_tiers: Dict[str, float],
+        tiers: Dict[str, float],
+    ) -> Tuple[float, float]:
+        """Return (sl_anchor, tp_anchor) for ATR-based SL/TP scaling of a zone entry.
+
+        Single source of truth for the zone anchor formula. `sl_anchor` is the extreme of the
+        raw AND front-run-shifted tiers; `tp_anchor` is the front-run-shifted L1 tier.
+        """
+        if (direction or "BUY").strip().upper() == "BUY":
+            sl_anchor = min(min(raw_tiers.values()), min(tiers.values()))
+        else:
+            sl_anchor = max(max(raw_tiers.values()), max(tiers.values()))
+        return float(sl_anchor), float(tiers["L1"])
+
+    def compute_zone_atr_anchors(
+        self,
+        symbol: str,
+        direction: str,
+        zone: Any,
+        final_tp: Optional[float],
+        raw_tp1: Optional[float],
+        pip_size: float,
+        digits: int,
+    ) -> Tuple[float, float]:
+        """Return (sl_anchor, tp_anchor) for ATR-based SL/TP scaling of a zone entry.
+
+        MUST stay the single source of truth shared by `execute_4layer_zone` (fresh signal)
+        and `main._handle_message_edited_unlocked` (stub-to-zone edit). Otherwise an edited
+        signal scales its SL/TP differently from an identical fresh signal on the same zone.
+        """
+        direction_norm = (direction or "BUY").strip().upper()
+        raw_tiers = self._resolve_zone_raw_tiers(direction_norm, zone, digits)
+        try:
+            tiers = {
+                k: self._apply_limit_entry_front_run(
+                    symbol=symbol,
+                    direction=direction_norm,
+                    target_price=float(v),
+                    final_tp=final_tp,
+                    raw_tp1=raw_tp1,
+                    pip_size=pip_size,
+                    digits=digits,
+                )
+                for k, v in raw_tiers.items()
+            }
+        except Exception as exc:  # defensive: tier math must never abort an edit
+            logger.warning(
+                f"Zone ATR anchors: front-run tier shift failed ({exc}); using raw zone tiers"
+            )
+            tiers = dict(raw_tiers)
+        return self._zone_anchors_from_tiers(direction_norm, raw_tiers, tiers)
+
     def _apply_limit_entry_front_run(
         self,
         symbol: str,
@@ -2498,24 +2594,15 @@ class MT5Executor:
             return [], [], {}
         direction_norm, resolved_sym, tick, _, digits, pip_size = prereq
 
-        if hasattr(zone, "get_tiers"):
-            raw_tiers = zone.get_tiers(direction_norm)
-        elif isinstance(zone, dict):
-            raw_tiers = compute_zone_4tiers(zone["top"], zone["bottom"], direction_norm, digits=digits)
-        else:
-            raw_tiers = compute_zone_4tiers(zone.top, zone.bottom, direction_norm, digits=digits)
-        tiers = {
-            k: self._apply_limit_entry_front_run(
-                symbol=resolved_sym,
-                direction=direction_norm,
-                target_price=float(v),
-                final_tp=final_tp,
-                raw_tp1=raw_tp1 or (tp_levels or {}).get("TP1"),
-                pip_size=pip_size,
-                digits=digits,
-            )
-            for k, v in raw_tiers.items()
-        }
+        raw_tiers, tiers = self._resolve_zone_tiers(
+            symbol=resolved_sym,
+            direction=direction_norm,
+            zone=zone,
+            final_tp=final_tp,
+            raw_tp1=raw_tp1 or (tp_levels or {}).get("TP1"),
+            pip_size=pip_size,
+            digits=digits,
+        )
 
         market_mask = [
             self._layer_will_execute_at_market(
@@ -2535,16 +2622,12 @@ class MT5Executor:
             self.last_error = warn or "High Risk Lot Cap reached"
             return [], [], {}
 
-        sl_anchor = (
-            min(min(raw_tiers.values()), min(tiers.values()))
-            if direction_norm == "BUY"
-            else max(max(raw_tiers.values()), max(tiers.values()))
-        )
+        sl_anchor, tp_anchor = self._zone_anchors_from_tiers(direction_norm, raw_tiers, tiers)
         sl, layer_tps, _ = self._prepare_dynamic_sltp_inputs(
             symbol=resolved_sym,
             direction=direction_norm,
             sl_anchor=sl_anchor,
-            tp_anchor=tiers["L1"],
+            tp_anchor=tp_anchor,
             sl=sl,
             final_tp=final_tp,
             raw_tp1=raw_tp1,
