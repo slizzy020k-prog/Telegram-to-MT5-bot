@@ -4,6 +4,61 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ---
 
+## [2026-11-20] — v3.7.0 Msg 10180/10196 Audit Fixes, Progressive ATR Trail & Regression Suite
+
+- **Baseline Commit:** `c57b728` (`v3.6.0` line — MT5 saved-credential account switching via `MT5_LOGIN`)
+- **Target Version:** `v3.7.0` (Msg 10180 / Msg 10196 Audit Fixes + Progressive ATR Trail + Regression Suite)
+- **Verification Status:** `230/230` pytest tests PASS (`0` failures); `check_algo.py` → `ALL CHECKS PASSED`; `startup_checks.validate_environment()` → `{'ok': True, 'errors': [], 'warnings': []}`; `python -c "import config, parser, dynamic_risk, mt5_executor, main, startup_checks"` → `imports ok`.
+
+### 1. Upgrade 1 — Premature TP1→TP2 Lift Guard & `roles_locked` Scoping (`dynamic_risk.py`, `mt5_executor.py`)
+
+- A broker TP1→TP2 lift is now gated on a minimum TP1-leg progress of `DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT = 0.50` (50%) **plus** ATR proximity to the TP1 target; the gate is bypassed only when the layer is already BE-locked, has reached TP1, or sits at stage `k >= 2`.
+- `roles_locked` is now set **only** on a BE-lock or a TP1-clear — never on a pre-BE TP lift (the previously dead `has_pending_limits` clause was removed; behaviour-identical because it could never be `False`).
+- Rationale: `main.py` `_forward_only_sl_guard` blocks edits while `roles_locked` is truthy, so a premature `roles_locked` would also block legitimate “Extend SL” edits (Msg 10181).
+- The not-armed engine state now reports the **effective** multiplier and zone (`eff_mult`, `trail_zone`) instead of always the base multiplier with a hardcoded `"STANDARD"` label (reachable at ATR `20.00` / MFE `12.00` → EXTENDED `1.00x`).
+
+### 2. Upgrade 2 — `ACTION_CLOSE_WORST_HOLD_LAYERS` Hardening (`parser.py`, `mt5_executor.py`)
+
+- **Future-tense chatter rejection:** conversational future-tense phrasing (e.g. “I'm gonna go breakeven early and close worst soon”) is now rejected **before** any trade-management classification, so it can never reach the order-modification path. The rejection is always logged, never silent. Trade-off recorded in-code: the reject is blunt, so a genuine command that merely mentions one of the tokens is dropped too.
+- **BANK_TP1 TP targets are never overwritten:** a layer whose role is `BANK_TP1` keeps its TP1 target; the runner-phase TP-edit path no longer substitutes TP3 for a BANK_TP1 layer's TP1.
+- **Broker stops level validated before a BE move:** the broker `trade_stops_level` is validated against the requested breakeven distance before the move is attempted, and the stops buffer scales with `trade_stops_level` while ignoring `trade_freeze_level`.
+
+### 3. Upgrade 3 — Monotonic TP Typo Sanitizer (`parser.py`)
+
+- The TP ladder sanitizer now guarantees a **contiguous, strictly ordered** ladder: `_sanitize_labeled_tps_monotonic` always re-numbers the surviving stages to `TP1..TPn` (no gaps, no mislabelled stage).
+- Worked example: the typo ladder `3568/3555/3437/3520/3500` is non-monotonic — `3437` is dropped and the surviving stages are renumbered.
+- A stage-preserving variant `_sanitize_labeled_tps_monotonic_stages` keeps the provider's original `TPn` keys and is what live-signal merges consume, so a TP2 never shifts onto TP1 on an already-running signal. Gates 4 and 5 publish both views (`labeled_tps` contiguous, `labeled_tps_stages` stage-preserving).
+
+### 4. Upgrade 4 — ADAPTIVE ATR Scaling on Stub-to-Zone Edits (`main.py`, `mt5_executor.py`)
+
+- The stub-to-zone **edit** path now applies the same ADAPTIVE ATR scaling as a fresh signal (previously the edit path did not scale at all).
+- **Critical defect fixed:** `TP1_CLOSE_PROXIMITY_PIPS` was used without being imported, so the entire stub-to-zone edit path died with a `NameError` — the feature was non-functional rather than merely mis-scaled (commit `14f742c`).
+- **Zone-anchor parity:** the zone anchor formula was extracted into one shared helper (`MT5Executor._resolve_zone_raw_tiers` / `_resolve_zone_tiers` / `_zone_anchors_from_tiers` / public `compute_zone_atr_anchors`). `execute_4layer_zone` (fresh signal) and `main._handle_message_edited_unlocked` (edit) now route through it, so an edit and an identical fresh signal on the same zone scale SL/TP identically. The previous inline edit formula anchored on the raw zone edge while the fresh path anchored on the min/max over the raw and front-run-shifted tiers.
+
+### 5. Upgrade 5 — Progressive ATR Trail (`dynamic_risk.py`, `config.py`, `mt5_executor.py`)
+
+| Zone | MFE ($) | Trail Multiplier | Knob |
+|---|---:|---:|---|
+| `STANDARD` | `< 10.00` | `1.40x` | `DYNAMIC_ATR_TRAIL_MULT` |
+| `EXTENDED` | `10.00 – 17.99` | `1.00x` | `DYNAMIC_ATR_TRAIL_EXTENDED_MULT` / `DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS` |
+| `HOME_RUN` | `>= 18.00` | `0.80x` | `DYNAMIC_ATR_TRAIL_HOMERUN_MULT` / `DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS` |
+
+- Trail distance floor `$2.50` (`DYNAMIC_ATR_TRAIL_MIN_DOLLARS`) and ceiling `$12.00` (`DYNAMIC_ATR_TRAIL_MAX_DOLLARS`) unchanged; step `$0.25`.
+- **Forward-only ratchet** is invariant and documented on `select_progressive_trail_mult`: a non-decreasing peak MFE → a non-increasing multiplier → a non-increasing trail distance → `atr_sl` only ever moves forward.
+- **Config correction:** the shipped `.env` pinned `DYNAMIC_ATR_TRAIL_MULT=1.50`, so the effective STANDARD tier was `1.50x`, not the `1.40x` the directive specifies. Corrected to `1.40` locally and in `.env.example` (both verified: `config.DYNAMIC_ATR_TRAIL_MULT = 1.4`).
+
+### 6. Upgrade 6 — Regression Suite (`tests/`)
+
+- `11` new tests in `tests/test_msg_10180_10196_regressions.py` covering the premature-lift guard, `roles_locked` scoping, worst-hold-layers hardening, the monotonic TP sanitizer, the progressive trail zone boundaries and the stub-to-zone edit scaling.
+- `4` repaired legacy expectations (expected-value drift from the intentional Upgrade 5 change, not regressions): `test_atr_trail_dist_clamps_to_range` and `test_atr_trail_ratchets_forward_only` (MFE `$10.00` now lands exactly on the EXTENDED boundary), `test_v31_single_layer_dynamically_becomes_runner_and_scales_tp1_to_tp4` (MFE `$10.60` → EXTENDED, `runner_sl_floor 3896.60`), and `test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profit` (MFE `$9.75` → STANDARD, SL `3894.15` under the `1.40x` multiplier).
+
+### 7. Deploy-Readiness
+
+- **No VPS deployment was performed** for this change — no SSH, no file copy, no service restart.
+- **`.env` drift on the VPS is UNRESOLVED and must be corrected at deploy time:** the VPS `.env` still pins `DYNAMIC_ATR_TRAIL_MULT=1.50` and does not define the new ATR trail knobs (`DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS`, `DYNAMIC_ATR_TRAIL_EXTENDED_MULT`, `DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS`, `DYNAMIC_ATR_TRAIL_HOMERUN_MULT`, `DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT`).
+- `.env` is gitignored, so this push cannot fix it; the local `.env` and `.env.example` are already aligned to the spec.
+
+---
 ## [2026-11-19] — v3.6.0 Autonomous Audit, Profit Ratchet Calibration & Production Bug Fixes
 
 - **Baseline Commit:** `4544f7f` (`v3.5.2`)
