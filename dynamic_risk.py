@@ -50,7 +50,11 @@ class DynamicRiskPolicy:
     scale_max: float = 1.75
     trail_enabled: bool = True
     trail_timeframe: str = "M5"
-    trail_atr_mult: float = 1.50
+    trail_atr_mult: float = 1.40
+    trail_extended_mfe_dollars: float = 10.00
+    trail_extended_atr_mult: float = 1.00
+    trail_homerun_mfe_dollars: float = 18.00
+    trail_homerun_atr_mult: float = 0.80
     trail_activation_atr_mult: float = 1.00
     trail_min_dollars: float = 2.50
     trail_max_dollars: float = 12.00
@@ -61,6 +65,7 @@ class DynamicRiskPolicy:
     tp_trail_enabled: bool = True
     tp_lift_atr_mult: float = 0.50
     tp_lift_progress_pct: float = 0.75
+    tp1_lift_min_progress_pct: float = 0.50
 
 
 def _safe_float(value: Any, default: float) -> float:
@@ -92,6 +97,13 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
     tr_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50), 2.50))
     tr_hi = max(tr_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00), 12.00))
     raw_per = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_PERIOD", 14), 14.0)
+    ext_mfe_raw = max(0.50, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00), 10.00))
+    home_mfe_raw = max(0.50, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00), 18.00))
+    ext_mfe = min(ext_mfe_raw, home_mfe_raw)
+    home_mfe = max(ext_mfe_raw, home_mfe_raw)
+    ext_mult = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_EXTENDED_MULT", 1.00), 1.00))
+    home_mult = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_HOMERUN_MULT", 0.80), 0.80))
+    tp1_prog = _clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", 0.50), 0.50), 0.05, 0.99)
     return DynamicRiskPolicy(
         sltp_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_SLTP_ENABLED", True)),
         sltp_mode=_norm_choice(getattr(cfg_mod, "DYNAMIC_SLTP_MODE", "ADAPTIVE"), "ADAPTIVE", VALID_DYNAMIC_SLTP_MODES),
@@ -109,7 +121,11 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         scale_max=sc_hi,
         trail_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ENABLED", True)),
         trail_timeframe=_norm_choice(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_TIMEFRAME", "M5"), "M5", VALID_ATR_TIMEFRAMES),
-        trail_atr_mult=max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MULT", 1.50), 1.50)),
+        trail_atr_mult=max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MULT", 1.40), 1.40)),
+        trail_extended_mfe_dollars=ext_mfe,
+        trail_extended_atr_mult=ext_mult,
+        trail_homerun_mfe_dollars=home_mfe,
+        trail_homerun_atr_mult=home_mult,
         trail_activation_atr_mult=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00), 1.00)),
         trail_min_dollars=tr_lo,
         trail_max_dollars=tr_hi,
@@ -120,6 +136,7 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         tp_trail_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)),
         tp_lift_atr_mult=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50), 0.50)),
         tp_lift_progress_pct=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75), 0.75), 0.10, 0.99),
+        tp1_lift_min_progress_pct=tp1_prog,
     )
 
 
@@ -334,6 +351,7 @@ def compute_dynamic_tp_step(
     policy: DynamicRiskPolicy,
     digits: int = 2,
     stops_buffer: float = 0.0,
+    be_locked: bool = False,
 ) -> Dict[str, Any]:
     """Compute momentum-gated Dynamic Trailing TP step (`TP1 -> TP2 -> ... -> max_stage`)."""
     sign = 1.0 if (direction or "BUY").strip().upper() == "BUY" else -1.0
@@ -381,10 +399,15 @@ def compute_dynamic_tp_step(
             dist_to_target = sign * (cur_tp - live_price)
             leg_span = sign * (cur_tp - anchor)
             progress = (sign * (live_price - anchor) / leg_span) if leg_span > 1e-9 else 0.0
-            near_target = (
-                dist_to_target <= (policy.tp_lift_atr_mult * atr_f) + 1e-9
-                or (leg_span > 1e-9 and progress >= policy.tp_lift_progress_pct - 1e-9)
-            )
+            atr_proximity = dist_to_target <= (policy.tp_lift_atr_mult * atr_f) + 1e-9
+            progress_hit = leg_span > 1e-9 and progress >= policy.tp_lift_progress_pct - 1e-9
+            if k == 1:
+                atr_proximity_allowed = bool(
+                    be_locked or (leg_span > 1e-9 and progress >= policy.tp1_lift_min_progress_pct - 1e-9)
+                )
+                near_target = (atr_proximity and atr_proximity_allowed) or progress_hit
+            else:
+                near_target = atr_proximity or progress_hit
             can_advance = bool(past_anchor and momentum_ok and near_target)
         if not can_advance:
             break
@@ -411,6 +434,16 @@ def compute_dynamic_tp_step(
         "newly_cleared": newly_cleared,
         "momentum_ok": momentum_ok,
     }
+
+
+def select_progressive_trail_mult(mfe_dollars: float, policy: DynamicRiskPolicy) -> Tuple[float, str]:
+    """Select progressive ATR trailing multiplier and zone based on MFE dollars."""
+    mfe_f = max(0.0, _safe_float(mfe_dollars, 0.0))
+    if mfe_f + 1e-9 >= policy.trail_homerun_mfe_dollars:
+        return (min(policy.trail_atr_mult, policy.trail_extended_atr_mult, policy.trail_homerun_atr_mult), "HOME_RUN")
+    if mfe_f + 1e-9 >= policy.trail_extended_mfe_dollars:
+        return (min(policy.trail_atr_mult, policy.trail_extended_atr_mult), "EXTENDED")
+    return (policy.trail_atr_mult, "STANDARD")
 
 
 def compute_dynamic_atr_trail_stop(
@@ -445,6 +478,8 @@ def compute_dynamic_atr_trail_stop(
             "stop_source": None,
             "atr": round(atr_f, 4),
             "mfe_dollars": 0.0,
+            "trail_mult": round(policy.trail_atr_mult, 4),
+            "trail_zone": "STANDARD",
         }
 
     sign = 1.0 if (direction or "BUY").strip().upper() == "BUY" else -1.0
@@ -457,7 +492,8 @@ def compute_dynamic_atr_trail_stop(
     be_sl = round(entry_price + sign * max(0.0, policy.be_lock_offset_dollars), digits) if be_armed else None
     should_sweep_pending = be_armed
 
-    trail_dist = round(_clamp(atr_f * policy.trail_atr_mult, policy.trail_min_dollars, policy.trail_max_dollars), digits)
+    eff_mult, trail_zone = select_progressive_trail_mult(max(0.0, mfe), policy)
+    trail_dist = round(_clamp(atr_f * eff_mult, policy.trail_min_dollars, policy.trail_max_dollars), digits)
     trail_armed = mfe + 1e-9 >= max(0.0, policy.trail_activation_atr_mult * atr_f)
     atr_sl = round(peak_px - sign * trail_dist, digits) if trail_armed else None
 
@@ -492,6 +528,8 @@ def compute_dynamic_atr_trail_stop(
             "stop_source": None,
             "atr": round(atr_f, 4),
             "mfe_dollars": round(max(0.0, mfe), 4),
+            "trail_mult": round(policy.trail_atr_mult, 4),
+            "trail_zone": "STANDARD",
         }
 
     _, stop_source, raw_sl = min(
@@ -520,6 +558,8 @@ def compute_dynamic_atr_trail_stop(
         "stop_source": stop_source,
         "atr": round(atr_f, 4),
         "mfe_dollars": round(max(0.0, mfe), 4),
+        "trail_mult": round(eff_mult, 4),
+        "trail_zone": trail_zone,
     }
 
 
@@ -572,8 +612,8 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
         atr_txt = f"${atr_f:.2f} → Trail `${_clamp(atr_f * pol.trail_atr_mult, pol.trail_min_dollars, pol.trail_max_dollars):.2f}`" if atr_f > 0.0 else "N/A"
         return False, (
             f"🎯 **Dynamic ATR Trailing Engine:** {badge}\n"
-            f"• Timeframe: `{pol.trail_timeframe}` | SL Trail: `{pol.trail_atr_mult:.2f}x ATR` (Arm `{pol.trail_activation_atr_mult:.2f}x` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}` | Step `${pol.trail_step_dollars:.2f}`)\n"
-            f"• BE Lock: `max({pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f})` → `Entry ± ${pol.be_lock_offset_dollars:.2f}` | TP Trail: {tp_badge} (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%`) | Live: `{atr_txt}`\n"
+            f"• Timeframe: `{pol.trail_timeframe}` | SL Trail: `{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f}` (Arm `{pol.trail_activation_atr_mult:.2f}x` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}` | Step `${pol.trail_step_dollars:.2f}`)\n"
+            f"• BE Lock: `max({pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f})` → `Entry ± ${pol.be_lock_offset_dollars:.2f}` | TP Trail: {tp_badge} (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%` [TP1 `≥{pol.tp1_lift_min_progress_pct * 100:.0f}%`]) | Live: `{atr_txt}`\n"
             "• Controls: `/atrtrail on|off`, `/atrtrail tp on|off`, or `/atrtrail <mult> [activation_mult] [M1|M5|M15|H1]`"
         )
     tok = cleaned[0].lower()
@@ -583,7 +623,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
     if len(cleaned) == 1 and tok in _ON_TOKENS:
         setattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ENABLED", True)
         return True, (
-            f"🎯 **Dynamic ATR Trailing Engine Enabled → `ON`** (`{pol.trail_atr_mult:.2f}x {pol.trail_timeframe} ATR`, "
+            f"🎯 **Dynamic ATR Trailing Engine Enabled → `ON`** (`{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} {pol.trail_timeframe} ATR`, "
             f"Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}`, "
             f"BE `≥max({pol.be_activation_atr_mult:.2f}x, ${pol.be_min_mfe_dollars:.2f})`, "
             f"TP Trail `{'ON' if pol.tp_trail_enabled else 'OFF'}`)."
@@ -592,7 +632,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
         sub = cleaned[1].lower()
         if sub in _ON_TOKENS:
             setattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
-            return True, f"🎯 **Dynamic ATR TP Trail Enabled → `ON`** (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%`)."
+            return True, f"🎯 **Dynamic ATR TP Trail Enabled → `ON`** (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%` [TP1 `≥{pol.tp1_lift_min_progress_pct * 100:.0f}%`])."
         if sub in _OFF_TOKENS:
             setattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", False)
             return True, "⚪ **Dynamic ATR TP Trail Disabled (OFF)** — broker TPs stay fixed unless cleared."
@@ -614,7 +654,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
     setattr(cfg_mod, "DYNAMIC_ATR_TRAIL_TIMEFRAME", tf)
     return True, (
         f"🎯 **Dynamic ATR Trailing Engine Enabled → `ON` (`{tf}`)**\n"
-        f"• Trail: `{mult:.2f}x ATR` | Activation: `{act:.2f}x ATR` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}`\n"
+        f"• Trail: `{mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} ATR` | Activation: `{act:.2f}x ATR` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}`\n"
         f"• BE Lock: `max({pol.be_activation_atr_mult:.2f}x, ${pol.be_min_mfe_dollars:.2f})` → `±${pol.be_lock_offset_dollars:.2f}` | TP Trail: `{'ON' if pol.tp_trail_enabled else 'OFF'}`"
     )
 
@@ -628,7 +668,7 @@ def format_dynamic_risk_status_line(cfg_mod: Any, live_sltp_atr: float = 0.0, li
     )
     tp_tag = "+TP" if pol.tp_trail_enabled else ""
     trail_s = (
-        f"🟢 ON (`{pol.trail_atr_mult:.2f}x {pol.trail_timeframe}` `${pol.trail_min_dollars:.2f}-${pol.trail_max_dollars:.2f}` BE≥`${pol.be_min_mfe_dollars:.2f}`{tp_tag}"
+        f"🟢 ON (`{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} {pol.trail_timeframe}` `${pol.trail_min_dollars:.2f}-${pol.trail_max_dollars:.2f}` BE≥`${pol.be_min_mfe_dollars:.2f}`{tp_tag}"
         + (f" ATR=${live_trail_atr:.2f}" if live_trail_atr > 0.0 else "")
         + ")"
         if pol.trail_enabled else "⚪ OFF"

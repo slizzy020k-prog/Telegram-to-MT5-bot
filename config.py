@@ -498,7 +498,19 @@ DYNAMIC_ATR_TRAIL_TIMEFRAME: str = _env_choice(
     "DYNAMIC_ATR_TRAIL_TIMEFRAME", "M5", ("M1", "M5", "M15", "H1")
 )
 DYNAMIC_ATR_TRAIL_MULT: float = _env_float(
-    "DYNAMIC_ATR_TRAIL_MULT", 1.50, min_val=0.20, max_val=20.0, positive_only=True
+    "DYNAMIC_ATR_TRAIL_MULT", 1.40, min_val=0.20, max_val=20.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00, min_val=0.50, max_val=500.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_EXTENDED_MULT: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MULT", 1.00, min_val=0.10, max_val=20.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00, min_val=1.00, max_val=500.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_HOMERUN_MULT: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MULT", 0.80, min_val=0.10, max_val=20.0, positive_only=True
 )
 DYNAMIC_ATR_TRAIL_ACTIVATION_MULT: float = _env_float(
     "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, min_val=0.0, max_val=20.0
@@ -528,6 +540,9 @@ DYNAMIC_ATR_TP_LIFT_ATR_MULT: float = _env_float(
 DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT: float = _env_float(
     "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75, min_val=0.10, max_val=0.99
 )
+DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT: float = _env_float(
+    "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", 0.50, min_val=0.05, max_val=0.99
+)
 
 
 def validate_dynamic_risk_pairs() -> None:
@@ -538,6 +553,7 @@ def validate_dynamic_risk_pairs() -> None:
         ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
         ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
         ("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_MAX_DOLLARS"),
+        ("DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS"),
     )
     for min_k, max_k in pairs:
         mn, mx = float(g[min_k]), float(g[max_k])

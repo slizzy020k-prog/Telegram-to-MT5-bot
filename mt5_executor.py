@@ -40,9 +40,14 @@ from config import (
     DYNAMIC_ATR_TIMEFRAME,
     DYNAMIC_ATR_TP_LIFT_ATR_MULT,
     DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT,
+    DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT,
     DYNAMIC_ATR_TP_TRAIL_ENABLED,
     DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
     DYNAMIC_ATR_TRAIL_ENABLED,
+    DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS,
+    DYNAMIC_ATR_TRAIL_EXTENDED_MULT,
+    DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS,
+    DYNAMIC_ATR_TRAIL_HOMERUN_MULT,
     DYNAMIC_ATR_TRAIL_MAX_DOLLARS,
     DYNAMIC_ATR_TRAIL_MIN_DOLLARS,
     DYNAMIC_ATR_TRAIL_MULT,
@@ -177,6 +182,10 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TRAIL_ENABLED",
         "DYNAMIC_ATR_TRAIL_TIMEFRAME",
         "DYNAMIC_ATR_TRAIL_MULT",
+        "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_EXTENDED_MULT",
+        "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_HOMERUN_MULT",
         "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT",
         "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
@@ -187,6 +196,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TP_TRAIL_ENABLED",
         "DYNAMIC_ATR_TP_LIFT_ATR_MULT",
         "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT",
+        "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT",
         "MT5_LOGIN",
         "MT5_PASSWORD",
         "MT5_SERVER",
@@ -1327,6 +1337,10 @@ class MT5Executor:
             DYNAMIC_ATR_TRAIL_ENABLED=_cfg("DYNAMIC_ATR_TRAIL_ENABLED", DYNAMIC_ATR_TRAIL_ENABLED),
             DYNAMIC_ATR_TRAIL_TIMEFRAME=_cfg("DYNAMIC_ATR_TRAIL_TIMEFRAME", DYNAMIC_ATR_TRAIL_TIMEFRAME),
             DYNAMIC_ATR_TRAIL_MULT=_cfg("DYNAMIC_ATR_TRAIL_MULT", DYNAMIC_ATR_TRAIL_MULT),
+            DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS),
+            DYNAMIC_ATR_TRAIL_EXTENDED_MULT=_cfg("DYNAMIC_ATR_TRAIL_EXTENDED_MULT", DYNAMIC_ATR_TRAIL_EXTENDED_MULT),
+            DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS),
+            DYNAMIC_ATR_TRAIL_HOMERUN_MULT=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MULT", DYNAMIC_ATR_TRAIL_HOMERUN_MULT),
             DYNAMIC_ATR_TRAIL_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", DYNAMIC_ATR_TRAIL_ACTIVATION_MULT),
             DYNAMIC_ATR_TRAIL_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_MIN_DOLLARS),
             DYNAMIC_ATR_TRAIL_MAX_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MAX_DOLLARS", DYNAMIC_ATR_TRAIL_MAX_DOLLARS),
@@ -1337,6 +1351,7 @@ class MT5Executor:
             DYNAMIC_ATR_TP_TRAIL_ENABLED=_cfg("DYNAMIC_ATR_TP_TRAIL_ENABLED", DYNAMIC_ATR_TP_TRAIL_ENABLED),
             DYNAMIC_ATR_TP_LIFT_ATR_MULT=_cfg("DYNAMIC_ATR_TP_LIFT_ATR_MULT", DYNAMIC_ATR_TP_LIFT_ATR_MULT),
             DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT=_cfg("DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT),
+            DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT=_cfg("DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT),
         )
         return read_dynamic_risk_policy(proxy)
 
@@ -4961,19 +4976,8 @@ class MT5Executor:
 
         held_tickets = [_int_num(getattr(p, "ticket", 0), 0) for p in held_positions]
 
-        if raw_tp3:
-            for hp in held_positions:
-                hp_ticket = _int_num(getattr(hp, "ticket", 0), 0)
-                is_buy = _int_num(getattr(hp, "type", buy_order_type), buy_order_type) == buy_order_type
-                hp_tp = _num(getattr(hp, "tp", 0.0), 0.0)
-                hp_sl = _num(getattr(hp, "sl", 0.0), 0.0)
-                should_extend = (
-                    hp_tp == 0.0
-                    or (is_buy and raw_tp3 > hp_tp)
-                    or (not is_buy and raw_tp3 < hp_tp)
-                )
-                if should_extend and hp_ticket:
-                    self.modify_position_sltp(ticket=hp_ticket, sl=hp_sl, tp=round(raw_tp3, digits))
+        tick = self.get_tick(symbol)
+        stops_buffer = self._compute_stops_buffer(sym_info)
 
         for wp in worst_positions:
             wp_ticket = _int_num(getattr(wp, "ticket", 0), 0)
@@ -4995,6 +4999,29 @@ class MT5Executor:
             )
             if already_better:
                 be_tickets.append(wp_ticket)
+                continue
+
+            ref_price = 0.0
+            if tick is not None:
+                raw_ref = float(tick.bid) if wp_is_buy else float(tick.ask)
+                if math.isfinite(raw_ref) and raw_ref > 0.0:
+                    ref_price = raw_ref
+            if ref_price <= 0.0:
+                ref_price = _num(getattr(wp, "price_current", 0.0), 0.0)
+
+            stops_valid = True
+            if ref_price > 0.0:
+                if wp_is_buy:
+                    stops_valid = (ref_price - new_sl) > 0.0 and (ref_price - new_sl) >= stops_buffer - 1e-9
+                else:
+                    stops_valid = (new_sl - ref_price) > 0.0 and (new_sl - ref_price) >= stops_buffer - 1e-9
+                if stops_valid and tick is not None and self.is_within_freeze_level(symbol, new_sl, tick=tick, sym_info=sym_info):
+                    stops_valid = False
+
+            if not stops_valid:
+                err_msg = f"Underwater / within stops_level ({stops_buffer:.{digits}f}) for BE SL {new_sl:.{digits}f}"
+                failed_be_tickets.append((wp_ticket, err_msg))
+                logger.warning(f"Could not move worst entry #{wp_ticket} to BE ({err_msg})")
                 continue
 
             if self.modify_position_sltp(ticket=wp_ticket, sl=new_sl, tp=wp_tp):
@@ -5846,14 +5873,28 @@ class MT5Executor:
 
         roles_locked = bool(signal_data.get("roles_locked"))
         if not roles_locked:
-            if any(
-                isinstance(layers.get(lk), dict)
-                and str(layers[lk].get("tp_stage") or "TP1").strip().upper() != "TP1"
-                and str(layers[lk].get("role") or "").strip().upper() != ""
-                for lk in open_keys
-            ):
-                roles_locked = True
-                signal_data["roles_locked"] = True
+            has_pending_limits = bool(signal_data.get("pending_tickets")) or any(
+                isinstance(v, dict) and str(v.get("status") or "").strip().upper() == "PENDING"
+                for v in layers.values()
+            )
+            any_be_locked = bool(
+                signal_data.get("be_armed")
+                or str(signal_data.get("status") or "").strip().upper() == "BE_APPLIED"
+                or any(isinstance(layers.get(k), dict) and layers[k].get("be_locked") for k in open_keys)
+            )
+            tp1_cleared = bool(
+                signal_data.get("tp1_reached")
+                or "TP1" in {str(x).strip().upper() for x in (signal_data.get("runner_cleared_milestones") or [])}
+            )
+            if (any_be_locked or tp1_cleared) and not (has_pending_limits and not any_be_locked and not tp1_cleared):
+                if any(
+                    isinstance(layers.get(lk), dict)
+                    and str(layers[lk].get("tp_stage") or "TP1").strip().upper() != "TP1"
+                    and str(layers[lk].get("role") or "").strip().upper() != ""
+                    for lk in open_keys
+                ):
+                    roles_locked = True
+                    signal_data["roles_locked"] = True
 
         tiered_on = bool(_cfg("TIERED_STAGE_BANKING_ENABLED", TIERED_STAGE_BANKING_ENABLED))
         assigned: Dict[str, str] = {}
@@ -7135,20 +7176,33 @@ class MT5Executor:
             or signal_data.get("be_armed")
             or str(signal_data.get("status") or "").strip().upper() == "BE_APPLIED"
             or signal_data.get("roles_locked")
-            or any(isinstance(lv, dict) and lv.get("be_locked") for lv in layers.values())
+            or any(
+                isinstance(lv, dict)
+                and (
+                    lv.get("be_locked")
+                    or (isinstance(lv.get("dynamic_atr_trail_sl"), numbers.Real) and not isinstance(lv.get("dynamic_atr_trail_sl"), bool) and float(lv.get("dynamic_atr_trail_sl")) > 0.0)
+                    or (isinstance(lv.get("be_sl"), numbers.Real) and not isinstance(lv.get("be_sl"), bool) and float(lv.get("be_sl")) > 0.0)
+                )
+                for lv in layers.values()
+            )
         )
-        existing_stops: List[float] = []
-        for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+        for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor"):
             sv = signal_data.get(stop_k)
             if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
-                existing_stops.append(round(float(sv), digits))
-        for lv in layers.values():
-            if isinstance(lv, dict):
-                for lsk in ("dynamic_atr_trail_sl", "broker_sl", "be_sl"):
-                    sv = lv.get(lsk)
-                    if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
-                        existing_stops.append(round(float(sv), digits))
-                        has_protected_sl = True
+                has_protected_sl = True
+
+        existing_stops: List[float] = []
+        if has_protected_sl:
+            for stop_k in ("trail_stop", "runner_sl_floor", "soft_tp1_floor", "broker_sl"):
+                sv = signal_data.get(stop_k)
+                if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
+                    existing_stops.append(round(float(sv), digits))
+            for lv in layers.values():
+                if isinstance(lv, dict):
+                    for lsk in ("dynamic_atr_trail_sl", "be_sl", "broker_sl"):
+                        sv = lv.get(lsk)
+                        if isinstance(sv, numbers.Real) and not isinstance(sv, bool) and float(sv) > 0.0:
+                            existing_stops.append(round(float(sv), digits))
         cur_floor: Optional[float] = (
             (max(existing_stops) if is_buy else min(existing_stops))
             if existing_stops
@@ -7723,6 +7777,10 @@ class MT5Executor:
         empty_disabled = {
             "enabled": False,
             "paused_by_spread": False,
+            "atr": 0.0,
+            "timeframe": "M5",
+            "trail_mult": 1.40,
+            "trail_zone": "STANDARD",
             "updated_tickets": [],
             "tp_lifted_tickets": [],
             "pending_swept": [],
@@ -7750,6 +7808,8 @@ class MT5Executor:
                 "paused_by_spread": True,
                 "atr": 0.0,
                 "timeframe": policy.trail_timeframe,
+                "trail_mult": policy.trail_atr_mult,
+                "trail_zone": "STANDARD",
                 "updated_tickets": [],
                 "tp_lifted_tickets": [],
                 "pending_swept": [],
@@ -7766,6 +7826,8 @@ class MT5Executor:
                 "paused_by_spread": True,
                 "atr": 0.0,
                 "timeframe": policy.trail_timeframe,
+                "trail_mult": policy.trail_atr_mult,
+                "trail_zone": "STANDARD",
                 "updated_tickets": [],
                 "tp_lifted_tickets": [],
                 "pending_swept": [],
@@ -7782,6 +7844,8 @@ class MT5Executor:
                 "paused_by_spread": False,
                 "atr": 0.0,
                 "timeframe": policy.trail_timeframe,
+                "trail_mult": policy.trail_atr_mult,
+                "trail_zone": "STANDARD",
                 "updated_tickets": [],
                 "tp_lifted_tickets": [],
                 "pending_swept": [],
@@ -7825,6 +7889,8 @@ class MT5Executor:
         any_be_armed = False
         any_trail_armed = False
         last_trail_dist = prev_meta.get("trail_dist", 0.0)
+        last_trail_mult = prev_meta.get("trail_mult") or policy.trail_atr_mult
+        last_trail_zone = prev_meta.get("trail_zone") or "STANDARD"
         last_stop_source = prev_meta.get("stop_source") or signal_data.get("active_stop_source")
         last_sl_applied: Optional[float] = None
         trail_armed_sl: Optional[float] = None
@@ -7869,6 +7935,12 @@ class MT5Executor:
                 continue
 
             role = str(roles.get(lk) or lv.get("role") or "").strip().upper()
+            layer_be_locked = bool(
+                lv.get("be_locked")
+                or signal_data.get("be_armed")
+                or str(signal_data.get("status") or "").strip().upper() == "BE_APPLIED"
+                or bool(prev_meta.get("be_armed"))
+            )
 
             # Read live position SL/TP once if live
             live_pos_tp: Optional[float] = None
@@ -7911,6 +7983,24 @@ class MT5Executor:
                 and not (bank_single_tp1 and len(open_keys) == 1)
                 and role not in ("BANK_TP1", "LATE_RECOVERY")
             )
+            if not allow_tp_lift:
+                if ("TP1" not in seen_cleared) and str(lv.get("tp_stage") or "TP1").strip().upper() != "TP1":
+                    lv["tp_stage"] = "TP1"
+                    tp1_target = None
+                    if tp_levels and tp_levels.get("TP1") is not None:
+                        tp1_target = round(float(tp_levels["TP1"]), digits)
+                    elif signal_data.get("final_tp") is not None:
+                        tp1_target = round(float(signal_data["final_tp"]), digits)
+                    cur_layer_tp = live_pos_tp if live_pos_tp is not None else _num(lv.get("tp"), 0.0)
+                    if tp1_target is not None and tp1_target > 0.0 and (cur_layer_tp <= 0.0 or abs(cur_layer_tp - tp1_target) >= 1e-6):
+                        cur_tp_freeze_ok = cur_layer_tp <= 0.0 or not self.is_within_freeze_level(symbol, cur_layer_tp, tick=tick, sym_info=sym_info)
+                        tgt_tp_freeze_ok = not self.is_within_freeze_level(symbol, tp1_target, tick=tick, sym_info=sym_info)
+                        dist_ok = sign * (tp1_target - live_price) >= stops_buffer - 1e-9
+                        if cur_tp_freeze_ok and tgt_tp_freeze_ok and dist_ok:
+                            if self.modify_position_sltp(t_int, sl=None, tp=tp1_target):
+                                lv["tp"] = tp1_target
+                                logger.info(f"Demoted layer {lk} ({role}) TP reset to TP1={tp1_target}")
+
             if allow_tp_lift and tp_levels:
                 layer_max_stage = min(2, max_stage) if role == "STAGE2_BANKER" else max_stage
                 l_stage_str = str(lv.get("tp_stage") or signal_data.get("tp_stage") or "TP1").strip().upper()
@@ -7932,6 +8022,7 @@ class MT5Executor:
                     policy=policy,
                     digits=digits,
                     stops_buffer=stops_buffer,
+                    be_locked=layer_be_locked,
                 )
                 for m_tok in list(tp_step.get("cleared_milestones") or []):
                     m_u = str(m_tok).strip().upper()
@@ -7949,6 +8040,7 @@ class MT5Executor:
                 if "TP1" in seen_cleared:
                     signal_data["tp1_reached"] = True
                     signal_data["tp1_touched"] = True
+                    signal_data["roles_locked"] = True
                     if (runner_ticket_set or role in ("CORE_RUNNER", "SOLO_RUNNER")) and str(signal_data.get("status") or "").strip().upper() != "CLOSED":
                         signal_data["status"] = "RUNNER_ACTIVE"
                 for m_idx in range(2, 6):
@@ -7972,7 +8064,8 @@ class MT5Executor:
                                 old_tp_rec = round(float(cur_tp), digits) if cur_tp > 0.0 else target_tp
                                 lv["tp"] = target_tp
                                 lv["tp_stage"] = target_stage_name
-                                signal_data["roles_locked"] = True
+                                if ("TP1" in seen_cleared) or layer_be_locked:
+                                    signal_data["roles_locked"] = True
                                 cur_sig_m = _int_num(signal_data.get("runner_milestone_idx"), 1)
                                 if role in ("CORE_RUNNER", "SOLO_RUNNER") or target_stage_idx > cur_sig_m:
                                     signal_data["tp_stage"] = target_stage_name
@@ -8010,6 +8103,8 @@ class MT5Executor:
                 lv["dynamic_atr_trail_peak"] = trail_step["peak_price"]
                 lv["mfe_peak_price"] = trail_step["peak_price"]
             last_trail_dist = trail_step.get("trail_dist") or last_trail_dist
+            last_trail_mult = trail_step.get("trail_mult") or last_trail_mult
+            last_trail_zone = trail_step.get("trail_zone") or last_trail_zone
             any_armed = any_armed or bool(trail_step.get("armed"))
             any_be_armed = any_be_armed or bool(trail_step.get("be_armed"))
             any_trail_armed = any_trail_armed or bool(trail_step.get("trail_armed"))
@@ -8049,6 +8144,8 @@ class MT5Executor:
             lv["broker_sl"] = cand_sl
             if trail_step.get("be_armed") and not was_be_locked:
                 lv["be_locked"] = True
+                signal_data["roles_locked"] = True
+                signal_data["be_armed"] = True
                 lv["be_sl"] = trail_step.get("be_sl") or cand_sl
                 newly_be_locked.append((t_int, lk, cand_sl))
                 be_lock_events.append({
@@ -8066,6 +8163,11 @@ class MT5Executor:
                 lv["dynamic_atr_trail_sl"] = cand_sl
                 lv["dynamic_atr_trail_dist"] = trail_step["trail_dist"]
                 lv["dynamic_atr_trail_atr"] = trail_step["atr"]
+                lv["dynamic_atr_trail_mult"] = trail_step.get("trail_mult") or last_trail_mult
+                lv["dynamic_atr_trail_zone"] = trail_step.get("trail_zone") or last_trail_zone
+
+            lv["dynamic_atr_trail_mult"] = trail_step.get("trail_mult") or last_trail_mult
+            lv["dynamic_atr_trail_zone"] = trail_step.get("trail_zone") or last_trail_zone
 
             _forward_update_sig("broker_sl", cand_sl)
             _forward_update_sig("trail_stop", cand_sl)
@@ -8106,6 +8208,8 @@ class MT5Executor:
                 "timeframe": policy.trail_timeframe,
                 "atr": round(atr, 4),
                 "trail_dist": last_trail_dist,
+                "trail_mult": last_trail_mult,
+                "trail_zone": last_trail_zone,
                 "last_sl": last_sl,
                 "stop_source": last_stop_source,
             }
@@ -8115,6 +8219,8 @@ class MT5Executor:
             "paused_by_spread": False,
             "atr": round(atr, 4),
             "timeframe": policy.trail_timeframe,
+            "trail_mult": last_trail_mult,
+            "trail_zone": last_trail_zone,
             "updated_tickets": updated_tickets,
             "tp_lifted_tickets": tp_lifted_tickets,
             "pending_swept": pending_swept,

@@ -19,6 +19,9 @@ copier.log*
 *.tmp
 *.bak*
 
+# Agent scratch workspaces (Superpowers SDD ledgers, briefs, review packages)
+.superpowers/
+
 # Python & Test Caches
 __pycache__/
 *.py[cod]

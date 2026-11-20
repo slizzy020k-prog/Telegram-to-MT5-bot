@@ -502,6 +502,10 @@ def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
         "DYNAMIC_SLTP_SCALE_MIN",
         "DYNAMIC_SLTP_SCALE_MAX",
         "DYNAMIC_ATR_TRAIL_MULT",
+        "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_EXTENDED_MULT",
+        "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS",
+        "DYNAMIC_ATR_TRAIL_HOMERUN_MULT",
         "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
         "DYNAMIC_ATR_TRAIL_STEP_DOLLARS",
@@ -510,14 +514,16 @@ def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
         val = getattr(cfg, pos_field, 1.0)
         if not _is_finite_number(val) or float(val) <= 0.0:
             errors.append(f"{pos_field} must be > 0, got {val!r}.")
-    prog_pct = getattr(cfg, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75)
-    if not _is_finite_number(prog_pct) or not (0.0 < float(prog_pct) < 1.0):
-        errors.append(f"DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT must be in (0, 1), got {prog_pct!r}.")
+    for pct_field in ("DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT"):
+        prog_pct = getattr(cfg, pct_field, 0.75 if pct_field == "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT" else 0.50)
+        if not _is_finite_number(prog_pct) or not (0.0 < float(prog_pct) < 1.0):
+            errors.append(f"{pct_field} must be in (0, 1), got {prog_pct!r}.")
     for lo_field, hi_field in (
         ("DYNAMIC_SL_MIN_DOLLARS", "DYNAMIC_SL_MAX_DOLLARS"),
         ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
         ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
         ("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_MAX_DOLLARS"),
+        ("DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS"),
     ):
         lo_v, hi_v = getattr(cfg, lo_field, 1.0), getattr(cfg, hi_field, 10.0)
         if _is_finite_number(lo_v) and _is_finite_number(hi_v) and float(lo_v) > float(hi_v):

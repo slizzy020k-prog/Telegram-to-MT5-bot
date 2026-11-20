@@ -850,10 +850,17 @@ async def _emit_dynamic_atr_alerts(
 
     if isinstance(dt_res, dict):
         tf_log = dt_res.get("timeframe", "M5")
+        t_mult = dt_res.get("trail_mult")
+        t_zone = dt_res.get("trail_zone")
+        prog_info = (
+            f", tier={float(t_mult):.2f}x {t_zone}"
+            if (_is_num(t_mult) and t_zone)
+            else (f", tier={t_zone}" if t_zone else "")
+        )
         for _t, _lk, _new_sl, _tdist, _tatr in (dt_res.get("updated_tickets") or []):
             logger.info(
                 f"[DYNAMIC ATR TRAIL] Msg {msg_id} {_lk} (#{_t}): SL -> {_new_sl} "
-                f"({tf_log} ATR=${float(_tatr or 0.0):.2f}, dist=${float(_tdist or 0.0):.2f})"
+                f"({tf_log} ATR=${float(_tatr or 0.0):.2f}, dist=${float(_tdist or 0.0):.2f}{prog_info})"
             )
 
     ev_list = list(events or [])
@@ -4754,7 +4761,7 @@ async def _handle_trade_management_action(
             symbol=symbol,
             direction=direction,
             be_offset_pips=BE_OFFSET_PIPS,
-            raw_tp3=raw_tp3,
+            raw_tp3=None,
         )
         be_tkts = res.get("be_tickets", [])
         held_tkts = res.get("held_tickets", [])
@@ -4770,7 +4777,7 @@ async def _handle_trade_management_action(
             fail_details = ", ".join(f"#{t} ({err})" for t, err in failed_be)
             fail_str = f"\n• ⚠️ **Could not BE yet:** {fail_details}"
 
-        target_note = f"TP3 (`{raw_tp3}`) + Trail SL" if raw_tp3 else "TP1 / TP2 + Trail SL"
+        target_note = "Existing TP1 / Dynamic ATR Runner TP + Trail SL"
         await notify_saved_messages(
             f"🛡️ **Worst Entries -> Breakeven | Holding Top 2 Profit Layers**\n"
             f"• Symbol: `{symbol}` ({direction}) [Msg ID: {target_msg_id}]\n"
@@ -6323,6 +6330,92 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         )
         return handoff_alert, False
 
+    # Upgrade 4 — Apply ADAPTIVE ATR Scaling on Stub-to-Zone / Initial-Levels Edits
+    had_zone = bool(existing_signal.get("zone") or existing_signal.get("is_zone"))
+    already_edit_scaled = bool(existing_signal.get("edit_dynamic_risk_scaled"))
+    prev_dr = existing_signal.get("dynamic_risk") if isinstance(existing_signal.get("dynamic_risk"), dict) else None
+    prev_had_full_entry_dr = bool(prev_dr and prev_dr.get("applied") and not was_fallback_tp and had_zone)
+    has_new_levels = bool((parsed.sl_valid and parsed.sl is not None) or has_new_explicit_tps)
+
+    should_scale_dynamic_risk = (
+        not already_edit_scaled
+        and not prev_had_full_entry_dr
+        and not existing_signal.get("tp1_reached")
+        and (
+            (not had_zone and parsed.zone is not None)
+            or (was_fallback_tp and has_new_explicit_tps)
+            or (existing_signal.get("is_instant_now") and has_new_levels)
+        )
+    )
+
+    scaled_prox_price: Optional[float] = None
+    dyn_edit_snap_applied: Optional[Dict[str, Any]] = None
+
+    if should_scale_dynamic_risk:
+        is_buy_dir = str(direction).upper() == "BUY"
+        sl_anchor = 0.0
+        tp_anchor = 0.0
+        if parsed.zone:
+            sl_anchor = float(parsed.zone.bottom if is_buy_dir else parsed.zone.top)
+            tp_anchor = float(parsed.zone.top if is_buy_dir else parsed.zone.bottom)
+        elif isinstance(existing_signal.get("zone"), dict):
+            ez = existing_signal["zone"]
+            sl_anchor = float(ez.get("bottom", 0.0) if is_buy_dir else ez.get("top", 0.0))
+            tp_anchor = float(ez.get("top", 0.0) if is_buy_dir else ez.get("bottom", 0.0))
+        else:
+            l1_entry = existing_signal.get("recorded_entry_price")
+            if not _is_num(l1_entry) and isinstance(layers.get("L1"), dict):
+                l1_entry = layers["L1"].get("entry_price") or layers["L1"].get("target_price")
+            if not _is_num(l1_entry) and parsed.single_price is not None:
+                l1_entry = parsed.single_price
+            if not _is_num(l1_entry):
+                l1_entry = live_price
+            if _is_num(l1_entry) and float(l1_entry) > 0.0:
+                sl_anchor = float(l1_entry)
+                tp_anchor = float(l1_entry)
+
+        if sl_anchor > 0.0 and tp_anchor > 0.0 and callable(getattr(executor, "apply_dynamic_atr_sl_tp", None)):
+            dyn_edit_snap = await _mt5_call(
+                executor.apply_dynamic_atr_sl_tp,
+                symbol=symbol,
+                direction=direction,
+                sl_anchor=sl_anchor,
+                tp_anchor=tp_anchor,
+                sl=new_sl,
+                raw_tp1=raw_tp1,
+                tp_levels=merged_tp_levels or None,
+                final_tp=new_tp,
+                pip_size=pip_size,
+                digits=2,
+            )
+            if isinstance(dyn_edit_snap, dict) and dyn_edit_snap.get("applied"):
+                dyn_merged = _merge_dynamic_risk_into_signal_fields(
+                    dyn_edit_snap,
+                    new_sl,
+                    new_tp,
+                    raw_tp1,
+                    raw_tp2,
+                    raw_tp3,
+                    raw_tp4,
+                    raw_tp5,
+                    merged_tp_levels or None,
+                )
+                new_sl = dyn_merged["sl"]
+                new_tp = dyn_merged["final_tp"]
+                raw_tp1 = dyn_merged["raw_tp1"]
+                raw_tp2 = dyn_merged["raw_tp2"]
+                raw_tp3 = dyn_merged["raw_tp3"]
+                raw_tp4 = dyn_merged["raw_tp4"]
+                raw_tp5 = dyn_merged["raw_tp5"]
+                merged_tp_levels = dict(dyn_merged["tp_levels"] or {})
+                dyn_edit_snap_applied = dyn_merged["dynamic_risk"]
+                if raw_tp1 is not None:
+                    pip_distance_20 = TP1_CLOSE_PROXIMITY_PIPS * 0.10
+                    if is_buy_dir:
+                        scaled_prox_price = round(float(raw_tp1) - pip_distance_20, 2)
+                    else:
+                        scaled_prox_price = round(float(raw_tp1) + pip_distance_20, 2)
+
     tp1_changed_pre_tp1 = (
         not existing_signal.get("tp1_reached")
         and ((was_fallback_tp and has_new_explicit_tps) or (raw_tp1 is not None and raw_tp1 != old_raw_tp1))
@@ -6694,7 +6787,11 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         "final_tp": new_tp,
         "hard_broker_tp": new_tp,
         "fallback_tp_applied": fallback_tp_flag,
-        "proximity_close_price": parsed.proximity_close_price or existing_signal.get("proximity_close_price"),
+        "proximity_close_price": (
+            scaled_prox_price
+            if scaled_prox_price is not None
+            else (parsed.proximity_close_price or existing_signal.get("proximity_close_price"))
+        ),
         "zone": parsed.zone.to_dict() if parsed.zone else existing_signal.get("zone"),
         "is_zone": True if parsed.zone else existing_signal.get("is_zone", False),
         "is_zone_order": True if parsed.zone else existing_signal.get("is_zone_order", existing_signal.get("is_zone", False)),
@@ -6709,6 +6806,9 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         signal_updates["recorded_entry_price"] = existing_signal["recorded_entry_price"]
     if parsed.single_price is not None and not parsed.zone:
         signal_updates["single_price"] = parsed.single_price
+    if dyn_edit_snap_applied is not None:
+        signal_updates["dynamic_risk"] = dyn_edit_snap_applied
+        signal_updates["edit_dynamic_risk_scaled"] = True
     if tp1_changed_pre_tp1:
         signal_updates["peak_price"] = None
         signal_updates["tp1_guard_armed"] = _compute_initial_tp1_guard_armed(

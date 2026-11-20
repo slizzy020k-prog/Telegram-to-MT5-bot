@@ -117,6 +117,11 @@ WORST_HOLD_PATTERNS = [
     r"\bbreakeven\s+worst\b",
 ]
 
+_FUTURE_TENSE_CHATTER_RE = re.compile(
+    r"\b(?:gonna|going\s+to|soon|about\s+to|might|will\s+soon)\b",
+    re.IGNORECASE,
+)
+
 PARTIAL_CLOSE_PATTERNS = [
     r"\bclose\s+half\b",
     r"\bpartial\b",
@@ -345,6 +350,145 @@ def compute_zone_4tiers(
     return {"L1": prices[0], "L2": prices[1], "L3": prices[2], "L4": prices[3]}
 
 
+def _longest_monotonic_indices(
+    tps: Sequence[float],
+    direction: str = "BUY",
+) -> Tuple[List[int], List[int]]:
+    """
+    Compute kept and dropped indices using exact Longest Strictly Monotonic Subsequence DP
+    (strictly ascending for BUY, strictly descending for SELL).
+    Primary score: maximum subsequence length.
+    Tie-breaker 1: minimum total span abs(seq[-1] - seq[0]).
+    Tie-breaker 2: minimum max adjacent gap max(abs(seq[i] - seq[i-1])).
+    Tie-breaker 3: earliest index tuple (keeps valid TP1).
+    """
+    if not tps:
+        return [], []
+    vals = [float(v) for v in tps]
+    n = len(vals)
+    if n <= 1:
+        return [0], []
+
+    is_buy = (direction or "BUY").upper() == "BUY"
+
+    def _is_step_valid(prev: float, curr: float) -> bool:
+        return (curr > prev) if is_buy else (curr < prev)
+
+    # L[i] = length of longest strictly monotonic subsequence ending at index i
+    L = [1] * n
+    for i in range(n):
+        for j in range(i):
+            if _is_step_valid(vals[j], vals[i]):
+                if L[j] + 1 > L[i]:
+                    L[i] = L[j] + 1
+
+    max_len = max(L)
+    if max_len == n:
+        return list(range(n)), []
+
+    all_paths: List[List[int]] = []
+
+    def _backtrack(curr_idx: int, rem_len: int, current_path: List[int]) -> None:
+        if rem_len == 1:
+            all_paths.append([curr_idx] + current_path)
+            return
+        curr_val = vals[curr_idx]
+        for prev_idx in range(curr_idx):
+            if L[prev_idx] == rem_len - 1 and _is_step_valid(vals[prev_idx], curr_val):
+                _backtrack(prev_idx, rem_len - 1, [curr_idx] + current_path)
+
+    for i in range(n):
+        if L[i] == max_len:
+            _backtrack(i, max_len, [])
+
+    if not all_paths:
+        return list(range(n)), []
+
+    def _score_path(p: List[int]) -> Tuple[float, float, Tuple[int, ...]]:
+        subseq = [vals[idx] for idx in p]
+        span = abs(subseq[-1] - subseq[0])
+        max_gap = max((abs(subseq[k] - subseq[k - 1]) for k in range(1, len(subseq))), default=0.0)
+        return (span, max_gap, tuple(p))
+
+    best_path = min(all_paths, key=_score_path)
+    kept_set = set(best_path)
+    kept_indices = [i for i in range(n) if i in kept_set]
+    dropped_indices = [i for i in range(n) if i not in kept_set]
+    return kept_indices, dropped_indices
+
+
+def sanitize_monotonic_tps(
+    tps: Sequence[float],
+    direction: str = "BUY",
+) -> Tuple[List[float], List[float]]:
+    """
+    Sanitize Take Profit sequence using exact Longest Strictly Monotonic Subsequence DP
+    (strictly ascending for BUY, strictly descending for SELL).
+    Primary score: maximum subsequence length.
+    Tie-breaker 1: minimum total span abs(seq[-1] - seq[0]).
+    Tie-breaker 2: minimum max adjacent gap max(abs(seq[i] - seq[i-1])).
+    Tie-breaker 3: earliest index tuple (keeps valid TP1).
+    Returns (kept_tps, dropped_tps) in original order.
+    """
+    if not tps:
+        return [], []
+    vals = [float(v) for v in tps]
+    kept_indices, dropped_indices = _longest_monotonic_indices(vals, direction=direction)
+    return [vals[i] for i in kept_indices], [vals[i] for i in dropped_indices]
+
+
+def _sanitize_labeled_tps_monotonic(
+    labeled_tps: Dict[str, float],
+    direction: str = "BUY",
+) -> Tuple[Dict[str, float], List[float]]:
+    """
+    Sanitize labeled TP dictionary using exact Longest Strictly Monotonic Subsequence DP
+    over stages ordered by TP1..TP5. Drops out-of-order typo stages and cleanly re-numbers/keeps valid stages.
+    """
+    if not labeled_tps:
+        return {}, []
+
+    parsed_items: List[Tuple[int, str, float]] = []
+    for k, v in labeled_tps.items():
+        if v is None:
+            continue
+        k_str = str(k).strip().upper()
+        if k_str.startswith("TP") and len(k_str) == 3 and k_str[2].isdigit():
+            idx = int(k_str[2])
+        elif k_str.isdigit():
+            idx = int(k_str)
+        else:
+            continue
+        if 1 <= idx <= 5:
+            try:
+                fv = float(v)
+                if fv > 0:
+                    parsed_items.append((idx, f"TP{idx}", fv))
+            except (TypeError, ValueError):
+                pass
+
+    if not parsed_items:
+        return {}, []
+
+    parsed_items.sort(key=lambda x: x[0])
+    raw_prices = [item[2] for item in parsed_items]
+    kept_idx, dropped_idx = _longest_monotonic_indices(raw_prices, direction=direction)
+
+    if not dropped_idx:
+        return {item[1]: item[2] for item in parsed_items}, []
+
+    dropped_prices = [raw_prices[i] for i in dropped_idx]
+    kept_prices = [raw_prices[i] for i in kept_idx]
+
+    starts_at_tp1 = (parsed_items[0][0] == 1)
+    if starts_at_tp1:
+        clean_labeled = {f"TP{i + 1}": kept_prices[i] for i in range(len(kept_prices))}
+    else:
+        clean_labeled = {parsed_items[i][1]: parsed_items[i][2] for i in kept_idx}
+
+    return clean_labeled, dropped_prices
+
+
 def derive_tp_levels(
     tps: Sequence[float],
     direction: str = "BUY",
@@ -357,8 +501,10 @@ def derive_tp_levels(
     """
     if not tps:
         return {}
+    sanitized_tps, _ = sanitize_monotonic_tps(tps, direction=direction)
     digits = _decimals_for_pip(pip_size)
-    base = [round(float(val), digits) for val in list(tps)[:5]]
+    source_tps = sanitized_tps if sanitized_tps else list(tps)
+    base = [round(float(val), digits) for val in source_tps[:5]]
 
     steps = (
         [float(s) for s in step_pips]
@@ -449,6 +595,20 @@ def merge_tp_levels_for_active_signal(
 
     if not merged:
         return {}
+
+    # Enforce strict monotonicity across populated stages before re-deriving missing slots
+    present_stage_keys = [f"TP{i}" for i in range(1, 6) if f"TP{i}" in merged]
+    if len(present_stage_keys) >= 2:
+        stage_prices = [merged[k] for k in present_stage_keys]
+        kept_idx, dropped_idx = _longest_monotonic_indices(stage_prices, direction=direction)
+        for idx in dropped_idx:
+            k = present_stage_keys[idx]
+            del merged[k]
+            if k in explicit_labeled:
+                del explicit_labeled[k]
+            idx_num = int(k[2])
+            if idx_num in updated_stages:
+                updated_stages.remove(idx_num)
 
     steps = (
         [float(s) for s in step_pips]
@@ -811,6 +971,11 @@ def gate_3_classify_trade_management(
                     continue
                 return True
         return False
+
+    # Reject future-tense conversational chatter before trade management classification
+    if _FUTURE_TENSE_CHATTER_RE.search(lower):
+        logger.info(f"Gate 3: Rejected future-tense chatter message | text={text!r}")
+        return None
 
     # 1. Close Worst Entries & Hold Layers (must check before generic Partial/Full Close)
     if not action and _hit(WORST_HOLD_PATTERNS):
@@ -1393,6 +1558,41 @@ def gate_4_extract_signal(
     # 4. Pre-extract TP & SL so stub vs complete-signal validation knows whether targets exist
     labeled_tps, unlabeled_tps = extract_labeled_tps(text)
     explicit_tps = [v for v in extract_tps(text, direction=direction) if 500.0 <= v < 100000.0]
+
+    # Monotonic TP typo sanitization
+    all_monotonic_dropped: List[float] = []
+
+    if explicit_tps:
+        sanitized_explicit, dropped_exp = sanitize_monotonic_tps(explicit_tps, direction=direction)
+        if dropped_exp:
+            logger.warning(
+                f"Gate 4: Dropped non-monotonic explicit TP typos on {direction}: {dropped_exp} from {explicit_tps}"
+            )
+            explicit_tps = sanitized_explicit
+            all_monotonic_dropped.extend(dropped_exp)
+
+    if unlabeled_tps:
+        sanitized_unlabeled, dropped_unl = sanitize_monotonic_tps(unlabeled_tps, direction=direction)
+        if dropped_unl:
+            logger.warning(
+                f"Gate 4: Dropped non-monotonic unlabeled TP typos on {direction}: {dropped_unl} from {unlabeled_tps}"
+            )
+            unlabeled_tps = sanitized_unlabeled
+            for d in dropped_unl:
+                if d not in all_monotonic_dropped:
+                    all_monotonic_dropped.append(d)
+
+    if labeled_tps:
+        sanitized_labeled, dropped_lab = _sanitize_labeled_tps_monotonic(labeled_tps, direction=direction)
+        if dropped_lab:
+            logger.warning(
+                f"Gate 4: Dropped non-monotonic labeled TP typos on {direction}: {dropped_lab} from {labeled_tps}"
+            )
+            labeled_tps = sanitized_labeled
+            for d in dropped_lab:
+                if d not in all_monotonic_dropped:
+                    all_monotonic_dropped.append(d)
+
     raw_sl = _extract_sl(text)
     has_valid_targets = bool(explicit_tps) or (raw_sl is not None and 500.0 <= raw_sl < 100000.0)
 
@@ -1468,7 +1668,7 @@ def gate_4_extract_signal(
             final_tp = round(raw_tp1 + TP_FRONT_RUN_OFFSET, 2)
             proximity_close_price = round(raw_tp1 + pip_distance_20, 2)
 
-    return SignalAction({
+    action_payload: Dict[str, Any] = {
         "event_type": "NEW_SIGNAL",
         "message_id": message_id,
         "is_edit": is_edit,
@@ -1501,7 +1701,11 @@ def gate_4_extract_signal(
         "direction_inferred": bool(inferred_direction),
         "zone_typo_repaired": bool(repair_note),
         "raw_text": text,
-    })
+    }
+    if all_monotonic_dropped:
+        action_payload["monotonic_dropped_tps"] = all_monotonic_dropped
+
+    return SignalAction(action_payload)
 
 
 def _is_valid_tp_vs_ref(
@@ -1609,6 +1813,38 @@ def gate_5_validate_price_sanity(
                     f"Gate 5 Sanity Check: Stripped invalid {direction} fallback TP={v} "
                     f"(tp_ref={tp_ref}, max_dist={max_tp_dist})."
                 )
+
+    mono_dropped_g5: List[float] = []
+    if valid_explicit:
+        san_exp5, d_exp5 = sanitize_monotonic_tps(valid_explicit, direction=direction)
+        if d_exp5:
+            valid_explicit = san_exp5
+            any_tp_stripped = True
+            mono_dropped_g5.extend(d_exp5)
+            logger.warning(f"Gate 5 Sanity Check: Stripped non-monotonic explicit TPs on {direction}: {d_exp5}")
+
+    if valid_unlabeled:
+        san_unl5, d_unl5 = sanitize_monotonic_tps(valid_unlabeled, direction=direction)
+        if d_unl5:
+            valid_unlabeled = san_unl5
+            any_tp_stripped = True
+            mono_dropped_g5.extend(d_unl5)
+            logger.warning(f"Gate 5 Sanity Check: Stripped non-monotonic unlabeled TPs on {direction}: {d_unl5}")
+
+    if valid_labeled:
+        san_lab5, d_lab5 = _sanitize_labeled_tps_monotonic(valid_labeled, direction=direction)
+        if d_lab5:
+            valid_labeled = san_lab5
+            any_tp_stripped = True
+            mono_dropped_g5.extend(d_lab5)
+            logger.warning(f"Gate 5 Sanity Check: Stripped non-monotonic labeled TPs on {direction}: {d_lab5}")
+
+    if mono_dropped_g5:
+        existing_mono = list(action.get("monotonic_dropped_tps") or [])
+        for d in mono_dropped_g5:
+            if d not in existing_mono:
+                existing_mono.append(d)
+        action["monotonic_dropped_tps"] = existing_mono
 
     if any_tp_stripped:
         action["invalid_explicit_tps"] = list(raw_explicit_tps or raw_unlabeled_tps or raw_labeled_tps.values())
