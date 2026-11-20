@@ -1556,4 +1556,73 @@ async def test_phase1_bug_regressions_and_bat_launchers(tmp_path):
             assert "ERRORLEVEL% EQU 0" in txt
 
 
+def test_mt5_connect_passwordless_account_switching(monkeypatch):
+    """
+    MT5Executor.connect() supports saved-credential account switching with
+    MT5_LOGIN + optional MT5_SERVER (without requiring plaintext MT5_PASSWORD),
+    skips redundant mt5.login when already connected to the target login, and
+    retries login(login=...) if server-scoped login fails without a password.
+    """
+    import config
+    import mt5_executor as ex_mod
+    from types import SimpleNamespace
+
+    login_calls = []
+
+    def _rec_login(**kwargs):
+        login_calls.append(dict(kwargs))
+        # Fail first server-scoped attempt when testing fallback to bare login=
+        if kwargs.get("server") == "AliasServer":
+            return False
+        return True
+
+    # 1) Already logged into target login/server -> skip mt5.login
+    monkeypatch.setattr(config, "MT5_LOGIN", 36393319, raising=False)
+    monkeypatch.setattr(ex_mod, "MT5_LOGIN", 36393319, raising=False)
+    monkeypatch.setattr(config, "MT5_SERVER", "PUPrime-Live 6", raising=False)
+    monkeypatch.setattr(ex_mod, "MT5_SERVER", "PUPrime-Live 6", raising=False)
+    monkeypatch.setattr(config, "MT5_PASSWORD", None, raising=False)
+    monkeypatch.setattr(ex_mod, "MT5_PASSWORD", None, raising=False)
+
+    same_acc = SimpleNamespace(login=36393319, server="PUPrime-Live 6", balance=50.0, currency="GBP")
+    with patch.object(ex_mod.mt5, "initialize", return_value=True), \
+         patch.object(ex_mod.mt5, "account_info", return_value=same_acc), \
+         patch.object(ex_mod.mt5, "login", side_effect=_rec_login):
+        ex = MT5Executor(dry_run=False)
+        assert ex.connect() is True
+    assert login_calls == []
+
+    # 2) Different active account (e.g. Demo 700198561) -> switch to Live 36393319 without password
+    demo_acc = SimpleNamespace(login=700198561, server="PUPrime-Demo", balance=100.0, currency="GBP")
+    with patch.object(ex_mod.mt5, "initialize", return_value=True), \
+         patch.object(ex_mod.mt5, "account_info", side_effect=[demo_acc, same_acc]), \
+         patch.object(ex_mod.mt5, "login", side_effect=_rec_login):
+        ex = MT5Executor(dry_run=False)
+        assert ex.connect() is True
+    assert login_calls == [{"login": 36393319, "server": "PUPrime-Live 6"}]
+
+    # 3) Server alias fallback (server-scoped fails, bare login succeeds)
+    login_calls.clear()
+    monkeypatch.setattr(config, "MT5_SERVER", "AliasServer", raising=False)
+    monkeypatch.setattr(ex_mod, "MT5_SERVER", "AliasServer", raising=False)
+    with patch.object(ex_mod.mt5, "initialize", return_value=True), \
+         patch.object(ex_mod.mt5, "account_info", side_effect=[demo_acc, same_acc]), \
+         patch.object(ex_mod.mt5, "login", side_effect=_rec_login):
+        ex = MT5Executor(dry_run=False)
+        assert ex.connect() is True
+    assert login_calls == [
+        {"login": 36393319, "server": "AliasServer"},
+        {"login": 36393319},
+    ]
+
+    # 4) Failed login returns False cleanly
+    with patch.object(ex_mod.mt5, "initialize", return_value=True), \
+         patch.object(ex_mod.mt5, "account_info", return_value=demo_acc), \
+         patch.object(ex_mod.mt5, "login", return_value=False), \
+         patch.object(ex_mod.mt5, "last_error", return_value=(-2, "Auth failed")):
+        ex = MT5Executor(dry_run=False)
+        assert ex.connect() is False
+
+
+
 

@@ -7,7 +7,9 @@
 # Runtime State & Logs (contain trade/account data)
 signals_state.json
 signals_state.json*
+signals_state_demo.json*
 sim_state.json
+start_copier_demo.bat
 trades_ledger.jsonl
 *.jsonl
 copier.lock

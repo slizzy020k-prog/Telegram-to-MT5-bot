@@ -187,6 +187,10 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TP_TRAIL_ENABLED",
         "DYNAMIC_ATR_TP_LIFT_ATR_MULT",
         "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT",
+        "MT5_LOGIN",
+        "MT5_PASSWORD",
+        "MT5_SERVER",
+        "MT5_PATH",
     )
 }
 
@@ -563,20 +567,65 @@ class MT5Executor:
 
         with self._mt5_lock:
             init_kwargs = {}
-            if MT5_PATH:
-                init_kwargs["path"] = MT5_PATH
+            mt5_path = _cfg("MT5_PATH", MT5_PATH)
+            if mt5_path:
+                init_kwargs["path"] = mt5_path
 
             if not mt5.initialize(**init_kwargs):
                 err = mt5.last_error()
                 logger.error(f"MT5 initialize() failed: {err}")
                 return False
 
-            if MT5_LOGIN and MT5_PASSWORD and MT5_SERVER:
-                if not mt5.login(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-                    err = mt5.last_error()
-                    logger.error(f"MT5 login failed: {err}")
+            mt5_login = _cfg("MT5_LOGIN", MT5_LOGIN)
+            mt5_password = _cfg("MT5_PASSWORD", MT5_PASSWORD)
+            mt5_server = _cfg("MT5_SERVER", MT5_SERVER)
+
+            if mt5_login:
+                try:
+                    login_int = int(mt5_login)
+                except (TypeError, ValueError):
+                    logger.error(f"Invalid MT5_LOGIN={mt5_login!r}")
                     return False
-                logger.info(f"MT5 logged in successfully to account {MT5_LOGIN} ({MT5_SERVER})")
+
+                cur_acc = mt5.account_info()
+                cur_login = _int_num(getattr(cur_acc, "login", None), 0) if cur_acc is not None else 0
+                cur_srv = str(getattr(cur_acc, "server", "") or "").strip() if cur_acc is not None else ""
+                srv_target = str(mt5_server).strip() if mt5_server else ""
+                if cur_login == login_int and (not srv_target or cur_srv == srv_target):
+                    logger.info(
+                        f"Connected to MT5 active account: {login_int} "
+                        f"on {cur_srv or 'N/A'} "
+                        f"(Balance: {_num(getattr(cur_acc, 'balance', 0.0))} {getattr(cur_acc, 'currency', '')})"
+                    )
+                else:
+                    login_kwargs: Dict[str, Any] = {"login": login_int}
+                    if srv_target:
+                        login_kwargs["server"] = srv_target
+                    if mt5_password:
+                        login_kwargs["password"] = str(mt5_password)
+
+                    logged_in = bool(mt5.login(**login_kwargs))
+                    if not logged_in and srv_target and not mt5_password:
+                        logged_in = bool(mt5.login(login=login_int))
+
+                    if not logged_in:
+                        err = mt5.last_error()
+                        logger.error(
+                            f"MT5 login failed for account {login_int} ({srv_target or 'saved server'}): {err}"
+                        )
+                        return False
+
+                    acc_info = mt5.account_info()
+                    if acc_info:
+                        logger.info(
+                            f"MT5 logged in successfully to account {getattr(acc_info, 'login', login_int)} "
+                            f"on {getattr(acc_info, 'server', srv_target or 'N/A')} "
+                            f"(Balance: {_num(getattr(acc_info, 'balance', 0.0))} {getattr(acc_info, 'currency', '')})"
+                        )
+                    else:
+                        logger.info(
+                            f"MT5 logged in successfully to account {login_int} ({srv_target or 'saved server'})"
+                        )
             else:
                 term_info = mt5.terminal_info()
                 acc_info = mt5.account_info()
