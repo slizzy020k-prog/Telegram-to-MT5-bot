@@ -5787,16 +5787,22 @@ class MT5Executor:
             try:
                 tick = self.get_tick(symbol)
             except Exception as exc:
+                # A terminal that is briefly unreachable is a SKIP, not a
+                # failure: the de-risk is retried on the next tick instead of
+                # being reported as failed every second.
                 logger.warning(f"[LIFECYCLE DERISK] tick for {symbol} failed: {exc}")
-                result["failed"].append(f"tick:{exc}")
+                result["skipped"] = "no_live_price"
+                price_unavailable = True
             if tick is None:
                 price_unavailable = True
+                result["skipped"] = "no_live_price"
             else:
                 _raw_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
                 live_price = _num(_raw_px, 0.0)
                 if not (live_price > 0.0):
                     price_unavailable = True
-        stops_buffer = self._compute_stops_buffer(sym_info)
+                    result["skipped"] = "no_live_price"
+            stops_buffer = self._compute_stops_buffer(sym_info)
 
         for lk, lv in list(layers.items()):
             if not isinstance(lv, dict):

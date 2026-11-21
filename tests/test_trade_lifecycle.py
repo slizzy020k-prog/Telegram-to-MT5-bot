@@ -2513,3 +2513,501 @@ def test_apply_lifecycle_flatten_gives_up_on_the_call_that_reaches_the_budget(mo
     assert len(attempts) == 3, "the give-up path must not close anything"
     assert res.get("gave_up") is True
     assert res["failed"] == ["close:give_up"]
+
+
+# --- main.py age guard ---------------------------------------------------
+
+
+def _install_signal(monkeypatch, tmp_path, sig):
+    """Install `sig` in a throw-away state manager and return the main module."""
+    import main
+    from state_manager import StateManager
+    from trade_ledger import TradeLedger
+
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "lifecycle_state.json"))
+    monkeypatch.setattr(main, "trade_ledger", TradeLedger(tmp_path / "lifecycle_ledger.jsonl"))
+    main.state_mgr.create_signal(
+        message_id="9001",
+        symbol="XAUUSD.s",
+        direction="BUY",
+    )
+    main.state_mgr.update_signal("9001", sig)
+    return main
+
+
+def _age_guard_signal(hours_old: float = 3.0):
+    """A signal that carries an open market position and an aged clock."""
+    from datetime import datetime, timedelta, timezone
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat()
+    sig["first_fill_at"] = sig["timestamp"]
+    # A priced TP1 keeps the tick out of the fallback-TP1 branch: these tests
+    # are about the age guard, not about the fallback TP1 attachment.
+    sig["raw_tp1"] = 3999.0
+    return sig
+
+
+class _StubExecutor:
+    """An executor whose lifecycle action returns scripted results."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+        self.seen = []
+        self.tick_calls = 0
+        self.atr_calls = 0
+
+    def get_tick(self, symbol):
+        from types import SimpleNamespace
+
+        self.tick_calls += 1
+        return SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0)
+
+    def get_pip_size(self, symbol):
+        return 0.1
+
+    def get_server_time_offset_seconds(self):
+        return 0
+
+    def evaluate_dynamic_atr_engine(self, signal_data, tick=None):
+        self.atr_calls += 1
+        return {}
+
+    def apply_lifecycle_action(self, signal_data, action):
+        self.calls.append(action)
+        self.seen.append(signal_data)
+        if self._results:
+            return self._results.pop(0)
+        return {
+            "action": action,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+
+
+def _enable_lifecycle(monkeypatch, **overrides):
+    """Switch the trade-age guard ON for the duration of the test."""
+    import config
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+    for name, value in overrides.items():
+        monkeypatch.setattr(config, name, value)
+
+
+@pytest.mark.asyncio
+async def test_age_guard_derisks_an_old_signal(monkeypatch, tmp_path):
+    """An aged trade is de-risked by the watcher."""
+    import main
+
+    _enable_lifecycle(monkeypatch, LIFECYCLE_DERISK_SECONDS=7200, LIFECYCLE_FLATTEN_SECONDS=21600)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert stub.calls == ["DERISK"]
+    assert stub.seen[0].get("lifecycle_derisk_at"), "a completed de-risk must be stamped"
+    assert stub.atr_calls == 1, "the tick must continue after the de-risk"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_stamp_a_failed_dersisk(monkeypatch, tmp_path):
+    """A failed action is not done: the next tick must retry it."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "DERISK",
+            "ok": False,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["L1:boom"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.calls == ["DERISK"]
+    assert not stub.seen[0].get("lifecycle_derisk_at"), "a failed action must not be stamped"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK", "DERISK"], "the next tick must retry"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_stamp_a_skipped_dersisk(monkeypatch, tmp_path):
+    """A skipped action (no live price) is not done either."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "DERISK",
+            "ok": True,
+            "skipped": "no_live_price",
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert not stub.seen[0].get("lifecycle_derisk_at"), "a skipped action must not be stamped"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK", "DERISK"], "the next tick must retry"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_closes_the_signal_only_after_a_successful_flatten(monkeypatch, tmp_path):
+    """A failed flatten must not close the signal: the position may still be open."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "FLATTEN",
+            "ok": False,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["close:boom"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.seen[0].get("status") != "CLOSED", "a failed flatten must not close the signal"
+    assert not stub.seen[0].get("lifecycle_flatten_at")
+    assert main_mod.state_mgr.get_signal("9001").get("status") != "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_alerts_once_when_the_flatten_gives_up(monkeypatch, tmp_path):
+    """The give-up path must be reachable, alert once, and stop retrying."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    alerts = []
+
+    async def _notify(text, *args, **kwargs):
+        alerts.append(text)
+
+    monkeypatch.setattr(main_mod, "notify_saved_messages", _notify)
+
+    stub = _StubExecutor([
+        {
+            "action": "FLATTEN",
+            "ok": False,
+            "gave_up": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["close:give_up"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert len(alerts) == 1, "the give-up must be reported once"
+    assert "gave up" in alerts[0]
+    assert stub.seen[0].get("status") != "CLOSED", "a gave-up flatten must not close the signal"
+    assert stub.seen[0].get("lifecycle_flatten_at"), "the give-up must stop the retries"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert len(alerts) == 1, "the give-up alert must not repeat"
+    assert stub.calls == ["FLATTEN"], "a gave-up flatten must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_repeat_a_completed_action(monkeypatch, tmp_path):
+    """A completed action is stamped, so the guard does not run it again."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.calls == ["DERISK"]
+    assert stub.seen[0].get("lifecycle_derisk_at")
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK"], "a completed action must not run again"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_is_a_no_op_when_the_guard_is_disabled(monkeypatch, tmp_path):
+    """With the guard OFF nothing is touched and the tick behaves exactly as before."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert stub.calls == [], "a disabled guard must not touch the broker"
+    assert stub.tick_calls == 1, "the tick must still run"
+    assert stub.atr_calls == 1, "the tick must continue exactly as before"
+    assert not stub.seen
+    assert not sig.get("lifecycle_flatten_at")
+    assert not sig.get("lifecycle_derisk_at")
+    assert sig.get("status") != "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_runs_before_the_tp1_branches(monkeypatch, tmp_path):
+    """An aged trade is de-risked FIRST, before the TP1 branches run."""
+    import config
+    import main
+
+    _enable_lifecycle(monkeypatch)
+    monkeypatch.setattr(config, "BANK_ALL_AT_TP1", True)
+
+    sig = _age_guard_signal(3.0)
+    sig["raw_tp1"] = 3895.0          # the tick (bid 3895.0) reaches TP1
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    order = []
+    stub = _StubExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    _real_apply = stub.apply_lifecycle_action
+
+    def _apply(signal_data, action):
+        order.append("lifecycle")
+        return _real_apply(signal_data, action)
+
+    stub.apply_lifecycle_action = _apply
+
+    async def _handoff(msg_id, sig, chat_id=None, source_label="", curr_price=None):
+        order.append("tp1")
+        return None, 0.0, ""
+
+    monkeypatch.setattr(main_mod, "_execute_tp1_scaling_handoff", _handoff)
+
+    async def _notify(text, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(main_mod, "notify_saved_messages", _notify)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert order == ["lifecycle", "tp1"], "the age guard must run before the TP1 branches"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_contains_an_exception_from_the_action(monkeypatch, tmp_path):
+    """A broker error inside the action must not escape the tick."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    class _RaisingExecutor(_StubExecutor):
+        def apply_lifecycle_action(self, signal_data, action):
+            self.calls.append(action)
+            raise RuntimeError("the broker pipe is closed")
+
+    stub = _RaisingExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert stub.calls == ["DERISK"]
+    assert stub.atr_calls == 1, "the tick must continue after a contained error"
+    assert not stub.seen
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_notify_on_a_failed_or_skipped_action(monkeypatch, tmp_path):
+    """Only a close and a give-up may talk to Saved Messages."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    alerts = []
+
+    async def _notify(text, *args, **kwargs):
+        alerts.append(text)
+
+    monkeypatch.setattr(main_mod, "notify_saved_messages", _notify)
+
+    stub = _StubExecutor([
+        {"action": "DERISK", "ok": False, "failed": ["L1:boom"]},
+        {"action": "DERISK", "ok": True, "skipped": "no_live_price"},
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+
+    assert stub.calls == ["DERISK", "DERISK"]
+    assert alerts == [], "a failed or skipped action must stay quiet"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_closes_the_signal_after_a_successful_flatten(monkeypatch, tmp_path):
+    """A completed flatten closes the signal and reports it once."""
+    import main
+
+    _enable_lifecycle(monkeypatch)
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    alerts = []
+
+    async def _notify(text, *args, **kwargs):
+        alerts.append(text)
+
+    monkeypatch.setattr(main_mod, "notify_saved_messages", _notify)
+
+    stub = _StubExecutor([
+        {
+            "action": "FLATTEN",
+            "ok": True,
+            "moved": [],
+            "closed": [101],
+            "cancelled": [102],
+            "failed": [],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert stub.calls == ["FLATTEN"]
+    assert stub.seen[0].get("status") == "CLOSED"
+    assert stub.seen[0].get("lifecycle_flatten_at")
+    assert main_mod.state_mgr.get_signal("9001").get("status") == "CLOSED"
+    assert len(alerts) == 1, "a completed flatten reports once"
+    assert "FLATTEN" in alerts[0]
+
+
+# --- the "skipped" action marker (Task 6, executor side) -------------------
+
+
+def test_apply_lifecycle_derisk_reports_a_skip_when_the_tick_is_unavailable(monkeypatch):
+    """No tick -> no live price -> the de-risk is SKIPPED, not failed."""
+    from types import SimpleNamespace
+
+    ex = _live_lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: None)
+
+    res = ex.apply_lifecycle_derisk(_lifecycle_signal())
+
+    assert res.get("skipped") == "no_live_price"
+    assert res["ok"] is True, "a skip is not a failure"
+    assert res["failed"] == [], "a skip must not be recorded as a failure"
+    assert res["moved"] == []
+
+
+def test_apply_lifecycle_derisk_reports_a_skip_when_the_tick_raises(monkeypatch):
+    """A terminal that is briefly unreachable must not fail the de-risk every second."""
+    from types import SimpleNamespace
+
+    ex = _live_lifecycle_executor()
+
+    def _raise(symbol):
+        raise RuntimeError("terminal not connected")
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(ex, "get_tick", _raise)
+
+    res = ex.apply_lifecycle_derisk(_lifecycle_signal())
+
+    assert res.get("skipped") == "no_live_price"
+    assert res["ok"] is True, "a skip is not a failure"
+    assert res["failed"] == [], "a skip must not be recorded as a failure"
+    assert res["moved"] == []
+
+
+@pytest.mark.parametrize(
+    "tick_spec",
+    [
+        {"bid": 0.0, "ask": 0.0},
+        {"bid": -1.0, "ask": -1.0},
+        {"ask": 3895.2},
+        {"bid": "not-a-number", "ask": "not-a-number"},
+    ],
+)
+def test_apply_lifecycle_derisk_reports_a_skip_for_an_unusable_price(monkeypatch, tick_spec):
+    """A missing, non-numeric or non-positive price is an unusable price."""
+    from types import SimpleNamespace
+
+    tick_value = SimpleNamespace(**tick_spec)
+    ex = _live_lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: tick_value)
+
+    res = ex.apply_lifecycle_derisk(_lifecycle_signal())
+
+    assert res.get("skipped") == "no_live_price"
+    assert res["ok"] is True, "a skip is not a failure"
+    assert res["failed"] == []
+    assert res["moved"] == []
