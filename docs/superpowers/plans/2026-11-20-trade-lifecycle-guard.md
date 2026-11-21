@@ -6466,13 +6466,27 @@ In `main.py`, the command list in the `/status` reply becomes:
 - Modify: `trade_ledger.py` -- `build_trade_record` (the schema-4 telemetry block, the new record
   keys and `schema_version`), `append_trade` (the `schema_version` default), and the
   `risk_lifecycle.resolve_fill_time` import
+- Modify: `mt5_executor.py` -- `MT5Executor.get_profit_currency_rate()` (the ACCOUNT-currency
+  rate lookup that the giveback needs)
 - Modify: `tests/test_trade_lifecycle.py` (append the ledger tests)
 
 **Interfaces:**
 - Consumes: `risk_lifecycle.resolve_fill_time` for the exit age (see the fill-time rule below).
+- Consumes: `MT5Executor.get_profit_currency_rate(symbol)` -- the number of ACCOUNT-currency
+  units one unit of the symbol's PROFIT currency is worth (see the currency rule below).
 - Produces: every closed-signal record gains `mfe_cash`, `giveback_cash`,
   `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action`; `schema_version`
   becomes `4`.
+
+**Currency rule (fix round 1):** `mfe_cash` is a price-based amount in the symbol's PROFIT
+currency (USD for XAUUSD), while `realized_pnl` comes from the broker in the ACCOUNT currency
+(GBP). The two may only be subtracted once the MFE has been converted, so
+`giveback_cash = mfe_cash * profit_currency_rate - realized_pnl` and is denominated in the
+ACCOUNT currency. When the rate is unknown the giveback is `None` -- never a mixed-currency
+number. `mfe_cash` is deliberately NOT converted: `r_at_exit` divides it by a price-based risk
+amount, so the R multiple stays currency-neutral. The record also carries
+`giveback_currency` (the account currency) and `fx_rate_to_account` (the rate actually used)
+for auditability.
 
 **Fill-time rule:** the ledger records the RESOLVED fill time via
 `risk_lifecycle.resolve_fill_time(signal_data)` -- NEVER the raw
@@ -6518,6 +6532,9 @@ def test_build_trade_record_adds_cash_mfe_and_giveback():
         signal_data=_schema4_signal(),
         realized_pnl=0.56,
         exit_reason="ATR_TRAIL",
+        # The account currency IS the profit currency here, so the rate is 1.0
+        # and the giveback is the MFE minus the realized PnL.
+        profit_currency_rate=1.0,
     )
 
     assert rec["schema_version"] == 4
@@ -6657,6 +6674,10 @@ def test_append_trade_defaults_to_schema_4(tmp_path):
 
     assert entry["schema_version"] == 4
 ```
+```
+
+- [x] **Step 2: the tests fail**
+```
 
 - [x] **Step 2: the tests fail** -- `schema_version` is `3` and the new keys are missing.
 
@@ -6680,10 +6701,11 @@ In `trade_ledger.py`, the computation block sits immediately **before** the
     if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
         mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)
 
-    realized_for_giveback = _safe_float(realized_pnl, 0.0)
+    # The giveback can only be computed once the MFE -- a price-based amount in
+    # the symbol's PROFIT currency -- has been converted into the ACCOUNT
+    # currency of `realized_pnl`. The conversion is applied to the finished
+    # record below; without a known rate the giveback stays UNKNOWN (None).
     giveback_cash: Optional[float] = None
-    if mfe_cash is not None:
-        giveback_cash = round(mfe_cash - realized_for_giveback, 2)
 
     initial_r = _safe_float(signal_data.get("initial_r_per_oz"), 0.0)
     if initial_r <= 0.0:
@@ -6727,17 +6749,25 @@ In `trade_ledger.py`, the computation block sits immediately **before** the
 
     lifecycle_action = signal_data.get("lifecycle_action")
 ```
+```
+
+The record gains the new keys:```
 
 The record gains the new keys:
 
 ```python
         "mfe_cash": mfe_cash,
         "giveback_cash": giveback_cash,
+        "giveback_currency": str(currency or "GBP"),
+        "fx_rate_to_account": None,
         "initial_r_per_oz": initial_r_per_oz,
         "r_at_exit": r_at_exit,
         "exit_age_seconds": exit_age_seconds,
         "lifecycle_action": (str(lifecycle_action) if lifecycle_action else None),
 ```
+```
+
+and its version becomes:```
 
 and its version becomes:
 
@@ -6757,13 +6787,485 @@ In `append_trade` the default becomes:
 from risk_lifecycle import resolve_fill_time
 ```
 
-- [x] **Step 4: the tests pass.**
+The giveback is denominated by a helper that is applied to the finished record:
+
+```python
+def _apply_giveback_currency(record: Dict[str, Any], profit_currency_rate: Optional[float]) -> None:
+    """Denominate `giveback_cash` in the ACCOUNT currency -- or leave it unknown.
+
+    `mfe_cash` is a price-based cash amount in the symbol's PROFIT currency
+    (USD for XAUUSD), while `realized_pnl` comes from the broker in the ACCOUNT
+    currency (GBP). The two can only be subtracted once the MFE has been
+    converted, so the giveback is `mfe_cash * rate - realized_pnl`, denominated
+    in the account currency.
+
+    Without a known rate the giveback stays `None`: a mixed-currency number is
+    never written. `mfe_cash` itself is left untouched, so `r_at_exit` -- a
+    ratio of two price-based amounts -- stays currency-neutral.
+    """
+    if record.get("fx_rate_to_account") is not None:
+        return  # already denominated
+    rate = _safe_float(profit_currency_rate, 0.0) if profit_currency_rate is not None else 0.0
+    if rate <= 0.0:
+        return
+    mfe_cash = record.get("mfe_cash")
+    if not _is_num(mfe_cash):
+        return
+    realized = _safe_float(record.get("realized_pnl"), 0.0)
+    record["giveback_cash"] = round(float(mfe_cash) * rate - realized, 2)
+    record["giveback_currency"] = str(record.get("currency") or "GBP")
+    record["fx_rate_to_account"] = round(rate, 8)
+```
+`build_trade_record` takes the rate as an optional argument:
+
+```python
+def build_trade_record(
+    signal_key: str,
+    signal_data: Dict[str, Any],
+    realized_pnl: float,
+    exit_reason: str,
+    currency: str = "GBP",
+    dry_run: bool = False,
+    extra: Optional[Dict[str, Any]] = None,
+    profit_currency_rate: Optional[float] = None,
+) -> Dict[str, Any]:
+```
+`TradeLedger.append_trade` and `TradeLedger.record_closed_signal` take the same optional
+argument and thread it through:
+
+```python
+    def append_trade(
+        self,
+        record: Dict[str, Any],
+        profit_currency_rate: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Append a single closed-trade record atomically as one JSON line."""
+        entry = dict(record)
+        entry.setdefault("schema_version", 4)
+        entry.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
+        entry["realized_pnl"] = round(_safe_float(entry.get("realized_pnl"), 0.0), 2)
+        # Every appended record carries the giveback contract, even when the
+        # giveback is unknown (no rate) -- an absent key is not the same thing
+        # as a known zero.
+        entry.setdefault("giveback_cash", None)
+        entry.setdefault("giveback_currency", str(record.get("currency") or "GBP"))
+        entry.setdefault("fx_rate_to_account", None)
+        _apply_giveback_currency(entry, profit_currency_rate)
+
+        line = json.dumps(entry, ensure_ascii=False, default=str)
+        with self._lock:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.file_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+        return entry
+```
+```python
+    def record_closed_signal(
+        self,
+        signal_key: str,
+        signal_data: Dict[str, Any],
+        realized_pnl: float,
+        exit_reason: str,
+        currency: str = "GBP",
+        dry_run: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
+        profit_currency_rate: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Construct and append a canonical closed-signal ledger entry."""
+        rec = build_trade_record(
+            signal_key=signal_key,
+            signal_data=signal_data,
+            realized_pnl=realized_pnl,
+            exit_reason=exit_reason,
+            currency=currency,
+            dry_run=dry_run,
+            extra=extra,
+            profit_currency_rate=profit_currency_rate,
+        )
+        return self.append_trade(rec, profit_currency_rate=profit_currency_rate)
+```
+The rate itself comes from the executor:
+
+```python
+    def get_profit_currency_rate(self, symbol: str) -> Optional[float]:
+        """Return how many ACCOUNT-currency units one unit of the symbol's profit currency is worth.
+
+        The ACCOUNT currency comes from the broker account (e.g. "GBP") and the
+        symbol's PROFIT currency from its symbol info (e.g. "USD" for XAUUSD.s).
+        When the two differ the rate is read from the FX symbol
+        "{account}{profit_currency}" (e.g. "GBPUSD"), whose bid is quoted as
+        account units per profit unit -- so the conversion factor is 1 / bid.
+
+        Returns None when the conversion cannot be established: the caller must
+        then record NO giveback rather than a mixed-currency number. Never guess.
+        """
+        try:
+            financials = self.get_account_financials() or {}
+            account_currency = str(financials.get("currency") or "").strip().upper()
+            if not account_currency:
+                return None
+
+            symbol_info = self.get_symbol_info(symbol)
+            if symbol_info is None:
+                return None
+            profit_currency = str(getattr(symbol_info, "currency_profit", None) or "USD").strip().upper()
+            if not profit_currency:
+                profit_currency = "USD"
+            if account_currency == profit_currency:
+                return 1.0
+
+            fx_symbol = f"{account_currency}{profit_currency}"
+            fx_info = self.get_symbol_info(fx_symbol)
+            bid = _num(getattr(fx_info, "bid", 0.0), 0.0) if fx_info is not None else 0.0
+            if bid <= 0.0:
+                logger.warning(
+                    f"No usable {fx_symbol} bid for {symbol} (profit currency {profit_currency}); "
+                    "the giveback cannot be converted."
+                )
+                return None
+            return 1.0 / bid
+        except Exception as exc:
+            logger.warning(f"Could not establish the profit currency rate for {symbol}: {exc}")
+            return None
+
+```
+- [x] **Step 4: the tests pass.**- [x] **Step 4: the tests pass.**
 
 - [x] **Step 5: the full suite passes.**
 
+- [x] **Step 6 (fix round 1): the currency-correctness tests**
+
+Appended to `tests/test_trade_lifecycle.py` (this block also covers the Task 9 call site and
+the `/stats` label):
+
+```python
+# --- giveback currency correctness (A1) ----------------------------------
+
+def _fx_signal():
+    """A closed signal whose MFE is denominated in the symbol profit currency."""
+    return {
+        "timestamp": "2026-11-19T06:19:09+00:00",
+        "chat_id": -100,
+        "message_id": 42,
+        "symbol": "XAUUSD.s",
+        "direction": "SELL",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "layers": {"L1": {"ticket": 1, "status": "CLOSED", "lot": 0.01, "entry_price": 3740.0}},
+        "max_favorable_excursion": {"peak_price": 3728.55, "peak_profit_per_oz": 11.12},
+        "initial_r_per_oz": 20.0,
+        "first_fill_at": "2026-11-19T06:19:09+00:00",
+        "closed_at": "2026-11-19T09:19:51+00:00",
+    }
+
+
+def test_build_trade_record_converts_the_giveback_into_the_account_currency():
+    """The MFE is USD and the realized PnL is GBP -- they can only meet after conversion."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_fx_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+        currency="GBP",
+        profit_currency_rate=0.7645,  # 1 / 1.30805 (the GBPUSD bid)
+    )
+
+    # mfe_cash stays in the symbol PROFIT currency (USD), so r_at_exit -- a
+    # ratio of two USD amounts -- is unchanged and currency-neutral.
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+    # The giveback is converted into the ACCOUNT currency BEFORE the subtraction.
+    assert rec["giveback_cash"] == pytest.approx(round(55.60 * 0.7645 - 0.56, 2))
+    assert rec["giveback_cash"] != pytest.approx(55.04)
+    assert rec["giveback_currency"] == "GBP"
+    assert rec["fx_rate_to_account"] == pytest.approx(0.7645)
+
+
+def test_build_trade_record_leaves_the_giveback_unknown_without_a_rate():
+    """Without the rate the giveback is UNKNOWN -- never a mixed-currency number."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_fx_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+        currency="GBP",
+    )
+
+    assert rec["giveback_cash"] is None
+    assert rec["fx_rate_to_account"] is None
+    # The price-based telemetry is unaffected by the missing rate.
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+
+
+def test_append_trade_denominates_the_giveback_in_the_account_currency(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade(
+        {"realized_pnl": 0.56, "currency": "GBP", "mfe_cash": 55.60},
+        profit_currency_rate=0.7645,
+    )
+
+    assert entry["giveback_cash"] == pytest.approx(round(55.60 * 0.7645 - 0.56, 2))
+    assert entry["giveback_currency"] == "GBP"
+    assert entry["fx_rate_to_account"] == pytest.approx(0.7645)
+
+
+def test_append_trade_leaves_the_giveback_unknown_without_a_rate(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade({"realized_pnl": 0.56, "currency": "GBP", "mfe_cash": 55.60})
+
+    assert entry["giveback_cash"] is None
+    assert entry["fx_rate_to_account"] is None
+
+
+def _rate_executor(monkeypatch, account_currency, symbols):
+    """An executor stub that answers the account financials and the symbol lookups."""
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    monkeypatch.setattr(ex, "get_account_financials", lambda: {"currency": account_currency})
+    monkeypatch.setattr(ex, "get_symbol_info", lambda symbol: symbols.get(symbol))
+    return ex
+
+
+def test_executor_profit_currency_rate_is_one_when_the_currencies_match(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(monkeypatch, "USD", {"XAUUSD.s": SimpleNamespace(currency_profit="USD")})
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0)
+
+
+def test_executor_profit_currency_rate_converts_a_usd_symbol_on_a_gbp_account(monkeypatch):
+    """A GBP account trading a USD symbol converts at 1 / the GBPUSD bid."""
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(currency_profit="USD"),
+            "GBPUSD": SimpleNamespace(currency_base="GBP", currency_profit="USD", bid=1.30805),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0 / 1.30805)
+
+
+def test_executor_profit_currency_rate_defaults_the_profit_currency_to_usd(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(),
+            "GBPUSD": SimpleNamespace(bid=1.30805),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0 / 1.30805)
+
+
+def test_executor_profit_currency_rate_is_none_when_the_fx_symbol_is_unavailable(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(monkeypatch, "GBP", {"XAUUSD.s": SimpleNamespace(currency_profit="USD")})
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") is None
+
+
+def test_executor_profit_currency_rate_is_none_when_the_fx_symbol_has_no_price(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(currency_profit="USD"),
+            "GBPUSD": SimpleNamespace(bid=0.0),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") is None
+
+
+def test_stats_excludes_an_unknown_giveback_from_the_total():
+    """A missing giveback is unknown, not zero."""
+    import main
+
+    records = [
+        {
+            "closed_at": "2026-11-19T09:00:00+00:00",
+            "realized_pnl": 10.0,
+            "giveback_cash": 12.34,
+            "giveback_currency": "GBP",
+        },
+        {
+            "closed_at": "2026-11-19T10:00:00+00:00",
+            "realized_pnl": 5.0,
+            "giveback_cash": None,
+            "giveback_currency": "GBP",
+        },
+    ]
+
+    allt = main._build_ledger_stats(records)["all_time"]
+
+    assert allt["total_giveback"] == pytest.approx(12.34)
+    assert allt["giveback_currency"] == "GBP"
+
+
+@pytest.mark.asyncio
+async def test_stats_labels_the_giveback_with_the_record_currency(monkeypatch, tmp_path):
+    """The giveback label comes from the record, not from the live account currency."""
+    import json
+
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    rec = {
+        "closed_at": "2026-11-19T09:00:00+00:00",
+        "realized_pnl": 10.0,
+        "giveback_cash": 20.0,
+        "giveback_currency": "USD",
+    }
+    ledger.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    body = ev.replies[0]
+    assert "20.00 USD" in body
+
+
+@pytest.mark.asyncio
+async def test_record_signal_to_ledger_passes_the_profit_currency_rate(monkeypatch, tmp_path):
+    """The call site looks the rate up once per record and hands it to the ledger."""
+    import main
+
+    main = _install_signal(monkeypatch, tmp_path, {})
+
+    captured = {}
+
+    class _RateExecutor:
+        dry_run = False
+
+        def get_account_financials(self):
+            return {"currency": "GBP", "formatted": ""}
+
+        def get_profit_currency_rate(self, symbol):
+            captured["calls"] = captured.get("calls", 0) + 1
+            captured["symbol"] = symbol
+            return 0.7645
+
+    monkeypatch.setattr(main, "executor", _RateExecutor())
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(main.trade_ledger, "record_closed_signal", _capture)
+
+    sig = {
+        "message_id": 9001,
+        "chat_id": -100,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "market_tickets": [101],
+        "banked_profit": 1.5,
+        "layers": {},
+    }
+
+    rec = await main._record_signal_to_ledger("9001", sig, exit_reason="MANUAL", currency="GBP")
+
+    assert rec is not None
+    assert captured["calls"] == 1, "the rate is looked up once per record"
+    assert captured["symbol"] == "XAUUSD.s"
+    assert captured["profit_currency_rate"] == pytest.approx(0.7645)
+
+
+@pytest.mark.asyncio
+async def test_record_signal_to_ledger_survives_a_failing_rate_lookup(monkeypatch, tmp_path):
+    """A failed rate lookup must never break the ledger write."""
+    import main
+
+    main = _install_signal(monkeypatch, tmp_path, {})
+
+    captured = {}
+
+    class _BrokenRateExecutor:
+        dry_run = False
+
+        def get_account_financials(self):
+            return {"currency": "GBP", "formatted": ""}
+
+        def get_profit_currency_rate(self, symbol):
+            raise RuntimeError("MT5 is not connected")
+
+    monkeypatch.setattr(main, "executor", _BrokenRateExecutor())
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(main.trade_ledger, "record_closed_signal", _capture)
+
+    sig = {
+        "message_id": 9001,
+        "chat_id": -100,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "market_tickets": [101],
+        "banked_profit": 1.5,
+        "layers": {},
+    }
+
+    rec = await main._record_signal_to_ledger("9001", sig, exit_reason="MANUAL", currency="GBP")
+
+    assert rec is not None
+    assert captured["profit_currency_rate"] is None
+
+
+# --- the "no fill stamp" fallback must be logged once (A11) ---------------
+
+def test_the_fill_age_fallback_is_logged_once_per_signal(caplog):
+    """The spec requires the no-fill-stamp fallback to be logged once per signal."""
+    import logging
+
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+
+    with caplog.at_level(logging.INFO, logger="copier.lifecycle"):
+        rl.evaluate_trade_age(sig, now, _policy())
+        rl.evaluate_trade_age(sig, now, _policy())
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "copier.lifecycle"]
+    assert len(messages) == 1, f"the fallback must be logged once, got {messages}"
+    assert "fill stamp" in messages[0].lower()
+    assert sig.get("_fill_age_fallback_logged") is True
+```
+- [x] **Step 7 (fix round 1): the tests pass.**
+
 ### Shipped notes (Task 8)
 
-- The plan's test snippet called `build_trade_record(sig, signal_key=...)` -- that passes
+- The plan's test snippet called- The plan's test snippet called `build_trade_record(sig, signal_key=...)` -- that passes
   `signal_data` positionally into `signal_key` and raises
   `TypeError: build_trade_record() got multiple values for argument 'signal_key'`. The shipped
   test calls it as `build_trade_record(signal_key=..., signal_data=..., realized_pnl=...,
@@ -6786,6 +7288,29 @@ from risk_lifecycle import resolve_fill_time
 - Schema 4 is an UPGRADE: the schema-3 fields are all still written, and a record written by
   the old code is still read (the new keys are simply absent). Both are covered by the shipped
   tests.
+
+- (fix round 1) The giveback was mixing currencies: `mfe_cash` is a price difference on
+  XAUUSD (USD) and `realized_pnl` comes from the broker in the ACCOUNT currency (GBP), so
+  `mfe_cash - realized_pnl` was overstated by the GBP/USD rate (`1.31x on this account) while
+  `/stats` labelled the result `GBP`. The giveback is now computed in ONE currency --
+  `mfe_cash * profit_currency_rate - realized_pnl`, denominated in the account currency -- and
+  is `None` when the rate cannot be established (fail closed, never a mixed number).
+- (fix round 1) `mfe_cash` is deliberately left in the symbol's profit currency: `r_at_exit`
+  divides it by `initial_r_per_oz * lots * 100`, a price-based amount, so the R multiple stays
+  currency-neutral and unchanged.
+- (fix round 1) `MT5Executor.get_profit_currency_rate()` returns `None` -- never a guess --
+  when the account currency is unknown, the symbol info is missing, or the FX symbol
+  `{account}{profit_currency}` (e.g. `GBPUSD`) has no usable bid. Verified on this machine:
+  MT5 exposes `GBPUSD` with `bid=1.30805` (`currency_base='GBP'`, `currency_profit='USD'`);
+  `USDGBP` does not exist.
+- (fix round 1) The one pre-existing test that asserted the mixed-currency number,
+  `test_build_trade_record_adds_cash_mfe_and_giveback`, now passes
+  `profit_currency_rate=1.0` (an account whose currency IS the profit currency). Every
+  assertion in it is unchanged; the rate-aware behaviour is covered by the additional tests.
+- (fix round 1) The `no fill stamp -> fall back to signal age` fallback in
+  `risk_lifecycle.evaluate_trade_age` is now logged ONCE per signal through the
+  `copier.lifecycle` logger, using the `_fill_age_fallback_logged` marker on the signal dict
+  (the same idiom as `_r_lock_skipped_logged`).
 
 ## Task 9: `main.py` -- the `/stats` command
 
@@ -6962,7 +7487,57 @@ def test_stats_is_a_known_saved_command():
 
     assert main._is_known_saved_command("/stats")
     assert main._is_known_saved_command("stats")
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_lists_the_active_signals_and_their_ages(monkeypatch, tmp_path):
+    """The spec requires the `/lifecycle` query to show per-signal ages and the next action."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    sig["first_fill_at"] = sig["timestamp"]
+    _install_signal(monkeypatch, tmp_path, sig)
+
+    class _OffsetExecutor:
+        def get_server_time_offset_seconds(self):
+            return 0
+
+    monkeypatch.setattr(main, "executor", _OffsetExecutor())
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    body = "\n".join(ev.replies)
+    assert "Active signals" in body
+    assert "9001" in body
+    assert "DERISK" in body
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_omits_the_signal_list_when_the_guard_is_off(monkeypatch, tmp_path):
+    """With the guard disabled there is no action to preview."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    _install_signal(monkeypatch, tmp_path, sig)
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    body = "\n".join(ev.replies)
+    assert "Active signals" not in body
 ```
+```
+
+- [x] **Step 2: the tests fail** -- `AttributeError:```
 
 - [x] **Step 2: the tests fail** -- `AttributeError: module 'main' has no attribute
   '_build_ledger_stats'`.
@@ -6999,6 +7574,16 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
             return list(rows)
         return [r for r in rows if _in_window(r, cutoff)]
 
+    def _giveback_currency(subset: List[Dict[str, Any]]) -> Optional[str]:
+        """The currency the giveback total is denominated in, taken from the records."""
+        for r in subset:
+            if r.get("giveback_cash") is None:
+                continue
+            curr = str(r.get("giveback_currency") or "").strip()
+            if curr:
+                return curr
+        return None
+
     def _aggregate(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
         pnls = [float(r.get("realized_pnl") or 0.0) for r in subset]
         wins = sum(1 for p in pnls if p > 0.0)
@@ -7016,6 +7601,7 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
             "losses": losses,
             "win_rate": round(wins / len(subset), 4) if subset else 0.0,
             "total_giveback": round(sum(givebacks), 2),
+            "giveback_currency": _giveback_currency(subset),
             "max_exit_age_seconds": max(ages) if ages else 0,
             "lifecycle_closes": sum(1 for r in subset if r.get("lifecycle_action")),
             "exit_reasons": reasons,
@@ -7032,8 +7618,10 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
 
 # ---------------------------------------------------------------------------
 # EXPOSURE SHUTDOWN & DAILY RISK LIMITS
-# ---------------------------------------------------------------------------
 ```
+```
+
+- [x] **Step 4: the `/stats` command**```
 
 - [x] **Step 4: the `/stats` command**
 
@@ -7079,10 +7667,14 @@ In `handle_saved_messages_command`, immediately before the `# LIVE CONTROL: /flo
         curr = fin.get("currency", "GBP")
 
         def _line(label: str, agg: Dict[str, Any]) -> str:
+            # The giveback is denominated in the account currency of the records
+            # themselves, so it is labelled from the ledger -- not from the live
+            # account currency, and not with a hard-coded currency.
+            giveback_currency = agg.get("giveback_currency") or curr
             return (
                 f"• **{label}:** `{agg['net_pnl']:+.2f} {curr}` | "
                 f"`{agg['count']}` trades | win rate `{agg['win_rate'] * 100:.0f}%` | "
-                f"giveback `{agg['total_giveback']:.2f} {curr}` | "
+                f"giveback `{agg['total_giveback']:.2f} {giveback_currency}` | "
                 f"max age `{agg['max_exit_age_seconds']}s`\n"
             )
 
@@ -7097,10 +7689,81 @@ In `handle_saved_messages_command`, immediately before the `# LIVE CONTROL: /flo
         )
         return
 ```
+```
+
+- [x] **Step 5: register `/stats```
+
+- [x] **Step 4b (fix round 1): the rate reaches the ledger**
+
+`_record_signal_to_ledger` looks the rate up ONCE per record and tolerates every failure --
+a failing lookup simply yields a record with no giveback:
+
+```python
+async def _record_signal_to_ledger(
+    msg_id: Any,
+    sig: Dict[str, Any],
+    exit_reason: str,
+    currency: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Persist a closed signal once to trades_ledger.jsonl when all its positions are closed.
+    Skips purely unentered/invalidated setups and avoids double recording via `ledger_recorded`.
+    """
+    if not isinstance(sig, dict) or sig.get("ledger_recorded") or not _has_executed_exposure(sig):
+        return None
+
+    chat_id = sig.get("chat_id")
+    mid_str = str(msg_id)
+    if chat_id is not None and ":" not in mid_str:
+        signal_key = f"{chat_id}:{mid_str}"
+    else:
+        signal_key = mid_str
+
+    if not currency:
+        fin = await _mt5_call(executor.get_account_financials)
+        currency = fin.get("currency", "GBP")
+    srv_date = await _trading_day_str_async()
+    realized_pnl = round(float(sig.get("banked_profit") or 0.0), 2)
+
+    # The giveback is the cash MFE -- a price-based amount in the symbol's
+    # PROFIT currency -- minus the realized PnL, which the broker reports in
+    # the ACCOUNT currency. The two can only be subtracted once the MFE has
+    # been converted, so the rate is looked up ONCE per record here. Every
+    # failure is tolerated: the record then simply carries no giveback rather
+    # than a mixed-currency number.
+    profit_currency_rate: Optional[float] = None
+    try:
+        _rate_fn = getattr(executor, "get_profit_currency_rate", None)
+        if _rate_fn is not None:
+            profit_currency_rate = await _mt5_call(
+                _rate_fn, sig.get("symbol", DEFAULT_SYMBOL)
+            )
+    except Exception as exc:
+        logger.warning(f"Could not establish the profit currency rate for {signal_key}: {exc}")
+        profit_currency_rate = None
+
+    try:
+        entry = trade_ledger.record_closed_signal(
+            signal_key=signal_key,
+            signal_data=sig,
+            realized_pnl=realized_pnl,
+            exit_reason=exit_reason,
+            currency=currency,
+            dry_run=executor.dry_run,
+            extra={"server_date": srv_date},
+            profit_currency_rate=profit_currency_rate,
+        )
+        sig["ledger_recorded"] = True
+        state_mgr.update_signal(msg_id, {"ledger_recorded": True}, chat_id=chat_id)
+        return entry
+    except Exception as exc:
+        logger.warning(f"Failed to append closed trade ledger entry for {signal_key}: {exc}")
+        return None
+```
 
 - [x] **Step 5: register `/stats` and add it to the help line**
 
-In `main.py`, in the `_KNOWN_SAVED_COMMANDS` set:
+In `main.py`, in the `_KNOWN_SAVED_COMMANDS` set:In `main.py`, in the `_KNOWN_SAVED_COMMANDS` set:
 
 ```python
     "/stats", "stats",
@@ -7127,6 +7790,17 @@ and in the `/status` reply:
 - The account-financials call is wrapped: if the broker connection is down the command still
   answers with the ledger figures instead of raising.
 - A missing or corrupt ledger answers "No ledger data found at `<path>`" -- it never raises.
+
+- (fix round 1) The giveback is no longer labelled with a hard-coded currency: each window's
+  aggregate carries a `giveback_currency` taken from the records that contributed to the
+  total, and the `/stats` line uses it (falling back to the live account currency only when
+  no record carries one -- e.g. for legacy schema-3 records).
+- (fix round 1) Records whose `giveback_cash` is `None` (the FX rate was unknown) are
+  EXCLUDED from `total_giveback`: unknown is not zero.
+- (fix round 1) `_record_signal_to_ledger` obtains the profit-currency rate from the executor
+  once per record and passes it to `trade_ledger.record_closed_signal`. Any failure -- the
+  lookup raising, the executor lacking the method, or the rate coming back `None` -- yields a
+  record with no giveback, and never breaks the ledger write.
 
 ## Task 10: `scripts/ab_replay_proof.py` — Arm C
 
