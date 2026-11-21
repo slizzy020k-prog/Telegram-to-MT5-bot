@@ -73,6 +73,10 @@
 Create `tests/test_trade_lifecycle.py`:
 
 ```python
+<!-- SNAPSHOT: this block is the state of the file as of Task 2. Every later task
+     appends to the same file; the live file in the repo is authoritative. -->
+
+
 """Unit tests for the pure trade-lifecycle domain module (`risk_lifecycle.py`)."""
 
 from datetime import datetime, timedelta, timezone
@@ -290,6 +294,13 @@ def test_r_lock_floor_rejects_an_unknown_direction():
     assert rl.compute_r_lock_floor("", 3900.0, 3880.0, 40.0, 3920.0, _policy()) is None
 
 
+def test_r_lock_floor_is_none_when_the_live_price_is_unusable():
+    # An unknown price cannot validate the floor -> fail closed (no floor at all)
+    for unusable in (0, -1.0, None, float("nan"), "not-a-price"):
+        assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, unusable, _policy()) is None
+        assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, unusable, _policy()) is None
+
+
 def test_r_lock_floor_is_order_independent():
     unsorted_policy = _policy(r_lock_tiers=((2.0, 0.75), (0.5, 0.0)))
     assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, unsorted_policy) == pytest.approx(3915.0)
@@ -356,6 +367,221 @@ def test_signal_without_a_timestamp_reports_an_unknown_age():
     res = rl.evaluate_trade_age({"market_tickets": [101]}, datetime.now(timezone.utc), pol)
     assert res["action"] == rl.ACTION_NONE
     assert "unknown age" in res["reason"]
+
+
+# --- dynamic_risk R_LOCK candidate ---------------------------------------
+
+def _atr_policy():
+    """An explicit policy, so the tests do not depend on ambient config values."""
+    import dynamic_risk
+
+    return dynamic_risk.DynamicRiskPolicy(
+        sltp_enabled=True,
+        sltp_mode="ADAPTIVE",
+        atr_timeframe="M5",
+        atr_period=14,
+        atr_baseline_dollars=4.00,
+        sl_atr_mult=2.50,
+        tp_atr_mult=1.50,
+        tp_step_atr_mult=1.50,
+        sl_min_dollars=4.50,
+        sl_max_dollars=35.00,
+        tp_min_dollars=2.50,
+        tp_max_dollars=50.00,
+        scale_min=0.75,
+        scale_max=1.75,
+        trail_enabled=True,
+        trail_timeframe="M5",
+        trail_atr_mult=1.40,
+        trail_extended_mfe_dollars=10.00,
+        trail_extended_atr_mult=1.00,
+        trail_homerun_mfe_dollars=18.00,
+        trail_homerun_atr_mult=0.80,
+        trail_activation_atr_mult=1.00,
+        trail_min_dollars=2.50,
+        trail_max_dollars=12.00,
+        trail_step_dollars=0.25,
+        be_activation_atr_mult=0.75,
+        be_min_mfe_dollars=3.50,
+        be_lock_offset_dollars=0.50,
+        tp_trail_enabled=True,
+        tp_lift_atr_mult=0.50,
+        tp_lift_progress_pct=0.75,
+        tp1_lift_min_progress_pct=0.50,
+    )
+
+
+def test_trail_stop_unchanged_when_r_lock_floor_is_none():
+    """With the default floor the engine must behave exactly as it did before."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=2.0,
+        policy=pol,
+        digits=2,
+    )
+    assert res["r_lock_floor"] is None
+    assert res["stop_source"] == "ATR_TRAIL"
+    # MFE 10.00 -> EXTENDED zone -> mult 1.00 -> trail_dist = clamp(2.00, 2.50, 12.00)
+    # = 2.50 -> atr_sl = 3905.00 - 2.50 = 3902.50 (pinned from the pre-R_LOCK baseline).
+    assert res["candidate_sl"] == pytest.approx(3902.50)
+    assert res["should_update"] is True
+
+
+def test_trail_stop_is_unchanged_across_a_baseline_grid():
+    """Permanent regression grid: `r_lock_floor=None` must reproduce the baseline exactly."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    # Exact baseline values, pinned from the pre-R_LOCK implementation (git 4c88faa)
+    # with this explicit policy: (candidate_sl, stop_source, trail_mult, trail_zone).
+    # BUY atr=0.0 -> trail disabled by an invalid ATR; BUY atr=2.0 -> ATR trail armed;
+    # BUY atr=20.0 -> MFE 10.00 is below the 20.00 trail activation, so nothing is armed.
+    # SELL never reaches a positive MFE here, so it is never armed.
+    expected = {
+        ("BUY", 0.0): (None, None, 1.4, "STANDARD"),
+        ("BUY", 2.0): (3902.5, "ATR_TRAIL", 1.0, "EXTENDED"),
+        ("BUY", 20.0): (None, None, 1.0, "EXTENDED"),
+        ("SELL", 0.0): (None, None, 1.4, "STANDARD"),
+        ("SELL", 2.0): (None, None, 1.4, "STANDARD"),
+        ("SELL", 20.0): (None, None, 1.4, "STANDARD"),
+    }
+    for direction in ("BUY", "SELL"):
+        for atr in (0.0, 2.0, 20.0):
+            for current_sl in (0.0, 3880.0, 3900.0, 3920.0):
+                res = dynamic_risk.compute_dynamic_atr_trail_stop(
+                    direction=direction,
+                    entry_price=3895.0,
+                    live_price=3905.0,
+                    prev_peak=3905.0,
+                    current_sl=current_sl,
+                    atr=atr,
+                    policy=pol,
+                    digits=2,
+                )
+                assert res["r_lock_floor"] is None
+                assert (
+                    res["candidate_sl"],
+                    res["stop_source"],
+                    res["trail_mult"],
+                    res["trail_zone"],
+                ) == expected[(direction, atr)]
+                assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR", None)
+                if res["stop_source"] is not None:
+                    # the engine may propose a looser candidate (the ATR trail trails
+                    # the broker stop), but it must never APPLY one: a looser pick is
+                    # always reported as "no update", so the stop is left alone
+                    if direction == "BUY" and current_sl > 0.0:
+                        assert res["candidate_sl"] >= current_sl or res["should_update"] is False
+                    elif direction == "SELL" and current_sl > 0.0:
+                        assert res["candidate_sl"] <= current_sl or res["should_update"] is False
+
+
+def test_trail_stop_uses_r_lock_floor_when_tighter():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=20.0,              # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+        policy=pol,
+        digits=2,
+        r_lock_floor=3898.0,
+    )
+    assert res["r_lock_floor"] == pytest.approx(3898.0)
+    assert res["candidate_sl"] == pytest.approx(3898.0)
+    assert res["stop_source"] == "R_LOCK"
+
+
+def test_trail_stop_r_lock_never_loosens_an_existing_stop():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3903.0,     # already tighter than the R floor
+        atr=2.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3902.8,   # the R lock wins the picker, but it is looser than the stop in place
+    )
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] >= 3900.0
+    # the existing stop is already tighter, so no SL update may be sent
+    assert res["should_update"] is False
+
+
+def test_trail_stop_sell_r_lock_is_mirrored():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="SELL",
+        entry_price=3905.0,
+        live_price=3895.0,
+        prev_peak=3895.0,
+        current_sl=3920.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3902.0,
+    )
+    assert res["candidate_sl"] == pytest.approx(3902.0)
+    assert res["stop_source"] == "R_LOCK"
+
+
+def test_trail_stop_reports_no_floor_when_another_candidate_wins():
+    """`r_lock_floor` must be None unless the R lock actually won the picker."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=2.0,               # narrow ATR -> the ATR trail is the tighter candidate
+        policy=pol,
+        digits=2,
+        r_lock_floor=3890.0,   # valid, but looser than the ATR trail
+    )
+    assert res["stop_source"] == "ATR_TRAIL"
+    assert res["r_lock_floor"] is None
+
+
+def test_trail_stop_ignores_a_non_numeric_or_invalid_floor():
+    """A malformed floor must never raise inside the per-tick stop computation."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    for bad in ("abc", 0.0, -5.0, None):
+        res = dynamic_risk.compute_dynamic_atr_trail_stop(
+            direction="BUY",
+            entry_price=3895.0,
+            live_price=3905.0,
+            prev_peak=3905.0,
+            current_sl=3880.0,
+            atr=2.0,
+            policy=pol,
+            digits=2,
+            r_lock_floor=bad,
+        )
+        assert res["r_lock_floor"] is None
+        assert res["stop_source"] != "R_LOCK"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -601,6 +827,8 @@ def compute_r_lock_floor(
     - the R lock is disabled, the direction is not ``BUY``/``SELL``, or the
       initial risk is unknown / below ``r_lock_min_r_dollars``;
     - no tier has been reached yet;
+    - the live price is unusable (missing, non-numeric or non-positive), so
+      no floor can be validated against the market;
     - the floor is not valid against the current market (for a BUY the floor
       must stay strictly below ``live_price``, for a SELL strictly above it).
       The floor is derived from the peak excursion, so a retracement can carry
@@ -644,11 +872,12 @@ def compute_r_lock_floor(
     floor_px = round(entry + sign * (lock_fraction * r), digits)
 
     live = _safe_float(live_price, 0.0)
-    if live > 0.0:
-        if sign > 0 and floor_px >= live:
-            return None
-        if sign < 0 and floor_px <= live:
-            return None
+    if live <= 0.0:
+        return None
+    if sign > 0 and floor_px >= live:
+        return None
+    if sign < 0 and floor_px <= live:
+        return None
 
     return floor_px
 
@@ -1069,7 +1298,9 @@ def test_trail_stop_unchanged_when_r_lock_floor_is_none():
     )
     assert res["r_lock_floor"] is None
     assert res["stop_source"] == "ATR_TRAIL"
-    assert res["candidate_sl"] == pytest.approx(3893.50)
+    # MFE 10.00 -> EXTENDED zone -> mult 1.00 -> trail_dist = clamp(2.00, 2.50, 12.00)
+    # = 2.50 -> atr_sl = 3905.00 - 2.50 = 3902.50 (pinned from the pre-R_LOCK baseline).
+    assert res["candidate_sl"] == pytest.approx(3902.50)
     assert res["should_update"] is True
 
 
@@ -1078,6 +1309,19 @@ def test_trail_stop_is_unchanged_across_a_baseline_grid():
     import dynamic_risk
 
     pol = _atr_policy()
+    # Exact baseline values, pinned from the pre-R_LOCK implementation (git 4c88faa)
+    # with this explicit policy: (candidate_sl, stop_source, trail_mult, trail_zone).
+    # BUY atr=0.0 -> trail disabled by an invalid ATR; BUY atr=2.0 -> ATR trail armed;
+    # BUY atr=20.0 -> MFE 10.00 is below the 20.00 trail activation, so nothing is armed.
+    # SELL never reaches a positive MFE here, so it is never armed.
+    expected = {
+        ("BUY", 0.0): (None, None, 1.4, "STANDARD"),
+        ("BUY", 2.0): (3902.5, "ATR_TRAIL", 1.0, "EXTENDED"),
+        ("BUY", 20.0): (None, None, 1.0, "EXTENDED"),
+        ("SELL", 0.0): (None, None, 1.4, "STANDARD"),
+        ("SELL", 2.0): (None, None, 1.4, "STANDARD"),
+        ("SELL", 20.0): (None, None, 1.4, "STANDARD"),
+    }
     for direction in ("BUY", "SELL"):
         for atr in (0.0, 2.0, 20.0):
             for current_sl in (0.0, 3880.0, 3900.0, 3920.0):
@@ -1092,13 +1336,21 @@ def test_trail_stop_is_unchanged_across_a_baseline_grid():
                     digits=2,
                 )
                 assert res["r_lock_floor"] is None
+                assert (
+                    res["candidate_sl"],
+                    res["stop_source"],
+                    res["trail_mult"],
+                    res["trail_zone"],
+                ) == expected[(direction, atr)]
                 assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR", None)
                 if res["stop_source"] is not None:
-                    # the picked stop must never be looser than the stop already in place
+                    # the engine may propose a looser candidate (the ATR trail trails
+                    # the broker stop), but it must never APPLY one: a looser pick is
+                    # always reported as "no update", so the stop is left alone
                     if direction == "BUY" and current_sl > 0.0:
-                        assert res["candidate_sl"] >= current_sl
+                        assert res["candidate_sl"] >= current_sl or res["should_update"] is False
                     elif direction == "SELL" and current_sl > 0.0:
-                        assert res["candidate_sl"] <= current_sl
+                        assert res["candidate_sl"] <= current_sl or res["should_update"] is False
 
 
 def test_trail_stop_uses_r_lock_floor_when_tighter():
@@ -1130,12 +1382,13 @@ def test_trail_stop_r_lock_never_loosens_an_existing_stop():
         entry_price=3895.0,
         live_price=3905.0,
         prev_peak=3905.0,
-        current_sl=3900.0,     # already tighter than the R floor
+        current_sl=3903.0,     # already tighter than the R floor
         atr=2.0,
         policy=pol,
         digits=2,
-        r_lock_floor=3898.0,
+        r_lock_floor=3902.8,   # the R lock wins the picker, but it is looser than the stop in place
     )
+    assert res["stop_source"] == "R_LOCK"
     assert res["candidate_sl"] >= 3900.0
     # the existing stop is already tighter, so no SL update may be sent
     assert res["should_update"] is False
