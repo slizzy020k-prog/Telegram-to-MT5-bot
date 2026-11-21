@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import math
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+
+logger = logging.getLogger("copier.lifecycle")
 
 __all__ = [
     "ACTION_NONE",
@@ -375,7 +378,18 @@ def evaluate_trade_age(
     # The fill clock is the EARLIEST known fill (the signal stamp or any layer
     # stamp). Fall back to the signal timestamp when no fill time is known: the
     # position is at least as old as the signal, so the age guard must not stand down.
-    fill_dt = resolve_fill_time(sig) or signal_dt
+    resolved_fill = resolve_fill_time(sig)
+    if resolved_fill is None and signal_dt is not None and not sig.get("_fill_age_fallback_logged"):
+        # `evaluate_trade_age` runs for EVERY active signal on EVERY tick, so
+        # the fallback is logged ONCE per signal (the marker rides on the
+        # signal dict, exactly like `_r_lock_skipped_logged` does).
+        sig["_fill_age_fallback_logged"] = True
+        logger.info(
+            "[FILL-AGE FALLBACK] Signal %s carries no fill stamp; falling back to "
+            "the signal timestamp for the trade age.",
+            sig.get("message_id") or sig.get("chat_id") or "unknown",
+        )
+    fill_dt = resolved_fill or signal_dt
     signal_age = int((now - signal_dt).total_seconds()) if signal_dt else 0
     fill_age = int((now - fill_dt).total_seconds()) if fill_dt else None
 

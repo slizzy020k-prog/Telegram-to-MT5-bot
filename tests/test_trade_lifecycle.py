@@ -3481,6 +3481,9 @@ def test_build_trade_record_adds_cash_mfe_and_giveback():
         signal_data=_schema4_signal(),
         realized_pnl=0.56,
         exit_reason="ATR_TRAIL",
+        # The account currency IS the profit currency here, so the rate is 1.0
+        # and the giveback is the MFE minus the realized PnL.
+        profit_currency_rate=1.0,
     )
 
     assert rec["schema_version"] == 4
@@ -3827,3 +3830,324 @@ async def test_lifecycle_command_omits_the_signal_list_when_the_guard_is_off(mon
     assert "Active signals" not in body
 
 
+
+# --- giveback currency correctness (A1) ----------------------------------
+
+def _fx_signal():
+    """A closed signal whose MFE is denominated in the symbol profit currency."""
+    return {
+        "timestamp": "2026-11-19T06:19:09+00:00",
+        "chat_id": -100,
+        "message_id": 42,
+        "symbol": "XAUUSD.s",
+        "direction": "SELL",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "layers": {"L1": {"ticket": 1, "status": "CLOSED", "lot": 0.01, "entry_price": 3740.0}},
+        "max_favorable_excursion": {"peak_price": 3728.55, "peak_profit_per_oz": 11.12},
+        "initial_r_per_oz": 20.0,
+        "first_fill_at": "2026-11-19T06:19:09+00:00",
+        "closed_at": "2026-11-19T09:19:51+00:00",
+    }
+
+
+def test_build_trade_record_converts_the_giveback_into_the_account_currency():
+    """The MFE is USD and the realized PnL is GBP -- they can only meet after conversion."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_fx_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+        currency="GBP",
+        profit_currency_rate=0.7645,  # 1 / 1.30805 (the GBPUSD bid)
+    )
+
+    # mfe_cash stays in the symbol PROFIT currency (USD), so r_at_exit -- a
+    # ratio of two USD amounts -- is unchanged and currency-neutral.
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+    # The giveback is converted into the ACCOUNT currency BEFORE the subtraction.
+    assert rec["giveback_cash"] == pytest.approx(round(55.60 * 0.7645 - 0.56, 2))
+    assert rec["giveback_cash"] != pytest.approx(55.04)
+    assert rec["giveback_currency"] == "GBP"
+    assert rec["fx_rate_to_account"] == pytest.approx(0.7645)
+
+
+def test_build_trade_record_leaves_the_giveback_unknown_without_a_rate():
+    """Without the rate the giveback is UNKNOWN -- never a mixed-currency number."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_fx_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+        currency="GBP",
+    )
+
+    assert rec["giveback_cash"] is None
+    assert rec["fx_rate_to_account"] is None
+    # The price-based telemetry is unaffected by the missing rate.
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+
+
+def test_append_trade_denominates_the_giveback_in_the_account_currency(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade(
+        {"realized_pnl": 0.56, "currency": "GBP", "mfe_cash": 55.60},
+        profit_currency_rate=0.7645,
+    )
+
+    assert entry["giveback_cash"] == pytest.approx(round(55.60 * 0.7645 - 0.56, 2))
+    assert entry["giveback_currency"] == "GBP"
+    assert entry["fx_rate_to_account"] == pytest.approx(0.7645)
+
+
+def test_append_trade_leaves_the_giveback_unknown_without_a_rate(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade({"realized_pnl": 0.56, "currency": "GBP", "mfe_cash": 55.60})
+
+    assert entry["giveback_cash"] is None
+    assert entry["fx_rate_to_account"] is None
+
+
+def _rate_executor(monkeypatch, account_currency, symbols):
+    """An executor stub that answers the account financials and the symbol lookups."""
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    monkeypatch.setattr(ex, "get_account_financials", lambda: {"currency": account_currency})
+    monkeypatch.setattr(ex, "get_symbol_info", lambda symbol: symbols.get(symbol))
+    return ex
+
+
+def test_executor_profit_currency_rate_is_one_when_the_currencies_match(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(monkeypatch, "USD", {"XAUUSD.s": SimpleNamespace(currency_profit="USD")})
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0)
+
+
+def test_executor_profit_currency_rate_converts_a_usd_symbol_on_a_gbp_account(monkeypatch):
+    """A GBP account trading a USD symbol converts at 1 / the GBPUSD bid."""
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(currency_profit="USD"),
+            "GBPUSD": SimpleNamespace(currency_base="GBP", currency_profit="USD", bid=1.30805),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0 / 1.30805)
+
+
+def test_executor_profit_currency_rate_defaults_the_profit_currency_to_usd(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(),
+            "GBPUSD": SimpleNamespace(bid=1.30805),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") == pytest.approx(1.0 / 1.30805)
+
+
+def test_executor_profit_currency_rate_is_none_when_the_fx_symbol_is_unavailable(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(monkeypatch, "GBP", {"XAUUSD.s": SimpleNamespace(currency_profit="USD")})
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") is None
+
+
+def test_executor_profit_currency_rate_is_none_when_the_fx_symbol_has_no_price(monkeypatch):
+    from types import SimpleNamespace
+
+    ex = _rate_executor(
+        monkeypatch,
+        "GBP",
+        {
+            "XAUUSD.s": SimpleNamespace(currency_profit="USD"),
+            "GBPUSD": SimpleNamespace(bid=0.0),
+        },
+    )
+
+    assert ex.get_profit_currency_rate("XAUUSD.s") is None
+
+
+def test_stats_excludes_an_unknown_giveback_from_the_total():
+    """A missing giveback is unknown, not zero."""
+    import main
+
+    records = [
+        {
+            "closed_at": "2026-11-19T09:00:00+00:00",
+            "realized_pnl": 10.0,
+            "giveback_cash": 12.34,
+            "giveback_currency": "GBP",
+        },
+        {
+            "closed_at": "2026-11-19T10:00:00+00:00",
+            "realized_pnl": 5.0,
+            "giveback_cash": None,
+            "giveback_currency": "GBP",
+        },
+    ]
+
+    allt = main._build_ledger_stats(records)["all_time"]
+
+    assert allt["total_giveback"] == pytest.approx(12.34)
+    assert allt["giveback_currency"] == "GBP"
+
+
+@pytest.mark.asyncio
+async def test_stats_labels_the_giveback_with_the_record_currency(monkeypatch, tmp_path):
+    """The giveback label comes from the record, not from the live account currency."""
+    import json
+
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    rec = {
+        "closed_at": "2026-11-19T09:00:00+00:00",
+        "realized_pnl": 10.0,
+        "giveback_cash": 20.0,
+        "giveback_currency": "USD",
+    }
+    ledger.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    body = ev.replies[0]
+    assert "20.00 USD" in body
+
+
+@pytest.mark.asyncio
+async def test_record_signal_to_ledger_passes_the_profit_currency_rate(monkeypatch, tmp_path):
+    """The call site looks the rate up once per record and hands it to the ledger."""
+    import main
+
+    main = _install_signal(monkeypatch, tmp_path, {})
+
+    captured = {}
+
+    class _RateExecutor:
+        dry_run = False
+
+        def get_account_financials(self):
+            return {"currency": "GBP", "formatted": ""}
+
+        def get_profit_currency_rate(self, symbol):
+            captured["calls"] = captured.get("calls", 0) + 1
+            captured["symbol"] = symbol
+            return 0.7645
+
+    monkeypatch.setattr(main, "executor", _RateExecutor())
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(main.trade_ledger, "record_closed_signal", _capture)
+
+    sig = {
+        "message_id": 9001,
+        "chat_id": -100,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "market_tickets": [101],
+        "banked_profit": 1.5,
+        "layers": {},
+    }
+
+    rec = await main._record_signal_to_ledger("9001", sig, exit_reason="MANUAL", currency="GBP")
+
+    assert rec is not None
+    assert captured["calls"] == 1, "the rate is looked up once per record"
+    assert captured["symbol"] == "XAUUSD.s"
+    assert captured["profit_currency_rate"] == pytest.approx(0.7645)
+
+
+@pytest.mark.asyncio
+async def test_record_signal_to_ledger_survives_a_failing_rate_lookup(monkeypatch, tmp_path):
+    """A failed rate lookup must never break the ledger write."""
+    import main
+
+    main = _install_signal(monkeypatch, tmp_path, {})
+
+    captured = {}
+
+    class _BrokenRateExecutor:
+        dry_run = False
+
+        def get_account_financials(self):
+            return {"currency": "GBP", "formatted": ""}
+
+        def get_profit_currency_rate(self, symbol):
+            raise RuntimeError("MT5 is not connected")
+
+    monkeypatch.setattr(main, "executor", _BrokenRateExecutor())
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(main.trade_ledger, "record_closed_signal", _capture)
+
+    sig = {
+        "message_id": 9001,
+        "chat_id": -100,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "market_tickets": [101],
+        "banked_profit": 1.5,
+        "layers": {},
+    }
+
+    rec = await main._record_signal_to_ledger("9001", sig, exit_reason="MANUAL", currency="GBP")
+
+    assert rec is not None
+    assert captured["profit_currency_rate"] is None
+
+
+# --- the "no fill stamp" fallback must be logged once (A11) ---------------
+
+def test_the_fill_age_fallback_is_logged_once_per_signal(caplog):
+    """The spec requires the no-fill-stamp fallback to be logged once per signal."""
+    import logging
+
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+
+    with caplog.at_level(logging.INFO, logger="copier.lifecycle"):
+        rl.evaluate_trade_age(sig, now, _policy())
+        rl.evaluate_trade_age(sig, now, _policy())
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "copier.lifecycle"]
+    assert len(messages) == 1, f"the fallback must be logged once, got {messages}"
+    assert "fill stamp" in messages[0].lower()
+    assert sig.get("_fill_age_fallback_logged") is True

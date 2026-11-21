@@ -983,6 +983,23 @@ async def _record_signal_to_ledger(
     srv_date = await _trading_day_str_async()
     realized_pnl = round(float(sig.get("banked_profit") or 0.0), 2)
 
+    # The giveback is the cash MFE -- a price-based amount in the symbol's
+    # PROFIT currency -- minus the realized PnL, which the broker reports in
+    # the ACCOUNT currency. The two can only be subtracted once the MFE has
+    # been converted, so the rate is looked up ONCE per record here. Every
+    # failure is tolerated: the record then simply carries no giveback rather
+    # than a mixed-currency number.
+    profit_currency_rate: Optional[float] = None
+    try:
+        _rate_fn = getattr(executor, "get_profit_currency_rate", None)
+        if _rate_fn is not None:
+            profit_currency_rate = await _mt5_call(
+                _rate_fn, sig.get("symbol", DEFAULT_SYMBOL)
+            )
+    except Exception as exc:
+        logger.warning(f"Could not establish the profit currency rate for {signal_key}: {exc}")
+        profit_currency_rate = None
+
     try:
         entry = trade_ledger.record_closed_signal(
             signal_key=signal_key,
@@ -992,6 +1009,7 @@ async def _record_signal_to_ledger(
             currency=currency,
             dry_run=executor.dry_run,
             extra={"server_date": srv_date},
+            profit_currency_rate=profit_currency_rate,
         )
         sig["ledger_recorded"] = True
         state_mgr.update_signal(msg_id, {"ledger_recorded": True}, chat_id=chat_id)
@@ -1236,6 +1254,16 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
             return list(rows)
         return [r for r in rows if _in_window(r, cutoff)]
 
+    def _giveback_currency(subset: List[Dict[str, Any]]) -> Optional[str]:
+        """The currency the giveback total is denominated in, taken from the records."""
+        for r in subset:
+            if r.get("giveback_cash") is None:
+                continue
+            curr = str(r.get("giveback_currency") or "").strip()
+            if curr:
+                return curr
+        return None
+
     def _aggregate(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
         pnls = [float(r.get("realized_pnl") or 0.0) for r in subset]
         wins = sum(1 for p in pnls if p > 0.0)
@@ -1253,6 +1281,7 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
             "losses": losses,
             "win_rate": round(wins / len(subset), 4) if subset else 0.0,
             "total_giveback": round(sum(givebacks), 2),
+            "giveback_currency": _giveback_currency(subset),
             "max_exit_age_seconds": max(ages) if ages else 0,
             "lifecycle_closes": sum(1 for r in subset if r.get("lifecycle_action")),
             "exit_reasons": reasons,
@@ -7775,10 +7804,14 @@ async def handle_saved_messages_command(event: Any) -> None:
         curr = fin.get("currency", "GBP")
 
         def _line(label: str, agg: Dict[str, Any]) -> str:
+            # The giveback is denominated in the account currency of the records
+            # themselves, so it is labelled from the ledger -- not from the live
+            # account currency, and not with a hard-coded currency.
+            giveback_currency = agg.get("giveback_currency") or curr
             return (
                 f"• **{label}:** `{agg['net_pnl']:+.2f} {curr}` | "
                 f"`{agg['count']}` trades | win rate `{agg['win_rate'] * 100:.0f}%` | "
-                f"giveback `{agg['total_giveback']:.2f} {curr}` | "
+                f"giveback `{agg['total_giveback']:.2f} {giveback_currency}` | "
                 f"max age `{agg['max_exit_age_seconds']}s`\n"
             )
 

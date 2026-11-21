@@ -305,6 +305,33 @@ def _extract_layers_summary(signal_data: Dict[str, Any]) -> Tuple[float, float, 
     return round(total_lots, 4), round(filled_lots, 4), layers_filled, tickets
 
 
+def _apply_giveback_currency(record: Dict[str, Any], profit_currency_rate: Optional[float]) -> None:
+    """Denominate `giveback_cash` in the ACCOUNT currency -- or leave it unknown.
+
+    `mfe_cash` is a price-based cash amount in the symbol's PROFIT currency
+    (USD for XAUUSD), while `realized_pnl` comes from the broker in the ACCOUNT
+    currency (GBP). The two can only be subtracted once the MFE has been
+    converted, so the giveback is `mfe_cash * rate - realized_pnl`, denominated
+    in the account currency.
+
+    Without a known rate the giveback stays `None`: a mixed-currency number is
+    never written. `mfe_cash` itself is left untouched, so `r_at_exit` -- a
+    ratio of two price-based amounts -- stays currency-neutral.
+    """
+    if record.get("fx_rate_to_account") is not None:
+        return  # already denominated
+    rate = _safe_float(profit_currency_rate, 0.0) if profit_currency_rate is not None else 0.0
+    if rate <= 0.0:
+        return
+    mfe_cash = record.get("mfe_cash")
+    if not _is_num(mfe_cash):
+        return
+    realized = _safe_float(record.get("realized_pnl"), 0.0)
+    record["giveback_cash"] = round(float(mfe_cash) * rate - realized, 2)
+    record["giveback_currency"] = str(record.get("currency") or "GBP")
+    record["fx_rate_to_account"] = round(rate, 8)
+
+
 def build_trade_record(
     signal_key: str,
     signal_data: Dict[str, Any],
@@ -313,6 +340,7 @@ def build_trade_record(
     currency: str = "GBP",
     dry_run: bool = False,
     extra: Optional[Dict[str, Any]] = None,
+    profit_currency_rate: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build a canonical trades_ledger.jsonl record for a closed signal (schema_version=4)."""
     total_lots, filled_lots, layers_filled, tickets = _extract_layers_summary(signal_data)
@@ -468,10 +496,11 @@ def build_trade_record(
     if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
         mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)
 
-    realized_for_giveback = _safe_float(realized_pnl, 0.0)
+    # The giveback can only be computed once the MFE -- a price-based amount in
+    # the symbol's PROFIT currency -- has been converted into the ACCOUNT
+    # currency of `realized_pnl`. The conversion is applied to the finished
+    # record below; without a known rate the giveback stays UNKNOWN (None).
     giveback_cash: Optional[float] = None
-    if mfe_cash is not None:
-        giveback_cash = round(mfe_cash - realized_for_giveback, 2)
 
     initial_r = _safe_float(signal_data.get("initial_r_per_oz"), 0.0)
     if initial_r <= 0.0:
@@ -541,6 +570,8 @@ def build_trade_record(
         "giveback_from_peak": giveback_from_peak,
         "mfe_cash": mfe_cash,
         "giveback_cash": giveback_cash,
+        "giveback_currency": str(currency or "GBP"),
+        "fx_rate_to_account": None,
         "initial_r_per_oz": initial_r_per_oz,
         "r_at_exit": r_at_exit,
         "exit_age_seconds": exit_age_seconds,
@@ -553,6 +584,7 @@ def build_trade_record(
     }
     if extra:
         record.update(extra)
+    _apply_giveback_currency(record, profit_currency_rate)
     return record
 
 
@@ -564,12 +596,23 @@ class TradeLedger:
         self.file_path = Path(file_path or configured)
         self._lock = threading.Lock()
 
-    def append_trade(self, record: Dict[str, Any]) -> Dict[str, Any]:
+    def append_trade(
+        self,
+        record: Dict[str, Any],
+        profit_currency_rate: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Append a single closed-trade record atomically as one JSON line."""
         entry = dict(record)
         entry.setdefault("schema_version", 4)
         entry.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
         entry["realized_pnl"] = round(_safe_float(entry.get("realized_pnl"), 0.0), 2)
+        # Every appended record carries the giveback contract, even when the
+        # giveback is unknown (no rate) -- an absent key is not the same thing
+        # as a known zero.
+        entry.setdefault("giveback_cash", None)
+        entry.setdefault("giveback_currency", str(record.get("currency") or "GBP"))
+        entry.setdefault("fx_rate_to_account", None)
+        _apply_giveback_currency(entry, profit_currency_rate)
 
         line = json.dumps(entry, ensure_ascii=False, default=str)
         with self._lock:
@@ -588,6 +631,7 @@ class TradeLedger:
         currency: str = "GBP",
         dry_run: bool = False,
         extra: Optional[Dict[str, Any]] = None,
+        profit_currency_rate: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Construct and append a canonical closed-signal ledger entry."""
         rec = build_trade_record(
@@ -598,8 +642,9 @@ class TradeLedger:
             currency=currency,
             dry_run=dry_run,
             extra=extra,
+            profit_currency_rate=profit_currency_rate,
         )
-        return self.append_trade(rec)
+        return self.append_trade(rec, profit_currency_rate=profit_currency_rate)
 
     def read_trades(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """Read parsed trade records from the JSONL ledger (skips corrupt lines safely)."""

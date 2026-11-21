@@ -840,6 +840,47 @@ class MT5Executor:
             resolved = self.resolve_symbol(symbol)
             return mt5.symbol_info(resolved)
 
+    def get_profit_currency_rate(self, symbol: str) -> Optional[float]:
+        """Return how many ACCOUNT-currency units one unit of the symbol's profit currency is worth.
+
+        The ACCOUNT currency comes from the broker account (e.g. "GBP") and the
+        symbol's PROFIT currency from its symbol info (e.g. "USD" for XAUUSD.s).
+        When the two differ the rate is read from the FX symbol
+        "{account}{profit_currency}" (e.g. "GBPUSD"), whose bid is quoted as
+        account units per profit unit -- so the conversion factor is 1 / bid.
+
+        Returns None when the conversion cannot be established: the caller must
+        then record NO giveback rather than a mixed-currency number. Never guess.
+        """
+        try:
+            financials = self.get_account_financials() or {}
+            account_currency = str(financials.get("currency") or "").strip().upper()
+            if not account_currency:
+                return None
+
+            symbol_info = self.get_symbol_info(symbol)
+            if symbol_info is None:
+                return None
+            profit_currency = str(getattr(symbol_info, "currency_profit", None) or "USD").strip().upper()
+            if not profit_currency:
+                profit_currency = "USD"
+            if account_currency == profit_currency:
+                return 1.0
+
+            fx_symbol = f"{account_currency}{profit_currency}"
+            fx_info = self.get_symbol_info(fx_symbol)
+            bid = _num(getattr(fx_info, "bid", 0.0), 0.0) if fx_info is not None else 0.0
+            if bid <= 0.0:
+                logger.warning(
+                    f"No usable {fx_symbol} bid for {symbol} (profit currency {profit_currency}); "
+                    "the giveback cannot be converted."
+                )
+                return None
+            return 1.0 / bid
+        except Exception as exc:
+            logger.warning(f"Could not establish the profit currency rate for {symbol}: {exc}")
+            return None
+
     def get_tick(self, symbol: str):
         """Get latest tick for symbol (thread-safe)."""
         if self.dry_run:
