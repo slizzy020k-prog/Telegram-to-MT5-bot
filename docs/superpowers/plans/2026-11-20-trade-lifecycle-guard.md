@@ -1003,7 +1003,7 @@ LIFECYCLE_ENABLED=false) so a fresh clone behaves identically to v3.7.0."
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (this task is independent of `risk_lifecycle`).
-- Produces: `compute_dynamic_atr_trail_stop(..., r_lock_floor: Optional[float] = None) -> Dict[str, Any]` — the result dict gains `"r_lock_floor"`. Tie-break priority becomes `R_LOCK` > `MILESTONE_FLOOR` > `ATR_TRAIL` > `BE_LOCK`.
+- Produces: `compute_dynamic_atr_trail_stop(..., *, r_lock_floor: Optional[float] = None) -> Dict[str, Any]` — the result dict gains `"r_lock_floor"`, which is the R floor **only when it won the picker** (`stop_source == "R_LOCK"`), otherwise `None`. Tie-break priority becomes `R_LOCK` > `MILESTONE_FLOOR` > `ATR_TRAIL` > `BE_LOCK`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1013,13 +1013,47 @@ Append to `tests/test_trade_lifecycle.py`:
 # --- dynamic_risk R_LOCK candidate ---------------------------------------
 
 def _atr_policy():
+    """An explicit policy, so the tests do not depend on ambient config values."""
     import dynamic_risk
-    import config
 
-    return dynamic_risk.read_dynamic_risk_policy(config)
+    return dynamic_risk.DynamicRiskPolicy(
+        sltp_enabled=True,
+        sltp_mode="ADAPTIVE",
+        atr_timeframe="M5",
+        atr_period=14,
+        atr_baseline_dollars=4.00,
+        sl_atr_mult=2.50,
+        tp_atr_mult=1.50,
+        tp_step_atr_mult=1.50,
+        sl_min_dollars=4.50,
+        sl_max_dollars=35.00,
+        tp_min_dollars=2.50,
+        tp_max_dollars=50.00,
+        scale_min=0.75,
+        scale_max=1.75,
+        trail_enabled=True,
+        trail_timeframe="M5",
+        trail_atr_mult=1.40,
+        trail_extended_mfe_dollars=10.00,
+        trail_extended_atr_mult=1.00,
+        trail_homerun_mfe_dollars=18.00,
+        trail_homerun_atr_mult=0.80,
+        trail_activation_atr_mult=1.00,
+        trail_min_dollars=2.50,
+        trail_max_dollars=12.00,
+        trail_step_dollars=0.25,
+        be_activation_atr_mult=0.75,
+        be_min_mfe_dollars=3.50,
+        be_lock_offset_dollars=0.50,
+        tp_trail_enabled=True,
+        tp_lift_atr_mult=0.50,
+        tp_lift_progress_pct=0.75,
+        tp1_lift_min_progress_pct=0.50,
+    )
 
 
 def test_trail_stop_unchanged_when_r_lock_floor_is_none():
+    """With the default floor the engine must behave exactly as it did before."""
     import dynamic_risk
 
     pol = _atr_policy()
@@ -1034,7 +1068,37 @@ def test_trail_stop_unchanged_when_r_lock_floor_is_none():
         digits=2,
     )
     assert res["r_lock_floor"] is None
-    assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR")
+    assert res["stop_source"] == "ATR_TRAIL"
+    assert res["candidate_sl"] == pytest.approx(3893.50)
+    assert res["should_update"] is True
+
+
+def test_trail_stop_is_unchanged_across_a_baseline_grid():
+    """Permanent regression grid: `r_lock_floor=None` must reproduce the baseline exactly."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    for direction in ("BUY", "SELL"):
+        for atr in (0.0, 2.0, 20.0):
+            for current_sl in (0.0, 3880.0, 3900.0, 3920.0):
+                res = dynamic_risk.compute_dynamic_atr_trail_stop(
+                    direction=direction,
+                    entry_price=3895.0,
+                    live_price=3905.0,
+                    prev_peak=3905.0,
+                    current_sl=current_sl,
+                    atr=atr,
+                    policy=pol,
+                    digits=2,
+                )
+                assert res["r_lock_floor"] is None
+                assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR", None)
+                if res["stop_source"] is not None:
+                    # the picked stop must never be looser than the stop already in place
+                    if direction == "BUY" and current_sl > 0.0:
+                        assert res["candidate_sl"] >= current_sl
+                    elif direction == "SELL" and current_sl > 0.0:
+                        assert res["candidate_sl"] <= current_sl
 
 
 def test_trail_stop_uses_r_lock_floor_when_tighter():
@@ -1073,6 +1137,8 @@ def test_trail_stop_r_lock_never_loosens_an_existing_stop():
         r_lock_floor=3898.0,
     )
     assert res["candidate_sl"] >= 3900.0
+    # the existing stop is already tighter, so no SL update may be sent
+    assert res["should_update"] is False
 
 
 def test_trail_stop_sell_r_lock_is_mirrored():
@@ -1092,6 +1158,47 @@ def test_trail_stop_sell_r_lock_is_mirrored():
     )
     assert res["candidate_sl"] == pytest.approx(3902.0)
     assert res["stop_source"] == "R_LOCK"
+
+
+def test_trail_stop_reports_no_floor_when_another_candidate_wins():
+    """`r_lock_floor` must be None unless the R lock actually won the picker."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=2.0,               # narrow ATR -> the ATR trail is the tighter candidate
+        policy=pol,
+        digits=2,
+        r_lock_floor=3890.0,   # valid, but looser than the ATR trail
+    )
+    assert res["stop_source"] == "ATR_TRAIL"
+    assert res["r_lock_floor"] is None
+
+
+def test_trail_stop_ignores_a_non_numeric_or_invalid_floor():
+    """A malformed floor must never raise inside the per-tick stop computation."""
+    import dynamic_risk
+
+    pol = _atr_policy()
+    for bad in ("abc", 0.0, -5.0, None):
+        res = dynamic_risk.compute_dynamic_atr_trail_stop(
+            direction="BUY",
+            entry_price=3895.0,
+            live_price=3905.0,
+            prev_peak=3905.0,
+            current_sl=3880.0,
+            atr=2.0,
+            policy=pol,
+            digits=2,
+            r_lock_floor=bad,
+        )
+        assert res["r_lock_floor"] is None
+        assert res["stop_source"] != "R_LOCK"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1120,6 +1227,7 @@ def compute_dynamic_atr_trail_stop(
     cleared_milestones: Optional[Sequence[str]] = None,
     tp_levels: Optional[Dict[str, float]] = None,
     apply_milestone_floor: bool = True,
+    *,
     r_lock_floor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
@@ -1129,15 +1237,27 @@ def compute_dynamic_atr_trail_stop(
     as the milestone floor, the ATR trail and the BE lock, so the picker keeps the
     tightest stop and the forward-only invariant is preserved. Passing `None`
     (the default) leaves every existing caller byte-for-byte unchanged.
+
+    The returned `"r_lock_floor"` key means **the R floor that won the picker**:
+    it is the rounded floor only when `stop_source == "R_LOCK"`, and `None`
+    otherwise (the floor was rejected as invalid, or another candidate was
+    tighter). A consumer can therefore treat `res["r_lock_floor"] is not None`
+    as exactly "the R lock is the active stop".
     """
 ```
 
 Then replace the candidate block at lines 529-535 with:
 
 ```python
+    # Validate the R floor ONCE, defensively, and reuse the validated value in
+    # the candidate list and in every return path. The candidate guard must
+    # never raise on a value the echo would happily `float()`.
+    r_lock_val = _safe_float(r_lock_floor, 0.0)
+    r_lock_candidate: Optional[float] = round(r_lock_val, digits) if r_lock_val > 0.0 else None
+
     candidates: List[Tuple[int, str, float]] = []
-    if r_lock_floor is not None and _safe_float(r_lock_floor, 0.0) > 0.0:
-        candidates.append((0, "R_LOCK", round(float(r_lock_floor), digits)))
+    if r_lock_candidate is not None:
+        candidates.append((0, "R_LOCK", r_lock_candidate))
     if milestone_floor is not None:
         candidates.append((1, "MILESTONE_FLOOR", milestone_floor))
     if atr_sl is not None:
@@ -1146,32 +1266,34 @@ Then replace the candidate block at lines 529-535 with:
         candidates.append((3, "BE_LOCK", be_sl))
 ```
 
-The tie-break comment above the picker at line 558 must be updated to record the new priority:
+The tie-break comment above the picker at line 558 must be updated to record the new priority, and the winning source must be captured so the returned key can report the floor that actually won:
 
 ```python
     # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > BE_LOCK.
     # The picker always keeps the tightest stop, so a floor can only tighten it.
+    _, stop_source, raw_sl = min(
+        candidates,
+        key=lambda item: (-round(item[2], digits) if sign > 0 else round(item[2], digits), item[0]),
+    )
+    # The R floor is "in effect" only when it won the picker.
+    active_r_lock = r_lock_candidate if stop_source == "R_LOCK" else None
 ```
 
-Finally, add `"r_lock_floor": None` to the **early return** dict (the `not policy.trail_enabled or atr_f <= 0.0 ...` branch at lines 488-506) and to the **`not armed`** branch (lines 539-556), so the key is present in every return path:
+Finally, the `"r_lock_floor"` key must be present in **every** return path with **one consistent meaning** — the R floor that won the picker, otherwise `None`:
 
 ```python
             "r_lock_floor": None,
 ```
 
-in the early-return dict, and
+in the **early-return** dict (the `not policy.trail_enabled or atr_f <= 0.0 ...` branch at lines 488-506) and in the **`not armed`** branch (lines 539-556) — in both cases no candidate was created, so no floor is in effect.
+
+In the **final** return dict (lines 569-586), add:
 
 ```python
-            "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
+        "r_lock_floor": active_r_lock,
 ```
 
-in the `not armed` dict.
-
-In the final return dict (lines 569-586), add:
-
-```python
-        "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
-```
+Never echo the raw argument: it may be a non-numeric value, and it may be a floor that was rejected as invalid (a negative price must never be advertised as an active stop).
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1605,6 +1727,25 @@ Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call at li
                 r_lock_floor=r_lock_floor,
             )
 ```
+
+**Also add `"R_LOCK"` to the ATR-trail bookkeeping whitelist.** `mt5_executor.py:8213` currently reads:
+
+```python
+            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR"):
+                lv["dynamic_atr_trail_sl"] = cand_sl
+                lv["dynamic_atr_trail_dist"] = trail_step["trail_dist"]
+                lv["dynamic_atr_trail_atr"] = trail_step["atr"]
+                lv["dynamic_atr_trail_mult"] = trail_step.get("trail_mult") or last_trail_mult
+                lv["dynamic_atr_trail_zone"] = trail_step.get("trail_zone") or last_trail_zone
+```
+
+When the R lock wins the picker, `stop_source == "R_LOCK"` and that block is skipped, so `lv["dynamic_atr_trail_sl"]` would lag the actual broker SL. That field drives the protection heuristics at `main.py:3372`, `main.py:5703-5710`, `mt5_executor.py:6912` and `mt5_executor.py:7234`, so a layer protected by an R-lock stop could be reported as not trail-protected. Change the condition to:
+
+```python
+            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK"):
+```
+
+The `dynamic_atr_trail_mult` / `_zone` values reported for an R-lock stop are the trail's own telemetry (the trail may not have been the winning candidate); that is acceptable — they describe the engine's live tier, not the stop's author.
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
