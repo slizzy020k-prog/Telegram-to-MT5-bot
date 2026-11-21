@@ -263,8 +263,17 @@ if age_res["action"] != "NONE":
     await _mt5_call(executor.apply_lifecycle_action, sig, age_res["action"])
 ```
 
-`apply_lifecycle_action` dispatches to the three methods above. Each action stamps its state key
-so a repeat tick is a no-op.
+`apply_lifecycle_action` dispatches to the three methods above.
+
+An action is stamped on the signal **only when it actually completed** (`ok` is true and the
+result is not `skipped`). A failed or skipped action — a de-risk with no usable live price, a
+stop the market would refuse, or a close the broker could not confirm — leaves the stamp unset
+so the next tick retries it, on a bounded cadence. The signal is marked `CLOSED` only after a
+successful flatten, and a `gave_up` result (the close-retry budget is spent) alerts the operator
+once, stops the retries, and leaves the position to its broker SL.
+
+The guard runs on BOTH the pre-TP1 path and the `RUNNER_ACTIVE` path, so a trade that has passed
+TP1 is de-risked and flattened on the same schedule.
 
 ### 4.8 Ledger instrumentation (`trade_ledger.py`)
 

@@ -7517,6 +7517,47 @@ def _effective_account_balance(fin: Dict[str, Any]) -> Tuple[float, str]:
     return eff_bal, curr
 
 
+async def _format_lifecycle_signal_ages() -> str:
+    """Per-signal fill ages and the action the age guard would take right now.
+
+    The `/lifecycle` query must tell the operator WHICH trades the guard will
+    touch and WHEN, not only the thresholds. The fill age comes from
+    `risk_lifecycle.evaluate_trade_age`, so it uses the same resolved fill
+    clock (the earliest known fill) as the guard itself.
+    """
+    pol = read_lifecycle_policy(sys.modules.get("config") or config)
+    if not pol.lifecycle_enabled:
+        return ""
+    now_utc = datetime.now(timezone.utc)
+    server_offset = 0
+    try:
+        server_offset = int(await _mt5_call(executor.get_server_time_offset_seconds) or 0)
+    except Exception:
+        server_offset = 0
+    try:
+        active = state_mgr.get_active_signals() or []
+    except Exception:
+        return ""
+    rows: List[str] = []
+    for msg_id, sig in active:
+        if not isinstance(sig, dict):
+            continue
+        try:
+            res = evaluate_trade_age(sig, now_utc, pol, server_offset)
+        except Exception:
+            continue
+        age = res.get("fill_age_seconds")
+        age_txt = f"{int(age)}s" if isinstance(age, (int, float)) and not isinstance(age, bool) else "unknown"
+        action = str(res.get("action") or "NONE")
+        rows.append(
+            f"• `{msg_id}` ({sig.get('direction', '?')} {sig.get('symbol', '')}): "
+            f"age `{age_txt}` → next `{action}`"
+        )
+    if not rows:
+        return ""
+    return "\n\n**Active signals (what the guard would do now):**\n" + "\n".join(rows)
+
+
 async def handle_saved_messages_command(event: Any) -> None:
     """Remote monitoring commands sent to Saved Messages ('me')."""
     global _awaiting_dailywin_input, _awaiting_dailyloss_input, _daily_50pct_alert_date, _daily_float_cap_alert_date, _daily_loss_locked, TRADING_HALTED
@@ -7689,6 +7730,9 @@ async def handle_saved_messages_command(event: Any) -> None:
         changed, reply_msg = apply_lifecycle_command(_cfg_mod, [arg] if arg else [])
         if changed:
             logger.info(f"[/lifecycle] LIFECYCLE_ENABLED updated to {getattr(_cfg_mod, 'LIFECYCLE_ENABLED', False)}")
+        if not arg:
+            # The query form must also show which trades the guard would touch.
+            reply_msg += await _format_lifecycle_signal_ages()
         await event.reply(reply_msg)
         return
 

@@ -3780,3 +3780,50 @@ def test_stats_is_a_known_saved_command():
     assert main._is_known_saved_command("stats")
 
 
+@pytest.mark.asyncio
+async def test_lifecycle_command_lists_the_active_signals_and_their_ages(monkeypatch, tmp_path):
+    """The spec requires the `/lifecycle` query to show per-signal ages and the next action."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    sig["first_fill_at"] = sig["timestamp"]
+    _install_signal(monkeypatch, tmp_path, sig)
+
+    class _OffsetExecutor:
+        def get_server_time_offset_seconds(self):
+            return 0
+
+    monkeypatch.setattr(main, "executor", _OffsetExecutor())
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    body = "\n".join(ev.replies)
+    assert "Active signals" in body
+    assert "9001" in body
+    assert "DERISK" in body
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_omits_the_signal_list_when_the_guard_is_off(monkeypatch, tmp_path):
+    """With the guard disabled there is no action to preview."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    _install_signal(monkeypatch, tmp_path, sig)
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    body = "\n".join(ev.replies)
+    assert "Active signals" not in body
+
+
