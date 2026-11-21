@@ -140,7 +140,13 @@ from dynamic_risk import (
     format_dynamic_risk_status_line,
     read_dynamic_risk_policy,
 )
-from risk_lifecycle import evaluate_trade_age, read_lifecycle_policy, stamp_fill_times
+from risk_lifecycle import (
+    apply_lifecycle_command,
+    apply_rlock_command,
+    evaluate_trade_age,
+    read_lifecycle_policy,
+    stamp_fill_times,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -7295,6 +7301,8 @@ _KNOWN_SAVED_COMMANDS = {
     "/set_daily_loss", "set_daily_loss", "/status_daily_loss", "status_daily_loss",
     "/bank", "bank", "/bank_tp1", "bank_tp1", "/bankall", "bankall", "/closeall", "closeall", "/panic", "panic",
     "/floatcap", "floatcap",
+    "/rlock", "rlock",
+    "/lifecycle", "lifecycle",
     "/losslimit", "losslimit", "/drawdown", "drawdown", "/ddcap", "ddcap",
     "/lotcap", "lotcap", "/riskcap", "riskcap", "/tradecap", "tradecap",
     "/dynamicrisk", "dynamicrisk", "/atrsltp", "atrsltp", "/atrrisk", "atrrisk",
@@ -7317,6 +7325,8 @@ _KNOWN_SAVED_PREFIXES = (
     "/set_daily_loss ", "set_daily_loss ",
     "/bank_tp1 ", "bank_tp1 ",
     "/floatcap ", "floatcap ",
+    "/rlock ", "rlock ",
+    "/lifecycle ", "lifecycle ",
     "/losslimit ", "losslimit ", "/drawdown ", "drawdown ", "/ddcap ", "ddcap ",
     "/lotcap ", "lotcap ", "/riskcap ", "riskcap ", "/tradecap ", "tradecap ",
     "/dynamicrisk ", "dynamicrisk ", "/atrsltp ", "atrsltp ", "/atrrisk ", "atrrisk ",
@@ -7595,6 +7605,32 @@ async def handle_saved_messages_command(event: Any) -> None:
                 f"  - `/bank`: Manually bank the current open trade right now at market"
             )
             return
+
+    # LIVE CONTROL: /rlock [on|off] — toggle the R-relative profit floor
+    if text in ("/rlock", "rlock") or any(
+        text.startswith(p) for p in ("/rlock ", "rlock ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        changed, reply_msg = apply_rlock_command(_cfg_mod, [arg] if arg else [])
+        if changed:
+            logger.info(f"[/rlock] R_LOCK_ENABLED updated to {getattr(_cfg_mod, 'R_LOCK_ENABLED', False)}")
+        await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /lifecycle [on|off] — toggle the trade-age guard
+    if text in ("/lifecycle", "lifecycle") or any(
+        text.startswith(p) for p in ("/lifecycle ", "lifecycle ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        changed, reply_msg = apply_lifecycle_command(_cfg_mod, [arg] if arg else [])
+        if changed:
+            logger.info(f"[/lifecycle] LIFECYCLE_ENABLED updated to {getattr(_cfg_mod, 'LIFECYCLE_ENABLED', False)}")
+        await event.reply(reply_msg)
+        return
 
     # LIVE CONTROL: /floatcap [pct|off] — toggle/configure floating-loss force-close hard cap
     if text in ("/floatcap", "floatcap") or text.startswith(("/floatcap ", "floatcap ")):
@@ -8679,7 +8715,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"\n• Runner Exit Architecture: `{staged_badge}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return

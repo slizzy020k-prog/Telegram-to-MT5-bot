@@ -3294,3 +3294,157 @@ def test_apply_lifecycle_derisk_reports_a_refused_stop_as_stop_not_valid(monkeyp
     assert res["moved"] == []
     assert res["failed"] == []
     assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+# --- Saved Messages commands ---------------------------------------------
+
+class _MockEvent:
+    """A minimal Saved Messages event that records the replies it receives."""
+
+    def __init__(self, text: str):
+        self.message = type("M", (), {"message": text, "out": True})()
+        self.replies = []
+
+    async def reply(self, text, **kwargs):
+        self.replies.append(text)
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_toggles_at_runtime(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock on")
+    await main.handle_saved_messages_command(ev)
+    assert config.R_LOCK_ENABLED is True
+    assert any("R-Relative Profit Floor" in r for r in ev.replies)
+
+    ev2 = _MockEvent("/rlock off")
+    await main.handle_saved_messages_command(ev2)
+    assert config.R_LOCK_ENABLED is False
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_toggles_at_runtime(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle on")
+    await main.handle_saved_messages_command(ev)
+    assert config.LIFECYCLE_ENABLED is True
+    assert any("Trade Lifecycle Guard" in r for r in ev.replies)
+
+    ev2 = _MockEvent("/lifecycle off")
+    await main.handle_saved_messages_command(ev2)
+    assert config.LIFECYCLE_ENABLED is False
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_without_argument_reports_status_and_changes_nothing(
+    monkeypatch, tmp_path
+):
+    """A bare /rlock is a status query: it must report and toggle nothing."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.R_LOCK_ENABLED is False, "a status query must not enable the guard"
+    assert ev.replies, "a status query must reply"
+    assert any("R-Relative Profit Floor" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_without_argument_reports_status_and_changes_nothing(
+    monkeypatch, tmp_path
+):
+    """A bare /lifecycle is a status query: it must report and toggle nothing."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.LIFECYCLE_ENABLED is False, "a status query must not enable the guard"
+    assert ev.replies, "a status query must reply"
+    assert any("Trade Lifecycle Guard" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_rejects_an_invalid_value_without_toggling(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock maybe")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.R_LOCK_ENABLED is False
+    assert any("Usage" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_rejects_an_invalid_value_without_toggling(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle maybe")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.LIFECYCLE_ENABLED is False
+    assert any("Usage" in r for r in ev.replies)
+
+
+def test_rlock_and_lifecycle_are_known_saved_commands():
+    """An unknown command would be treated as a numeric prompt reply."""
+    import main
+
+    assert main._is_known_saved_command("/rlock")
+    assert main._is_known_saved_command("rlock")
+    assert main._is_known_saved_command("/rlock on")
+    assert main._is_known_saved_command("/lifecycle")
+    assert main._is_known_saved_command("lifecycle")
+    assert main._is_known_saved_command("/lifecycle on")
+
+
+@pytest.mark.asyncio
+async def test_rlock_toggle_is_visible_to_the_executor_policy(monkeypatch, tmp_path):
+    """The toggle must reach the executor, not only the config module."""
+    import config
+    import main
+    import mt5_executor
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock on")
+    await main.handle_saved_messages_command(ev)
+
+    assert mt5_executor._cfg("R_LOCK_ENABLED", False) is True
+    ex = mt5_executor.MT5Executor(dry_run=True)
+    assert ex._get_lifecycle_policy().r_lock_enabled is True
+
+    ev2 = _MockEvent("/lifecycle on")
+    await main.handle_saved_messages_command(ev2)
+
+    assert mt5_executor._cfg("LIFECYCLE_ENABLED", False) is True
+    assert ex._get_lifecycle_policy().lifecycle_enabled is True
