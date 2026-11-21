@@ -5783,6 +5783,7 @@ class MT5Executor:
         tick = None
         live_price = 0.0
         price_unavailable = False
+        stops_buffer = self._compute_stops_buffer(sym_info)
         if not self.dry_run:
             try:
                 tick = self.get_tick(symbol)
@@ -5802,7 +5803,6 @@ class MT5Executor:
                 if not (live_price > 0.0):
                     price_unavailable = True
                     result["skipped"] = "no_live_price"
-            stops_buffer = self._compute_stops_buffer(sym_info)
 
         for lk, lv in list(layers.items()):
             if not isinstance(lv, dict):
@@ -5845,12 +5845,22 @@ class MT5Executor:
                         f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is not a "
                         f"valid stop at the market ({live_price}); the existing stop is kept."
                     )
+                    if not result.get("skipped"):
+                        # The market REFUSED the breakeven stop: the de-risk did
+                        # not complete, so the watcher must retry it later
+                        # instead of stamping it as done.
+                        result["skipped"] = "stop_not_valid"
                     continue
                 if self.is_within_freeze_level(symbol, be_sl, tick=tick, sym_info=sym_info):
                     logger.info(
                         f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is inside the "
                         f"broker freeze level; the existing stop is kept."
                     )
+                    if not result.get("skipped"):
+                        # The broker freeze level REFUSED the breakeven stop: the
+                        # de-risk did not complete, so the watcher must retry it
+                        # later instead of stamping it as done.
+                        result["skipped"] = "stop_not_valid"
                     continue
                 if self.modify_position_sltp(ticket, sl=be_sl, tp=None):
                     lv["sl"] = be_sl
