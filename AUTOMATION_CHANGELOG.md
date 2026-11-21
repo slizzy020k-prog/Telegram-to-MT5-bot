@@ -64,6 +64,14 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
   `signal_data["first_fill_at"]` key (which records the first LIMIT fill and can be later
   than the MARKET fill that actually opened the trade).
 - Schema 4 is an UPGRADE: every schema-3 field is retained and old records still read.
+- **Giveback is denominated in the ACCOUNT currency.** `mfe_cash` is a USD amount (a price
+  difference on XAUUSD) while `realized_pnl` comes from the broker in GBP, so the raw difference
+  was mixing currencies and overstated giveback by the GBP/USD rate (~1.31x). The record now
+  carries `giveback_currency` and `fx_rate_to_account`, and `giveback_cash` is
+  `mfe_cash x rate - realized_pnl` with BOTH terms in the account currency. When the rate cannot
+  be established the giveback is recorded as `null` — **never** a mixed-currency number.
+  `r_at_exit` is unchanged: it divides a USD amount by a USD amount, so it stays
+  currency-neutral.
 - New `/stats` command: today / 7-day / all-time P&L, win rate, total cash giveback,
   longest trade age, exit-reason mix. It degrades to "no ledger data" on a missing or
   corrupt ledger instead of raising.
@@ -85,9 +93,9 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 - Gate `g5` (Arm C >= Arm B on net P&L, <= on tail loss) **FAILED**. Gates `g1`-`g3` were
   already failing before this branch (pre-existing).
 - The whole gap is the `2 h` de-risk scratching the only two trades the harness holds open past
-  two hours. On the **recorded live tape every trade closed within 47.1 minutes**, so a 2 h
-  de-risk could never have fired live, and both affected trades were in fact closed at
-  breakeven live (`BROKER_SL BE`) — which Arm C reproduces and Arm B does not.
+  two hours (9937 and 9943): each was moved to breakeven and stopped at `£+0.76` instead of
+  `£+4.44` and `£+14.07`. Both trades were in fact closed at breakeven live
+  (`BROKER_SL BE`) — which Arm C reproduces and Arm B does not.
 - Two genuine harness bugs were found and fixed: the replayed layers never carried `initial_sl`
   (so the R lock was silently skipped and Arm C would not have exercised the feature at all),
   and the age guard read the wall clock (so on a replay of a Nov 17-19 tape every trade looked
@@ -98,18 +106,27 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ### 6. Known Limitations (read before enabling)
 
-- **The R floor never won the stop picker on the recorded replay tape**, so Arm C measured the
-  age guard alone and says nothing about the floor. The picker keeps the TIGHTEST stop and the
-  R-lock candidate only wins a TIE against the other candidates, so the floor engages exactly
-  when the ATR trail is looser than the floor — which does happen (Task 4's own test proves
-  `stop_source == "R_LOCK"` at `R = 15`, `ATR = 20`, `MFE = 0.73R`). Whether it engages on LIVE
-  tape is NOT established, because the replay harness does not reproduce the live ATR trail.
-  The tiers must be re-derived against real tape before the feature is enabled.
-- **The `2 h` de-risk threshold is not yet justified by evidence.** On the recorded tape it
-  fires on trades that closed well inside two hours. Measured sensitivity (not shipped):
-  `DERISK=10800` makes `g5` pass; `DERISK=21600` means the guard never fires.
-- Both features therefore ship **disabled** and must stay disabled until the tiers and the
-  de-risk threshold are re-derived and `g5` passes.
+- **The `2 h` de-risk DID fire in the replay harness** on 2 of the 12 replayed trades (9937 and
+  9943), and it is the entire `-£16.99` gap: each was moved to breakeven and stopped at
+  `£+0.76` instead of `£+4.44` and `£+14.07`. On the recorded LIVE tape every trade closed
+  within 47.1 minutes, which suggests it would not have fired live — but the harness replays a
+  generic FSM rather than the recorded message flow, so that is an INFERENCE, not a measurement.
+- **The R floor is purely ADDITIVE and can never DELAY or DISPLACE the flat BE lock.** The picker
+  keeps the TIGHTEST candidate, so the floor can only ever add protection on top of the
+  `max(0.75 x ATR, $3.50)` BE lock that motivated it — which still arms at `$3.50` regardless
+  of R, so a wide-stop trade is still BE-locked far too early. **Re-deriving the tiers alone will
+  not fix this**: the `BE_LOCK` candidate itself has to become R-relative (or be gated by R).
+  Measured on the recorded tape the R floor never won the picker at all (Arm C with
+  `R_LOCK_ENABLED=false` is identical to full Arm C), so enabling it as shipped buys nothing on
+  the tape it was designed for. It does engage for a narrow R (~<= $6).
+- **The `2 h` de-risk threshold is not yet justified by evidence.** Measured sensitivity (not
+  shipped): `DERISK=10800` makes `g5` pass; `DERISK=21600` means the guard never fires.
+- Both features therefore ship **disabled** and must stay disabled until the BE lock is made
+  R-relative, the tiers are re-derived, the de-risk threshold is re-derived, and `g5` passes.
+- The ledger file format is schema `4` even with both features DISABLED, so a fresh clone writes
+  schema-4 records. TRADING behaviour is identical to v3.7.0; the ledger FILE is not.
+- `/rlock on` and `/lifecycle on` are **in-memory only** — they are not written to `.env`, so
+  they reset on a restart. The `.env` knobs are the persistent switch.
 
 ### 7. Deploy Readiness
 

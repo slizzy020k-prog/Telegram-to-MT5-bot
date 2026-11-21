@@ -163,7 +163,9 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
 | `LIFECYCLE_MAX_CLOSE_RETRIES` | `3` | Retries before the guard gives up and alerts |
 
 Parsed in `config.py` at import; validated in `startup_checks.py` (ranges: seconds `0..604800`,
-tiers well-formed and ascending, `flatten > derisk`).
+`flatten >= derisk`, and `R_LOCK_TIERS` must contain at least one valid `r:fraction` pair). A
+PARTIALLY malformed or unsorted tier list is **repaired** rather than rejected — the malformed
+entries are dropped and the rest are sorted — so the bot always boots.
 
 ### 4.4 Integration — the R floor
 
@@ -206,7 +208,14 @@ make R ≈ 0.
 ### 4.5 Integration — the age guard
 
 New per-signal state keys (all additive): `first_fill_at`, `lifecycle_derisk_at`,
-`lifecycle_flatten_at`, `lifecycle_pending_expired_at`, `lifecycle_retry_count`.
+`lifecycle_flatten_at`, `lifecycle_pending_expired_at`, `lifecycle_retry_count`,
+`lifecycle_action`, `lifecycle_reason`, `lifecycle_gave_up_at`, `lifecycle_last_attempt_at`.
+
+An action is stamped only when it actually **completed**. A failed or skipped action leaves the
+stamp unset so the next tick retries it, on a bounded 30 s cadence (`lifecycle_last_attempt_at`)
+— the retry is deliberately not per-second, because `apply_lifecycle_derisk` sweeps the pending
+orders on every invocation and a per-second retry would be a broker sweep per second per aged
+trade.
 
 | Clock | Action | Effect |
 |---|---|---|
@@ -242,8 +251,12 @@ def apply_lifecycle_pending_expire(self, signal_data) -> Dict[str, Any]:
     """Cancel pending limits for a signal that never filled; mark it CLOSED."""
 ```
 
-Each returns a structured result (`{"moved": [...], "skipped": [...], "closed": [...],
-"failed": [...], "pending_cancelled": [...]}`) that is logged and summarised to Saved Messages.
+Each returns a structured result (`{"action": "...", "ok": bool, "moved": [...], "closed": [...],
+"cancelled": [...], "failed": [...]}`) that is logged and summarised to Saved Messages. An
+optional `"skipped"` key carries a short reason (`"no_live_price"`, `"stop_not_valid"`) when
+the action could not be ATTEMPTED — the caller must then retry it rather than treat it as done.
+An optional `"gave_up"` key means the close-retry budget is spent: stop retrying, alert, and
+leave the position to its broker SL.
 
 Reuse, not re-implement:
 
