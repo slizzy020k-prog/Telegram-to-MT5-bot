@@ -6150,19 +6150,19 @@ the watcher tests run against the shipped tick functions:
 
 ---
 
-## Task 7: `main.py` — the `/rlock` and `/lifecycle` commands
+## Task 7: `main.py` -- the `/rlock` and `/lifecycle` commands
 
 **Files:**
-- Modify: `main.py:7045-7049` (`_is_known_saved_command` list)
-- Modify: `main.py:7350` (insert the new command handlers before the `# LIVE CONTROL: /floatcap` block at line 7350)
-- Modify: `main.py:8433` (the command list in the `/status` reply)
+- Modify: `main.py` -- the `risk_lifecycle` import, the `_KNOWN_SAVED_COMMANDS` and
+  `_KNOWN_SAVED_PREFIXES` sets, the command handlers inside `handle_saved_messages_command`,
+  and the command list in the `/status` reply
 - Modify: `tests/test_trade_lifecycle.py` (append the command tests)
 
 **Interfaces:**
 - Consumes: `risk_lifecycle.apply_rlock_command`, `risk_lifecycle.apply_lifecycle_command` (Task 1).
 - Produces: the Saved Messages commands `/rlock` and `/lifecycle`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: the failing tests**
 
 Append to `tests/test_trade_lifecycle.py`:
 
@@ -6170,6 +6170,8 @@ Append to `tests/test_trade_lifecycle.py`:
 # --- Saved Messages commands ---------------------------------------------
 
 class _MockEvent:
+    """A minimal Saved Messages event that records the replies it receives."""
+
     def __init__(self, text: str):
         self.message = type("M", (), {"message": text, "out": True})()
         self.replies = []
@@ -6208,19 +6210,123 @@ async def test_lifecycle_command_toggles_at_runtime(monkeypatch, tmp_path):
     await main.handle_saved_messages_command(ev)
     assert config.LIFECYCLE_ENABLED is True
     assert any("Trade Lifecycle Guard" in r for r in ev.replies)
+
+    ev2 = _MockEvent("/lifecycle off")
+    await main.handle_saved_messages_command(ev2)
+    assert config.LIFECYCLE_ENABLED is False
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_without_argument_reports_status_and_changes_nothing(
+    monkeypatch, tmp_path
+):
+    """A bare /rlock is a status query: it must report and toggle nothing."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.R_LOCK_ENABLED is False, "a status query must not enable the guard"
+    assert ev.replies, "a status query must reply"
+    assert any("R-Relative Profit Floor" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_without_argument_reports_status_and_changes_nothing(
+    monkeypatch, tmp_path
+):
+    """A bare /lifecycle is a status query: it must report and toggle nothing."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.LIFECYCLE_ENABLED is False, "a status query must not enable the guard"
+    assert ev.replies, "a status query must reply"
+    assert any("Trade Lifecycle Guard" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_rejects_an_invalid_value_without_toggling(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock maybe")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.R_LOCK_ENABLED is False
+    assert any("Usage" in r for r in ev.replies)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_rejects_an_invalid_value_without_toggling(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle maybe")
+    await main.handle_saved_messages_command(ev)
+
+    assert config.LIFECYCLE_ENABLED is False
+    assert any("Usage" in r for r in ev.replies)
+
+
+def test_rlock_and_lifecycle_are_known_saved_commands():
+    """An unknown command would be treated as a numeric prompt reply."""
+    import main
+
+    assert main._is_known_saved_command("/rlock")
+    assert main._is_known_saved_command("rlock")
+    assert main._is_known_saved_command("/rlock on")
+    assert main._is_known_saved_command("/lifecycle")
+    assert main._is_known_saved_command("lifecycle")
+    assert main._is_known_saved_command("/lifecycle on")
+
+
+@pytest.mark.asyncio
+async def test_rlock_toggle_is_visible_to_the_executor_policy(monkeypatch, tmp_path):
+    """The toggle must reach the executor, not only the config module."""
+    import config
+    import main
+    import mt5_executor
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock on")
+    await main.handle_saved_messages_command(ev)
+
+    assert mt5_executor._cfg("R_LOCK_ENABLED", False) is True
+    ex = mt5_executor.MT5Executor(dry_run=True)
+    assert ex._get_lifecycle_policy().r_lock_enabled is True
+
+    ev2 = _MockEvent("/lifecycle on")
+    await main.handle_saved_messages_command(ev2)
+
+    assert mt5_executor._cfg("LIFECYCLE_ENABLED", False) is True
+    assert ex._get_lifecycle_policy().lifecycle_enabled is True
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: the tests fail** -- the commands are not recognised.
 
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
-```
+- [x] **Step 3: the commands**
 
-Expected: FAIL — the commands are not recognised.
-
-- [ ] **Step 3: Implement the commands**
-
-In `main.py`, insert the following block immediately **before** the `# LIVE CONTROL: /floatcap` comment (line 7350):
+In `main.py`, insert the following block immediately **before** the `# LIVE CONTROL: /floatcap`
+comment:
 
 ```python
     # LIVE CONTROL: /rlock [on|off] — toggle the R-relative profit floor
@@ -6250,88 +6356,92 @@ In `main.py`, insert the following block immediately **before** the `# LIVE CONT
         return
 ```
 
-Add the import at the top of `main.py`:
+The import at the top of `main.py` becomes:
 
 ```python
-from risk_lifecycle import apply_lifecycle_command, apply_rlock_command, evaluate_trade_age, read_lifecycle_policy
+from risk_lifecycle import (
+    apply_lifecycle_command,
+    apply_rlock_command,
+    evaluate_trade_age,
+    read_lifecycle_policy,
+    stamp_fill_times,
+)
 ```
 
-- [ ] **Step 4: Register the commands as known**
+- [x] **Step 4: register the commands as known**
 
-In `main.py`, in the `_is_known_saved_command` list (lines 7045-7049), add the new commands:
+In `main.py`, in the `_KNOWN_SAVED_COMMANDS` set:
 
 ```python
     "/rlock", "rlock",
     "/lifecycle", "lifecycle",
 ```
 
-- [ ] **Step 5: Add the commands to the `/status` help line**
-
-In `main.py` line 8433, extend the command list with `/rlock` and `/lifecycle`:
+and in the `_KNOWN_SAVED_PREFIXES` tuple, so that `/rlock on` and `/lifecycle on` are
+recognised as commands and not as a numeric prompt reply:
 
 ```python
-f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+    "/rlock ", "rlock ",
+    "/lifecycle ", "lifecycle ",
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 5: add the commands to the `/status` help line**
 
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
+In `main.py`, the command list in the `/status` reply becomes:
+
+```python
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/stats`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
 ```
 
-Expected: PASS.
+- [x] **Step 6: the tests pass.**
 
-- [ ] **Step 7: Run the full suite**
+- [x] **Step 7: the full suite passes.**
 
-```powershell
-python -m pytest -q
-```
+### Shipped notes (Task 7)
 
-Expected: **0 failed**.
+- The plan described the command list as a "list"; in the shipped `main.py` it is the
+  `_KNOWN_SAVED_COMMANDS` **set** plus the `_KNOWN_SAVED_PREFIXES` tuple. Both were updated.
+- The plan only registered the bare command names. `_is_known_saved_command` matches exact
+  names OR a known prefix, so `/rlock on` would have fallen through to the numeric-prompt
+  path. The prefixes `/rlock  / rlock ` and `/lifecycle  / lifecycle ` were added as well.
+- The handlers use `sys.modules.get("config") or config` so the toggled module is the one the
+  executor reads through `mt5_executor._cfg`; `config.R_LOCK_ENABLED` and
+  `config.LIFECYCLE_ENABLED` are the live attributes.
+- A bare `/rlock` or `/lifecycle` is a status query: it reports the policy and changes
+  nothing. An unrecognised argument is answered with the usage line and changes nothing.
 
-- [ ] **Step 8: Commit**
-
-```powershell
-git add main.py tests/test_trade_lifecycle.py
-git commit -m "feat(main): add /rlock and /lifecycle Saved Messages commands
-
-Both toggle their feature at runtime with no restart, and double as the live
-kill switches for the rollout."
-```
-
----
-
-## Task 8: `trade_ledger.py` — schema 4 with cash MFE, giveback, R and age
+## Task 8: `trade_ledger.py` -- schema 4 with cash MFE, giveback, R and age
 
 **Files:**
-- Modify: `trade_ledger.py:456-488` (`build_trade_record`)
-- Modify: `trade_ledger.py:502` (`append_trade` — the `schema_version` default)
-- Modify: `trade_ledger.py` (import `risk_lifecycle.resolve_fill_time`)
+- Modify: `trade_ledger.py` -- `build_trade_record` (the schema-4 telemetry block, the new record
+  keys and `schema_version`), `append_trade` (the `schema_version` default), and the
+  `risk_lifecycle.resolve_fill_time` import
 - Modify: `tests/test_trade_lifecycle.py` (append the ledger tests)
 
 **Interfaces:**
-- Consumes: nothing from earlier tasks (independent), except `risk_lifecycle.resolve_fill_time` for the exit age (see the fill-time rule below).
-- Produces: every closed-signal record gains `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action`; `schema_version` becomes `4`.
+- Consumes: `risk_lifecycle.resolve_fill_time` for the exit age (see the fill-time rule below).
+- Produces: every closed-signal record gains `mfe_cash`, `giveback_cash`,
+  `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action`; `schema_version`
+  becomes `4`.
 
 **Fill-time rule:** the ledger records the RESOLVED fill time via
-`risk_lifecycle.resolve_fill_time(signal_data)` — NEVER the raw
+`risk_lifecycle.resolve_fill_time(signal_data)` -- NEVER the raw
 `signal_data["first_fill_at"]` key. The signal-level stamp records the first
-`PENDING -> FILLED` transition, which for a normal zone signal is the first LIMIT fill
-(L2) and is therefore LATER than the MARKET fill of L1 that is stamped on the layer.
-`resolve_fill_time` returns the EARLIEST known fill, so `exit_age_seconds` measures the
-TRADE and not its first limit fill.
+`PENDING -> FILLED` transition, which for a normal zone signal is the first LIMIT fill (L2) and
+is therefore LATER than the MARKET fill of L1 that is stamped on the layer.
+`resolve_fill_time` returns the EARLIEST known fill, so `exit_age_seconds` measures the TRADE
+and not its first limit fill.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: the failing tests**
 
 Append to `tests/test_trade_lifecycle.py`:
 
 ```python
 # --- trade ledger schema 4 -----------------------------------------------
 
-def test_build_trade_record_adds_cash_mfe_and_giveback():
-    from trade_ledger import build_trade_record
-
-    sig = {
+def _schema4_signal():
+    """A representative closed signal carrying the schema-4 inputs."""
+    return {
         "timestamp": "2026-11-19T06:19:09+00:00",
         "chat_id": -100,
         "message_id": 42,
@@ -6346,17 +6456,30 @@ def test_build_trade_record_adds_cash_mfe_and_giveback():
         "realized_pnl": 0.56,
         "initial_r_per_oz": 20.0,
         "first_fill_at": "2026-11-19T06:19:09+00:00",
-        "closed_at": "2026-11-19T09:18:51+00:00",
+        "closed_at": "2026-11-19T09:19:51+00:00",
     }
 
-    rec = build_trade_record(sig, signal_key="-100:42", realized_pnl=0.56)
+
+def test_build_trade_record_adds_cash_mfe_and_giveback():
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_schema4_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+    )
 
     assert rec["schema_version"] == 4
     # 11.12 $/oz * 0.05 lots * 100 oz/lot = 55.60
     assert rec["mfe_cash"] == pytest.approx(55.60)
     assert rec["giveback_cash"] == pytest.approx(55.04)
     assert rec["initial_r_per_oz"] == pytest.approx(20.0)
-    assert rec["r_at_exit"] == pytest.approx(0.278)
+    # R at exit = MFE cash / risk cash = 55.60 / (20.0 * 0.05 * 100) = 0.556.
+    # (The plan's draft expectation of 0.278 is inconsistent with its own
+    #  mfe_cash/initial_r_per_oz expectations: 11.12 / 20.0 = 0.556.)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+    # 06:19:09 -> 09:19:51 = 3h00m42s
     assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2)
     assert rec["lifecycle_action"] is None
 
@@ -6365,27 +6488,132 @@ def test_build_trade_record_tolerates_missing_new_fields():
     from trade_ledger import build_trade_record
 
     rec = build_trade_record(
-        {"chat_id": -100, "message_id": 7, "direction": "BUY"},
         signal_key="-100:7",
+        signal_data={"chat_id": -100, "message_id": 7, "direction": "BUY"},
         realized_pnl=1.0,
+        exit_reason="MANUAL",
     )
     assert rec["schema_version"] == 4
     assert rec["mfe_cash"] is None
     assert rec["giveback_cash"] is None
     assert rec["exit_age_seconds"] is None
+    assert rec["initial_r_per_oz"] is None
+    assert rec["r_at_exit"] is None
+
+
+def test_build_trade_record_keeps_every_schema_3_field():
+    """Schema 4 is an UPGRADE: the old fields must not be dropped."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_schema4_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+    )
+
+    for key in (
+        "schema_version",
+        "closed_at",
+        "opened_at",
+        "signal_key",
+        "chat_id",
+        "message_id",
+        "symbol",
+        "direction",
+        "entry_type",
+        "total_lots",
+        "filled_lots",
+        "tickets",
+        "layers_filled",
+        "exit_reason",
+        "exit_reason_code",
+        "exit_price",
+        "max_favorable_excursion",
+        "giveback_from_peak",
+        "layer_exits",
+        "realized_pnl",
+        "currency",
+        "dry_run",
+    ):
+        assert key in rec, f"schema 4 dropped the schema 3 field {key}"
+    assert rec["realized_pnl"] == pytest.approx(0.56)
+    assert rec["max_favorable_excursion"]["peak_profit_per_oz"] == pytest.approx(11.12)
+
+
+def test_build_trade_record_exit_age_uses_the_earliest_resolved_fill():
+    """The L1 MARKET fill (on the layer) precedes the signal's LIMIT stamp."""
+    from trade_ledger import build_trade_record
+
+    sig = _schema4_signal()
+    # The signal-level stamp is the first LIMIT fill (L2) and is LATER.
+    sig["first_fill_at"] = "2026-11-19T07:19:09+00:00"
+    sig["layers"]["L1"]["filled_at"] = "2026-11-19T06:19:09+00:00"
+    sig["closed_at"] = "2026-11-19T09:19:51+00:00"
+
+    rec = build_trade_record(
+        signal_key="-100:42", signal_data=sig, realized_pnl=0.56, exit_reason="ATR_TRAIL"
+    )
+
+    assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2), (
+        "the trade age must be measured from the EARLIEST fill, not the signal stamp"
+    )
+
+
+def test_trade_ledger_reads_legacy_schema_3_records(tmp_path):
+    """A record written by the old code must still be readable and complete."""
+    import json
+
+    from trade_ledger import TradeLedger
+
+    path = tmp_path / "trades_ledger.jsonl"
+    legacy = {
+        "schema_version": 3,
+        "closed_at": "2026-11-18T09:19:51+00:00",
+        "opened_at": "2026-11-18T06:19:09+00:00",
+        "signal_key": "-100:1",
+        "chat_id": -100,
+        "message_id": 1,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "realized_pnl": 12.34,
+        "currency": "GBP",
+    }
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    ledger = TradeLedger(path)
+    trades = ledger.read_trades()
+
+    assert len(trades) == 1
+    rec = trades[0]
+    assert rec["schema_version"] == 3
+    assert rec["realized_pnl"] == pytest.approx(12.34)
+    assert rec["symbol"] == "XAUUSD.s"
+    # The new fields are simply absent on an old record -- never an error.
+    assert rec.get("mfe_cash") is None
+    assert rec.get("exit_age_seconds") is None
+    stats = ledger.get_stats()
+    assert stats["total_trades"] == 1
+    assert stats["total_realized_pnl"] == pytest.approx(12.34)
+
+
+def test_append_trade_defaults_to_schema_4(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade({"realized_pnl": 1.0})
+
+    assert entry["schema_version"] == 4
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: the tests fail** -- `schema_version` is `3` and the new keys are missing.
 
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
-```
+- [x] **Step 3: the schema-4 fields**
 
-Expected: FAIL — `schema_version` is `3` and the new keys are missing.
-
-- [ ] **Step 3: Implement the schema-4 fields**
-
-In `trade_ledger.py`, in `build_trade_record`, insert the computation block **before** the `record: Dict[str, Any] = {` assignment at line 456:
+In `trade_ledger.py`, the computation block sits immediately **before** the
+`record: Dict[str, Any] = {` assignment:
 
 ```python
     # --- Schema 4 telemetry: cash excursion, giveback, R and exit age -------
@@ -6394,7 +6622,10 @@ In `trade_ledger.py`, in `build_trade_record`, insert the computation block **be
     # measurable.
     CONTRACT_OZ_PER_LOT = 100.0
     mfe_per_oz = _safe_float((mfe_dict or {}).get("peak_profit_per_oz"), 0.0) if mfe_dict else 0.0
-    lots_for_mfe = _safe_float(total_lots, 0.0)
+    lots_for_mfe = _safe_float(signal_data.get("total_lots"), 0.0)
+    if lots_for_mfe <= 0.0:
+        # Fall back to the layer-derived total when the signal carries no size.
+        lots_for_mfe = _safe_float(total_lots, 0.0)
     mfe_cash: Optional[float] = None
     if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
         mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)
@@ -6434,10 +6665,12 @@ In `trade_ledger.py`, in `build_trade_record`, insert the computation block **be
     _closed_at = signal_data.get("closed_at") or datetime.now(timezone.utc).isoformat()
     if _filled_at and _closed_at:
         try:
-            from datetime import datetime as _dt
-
-            _f = _filled_at if isinstance(_filled_at, _dt) else _dt.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
-            _c = _dt.fromisoformat(str(_closed_at).replace("Z", "+00:00"))
+            _f = _filled_at if isinstance(_filled_at, datetime) else datetime.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
+            _c = datetime.fromisoformat(str(_closed_at).replace("Z", "+00:00"))
+            if _f.tzinfo is None:
+                _f = _f.replace(tzinfo=timezone.utc)
+            if _c.tzinfo is None:
+                _c = _c.replace(tzinfo=timezone.utc)
             exit_age_seconds = int((_c - _f).total_seconds())
         except (TypeError, ValueError):
             exit_age_seconds = None
@@ -6445,7 +6678,7 @@ In `trade_ledger.py`, in `build_trade_record`, insert the computation block **be
     lifecycle_action = signal_data.get("lifecycle_action")
 ```
 
-Then add the new keys to the `record` dict (after `"giveback_from_peak": giveback_from_peak,` at line 479):
+The record gains the new keys:
 
 ```python
         "mfe_cash": mfe_cash,
@@ -6456,59 +6689,68 @@ Then add the new keys to the `record` dict (after `"giveback_from_peak": givebac
         "lifecycle_action": (str(lifecycle_action) if lifecycle_action else None),
 ```
 
-And change `"schema_version": 3,` to `"schema_version": 4,` at line 457.
+and its version becomes:
 
-Also change the default in `append_trade` at line 502:
+```python
+        "schema_version": 4,
+```
+
+In `append_trade` the default becomes:
 
 ```python
         entry.setdefault("schema_version", 4)
 ```
 
-> If `Optional` is not imported in `trade_ledger.py`, add it to the `typing` import.
+`trade_ledger.py` imports the resolver:
 
-- [ ] **Step 4: Run the tests to verify they pass**
-
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
+```python
+from risk_lifecycle import resolve_fill_time
 ```
 
-Expected: PASS.
+- [x] **Step 4: the tests pass.**
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: the full suite passes.**
 
-```powershell
-python -m pytest -q
-```
+### Shipped notes (Task 8)
 
-Expected: **0 failed**.
+- The plan's test snippet called `build_trade_record(sig, signal_key=...)` -- that passes
+  `signal_data` positionally into `signal_key` and raises
+  `TypeError: build_trade_record() got multiple values for argument 'signal_key'`. The shipped
+  test calls it as `build_trade_record(signal_key=..., signal_data=..., realized_pnl=...,
+  exit_reason=...)`, the real signature (`exit_reason` is required).
+- The plan's fixture used `closed_at` `09:18:51` and expected `exit_age_seconds` `10842`. Those
+  two disagree: `06:19:09 -> 09:18:51` is `10782` s, and `10842` s is
+  `06:19:09 -> 09:19:51`. The shipped fixture uses `09:19:51`, so the planned expectation
+  `10842` is kept.
+- The plan's test expected `r_at_exit == 0.278`, which is inconsistent with the plan's own
+  `mfe_cash` and `initial_r_per_oz` expectations: `mfe_cash / (initial_r_per_oz * lots * 100)`
+  = `55.60 / 100` = `0.556`, and `peak_profit_per_oz / initial_r_per_oz` = `11.12 / 20.0` =
+  `0.556` as well. No formula satisfies `0.278` together with `mfe_cash == 55.60` and
+  `initial_r_per_oz == 20.0`. The shipped test asserts `0.556` (the correct R multiple);
+  shipping `0.278` would have halved every real trade's R at exit.
+- `lots_for_mfe` prefers the signal's own `total_lots` and falls back to the layer-derived
+  total. `build_trade_record` derives `total_lots` from the LAYERS, and the plan's fixture
+  carries a single 0.01-lot layer next to a 0.05-lot signal; using the signal's size is what
+  makes `mfe_cash` the cash excursion of the whole trade. Live signals carry no `total_lots`
+  key, so the layer-derived total is used there.
+- Schema 4 is an UPGRADE: the schema-3 fields are all still written, and a record written by
+  the old code is still read (the new keys are simply absent). Both are covered by the shipped
+  tests.
 
-- [ ] **Step 6: Commit**
-
-```powershell
-git add trade_ledger.py tests/test_trade_lifecycle.py
-git commit -m "feat(trade_ledger): schema 4 - cash MFE, cash giveback, R at exit, exit age
-
-max_favorable_excursion.peak_profit_per_oz is a per-ounce figure and was never
-converted to cash, so no tool could see the giveback. Schema 4 records mfe_cash,
-giveback_cash, initial_r_per_oz, r_at_exit, exit_age_seconds and
-lifecycle_action. Older records are read unchanged."
-```
-
----
-
-## Task 9: `main.py` — the `/stats` command
+## Task 9: `main.py` -- the `/stats` command
 
 **Files:**
-- Modify: `main.py` (new module-level helper `_build_ledger_stats()` plus the `/stats` handler)
-- Modify: `main.py:7045-7049` (register `/stats` as a known command)
-- Modify: `main.py:8433` (add `/stats` to the help line)
+- Modify: `main.py` -- the module-level helper `_build_ledger_stats()`, the `/stats` handler
+  inside `handle_saved_messages_command`, the `_KNOWN_SAVED_COMMANDS` set and the `/status`
+  help line
 - Modify: `tests/test_trade_lifecycle.py` (append the stats tests)
 
 **Interfaces:**
-- Consumes: `trade_ledger.jsonl` on disk (Task 8's records).
-- Produces: `main._build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] = None) -> Dict[str, Any]` and the `/stats` Saved Messages command.
+- Consumes: `trades_ledger.jsonl` on disk (Task 8's records).
+- Produces: `main._build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
+  None) -> Dict[str, Any]` and the `/stats` Saved Messages command.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: the failing tests**
 
 Append to `tests/test_trade_lifecycle.py`:
 
@@ -6541,29 +6783,143 @@ def test_build_ledger_stats_summarises_pnl_and_giveback():
 
     stats = main._build_ledger_stats(records)
 
-    assert stats["count"] == 2
-    assert stats["net_pnl"] == pytest.approx(5.0)
-    assert stats["wins"] == 1
-    assert stats["losses"] == 1
-    assert stats["win_rate"] == pytest.approx(0.5)
-    assert stats["total_giveback"] == pytest.approx(37.0)
-    assert stats["max_exit_age_seconds"] == 90000
-    assert stats["lifecycle_closes"] == 1
-    assert stats["exit_reasons"]["ATR_TRAIL"] == 1
-    assert stats["exit_reasons"]["BROKER_SL"] == 1
+    # The helper returns one aggregate per window; the plan's draft asserted
+    # these fields on the top level, so they are asserted on the all-time
+    # aggregate that carries them.
+    allt = stats["all_time"]
+    assert allt["count"] == 2
+    assert allt["net_pnl"] == pytest.approx(5.0)
+    assert allt["wins"] == 1
+    assert allt["losses"] == 1
+    assert allt["win_rate"] == pytest.approx(0.5)
+    assert allt["total_giveback"] == pytest.approx(37.0)
+    assert allt["max_exit_age_seconds"] == 90000
+    assert allt["lifecycle_closes"] == 1
+    assert allt["exit_reasons"]["ATR_TRAIL"] == 1
+    assert allt["exit_reasons"]["BROKER_SL"] == 1
+    assert set(stats) == {"today", "seven_day", "all_time"}
+
+
+def test_build_ledger_stats_windows_are_time_scoped():
+    import main
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    records = [
+        {"closed_at": "2026-11-19T09:00:00+00:00", "realized_pnl": 10.0},
+        {"closed_at": "2026-11-17T09:00:00+00:00", "realized_pnl": 20.0},
+        {"closed_at": "2026-01-01T09:00:00+00:00", "realized_pnl": 30.0},
+    ]
+
+    stats = main._build_ledger_stats(records, now=now)
+
+    assert stats["today"]["count"] == 1
+    assert stats["today"]["net_pnl"] == pytest.approx(10.0)
+    assert stats["seven_day"]["count"] == 2
+    assert stats["seven_day"]["net_pnl"] == pytest.approx(30.0)
+    assert stats["all_time"]["count"] == 3
+    assert stats["all_time"]["net_pnl"] == pytest.approx(60.0)
+
+
+def test_build_ledger_stats_tolerates_garbage_records():
+    import main
+
+    stats = main._build_ledger_stats([None, "nonsense", {"realized_pnl": None}])
+
+    assert stats["all_time"]["count"] == 1
+    assert stats["all_time"]["net_pnl"] == pytest.approx(0.0)
+    assert stats["all_time"]["total_giveback"] == pytest.approx(0.0)
+
+
+class _StubFinancialsExecutor:
+    """An executor stub that answers the account financials call."""
+
+    def get_account_financials(self):
+        return {"currency": "GBP", "balance": 1000.0, "formatted": "• Balance: 1000.00 GBP"}
+
+
+@pytest.mark.asyncio
+async def test_stats_command_reports_no_ledger_data(monkeypatch, tmp_path):
+    """A missing ledger must degrade gracefully, never raise."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", tmp_path / "missing_ledger.jsonl")
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    assert "no ledger data" in ev.replies[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_tolerates_a_corrupt_ledger(monkeypatch, tmp_path):
+    """A corrupt ledger must degrade gracefully, never raise."""
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    ledger.write_text("this is not json\n{broken\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    assert "no ledger data" in ev.replies[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_reports_the_ledger_summary(monkeypatch, tmp_path):
+    import json
+
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    rec = {
+        "schema_version": 4,
+        "closed_at": "2026-11-19T09:00:00+00:00",
+        "realized_pnl": 10.0,
+        "exit_reason_code": "ATR_TRAIL",
+        "mfe_cash": 30.0,
+        "giveback_cash": 20.0,
+        "exit_age_seconds": 7200,
+        "lifecycle_action": None,
+    }
+    ledger.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    body = ev.replies[0]
+    assert "Trade Stats" in body
+    assert "+10.00 GBP" in body
+    assert "giveback" in body
+
+
+def test_stats_is_a_known_saved_command():
+    import main
+
+    assert main._is_known_saved_command("/stats")
+    assert main._is_known_saved_command("stats")
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: the tests fail** -- `AttributeError: module 'main' has no attribute
+  '_build_ledger_stats'`.
 
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
-```
+- [x] **Step 3: the stats helper**
 
-Expected: FAIL — `AttributeError: module 'main' has no attribute '_build_ledger_stats'`.
-
-- [ ] **Step 3: Implement the stats helper**
-
-Add this module-level function to `main.py` (place it next to `_close_all_bot_exposure_and_signals` around line 1208):
+Added to `main.py` as a module-level function:
 
 ```python
 def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -6620,11 +6976,18 @@ def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] =
         "seven_day": _aggregate(_slice(cutoff_7d)),
         "all_time": _aggregate(rows),
     }
+
+
+
+
+# ---------------------------------------------------------------------------
+# EXPOSURE SHUTDOWN & DAILY RISK LIMITS
+# ---------------------------------------------------------------------------
 ```
 
-- [ ] **Step 4: Implement the `/stats` command**
+- [x] **Step 4: the `/stats` command**
 
-Add the command handler in `handle_saved_messages_command`, immediately before the `# LIVE CONTROL: /floatcap` block (line 7350), alongside the `/rlock` and `/lifecycle` handlers added in Task 7:
+In `handle_saved_messages_command`, immediately before the `# LIVE CONTROL: /floatcap` block:
 
 ```python
     # LIVE CONTROL: /stats — closed-trade analytics from the trade ledger
@@ -6634,14 +6997,19 @@ Add the command handler in `handle_saved_messages_command`, immediately before t
         records: List[Dict[str, Any]] = []
         try:
             if ledger_path.exists():
-                for line in ledger_path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        records.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+                # Streamed line by line: the ledger is JSONL, so no whole-file
+                # text blob is ever held in memory.
+                with ledger_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict):
+                            records.append(obj)
         except Exception as exc:
             logger.warning(f"[/stats] could not read ledger {ledger_path}: {exc}")
 
@@ -6653,7 +7021,11 @@ Add the command handler in `handle_saved_messages_command`, immediately before t
         today = stats["today"]
         seven = stats["seven_day"]
         allt = stats["all_time"]
-        fin = await _mt5_call(executor.get_account_financials)
+        try:
+            fin = await _mt5_call(executor.get_account_financials)
+        except Exception as exc:
+            logger.warning(f"[/stats] account financials unavailable: {exc}")
+            fin = {"currency": "GBP", "formatted": ""}
         curr = fin.get("currency", "GBP")
 
         def _line(label: str, agg: Dict[str, Any]) -> str:
@@ -6671,45 +7043,40 @@ Add the command handler in `handle_saved_messages_command`, immediately before t
             + _line("All time", allt)
             + f"• Lifecycle closes: `{allt['lifecycle_closes']}`\n"
             + f"• Exit reasons: `{allt['exit_reasons']}`\n\n"
-            f"{fin['formatted']}"
+            f"{fin.get('formatted', '')}"
         )
         return
 ```
 
-Ensure `json`, `Path`, `List`, `Dict`, `Any`, `Optional`, `timedelta` are imported in `main.py` (add any that are missing).
+- [x] **Step 5: register `/stats` and add it to the help line**
 
-- [ ] **Step 5: Register `/stats` and add it to the help line**
+In `main.py`, in the `_KNOWN_SAVED_COMMANDS` set:
 
-In `main.py`, add `"/stats", "stats",` to the `_is_known_saved_command` list (lines 7045-7049), and add `/stats` to the help line at line 8433.
-
-- [ ] **Step 6: Run the tests to verify they pass**
-
-```powershell
-python -m pytest tests/test_trade_lifecycle.py -q
+```python
+    "/stats", "stats",
 ```
 
-Expected: PASS.
+and in the `/status` reply:
 
-- [ ] **Step 7: Run the full suite**
-
-```powershell
-python -m pytest -q
+```python
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/stats`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
 ```
 
-Expected: **0 failed**.
+- [x] **Step 6: the tests pass.**
 
-- [ ] **Step 8: Commit**
+- [x] **Step 7: the full suite passes.**
 
-```powershell
-git add main.py tests/test_trade_lifecycle.py
-git commit -m "feat(main): add /stats - closed-trade analytics from the ledger
+### Shipped notes (Task 9)
 
-Reports net P&L, win rate, total cash giveback, longest trade age and the exit
-reason mix for today, 7 days and all time. This is the instrument that makes
-the giveback measurable rather than anecdotal."
-```
-
----
+- The plan's test asserted the aggregate fields on the top level of the helper's return value,
+  but the plan's own helper returns `{"today": ..., "seven_day": ..., "all_time": ...}`. The
+  shipped test asserts the same values on the `all_time` aggregate.
+- The ledger is read line by line (JSONL), so no whole-file text blob is ever held in memory;
+  only the parsed records are kept. The live ledger is ~19 KB (19 closed trades), so the read is
+  bounded in practice.
+- The account-financials call is wrapped: if the broker connection is down the command still
+  answers with the ledger figures instead of raising.
+- A missing or corrupt ledger answers "No ledger data found at `<path>`" -- it never raises.
 
 ## Task 10: `scripts/ab_replay_proof.py` — Arm C
 
