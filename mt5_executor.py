@@ -5695,6 +5695,40 @@ class MT5Executor:
                     _add(lv.get("ticket"))
         return tickets
 
+    def _publish_lifecycle_initial_r(self, signal_data: Dict[str, Any]) -> Optional[float]:
+        """Publish the signal's mean initial risk per ounce (`initial_r_per_oz`).
+
+        Only the layers that HOLD a position contribute: a PENDING layer has
+        no entry yet, so its planned `target_price` is a planned price and not
+        a realised risk. A layer whose risk is zero (entry == initial stop) is
+        ignored, and the field is only written when the mean is greater than
+        zero -- a zero R would make the ledger's `r_at_exit` meaningless.
+        """
+        layers = signal_data.get("layers") or {}
+        if not isinstance(layers, dict):
+            return None
+        risks: List[float] = []
+        for lv in layers.values():
+            if not isinstance(lv, dict):
+                continue
+            if str(lv.get("status") or "").strip().upper() in ("PENDING", "CANCELLED", "CLOSED"):
+                continue
+            entry = _num(lv.get("entry_price") or lv.get("entry"), 0.0)
+            stop = _num(lv.get("initial_sl"), 0.0)
+            if entry <= 0.0 or stop <= 0.0:
+                continue
+            risk = abs(entry - stop)
+            if risk <= 0.0:
+                continue
+            risks.append(risk)
+        if not risks:
+            return None
+        mean_r = round(sum(risks) / len(risks), 4)
+        if mean_r <= 0.0:
+            return None
+        signal_data["initial_r_per_oz"] = mean_r
+        return mean_r
+
     def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """Cancel unfilled pending limits and move every open layer to breakeven.
 
@@ -5740,16 +5774,7 @@ class MT5Executor:
 
         # Publish the signal's initial risk (per ounce) so the ledger can record
         # `initial_r_per_oz` and `r_at_exit` at close time.
-        _risks: List[float] = []
-        for _lv in layers.values():
-            if not isinstance(_lv, dict):
-                continue
-            _e = _num(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
-            _s = _num(_lv.get("initial_sl"), 0.0)
-            if _e > 0.0 and _s > 0.0:
-                _risks.append(abs(_e - _s))
-        if _risks:
-            signal_data["initial_r_per_oz"] = round(sum(_risks) / len(_risks), 4)
+        self._publish_lifecycle_initial_r(signal_data)
 
         # The market decides whether the breakeven stop is even a valid stop: a
         # BUY stop above the market (or a SELL stop below it) is rejected by the
@@ -5757,15 +5782,20 @@ class MT5Executor:
         # live broker only -- a dry run has nothing that could reject it.
         tick = None
         live_price = 0.0
+        price_unavailable = False
         if not self.dry_run:
             try:
                 tick = self.get_tick(symbol)
             except Exception as exc:
                 logger.warning(f"[LIFECYCLE DERISK] tick for {symbol} failed: {exc}")
                 result["failed"].append(f"tick:{exc}")
-            if tick is not None:
+            if tick is None:
+                price_unavailable = True
+            else:
                 _raw_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
                 live_price = _num(_raw_px, 0.0)
+                if not (live_price > 0.0):
+                    price_unavailable = True
         stops_buffer = self._compute_stops_buffer(sym_info)
 
         for lk, lv in list(layers.items()):
@@ -5791,6 +5821,16 @@ class MT5Executor:
                 if already_tighter:
                     continue
             try:
+                # Fail closed: without a usable live price the breakeven stop
+                # cannot be validated against the market, so it is NOT sent.
+                # The layer keeps its existing (already valid) stop and the
+                # next tick tries again.
+                if price_unavailable:
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: no live price for {symbol}; "
+                        f"the BE stop {be_sl} is not sent and the existing stop is kept."
+                    )
+                    continue
                 # The breakeven stop has to sit on the correct side of the
                 # market and far enough away from it, otherwise the broker
                 # rejects the modify with retcode 10016 (invalid stops).
@@ -5837,6 +5877,10 @@ class MT5Executor:
             result["ok"] = False
             return result
 
+        # A signal that is flattened before any de-risk still has to carry
+        # its initial risk for the ledger.
+        self._publish_lifecycle_initial_r(signal_data)
+
         max_attempts = max(1, self._get_lifecycle_policy().max_close_retries)
         retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
 
@@ -5866,14 +5910,33 @@ class MT5Executor:
             # retry (and eventually give up) instead of claiming a flatten that
             # never happened.
             closed_set = set(result["closed"])
+            live_ids: Set[int] = set()
+            query_ok = True
             try:
+                live_positions = self.get_live_positions() or []
+                # `get_live_positions` records whether the broker query really
+                # succeeded. A FAILED query returns an empty list, which is
+                # indistinguishable from "the account has no positions" unless
+                # the flag is read.
+                query_ok = bool(self._last_live_pos_query_ok)
                 live_ids = {
                     _int_num(getattr(p, "ticket", 0), 0)
-                    for p in (self.get_live_positions() or [])
+                    for p in live_positions
                 }
             except Exception as exc:
                 logger.warning(f"[LIFECYCLE FLATTEN] live position check failed: {exc}")
                 live_ids = set()
+                query_ok = False
+            unverified = [t for t in expected_open if t not in closed_set]
+            if unverified and not self.dry_run and not query_ok:
+                # The broker could not be asked, so the close cannot be
+                # verified: an unverified close is a FAILED close. The retry
+                # counter must never be reset on it.
+                logger.warning(
+                    f"[LIFECYCLE FLATTEN] the live position query failed; the close of "
+                    f"{','.join(str(t) for t in unverified)} could not be verified."
+                )
+                result["failed"].append("close:unverified")
             still_open = [t for t in expected_open if t not in closed_set and t in live_ids]
             if still_open:
                 result["failed"].append(
