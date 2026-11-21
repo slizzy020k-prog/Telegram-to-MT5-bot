@@ -3198,10 +3198,13 @@ guard on it immediately."
 ## Task 4: `mt5_executor.py` — compute and apply the R floor
 
 **Files:**
-- Modify: `mt5_executor.py:104-110` (the `dynamic_risk` import block)
-- Modify: `mt5_executor.py:8137-8152` (`evaluate_dynamic_atr_engine` — the trail call)
-- Modify: `mt5_executor.py:1320-1356` (`_get_dynamic_risk_policy` — add a lifecycle policy resolver)
-- Modify: `mt5_executor.py:168-205` (`_CFG_IMPORT_SNAPSHOT` name list — add the new knobs)
+- Modify: `mt5_executor.py:16-103` (the `from config import (...)` block — add the ten lifecycle knobs)
+- Modify: `mt5_executor.py:104-113` (the `dynamic_risk` / `risk_lifecycle` import block)
+- Modify: `mt5_executor.py:121-206` (`_CFG_IMPORT_SNAPSHOT` name list — add the new knobs)
+- Modify: `mt5_executor.py:1337-1373` (`_get_dynamic_risk_policy` — add a lifecycle policy resolver after it)
+- Modify: `mt5_executor.py:2388-2394` (`_execute_4layer_specs` — the `initial_sl` fallback: a zero stop is not a stop)
+- Modify: `mt5_executor.py:8206-8222` (`evaluate_dynamic_atr_engine` — the trail call)
+- Modify: `mt5_executor.py:8282` (`evaluate_dynamic_atr_engine` — the ATR-trail bookkeeping whitelist)
 - Modify: `tests/test_trade_lifecycle.py` (append the integration tests)
 
 **Interfaces:**
@@ -3298,6 +3301,26 @@ def test_executor_r_lock_skipped_without_initial_sl(monkeypatch):
     sig["layers"]["L1"].pop("initial_sl")     # a signal opened before the upgrade
     res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
     assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_execute_4layer_specs_treats_a_zero_stop_as_no_stop(monkeypatch):
+    """The executor computes a fallback when sl == 0.0, so 0.0 is not a stop."""
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    monkeypatch.setattr(ex, "_execute_layer_price", lambda **kwargs: (9002, "MARKET"))
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=0.0,
+        tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
+    )
+    assert layers["L1"]["initial_sl"] is None
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3385,9 +3408,55 @@ In `mt5_executor.py`, add this method immediately after `_get_dynamic_risk_polic
         return read_lifecycle_policy(proxy)
 ```
 
-- [ ] **Step 6: Compute and pass the R floor**
+- [ ] **Step 6: Treat a zero stop as no stop in the executor**
 
-In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor computation immediately before the `# 2) Dynamic Trailing SL` comment at line 8137:
+`main.py:_resolve_edit_initial_sl` already returns `None` for a zero stop, because the executor
+treats `sl == 0.0` as "no stop given" and computes a fallback instead (`_compute_fallback_sl`,
+`mt5_executor.py:1429`). The executor's own `initial_sl` fallback does not: at
+`mt5_executor.py:2391-2392` it records `sl == 0.0` as a stop.
+
+A zero stop is not a stop. Record `None` for it, so the layer has no initial risk R and the
+R-lock is skipped for that layer (exactly like a missing `initial_sl`) rather than being given a
+bogus R.
+
+In `_execute_4layer_specs`, change:
+
+```python
+                placed_sl = self.get_last_placed_sl(t)
+                if placed_sl is not None:
+                    initial_sl = round(float(placed_sl), digits)
+                elif sl is not None:
+                    initial_sl = round(float(sl), digits)
+                else:
+                    initial_sl = None
+```
+
+to:
+
+```python
+                placed_sl = self.get_last_placed_sl(t)
+                if placed_sl is not None and float(placed_sl) > 0.0:
+                    initial_sl = round(float(placed_sl), digits)
+                elif sl is not None and float(sl) > 0.0:
+                    initial_sl = round(float(sl), digits)
+                else:
+                    # A zero stop is not a stop: the executor treats `sl == 0.0` as
+                    # "no stop given" and computes a fallback instead, so there is
+                    # no initial risk R to record.
+                    initial_sl = None
+```
+
+**Test:** a layer placed with `sl=0.0` records `initial_sl is None`, and the R-lock is skipped
+for that layer (the stop is not moved to a floor).
+
+- [ ] **Step 7: Compute and pass the R floor**
+
+In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor computation immediately before the `# 2) Dynamic Trailing SL` comment (around line 8206).
+
+Use the layer's persisted `lv["mfe_dollars"]` as the maximum favourable excursion, NOT a fresh
+`sign * (layer_peak - entry_px)`. That field is already computed a few lines above
+(`mt5_executor.py:8087`) as the running, non-negative maximum over every tick, and it survives a
+restart; recomputing it would drop the monotonic guarantee.
 
 ```python
             # 1b) R-relative profit floor.
@@ -3402,7 +3471,7 @@ In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor com
                     direction=direction,
                     entry_price=entry_px,
                     initial_sl=initial_sl,
-                    mfe_dollars=sign * (layer_peak - entry_px),
+                    mfe_dollars=_num(lv.get("mfe_dollars"), 0.0),
                     live_price=live_price,
                     policy=lifecycle_pol,
                     digits=digits,
@@ -3454,7 +3523,7 @@ When the R lock wins the picker, `stop_source == "R_LOCK"` and that block is ski
 
 The `dynamic_atr_trail_mult` / `_zone` values reported for an R-lock stop are the trail's own telemetry (the trail may not have been the winning candidate); that is acceptable — they describe the engine's live tier, not the stop's author.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 8: Run the tests to verify they pass**
 
 ```powershell
 python -m pytest tests/test_trade_lifecycle.py -q
@@ -3462,7 +3531,7 @@ python -m pytest tests/test_trade_lifecycle.py -q
 
 Expected: PASS.
 
-- [ ] **Step 8: Run the full suite**
+- [ ] **Step 9: Run the full suite**
 
 ```powershell
 python -m pytest -q
@@ -3470,7 +3539,7 @@ python -m pytest -q
 
 Expected: **0 failed**. Pay attention to `tests/test_dynamic_risk_management.py` and `tests/test_msg_10180_10196_regressions.py` — they assert on `stop_source` values; with `R_LOCK_ENABLED=false` by default the tie-break change must not alter them.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```powershell
 git add mt5_executor.py tests/test_trade_lifecycle.py
@@ -3479,7 +3548,10 @@ git commit -m "feat(mt5_executor): wire the R-relative profit floor into the tra
 Each layer computes its own R floor from entry and the captured initial_sl and
 passes it to compute_dynamic_atr_trail_stop as an extra candidate. The ATR trail
 still owns the tight stop and the never-loosens invariant holds. Layers without
-initial_sl (signals opened before the upgrade) are skipped and logged once."
+initial_sl (signals opened before the upgrade) are skipped and logged once.
+
+A zero stop is recorded as no stop, matching the executor's own treatment of
+sl == 0.0 as a request to compute a fallback."
 ```
 
 ---
