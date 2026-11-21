@@ -5801,9 +5801,15 @@ def _resolve_edit_initial_sl(ticket: Any, sl: Optional[float], digits: int) -> O
                 pass
     if sl is not None:
         try:
-            return round(float(sl), digits)
+            value = float(sl)
         except (TypeError, ValueError):
             return None
+        # The executor treats `sl == 0.0` as "no stop given" and computes a
+        # fallback stop instead, so 0.0 is not a stop and must not be recorded
+        # as the layer's initial risk.
+        if value == 0.0:
+            return None
+        return round(value, digits)
     return None
 
 
@@ -6288,6 +6294,10 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                         if isinstance(l_data, dict) and l_data.get("ticket") == pt:
                             l_data["status"] = "OPEN"
                             l_data["order_type"] = "MARKET"
+                            # The ticket is leaving `pending_tickets`, so the 1-second
+                            # reconciler will never see it again and can never stamp its
+                            # fill time -- stamp it here.
+                            stamp_fill_times(existing_signal, l_data)
                             if p_open_ed > 0.0:
                                 l_data["entry_price"] = round(p_open_ed, 2)
                                 l_data["entry"] = round(p_open_ed, 2)
@@ -6650,6 +6660,10 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                     l_data["order_type"] = "MARKET"
                     l_data["status"] = "OPEN"
                     _populate_fill_entry_from_exec(existing_signal, l_data, t, l_lot, tick, direction, desired_px)
+                    # The ticket is leaving `pending_tickets`, so the 1-second
+                    # reconciler will never see it again and can never stamp its
+                    # fill time -- stamp it here.
+                    stamp_fill_times(existing_signal, l_data)
                     if l_tp_target is not None:
                         l_data["tp"] = l_tp_target
                         l_data["tp_stage"] = "TP1"
@@ -6701,6 +6715,10 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                         l_data["order_type"] = "MARKET"
                         l_data["status"] = "OPEN"
                         _populate_fill_entry_from_exec(existing_signal, l_data, t, l_data.get("lot"), tick, direction, l_data.get("target_price"))
+                        # The ticket is leaving `pending_tickets`, so the 1-second
+                        # reconciler will never see it again and can never stamp its
+                        # fill time -- stamp it here.
+                        stamp_fill_times(existing_signal, l_data)
                 handled_tickets.add(t)
 
         for mt in market_tickets:

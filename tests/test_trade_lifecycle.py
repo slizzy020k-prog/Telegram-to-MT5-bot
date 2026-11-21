@@ -1172,3 +1172,309 @@ async def test_edit_path_records_the_placed_stop_and_the_fill_time_on_the_new_la
     for name in ("L2", "L3", "L4"):
         assert sig["layers"][name]["initial_sl"] == pytest.approx(3870.0)
         assert sig["layers"][name].get("filled_at") is None
+
+
+# --- signal-edit path: fill stamps on promoted / freshly placed layers -------
+
+
+class _EditFakeMsg:
+    """Minimal stand-in for a Telethon message used by the edit-path tests."""
+
+    def __init__(self, msg_id, text, date=None, edit_date=None):
+        self.id = msg_id
+        self.message = text
+        self.raw_text = text
+        self.reply_to_msg_id = None
+        self.reply_to = None
+        self.forward = None
+        self.fwd_from = None
+        self.out = False
+        self.date = date or datetime.now(timezone.utc)
+        self.edit_date = edit_date
+
+
+class _EditFakeEvent:
+    """Minimal stand-in for a Telethon event used by the edit-path tests."""
+
+    def __init__(self, msg_id, text, chat_id=-1004369388188, date=None, edit_date=None):
+        self.message = _EditFakeMsg(msg_id, text, date=date, edit_date=edit_date)
+        self.chat_id = chat_id
+        self.is_private = False
+        self.is_reply = False
+        self.replies = []
+
+    async def reply(self, txt):
+        self.replies.append(txt)
+
+
+class _LiveExecutorView:
+    """Report `dry_run=False` to main.py while the wrapped executor stays in dry-run mode.
+
+    The pre-edit reconciliation only queries the broker when the executor is
+    live. This view lets the test drive that branch without a real MT5
+    terminal, while every order operation still goes through the dry-run
+    executor.
+    """
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    @property
+    def dry_run(self):
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._inner, name, value)
+
+
+async def _drive_signal_edit(
+    monkeypatch,
+    tmp_path,
+    msg_id,
+    initial_text,
+    edit_text,
+    configure=None,
+    live_view=False,
+):
+    """Run `handle_new_message` then `handle_message_edited` with MT5 mocked.
+
+    Returns `(signal_before_edit, signal_after_edit)` as persisted by the
+    state manager, so the assertions read the stored record and not the
+    broker calls.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    import config
+    import main
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from state_manager import StateManager
+    from trade_ledger import TradeLedger
+
+    # Other test modules set this flag at import time and never restore it, so
+    # the number of layers a single-price signal creates is not deterministic
+    # across the whole suite. Pin it to the shipped default (one consolidated
+    # order) so the scenario below always has the same shape.
+    monkeypatch.setattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
+    monkeypatch.setattr(mt5_executor, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
+
+    executor = MT5Executor(dry_run=True)
+    monkeypatch.setattr(main, "executor", executor)
+    monkeypatch.setattr(main, "state_mgr", StateManager(str(tmp_path / "edit_state.json")))
+    monkeypatch.setattr(main, "trade_ledger", TradeLedger(str(tmp_path / "edit_ledger.jsonl")))
+    executor.connect()
+
+    chat_id = -1004369388188
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
+    tick = SimpleNamespace(bid=3856.00, ask=3856.20, time=1700000000)
+
+    ctxs = [
+        patch.object(main, "notify_saved_messages", new_callable=AsyncMock),
+        patch.object(executor, "get_tick", return_value=tick),
+    ]
+    extra = []
+    for ctx in ctxs:
+        ctx.start()
+    try:
+        await main.handle_new_message(_EditFakeEvent(msg_id, initial_text, chat_id=chat_id, date=t0))
+        before = main.state_mgr.get_signal(msg_id, chat_id=chat_id) or {}
+
+        if configure is not None:
+            extra = configure(executor, before) or []
+            for ctx in extra:
+                ctx.start()
+        if live_view:
+            monkeypatch.setattr(main, "executor", _LiveExecutorView(executor))
+
+        await main.handle_message_edited(
+            _EditFakeEvent(
+                msg_id,
+                edit_text,
+                chat_id=chat_id,
+                date=t0,
+                edit_date=datetime.now(timezone.utc),
+            )
+        )
+        after = main.state_mgr.get_signal(msg_id, chat_id=chat_id) or {}
+        return before, after
+    finally:
+        for ctx in reversed(extra + ctxs):
+            ctx.stop()
+
+
+def _configure_pending_order_already_filled(executor, before):
+    """The broker reports the pending layer as an open position."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    ticket = (before.get("pending_tickets") or [None])[0]
+    position = SimpleNamespace(ticket=ticket, price_open=3856.20, volume=0.01, sl=3870.0)
+    return [
+        patch.object(executor, "get_live_positions", return_value=[position]),
+        patch.object(executor, "get_live_orders", return_value=[]),
+    ]
+
+
+def _configure_lost_cancel_race(executor, before):
+    """Cancelling the pending order fails because it already filled."""
+    from unittest.mock import patch
+
+    return [
+        patch.object(executor, "cancel_pending_order", return_value=False),
+        patch.object(executor, "modify_position_sltp", return_value=True),
+    ]
+
+
+def _configure_pending_modify_reports_the_fill(executor, before):
+    """The pending-order modify reports the order is gone; the position modify wins."""
+    from unittest.mock import patch
+
+    return [
+        patch.object(executor, "modify_pending_order_sltp", return_value=False),
+        patch.object(executor, "modify_position_sltp", return_value=True),
+    ]
+
+
+def _configure_retier_placement_rejected(executor, before):
+    """The re-tier's replacement order is rejected, so the layer is placed fresh."""
+    from unittest.mock import patch
+
+    real_execute = executor._execute_layer_price
+    calls = {"n": 0}
+
+    def side_effect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (None, "FAILED")
+        return real_execute(*args, **kwargs)
+
+    return [patch.object(executor, "_execute_layer_price", side_effect=side_effect)]
+
+
+@pytest.mark.asyncio
+async def test_edit_path_stamps_the_fill_time_when_a_pending_order_is_found_already_filled(monkeypatch, tmp_path):
+    """A pending layer that already filled must carry its fill time.
+
+    The pre-edit reconciliation promotes the layer to MARKET/OPEN and drops
+    the ticket from `pending_tickets`, so the 1-second reconciler never sees
+    that ticket again and can never stamp its fill time.
+    """
+    before, after = await _drive_signal_edit(
+        monkeypatch,
+        tmp_path,
+        msg_id=98601,
+        initial_text="SELL XAUUSD 3860\nTP 3800\nSL 3870",
+        edit_text="SELL XAUUSD 3860\nTP 3800\nSL 3871",
+        configure=_configure_pending_order_already_filled,
+        live_view=True,
+    )
+
+    assert before.get("pending_tickets"), "the signal must start with a pending order"
+    promoted_ticket = before["pending_tickets"][0]
+    l1 = after["layers"]["L1"]
+    assert l1["ticket"] == promoted_ticket, "the promoted layer keeps its original ticket"
+    assert l1["order_type"] == "MARKET", "the filled pending order must be promoted to MARKET"
+    assert l1["status"] == "OPEN", "the filled pending order must be promoted to OPEN"
+    assert l1.get("filled_at"), "the promoted layer must record its fill time"
+    assert after.get("first_fill_at"), "the promoted layer must stamp the signal-level first fill"
+    assert promoted_ticket not in (after.get("pending_tickets") or []), "the promoted ticket leaves pending_tickets"
+
+
+@pytest.mark.asyncio
+async def test_edit_path_stamps_the_fill_time_when_the_retier_loses_the_cancel_race(monkeypatch, tmp_path):
+    """The re-tier cannot cancel the pending order because it already filled.
+
+    The layer is promoted in place, so its fill time has to be stamped on the
+    spot -- the ticket leaves `pending_tickets` and the reconciler will never
+    see it again.
+    """
+    before, after = await _drive_signal_edit(
+        monkeypatch,
+        tmp_path,
+        msg_id=98602,
+        initial_text="SELL XAUUSD 3860\nTP 3800\nSL 3870",
+        edit_text="SELL XAUUSD 3856-3860\nTP 3800\nSL 3870",
+        configure=_configure_lost_cancel_race,
+    )
+
+    original_ticket = before["layers"]["L1"]["ticket"]
+    l1 = after["layers"]["L1"]
+    assert l1["ticket"] == original_ticket, "the promoted layer keeps its original ticket"
+    assert l1["order_type"] == "MARKET", "the filled layer must be promoted to MARKET"
+    assert l1["status"] == "OPEN", "the filled layer must be promoted to OPEN"
+    assert l1.get("filled_at"), "the promoted layer must record its fill time"
+    assert after.get("first_fill_at"), "the promoted layer must stamp the signal-level first fill"
+    assert original_ticket not in (after.get("pending_tickets") or []), "the filled ticket leaves pending_tickets"
+
+
+@pytest.mark.asyncio
+async def test_edit_path_stamps_the_fill_time_when_a_pending_modify_reports_the_fill(monkeypatch, tmp_path):
+    """A pending layer whose SL/TP modify finds it already filled must be stamped.
+
+    `modify_pending_order_sltp` fails because the order is gone; the position
+    modify succeeds, so the layer is promoted to MARKET/OPEN and leaves
+    `pending_tickets` -- the reconciler will never stamp it.
+    """
+    before, after = await _drive_signal_edit(
+        monkeypatch,
+        tmp_path,
+        msg_id=98603,
+        initial_text="SELL XAUUSD 3856-3860\nTP 3800\nSL 3870",
+        edit_text="SELL XAUUSD 3856-3860\nTP 3800\nSL 3871",
+        configure=_configure_pending_modify_reports_the_fill,
+    )
+
+    assert before["layers"]["L2"]["status"] == "PENDING", "L2 must start out pending"
+    l2 = after["layers"]["L2"]
+    assert l2["order_type"] == "MARKET", "the filled layer must be promoted to MARKET"
+    assert l2["status"] == "OPEN", "the filled layer must be promoted to OPEN"
+    assert l2.get("filled_at"), "the promoted layer must record its fill time"
+    assert after.get("first_fill_at"), "the promoted layer must stamp the signal-level first fill"
+    assert l2["ticket"] not in (after.get("pending_tickets") or []), "the filled ticket leaves pending_tickets"
+
+
+@pytest.mark.asyncio
+async def test_edit_path_stamps_the_fill_time_on_a_fresh_market_layer(monkeypatch, tmp_path):
+    """A layer the edit places fresh at MARKET must record its fill time.
+
+    The re-tier's replacement order is rejected, so the layer is placed fresh
+    by the edit (the `new_l_rec_a` branch). A MARKET layer fills at placement
+    and never goes through the PENDING -> FILLED transition, so its fill time
+    has to be stamped where it is created.
+    """
+    before, after = await _drive_signal_edit(
+        monkeypatch,
+        tmp_path,
+        msg_id=98604,
+        initial_text="BUY XAUUSD 3850\nTP 3900\nSL 3840",
+        edit_text="BUY XAUUSD 3850-3861\nTP 3900\nSL 3840",
+        configure=_configure_retier_placement_rejected,
+    )
+
+    assert before["layers"]["L1"]["status"] == "PENDING", "L1 must start out pending"
+    l1 = after["layers"]["L1"]
+    assert l1["order_type"] == "MARKET", "the freshly placed layer must execute at market"
+    assert l1["status"] == "OPEN", "the freshly placed layer must be OPEN"
+    assert l1.get("filled_at"), "a MARKET layer placed fresh by the edit must record its fill time"
+    assert after.get("first_fill_at"), "the fresh MARKET layer must stamp the signal-level first fill"
+
+
+def test_resolve_edit_initial_sl_treats_zero_as_no_stop(monkeypatch):
+    """A stop of 0.0 means "no stop given", not a stop at zero.
+
+    The executor treats `sl == 0.0` as "no stop" and computes a fallback
+    stop instead, so recording 0.0 as the layer's initial stop would be a
+    bogus R.
+    """
+    import main
+    from mt5_executor import MT5Executor
+
+    monkeypatch.setattr(main, "executor", MT5Executor(dry_run=True))
+
+    assert main._resolve_edit_initial_sl(4242, 0.0, 2) is None, "0.0 is not a stop"
+    assert main._resolve_edit_initial_sl(4242, None, 2) is None, "no stop stays no stop"
+    assert main._resolve_edit_initial_sl(4242, 3870.0, 2) == pytest.approx(3870.0), "a real stop is kept"
