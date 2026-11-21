@@ -1301,7 +1301,8 @@ LIFECYCLE_ENABLED=false) so a fresh clone behaves identically to v3.7.0."
 
 **Interfaces:**
 - Consumes: nothing from Task 1 (this task is independent of `risk_lifecycle`).
-- Produces: `compute_dynamic_atr_trail_stop(..., *, r_lock_floor: Optional[float] = None) -> Dict[str, Any]` — the result dict gains `"r_lock_floor"`, which is the R floor **only when it won the picker** (`stop_source == "R_LOCK"`), otherwise `None`. Tie-break priority becomes `R_LOCK` > `MILESTONE_FLOOR` > `ATR_TRAIL` > `BE_LOCK`.
+- Produces: `compute_dynamic_atr_trail_stop(..., *, r_lock_floor: Optional[float] = None, initial_r: Optional[float] = None) -> Dict[str, Any]` — the result dict gains `"r_lock_floor"`, which is the R floor **only when it won the picker** (`stop_source == "R_LOCK"`), otherwise `None`. Tie-break priority becomes `R_LOCK` > `MILESTONE_FLOOR` > `ATR_TRAIL` > `BE_LOCK`.
+- Since v3.8.1 the signature also gains `initial_r` (the trade's initial risk per ounce, `|entry - initial SL|`). When it is a positive number the BE lock becomes **R-gated**: it waits for `max(0.5R, 0.75 x ATR, $2.50)` of MFE instead of the flat `max(0.75 x ATR, $3.50)`, and the R ladder REPLACES the flat BE candidate so `R_LOCK` wins the picker tie. `initial_r=None` (the default) keeps the behaviour byte-for-byte.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1585,6 +1586,274 @@ def test_the_reported_r_lock_floor_is_pre_clamp_and_the_candidate_is_post_clamp(
     assert res["r_lock_floor"] == pytest.approx(3904.0)
     # ...but the broker minimum-distance clamp moved the effective stop.
     assert res["candidate_sl"] == pytest.approx(3903.0)
+
+# --- v3.8.1: the R-gated BE lock ----------------------------------------
+
+
+def _gated_stop(**overrides):
+    """Call the trail engine with an explicit policy and overridable inputs."""
+    import dynamic_risk
+
+    params = {
+        "direction": "BUY",
+        "entry_price": 3900.0,
+        "live_price": 3905.0,
+        "prev_peak": None,
+        "current_sl": 3880.0,
+        "atr": 4.0,
+        "policy": _atr_policy(),
+        "digits": 2,
+    }
+    params.update(overrides)
+    return dynamic_risk.compute_dynamic_atr_trail_stop(**params)
+
+
+def test_be_lock_stays_flat_when_the_initial_risk_is_unknown():
+    """Without a valid initial R the BE lock must behave exactly as it always has."""
+    flat = _gated_stop(live_price=3905.0)          # MFE 5.00, ATR 4.00
+    assert flat["be_armed"] is True
+    assert flat["be_sl"] == pytest.approx(3900.50)   # entry + $0.50
+    assert flat["stop_source"] == "BE_LOCK"
+
+    for bad in (None, 0.0, -5.0):
+        res = _gated_stop(live_price=3905.0, initial_r=bad)
+        assert res["be_armed"] is flat["be_armed"]
+        assert res["be_sl"] == flat["be_sl"]
+        assert res["stop_source"] == flat["stop_source"]
+        assert res["candidate_sl"] == flat["candidate_sl"]
+
+
+def test_gated_be_lock_waits_for_half_the_initial_risk():
+    """A wide-stop trade (R = $22) must not be BE-locked at $3.50 of MFE."""
+    flat = _gated_stop(live_price=3905.0)                 # MFE 5.00
+    gated = _gated_stop(live_price=3905.0, initial_r=22.0)
+
+    assert flat["be_armed"] is True
+    assert flat["stop_source"] == "BE_LOCK"
+
+    # The gated threshold is max(0.5 * 22.00, 0.75 * 4.00, 2.50) = $11.00
+    assert gated["be_armed"] is False
+    assert gated["be_sl"] is None
+    assert gated["stop_source"] == "ATR_TRAIL"
+
+
+@pytest.mark.parametrize(
+    "initial_r,atr,mfe,armed",
+    [
+        (22.0, 4.0, 10.99, False),    # 0.5R = $11.00 dominates
+        (22.0, 4.0, 11.00, True),
+        (3.0, 20.0, 14.99, False),    # 0.75 * ATR = $15.00 dominates
+        (3.0, 20.0, 15.00, True),
+        (3.0, 2.0, 2.49, False),      # the $2.50 trail minimum dominates
+        (3.0, 2.0, 2.50, True),
+    ],
+)
+def test_gated_be_threshold_is_half_r_the_atr_multiple_or_the_trail_minimum(
+    initial_r, atr, mfe, armed
+):
+    """The gated threshold is max(0.5R, 0.75 * ATR, $2.50) - whichever is largest."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3900.0 + mfe,
+        atr=atr,
+        initial_r=initial_r,
+    )
+    assert res["be_armed"] is armed
+
+
+def test_gated_be_lock_carries_the_r_floor_and_the_r_lock_wins_the_tie():
+    """The R ladder replaces the flat BE lock; R_LOCK (priority 0) wins the tie."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3911.0,        # MFE 11.00 = 0.5R
+        atr=12.0,                 # the ATR trail is not armed yet
+        current_sl=3878.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,      # the 0.5R tier locks the stop at the entry
+    )
+    assert res["be_armed"] is True
+    assert res["be_sl"] == pytest.approx(3900.0)      # the flat entry + $0.50 is gone
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+    assert res["r_lock_floor"] == pytest.approx(3900.0)
+
+
+def test_gated_be_lock_at_a_higher_tier_is_tighter_than_the_flat_be_stop():
+    """At 1.0R the R floor (entry + 0.25R) is tighter than the flat BE stop."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3922.0,        # MFE 22.00 = 1.0R
+        atr=23.0,                 # the ATR trail is not armed yet
+        current_sl=3878.0,
+        initial_r=22.0,
+        r_lock_floor=3905.5,      # the 1.0R tier: entry + 0.25 * R
+    )
+    assert res["be_armed"] is True
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3905.5)
+    assert res["candidate_sl"] > 3900.50             # tighter than the flat BE stop
+
+
+def test_gated_be_lock_never_lowers_the_stop_that_is_already_in_place():
+    """The forward-only invariant survives the gate."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3911.0,
+        atr=12.0,
+        current_sl=3900.50,       # already at the flat breakeven stop
+        initial_r=22.0,
+        r_lock_floor=3900.0,
+    )
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+    assert res["should_update"] is False
+
+
+def test_gated_be_lock_is_mirrored_for_a_sell():
+    res = _gated_stop(
+        direction="SELL",
+        entry_price=3900.0,
+        live_price=3889.0,        # MFE 11.00 = 0.5R
+        atr=12.0,
+        current_sl=3922.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,      # the 0.5R tier locks the stop at the entry
+    )
+    assert res["be_armed"] is True
+    assert res["be_sl"] == pytest.approx(3900.0)
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+
+
+def test_gated_be_armed_flag_still_drives_the_pending_sweep():
+    """The BE arming flag still drives the pending sweep, gated or not."""
+    below = _gated_stop(live_price=3905.0, initial_r=22.0)
+    assert below["be_armed"] is False
+    assert below["should_sweep_pending"] is False
+
+    at = _gated_stop(
+        live_price=3911.0,
+        atr=12.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,
+    )
+    assert at["be_armed"] is True
+    assert at["should_sweep_pending"] is True
+
+
+def test_gated_be_lock_never_produces_a_stop_on_the_wrong_side_of_the_current_stop():
+    """No gated case may propose a stop looser than the one already in place."""
+    for direction in ("BUY", "SELL"):
+        for atr in (2.0, 4.0, 12.0, 23.0):
+            for mfe in (0.5, 2.5, 5.0, 11.0, 22.0):
+                for current_sl in (0.0, 3878.0, 3900.50, 3922.0):
+                    entry = 3900.0
+                    live = entry + mfe if direction == "BUY" else entry - mfe
+                    res = _gated_stop(
+                        direction=direction,
+                        entry_price=entry,
+                        live_price=live,
+                        atr=atr,
+                        current_sl=current_sl,
+                        initial_r=22.0,
+                        r_lock_floor=entry,
+                    )
+                    cand = res["candidate_sl"]
+                    if cand is None or current_sl <= 0.0:
+                        continue
+                    if direction == "BUY":
+                        assert cand >= current_sl or res["should_update"] is False
+                    else:
+                        assert cand <= current_sl or res["should_update"] is False
+
+
+# --- executor: the R-gated BE lock ---------------------------------------
+
+def _gated_executor(monkeypatch, atr, r_lock_enabled):
+    """Build a dry-run executor with the R lock on or off."""
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", r_lock_enabled)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", r_lock_enabled)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = atr
+    return ex
+
+
+def test_executor_passes_the_initial_r_only_when_the_r_lock_is_enabled(monkeypatch):
+    """With the R lock off the engine must not receive an initial R at all."""
+    import mt5_executor
+    from types import SimpleNamespace
+
+    captured = []
+    original = mt5_executor.compute_dynamic_atr_trail_stop
+
+    def spy(**kwargs):
+        captured.append(kwargs.get("initial_r"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(mt5_executor, "compute_dynamic_atr_trail_stop", spy)
+
+    ex = _gated_executor(monkeypatch, atr=20.0, r_lock_enabled=True)
+    sig = _atr_signal(3895.0, 3880.0)          # R = 15.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert captured[-1] == pytest.approx(15.0)
+
+    ex_off = _gated_executor(monkeypatch, atr=20.0, r_lock_enabled=False)
+    sig_off = _atr_signal(3895.0, 3880.0)
+    ex_off.evaluate_dynamic_atr_engine(sig_off, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert captured[-1] is None
+
+
+def test_executor_does_not_be_lock_a_wide_stop_before_half_r(monkeypatch):
+    """A wide stop (R = $22) must not be BE-locked before MFE $11."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=4.0, r_lock_enabled=True)
+    sig = _atr_signal(3900.0, 3878.0)          # R = 22.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3905.0, ask=3905.2, time=1700000000.0))
+
+    # The flat BE lock would have moved the stop to $3900.50 at MFE $5.00.
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3899.40)
+    assert sig.get("active_stop_source") == "ATR_TRAIL"
+    assert not sig["layers"]["L1"].get("be_locked")
+
+
+def test_executor_keeps_the_flat_be_lock_when_the_r_lock_is_off(monkeypatch):
+    """The control case: with the R lock off the flat BE lock still arms."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=4.0, r_lock_enabled=False)
+    sig = _atr_signal(3900.0, 3878.0)          # R = 22.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3905.0, ask=3905.2, time=1700000000.0))
+
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.50)
+    assert sig.get("active_stop_source") == "BE_LOCK"
+
+
+def test_executor_r_lock_wins_the_picker_from_half_r_upward(monkeypatch):
+    """With a wide ATR the R ladder owns the stop from the 0.5R tier upward."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=23.0, r_lock_enabled=True)
+
+    half_r = _atr_signal(3900.0, 3878.0)       # R = 22.0, MFE 11.00 = 0.5R
+    ex.evaluate_dynamic_atr_engine(half_r, tick=SimpleNamespace(bid=3911.0, ask=3911.2, time=1700000000.0))
+    assert half_r.get("active_stop_source") == "R_LOCK"
+    assert half_r["layers"]["L1"]["broker_sl"] == pytest.approx(3900.0)     # entry
+
+    one_r = _atr_signal(3900.0, 3878.0)        # R = 22.0, MFE 22.00 = 1.0R
+    ex.evaluate_dynamic_atr_engine(one_r, tick=SimpleNamespace(bid=3922.0, ask=3922.2, time=1700000000.0))
+    assert one_r.get("active_stop_source") == "R_LOCK"
+    assert one_r["layers"]["L1"]["broker_sl"] == pytest.approx(3905.5)      # entry + 0.25R
+    # the BE lock now carries the R floor price, not the flat entry + $0.50
+    assert one_r["layers"]["L1"]["be_sl"] == pytest.approx(3905.5)
+
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1593,7 +1862,7 @@ def test_the_reported_r_lock_floor_is_pre_clamp_and_the_candidate_is_post_clamp(
 python -m pytest tests/test_trade_lifecycle.py -q
 ```
 
-Expected: FAIL — `TypeError: compute_dynamic_atr_trail_stop() got an unexpected keyword argument 'r_lock_floor'`.
+Expected: FAIL — `TypeError: compute_dynamic_atr_trail_stop() got an unexpected keyword argument 'r_lock_floor'` (and `'initial_r'` for the v3.8.1 gate tests).
 
 - [ ] **Step 3: Implement the candidate**
 
@@ -1615,6 +1884,7 @@ def compute_dynamic_atr_trail_stop(
     apply_milestone_floor: bool = True,
     *,
     r_lock_floor: Optional[float] = None,
+    initial_r: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
 
@@ -1635,10 +1905,19 @@ def compute_dynamic_atr_trail_stop(
     the price after the broker minimum-distance clamp was applied. The two can
     differ; a consumer must take the price from `"candidate_sl"` and use
     `"r_lock_floor"` only as the provenance signal.
+
+    `initial_r` is the trade's initial risk per ounce (`|entry - initial SL|`).
+    When it is a positive number the BE lock becomes **R-gated**: it then waits
+    for `max(0.5 * R, 0.75 * ATR, $2.50)` of favourable excursion instead of the
+    flat `max(0.75 * ATR, $3.50)`, so a wide-stop trade is not locked at
+    breakeven long before the R ladder could matter. While the gate is active
+    the R ladder REPLACES the flat BE lock: the BE candidate then carries the
+    same price as the R floor, and `R_LOCK` (picker priority 0) wins the tie.
+    When `initial_r` is `None` or non-positive the behaviour is unchanged.
     """
 ```
 
-Then replace the candidate block at lines 529-535 with:
+Then replace the BE block (the old lines 535-538) with the R-gated version, and move the R-floor validation above it — the gate needs the *validated* floor, so that the BE candidate and the R_LOCK candidate carry exactly the same price and the tie-break decides:
 
 ```python
     # Validate the R floor ONCE, defensively, and reuse the validated value in
@@ -1647,6 +1926,36 @@ Then replace the candidate block at lines 529-535 with:
     r_lock_val = _safe_float(r_lock_floor, 0.0)
     r_lock_candidate: Optional[float] = round(r_lock_val, digits) if r_lock_val > 0.0 else None
 
+    # The BE lock is R-gated when the trade's own initial risk is known. The
+    # gate only ever DELAYS the flat breakeven lock until the trade has earned
+    # half of its own risk, so it can never loosen a stop.
+    r_val = _safe_float(initial_r, 0.0)
+    r_gated = r_val > 0.0
+    if r_gated:
+        # The BE lock waits for half the trade's own risk, and never arms closer
+        # than the trail's minimum distance ($2.50).
+        be_threshold = max(
+            0.5 * r_val,
+            max(0.0, policy.be_activation_atr_mult) * atr_f,
+            max(0.0, policy.trail_min_dollars),
+        )
+    else:
+        be_threshold = max(max(0.0, policy.be_activation_atr_mult) * atr_f, max(0.0, policy.be_min_mfe_dollars))
+    be_armed = mfe + 1e-9 >= be_threshold
+    if not be_armed:
+        be_sl = None
+    elif r_gated and r_lock_candidate is not None:
+        # The R ladder REPLACES the flat BE lock while R is valid: both candidates
+        # then carry the same price, and R_LOCK (picker priority 0) wins the tie.
+        be_sl = r_lock_candidate
+    else:
+        be_sl = round(entry_price + sign * max(0.0, policy.be_lock_offset_dollars), digits)
+    should_sweep_pending = be_armed
+```
+
+The candidate list itself stays exactly as it is:
+
+```python
     candidates: List[Tuple[int, str, float]] = []
     if r_lock_candidate is not None:
         candidates.append((0, "R_LOCK", r_lock_candidate))
@@ -3208,7 +3517,7 @@ guard on it immediately."
 - Modify: `tests/test_trade_lifecycle.py` (append the integration tests, lines 1482-1679)
 
 **Interfaces:**
-- Consumes: `risk_lifecycle.read_lifecycle_policy`, `risk_lifecycle.compute_r_lock_floor`, `LifecyclePolicy` (Task 1); `compute_dynamic_atr_trail_stop(..., r_lock_floor=...)` (Task 2); `layers[...]["initial_sl"]` (Task 3).
+- Consumes: `risk_lifecycle.read_lifecycle_policy`, `risk_lifecycle.compute_r_lock_floor`, `risk_lifecycle.compute_initial_r`, `LifecyclePolicy` (Task 1); `compute_dynamic_atr_trail_stop(..., r_lock_floor=..., initial_r=...)` (Task 2); `layers[...]["initial_sl"]` (Task 3).
 - Produces: `MT5Executor._get_lifecycle_policy() -> LifecyclePolicy`; the trail engine now receives a per-layer `r_lock_floor`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -3437,7 +3746,13 @@ At the `from dynamic_risk import (...)` block (lines 114-120), the existing
 
 ```python
 from risk_lifecycle import (
+    ACTION_DERISK,
+    ACTION_EXPIRE_PENDING,
+    ACTION_FLATTEN,
+    ACTION_NONE,
+    ACTION_SESSION_FLATTEN,
     LifecyclePolicy,
+    compute_initial_r,
     compute_r_lock_floor,
     read_lifecycle_policy,
     stamp_fill_times,
@@ -3571,9 +3886,14 @@ restart; recomputing it would drop the monotonic guarantee.
             # stop, and it scales with the trade's own initial risk R so a wide
             # stop is not protected after the same absolute move as a scalp.
             r_lock_floor = None
+            initial_r = None
             lifecycle_pol = self._get_lifecycle_policy()
             initial_sl = _num(lv.get("initial_sl"), 0.0)
             if lifecycle_pol.r_lock_enabled and initial_sl > 0.0:
+                # The trade's own initial risk per ounce. It gates the BE lock,
+                # so a wide stop is not BE-locked long before the R ladder could
+                # matter. None keeps the flat (pre-R) behaviour byte-for-byte.
+                initial_r = compute_initial_r(entry_px, initial_sl)
                 r_lock_floor = compute_r_lock_floor(
                     direction=direction,
                     entry_price=entry_px,
@@ -3590,6 +3910,14 @@ restart; recomputing it would drop the monotonic guarantee.
                     "or the signal predates the upgrade); ATR trail only."
                 )
 ```
+
+Since v3.8.1 the same block also derives the layer's `initial_r` (`|entry - initial SL|`) and
+hands it to the trail engine, which uses it to gate the BE lock (`max(0.5R, 0.75 x ATR,
+$2.50)` instead of the flat `max(0.75 x ATR, $3.50)`) and to let the R ladder replace the
+flat BE candidate. It is only derived while `R_LOCK_ENABLED` is true, so the shipped
+default passes `initial_r=None` and the engine behaves byte-for-byte as before — verified
+by a before/after differential over 2,304 pure-engine cases (0 differences) and 144
+executor cases (0 differences).
 
 Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call (the shipped call occupies lines 8284-8298):
 
@@ -3608,6 +3936,7 @@ Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call (the 
                 tp_levels=tp_levels,
                 apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
                 r_lock_floor=r_lock_floor,
+                initial_r=initial_r,
             )
 ```
 
