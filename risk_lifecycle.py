@@ -58,11 +58,11 @@ _ON_TOKENS = frozenset({"on", "true", "1", "enable", "enabled"})
 _OFF_TOKENS = frozenset({"off", "false", "0", "disable", "disabled", "none"})
 
 _LIFECYCLE_USAGE = (
-    "🚫 **Invalid value.** Usage: `/lifecycle on|off`\n"
+    "⚠️ **Invalid value.** Usage: `/lifecycle on|off`\n"
     "Examples: `/lifecycle on` or `/lifecycle off`."
 )
 _RLOCK_USAGE = (
-    "🚫 **Invalid value.** Usage: `/rlock on|off`\n"
+    "⚠️ **Invalid value.** Usage: `/rlock on|off`\n"
     "Examples: `/rlock on` or `/rlock off`."
 )
 
@@ -204,25 +204,45 @@ def compute_r_lock_floor(
     entry_price: float,
     initial_sl: float,
     mfe_dollars: float,
+    live_price: float,
     policy: LifecyclePolicy,
     digits: int = 2,
 ) -> Optional[float]:
     """Return the R-relative stop floor for the current favourable excursion.
 
-    The active tier is the highest tier whose ``r_threshold * R`` has been
-    reached. The floor is ``entry + sign * (lock_fraction * R)`` -- never below
-    entry for a BUY and never above entry for a SELL.
+    The active fraction is the **greatest lock fraction among the tiers whose
+    ``r_threshold * R`` has been reached**. Taking the greatest reached fraction
+    (rather than "the highest threshold reached") keeps the floor order-
+    independent and monotone: the lock can never loosen as the excursion grows,
+    even if a caller builds ``LifecyclePolicy`` directly with unsorted tiers.
+    For the default ladder the two rules agree exactly:
+    ``0.5R -> entry``, ``1.0R -> +0.25R``, ``1.5R -> +0.50R``, ``2.0R -> +0.75R``.
 
-    Returns ``None`` when the R lock is disabled, when the initial risk is
-    unknown, or when no tier has been reached yet.
+    The floor is ``entry + sign * (lock_fraction * R)`` -- never below entry for
+    a BUY and never above entry for a SELL.
+
+    Returns ``None`` when:
+    - the R lock is disabled, the direction is not ``BUY``/``SELL``, or the
+      initial risk is unknown / below ``r_lock_min_r_dollars``;
+    - no tier has been reached yet;
+    - the floor is not valid against the current market (for a BUY the floor
+      must stay strictly below ``live_price``, for a SELL strictly above it).
+      The floor is derived from the peak excursion, so a retracement can carry
+      price back past it; submitting a stop on the wrong side of the market
+      would be rejected by the broker with retcode 10016. The consumer's own
+      stops-buffer clamp is a second line of defence, not the only one.
 
     Note: the existing ``BE_LOCK`` candidate in `dynamic_risk.py` may sit
-    slightly tighter than this floor (it adds the $0.50 breakeven offset). The
-    candidate picker keeps the tightest stop, so the R floor can only ever make
-    protection *better*, never worse.
+    slightly tighter than this floor (it adds the $0.50 breakeven offset), and
+    the candidate picker keeps the tightest stop.
     """
     if not policy.r_lock_enabled:
         return None
+
+    dir_token = str(direction or "").strip().upper()
+    if dir_token not in ("BUY", "SELL"):
+        return None
+    sign = 1.0 if dir_token == "BUY" else -1.0
 
     entry = _safe_float(entry_price, 0.0)
     if entry <= 0.0:
@@ -236,19 +256,25 @@ def compute_r_lock_floor(
     if mfe <= 0.0:
         return None
 
-    lock_fraction = 0.0
-    reached = False
-    for r_threshold, fraction in policy.r_lock_tiers:
-        if mfe + 1e-9 >= r_threshold * r:
-            lock_fraction = fraction
-            reached = True
-        else:
-            break
+    reached = [
+        fraction
+        for r_threshold, fraction in policy.r_lock_tiers
+        if mfe + 1e-9 >= r_threshold * r
+    ]
     if not reached:
         return None
+    lock_fraction = max(reached)
 
-    sign = 1.0 if str(direction or "BUY").strip().upper() == "BUY" else -1.0
-    return round(entry + sign * (lock_fraction * r), digits)
+    floor_px = round(entry + sign * (lock_fraction * r), digits)
+
+    live = _safe_float(live_price, 0.0)
+    if live > 0.0:
+        if sign > 0 and floor_px >= live:
+            return None
+        if sign < 0 and floor_px <= live:
+            return None
+
+    return floor_px
 
 
 def _parse_iso_utc(value: Any) -> Optional[datetime]:
@@ -328,7 +354,7 @@ def evaluate_trade_age(
         result["reason"] = "no open or pending orders"
         return result
 
-    if policy.session_flatten_enabled and server_minutes >= session_minutes:
+    if policy.session_flatten_enabled and has_market and server_minutes >= session_minutes:
         result["action"] = ACTION_SESSION_FLATTEN
         result["reason"] = f"session cut reached ({server_time} >= {policy.session_flatten_at} broker time)"
         return result
@@ -348,12 +374,20 @@ def evaluate_trade_age(
         result["reason"] = f"signal age {signal_age}s >= {policy.pending_expire_seconds}s and never filled"
         return result
 
+    if signal_dt is None and fill_dt is None:
+        result["reason"] = "unknown age (signal carries no timestamp)"
+        return result
+
     result["reason"] = "within thresholds"
     return result
 
 
 def _format_tiers(policy: LifecyclePolicy) -> str:
-    return ", ".join(f"{r_threshold:g}R -> {fraction:.0%}" for r_threshold, fraction in policy.r_lock_tiers)
+    parts = []
+    for r_threshold, fraction in policy.r_lock_tiers:
+        label = "BE" if fraction <= 0.0 else f"{fraction:.0%}"
+        parts.append(f"{r_threshold:g}R -> {label}")
+    return ", ".join(parts)
 
 
 def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
@@ -363,22 +397,25 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
     if not cleaned:
         badge = "🟢 ON" if policy.r_lock_enabled else "⚪ OFF"
         return False, (
-            f"🎯 **R-Relative Profit Floor (`/rlock`) — R_LOCK: {badge}**\n"
+            f"📐 **R-Relative Profit Floor (`/rlock`): {badge}**\n"
             f"• Tiers: `{_format_tiers(policy)}`\n"
             f"• Minimum R: `${policy.r_lock_min_r_dollars:.2f}` per ounce\n"
-            "• Change: `/rlock on` | `/rlock off`"
+            "• Toggles `R_LOCK_ENABLED`\n"
+            "• Change: `/rlock on` | `/rlock off`\n"
+            "• The floor is a peak-derived level: it disappears if price retraces past it,"
+            " so it can never place a stop on the wrong side of the market."
         )
     token = cleaned[0].lower()
     if token in _ON_TOKENS:
         setattr(cfg_mod, "R_LOCK_ENABLED", True)
         return True, (
-            f"🎯 **R-Relative Profit Floor Enabled — R_LOCK: ON**\n"
+            f"📐 **R-Relative Profit Floor Enabled → `ON`**\n"
             f"• Tiers: `{_format_tiers(policy)}`\n"
-            "• The floor is only ever tighter than the existing ATR trail stop."
+            "• The floor only ever raises the stop, and it disappears if price retraces past it."
         )
     if token in _OFF_TOKENS:
         setattr(cfg_mod, "R_LOCK_ENABLED", False)
-        return True, "⚪ **R-Relative Profit Floor Disabled — R_LOCK: OFF** (ATR trail only)."
+        return True, "⚪ **R-Relative Profit Floor Disabled → `OFF`** (ATR trail only)."
     return False, _RLOCK_USAGE
 
 
@@ -400,17 +437,18 @@ def apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, st
             f"• Pending expiry: `{policy.pending_expire_seconds}s`\n"
             f"• Session cut: {session}\n"
             f"• Max close retries: `{policy.max_close_retries}`\n"
+            "• Toggles `LIFECYCLE_ENABLED`\n"
             "• Change: `/lifecycle on` | `/lifecycle off`"
         )
     token = cleaned[0].lower()
     if token in _ON_TOKENS:
         setattr(cfg_mod, "LIFECYCLE_ENABLED", True)
         return True, (
-            "⏱ **Trade Lifecycle Guard Enabled — ON**\n"
+            "⏱ **Trade Lifecycle Guard Enabled → `ON`**\n"
             f"• De-risk at `{policy.derisk_after_seconds}s`, flatten at `{policy.flatten_after_seconds}s`, "
             f"pending expiry `{policy.pending_expire_seconds}s`."
         )
     if token in _OFF_TOKENS:
         setattr(cfg_mod, "LIFECYCLE_ENABLED", False)
-        return True, "⚪ **Trade Lifecycle Guard Disabled — OFF** (no age-based de-risk or flatten)."
+        return True, "⚪ **Trade Lifecycle Guard Disabled → `OFF`** (no age-based de-risk or flatten)."
     return False, _LIFECYCLE_USAGE
