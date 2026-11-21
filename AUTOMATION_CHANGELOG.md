@@ -4,6 +4,125 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ---
 
+## [2026-11-21] — v3.8.0 Trade Lifecycle Guard (R-Relative Profit Floor + Trade-Age Guard)
+
+- **Baseline Commit:** `a64156f` (design spec) — branch base `a64156f..c184b47`
+- **Target Version:** `v3.8.0` (Trade Lifecycle Guard)
+- **Spec:** `docs/superpowers/specs/2026-11-20-trade-lifecycle-guard-design.md`
+- **Plan:** `docs/superpowers/plans/2026-11-20-trade-lifecycle-guard.md`
+- **Verification Status:** `396/396` pytest PASS (`0` failures); `check_algo.py` → `ALL CHECKS PASSED`;
+  `startup_checks.validate_environment()` → `{'ok': True, 'errors': [], 'warnings': []}`;
+  `import parser, mt5_executor, main, risk_lifecycle, config` → `IMPORT OK`;
+  `R_LOCK_ENABLED=False`, `LIFECYCLE_ENABLED=False` (both ship **disabled**).
+- **Replay Proof (Arm C):** gate `g5` **FAILED** — Arm C net P&L was `£16.99` BELOW Arm B.
+  The feature is therefore **not** enabled. See §5.
+- **Motivation:** the live ledger (19 closed signals, `dry_run=false`) showed `£154.93` of
+  favourable excursion turning into `-£33.15` realized — `£188.08` given back, 121% of
+  everything the market gave. Two trades held 21.0 h and 20.3 h (`-£105.43`, 61% of the
+  total loss).
+
+### 1. R-Relative Profit Floor (`risk_lifecycle.py`, `dynamic_risk.py`, `mt5_executor.py`)
+
+- The ATR engine armed its breakeven lock at `max(0.75 x ATR, $3.50)` regardless of stop
+  distance, so a `$22/oz` stop and a `$2.00` scalp both became risk-free after the same
+  `$3.50`. The new floor scales to each trade's own risk `R = |entry - initial SL|`
+  (tiers `0.5R -> entry`, `1.0R -> +0.25R`, `1.5R -> +0.50R`, `2.0R -> +0.75R`).
+- `compute_dynamic_atr_trail_stop` gained an additive keyword-only `r_lock_floor`; the floor
+  joins the existing candidate list, so the ATR trail still owns the tight stop and the
+  forward-only (never-loosens) invariant is preserved.
+- `initial_sl` is captured per layer at placement as the stop the **broker actually received**
+  (the `sl` argument is only a request — when it is `None` the executor computes an ATR /
+  `FALLBACK_SL_PIPS` fallback and sends THAT), because the trail overwrites `sl`/`broker_sl`
+  and the original risk would otherwise be lost.
+- The floor is computed from the layer's persisted `mfe_dollars` — the running, non-negative
+  maximum excursion — never from a recomputed current-tick excursion.
+
+### 2. Trade-Age Guard (`risk_lifecycle.py`, `mt5_executor.py`, `main.py`)
+
+- No trade-age, pending-expiry or session guard existed in the live code.
+- Two-step de-risk: at `2 h` the unfilled pending limits are cancelled and every open layer
+  moves to breakeven (never loosening an existing stop); at `6 h` everything is closed at
+  market. Unfilled signals are cancelled at `12 h`.
+- The session/rollover cut ships **disabled** (`LIFECYCLE_SESSION_FLATTEN_ENABLED=false`).
+- The guard runs on BOTH the pre-TP1 path and the `RUNNER_ACTIVE` path, so a post-TP1 trade is
+  never left un-managed — that population held the two longest trades in the ledger.
+- The guard stamps an action on the signal only when it actually **completed**. A skipped
+  action (no usable live price, or a stop the market would refuse) and a failed action leave
+  the stamp unset and are retried, on a bounded 30 s cadence so the retry is not a broker
+  sweep per second per aged trade.
+- Fail-closed throughout: a de-risk without a usable live price does not send the stop, and a
+  flatten whose close cannot be verified against the broker is counted as a FAILED close, so
+  the retry counter increments and the give-up alert can actually fire.
+
+### 3. Instrumentation (`trade_ledger.py`)
+
+- Ledger schema `3 -> 4`: `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`,
+  `exit_age_seconds`, `lifecycle_action`. `peak_profit_per_oz` is per-ounce and was never
+  converted to cash, so giveback was not measurable.
+- The exit age is measured from the **earliest known fill** via
+  `risk_lifecycle.resolve_fill_time(signal_data)`, never from the raw
+  `signal_data["first_fill_at"]` key (which records the first LIMIT fill and can be later
+  than the MARKET fill that actually opened the trade).
+- Schema 4 is an UPGRADE: every schema-3 field is retained and old records still read.
+- New `/stats` command: today / 7-day / all-time P&L, win rate, total cash giveback,
+  longest trade age, exit-reason mix. It degrades to "no ledger data" on a missing or
+  corrupt ledger instead of raising.
+
+### 4. Live Control
+
+- `/rlock on|off` and `/lifecycle on|off` toggle both features at runtime with no restart
+  and double as the kill switches. A bare `/rlock` or `/lifecycle` reports the current policy
+  and changes nothing.
+
+### 5. Replay Proof — Arm C (the gate FAILED)
+
+| Arm | Net P&L | Trades | Tail loss (`13078+9953`) | Errors |
+|---|---:|---:|---:|---:|
+| A (`4544f7f`) | `£+11.89` | 12 | `£-61.99` | 0 |
+| B (calibrated) | `£+0.14` | 12 | `£-61.99` | 0 |
+| **C (R lock + age guard)** | **`£-16.85`** | 12 | `£-61.99` | 0 |
+
+- Gate `g5` (Arm C >= Arm B on net P&L, <= on tail loss) **FAILED**. Gates `g1`-`g3` were
+  already failing before this branch (pre-existing).
+- The whole gap is the `2 h` de-risk scratching the only two trades the harness holds open past
+  two hours. On the **recorded live tape every trade closed within 47.1 minutes**, so a 2 h
+  de-risk could never have fired live, and both affected trades were in fact closed at
+  breakeven live (`BROKER_SL BE`) — which Arm C reproduces and Arm B does not.
+- Two genuine harness bugs were found and fixed: the replayed layers never carried `initial_sl`
+  (so the R lock was silently skipped and Arm C would not have exercised the feature at all),
+  and the age guard read the wall clock (so on a replay of a Nov 17-19 tape every trade looked
+  4 days old and would have been flattened on its first tick). Arms A and B are unchanged by
+  both fixes.
+- The harness replays a generic FSM rather than the recorded message flow, so it cannot
+  reproduce the recorded close times. Fixing that would change the frozen Arm A/B baseline.
+
+### 6. Known Limitations (read before enabling)
+
+- **The default `R_LOCK_TIERS` is effectively INERT.** The R-lock candidate sits at picker
+  priority 0 and is dominated by the existing `BE_LOCK` / `ATR_TRAIL` candidates, so on the
+  recorded tape the R floor never wins the stop picker. As configured the R floor would not
+  change any stop. The tiers must be re-derived against real tape before the feature is
+  enabled.
+- **The `2 h` de-risk threshold is not yet justified by evidence.** On the recorded tape it
+  fires on trades that closed well inside two hours. Measured sensitivity (not shipped):
+  `DERISK=10800` makes `g5` pass; `DERISK=21600` means the guard never fires.
+- Both features therefore ship **disabled** and must stay disabled until the tiers and the
+  de-risk threshold are re-derived and `g5` passes.
+
+### 7. Deploy Readiness
+
+- **Both features ship DISABLED** (`R_LOCK_ENABLED=false`, `LIFECYCLE_ENABLED=false`).
+  A fresh clone behaves identically to v3.7.0.
+- **No VPS deployment was performed.** No SSH, no file copy, no service restart.
+- **VPS `.env` drift is UNRESOLVED and must be corrected by hand at deploy time.** `.env` is
+  gitignored, so the push cannot fix it. The knobs to add are: `R_LOCK_ENABLED`,
+  `R_LOCK_TIERS`, `R_LOCK_MIN_R_DOLLARS`, `LIFECYCLE_ENABLED`, `LIFECYCLE_DERISK_SECONDS`,
+  `LIFECYCLE_FLATTEN_SECONDS`, `LIFECYCLE_PENDING_EXPIRE_SECONDS`,
+  `LIFECYCLE_SESSION_FLATTEN_ENABLED`, `LIFECYCLE_SESSION_FLATTEN_AT`,
+  `LIFECYCLE_MAX_CLOSE_RETRIES`.
+- The server still pins `DYNAMIC_ATR_TRAIL_MULT=1.50` while the repo says `1.40` — fix that
+  at the same time.
+
 ## [2026-11-20] — v3.7.0 Msg 10180/10196 Audit Fixes, Progressive ATR Trail & Regression Suite
 
 - **Baseline Commit:** `c57b728` (`v3.6.0` line — MT5 saved-credential account switching via `MT5_LOGIN`)
