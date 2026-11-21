@@ -2590,10 +2590,18 @@ class _StubExecutor:
 
 
 def _enable_lifecycle(monkeypatch, **overrides):
-    """Switch the trade-age guard ON for the duration of the test."""
+    """Switch the trade-age guard ON for the duration of the test.
+
+    The trade-age timers are pinned to the pre-v3.8.1 baseline (2 h de-risk /
+    6 h flatten) so these mechanics tests keep asserting the exact behaviour
+    they were written for and do not silently follow the shipped defaults,
+    which v3.8.1 widened to 4 h de-risk / 8 h flatten.
+    """
     import config
 
     monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+    monkeypatch.setattr(config, "LIFECYCLE_DERISK_SECONDS", 7200)
+    monkeypatch.setattr(config, "LIFECYCLE_FLATTEN_SECONDS", 21600)
     for name, value in overrides.items():
         monkeypatch.setattr(config, name, value)
 
@@ -3790,6 +3798,10 @@ async def test_lifecycle_command_lists_the_active_signals_and_their_ages(monkeyp
     import main
 
     monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+    # The trade-age timers are pinned to the pre-v3.8.1 baseline so this test
+    # asserts the same next action it did before the timers were widened.
+    monkeypatch.setattr(config, "LIFECYCLE_DERISK_SECONDS", 7200)
+    monkeypatch.setattr(config, "LIFECYCLE_FLATTEN_SECONDS", 21600)
 
     sig = _lifecycle_signal()
     sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()

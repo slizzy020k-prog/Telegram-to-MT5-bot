@@ -538,8 +538,8 @@ def _validate_lifecycle_config(cfg: Any, errors: List[str]) -> None:
             if not isinstance(flag_val, bool):
                 errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
 
-    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 7200)
-    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 21600)
+    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 14400)
+    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 28800)
     if not isinstance(derisk, int) or isinstance(derisk, bool) or derisk < 0:
         errors.append(f"LIFECYCLE_DERISK_SECONDS must be a non-negative int, got {derisk!r}.")
     if not isinstance(flatten, int) or isinstance(flatten, bool) or flatten < 0:

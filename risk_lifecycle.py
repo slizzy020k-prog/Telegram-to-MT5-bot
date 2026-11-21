@@ -113,8 +113,8 @@ class LifecyclePolicy:
     r_lock_tiers: Tuple[Tuple[float, float], ...] = DEFAULT_R_LOCK_TIERS
     r_lock_min_r_dollars: float = 0.50
     lifecycle_enabled: bool = False
-    derisk_after_seconds: int = 7200
-    flatten_after_seconds: int = 21600
+    derisk_after_seconds: int = 14400
+    flatten_after_seconds: int = 28800
     pending_expire_seconds: int = 43200
     session_flatten_enabled: bool = False
     session_flatten_at: str = "23:30"
@@ -164,8 +164,8 @@ def read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy:
     if not tiers:
         tiers = DEFAULT_R_LOCK_TIERS
 
-    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 7200), 7200))
-    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 21600), 21600))
+    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 14400), 14400))
+    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 28800), 28800))
     if flatten < derisk:
         flatten = derisk
 
