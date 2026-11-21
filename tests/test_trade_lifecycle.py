@@ -4151,3 +4151,271 @@ def test_the_fill_age_fallback_is_logged_once_per_signal(caplog):
     assert len(messages) == 1, f"the fallback must be logged once, got {messages}"
     assert "fill stamp" in messages[0].lower()
     assert sig.get("_fill_age_fallback_logged") is True
+
+
+# --- v3.8.1: the R-gated BE lock ----------------------------------------
+
+
+def _gated_stop(**overrides):
+    """Call the trail engine with an explicit policy and overridable inputs."""
+    import dynamic_risk
+
+    params = {
+        "direction": "BUY",
+        "entry_price": 3900.0,
+        "live_price": 3905.0,
+        "prev_peak": None,
+        "current_sl": 3880.0,
+        "atr": 4.0,
+        "policy": _atr_policy(),
+        "digits": 2,
+    }
+    params.update(overrides)
+    return dynamic_risk.compute_dynamic_atr_trail_stop(**params)
+
+
+def test_be_lock_stays_flat_when_the_initial_risk_is_unknown():
+    """Without a valid initial R the BE lock must behave exactly as it always has."""
+    flat = _gated_stop(live_price=3905.0)          # MFE 5.00, ATR 4.00
+    assert flat["be_armed"] is True
+    assert flat["be_sl"] == pytest.approx(3900.50)   # entry + $0.50
+    assert flat["stop_source"] == "BE_LOCK"
+
+    for bad in (None, 0.0, -5.0):
+        res = _gated_stop(live_price=3905.0, initial_r=bad)
+        assert res["be_armed"] is flat["be_armed"]
+        assert res["be_sl"] == flat["be_sl"]
+        assert res["stop_source"] == flat["stop_source"]
+        assert res["candidate_sl"] == flat["candidate_sl"]
+
+
+def test_gated_be_lock_waits_for_half_the_initial_risk():
+    """A wide-stop trade (R = $22) must not be BE-locked at $3.50 of MFE."""
+    flat = _gated_stop(live_price=3905.0)                 # MFE 5.00
+    gated = _gated_stop(live_price=3905.0, initial_r=22.0)
+
+    assert flat["be_armed"] is True
+    assert flat["stop_source"] == "BE_LOCK"
+
+    # The gated threshold is max(0.5 * 22.00, 0.75 * 4.00, 2.50) = $11.00
+    assert gated["be_armed"] is False
+    assert gated["be_sl"] is None
+    assert gated["stop_source"] == "ATR_TRAIL"
+
+
+@pytest.mark.parametrize(
+    "initial_r,atr,mfe,armed",
+    [
+        (22.0, 4.0, 10.99, False),    # 0.5R = $11.00 dominates
+        (22.0, 4.0, 11.00, True),
+        (3.0, 20.0, 14.99, False),    # 0.75 * ATR = $15.00 dominates
+        (3.0, 20.0, 15.00, True),
+        (3.0, 2.0, 2.49, False),      # the $2.50 trail minimum dominates
+        (3.0, 2.0, 2.50, True),
+    ],
+)
+def test_gated_be_threshold_is_half_r_the_atr_multiple_or_the_trail_minimum(
+    initial_r, atr, mfe, armed
+):
+    """The gated threshold is max(0.5R, 0.75 * ATR, $2.50) - whichever is largest."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3900.0 + mfe,
+        atr=atr,
+        initial_r=initial_r,
+    )
+    assert res["be_armed"] is armed
+
+
+def test_gated_be_lock_carries_the_r_floor_and_the_r_lock_wins_the_tie():
+    """The R ladder replaces the flat BE lock; R_LOCK (priority 0) wins the tie."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3911.0,        # MFE 11.00 = 0.5R
+        atr=12.0,                 # the ATR trail is not armed yet
+        current_sl=3878.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,      # the 0.5R tier locks the stop at the entry
+    )
+    assert res["be_armed"] is True
+    assert res["be_sl"] == pytest.approx(3900.0)      # the flat entry + $0.50 is gone
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+    assert res["r_lock_floor"] == pytest.approx(3900.0)
+
+
+def test_gated_be_lock_at_a_higher_tier_is_tighter_than_the_flat_be_stop():
+    """At 1.0R the R floor (entry + 0.25R) is tighter than the flat BE stop."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3922.0,        # MFE 22.00 = 1.0R
+        atr=23.0,                 # the ATR trail is not armed yet
+        current_sl=3878.0,
+        initial_r=22.0,
+        r_lock_floor=3905.5,      # the 1.0R tier: entry + 0.25 * R
+    )
+    assert res["be_armed"] is True
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3905.5)
+    assert res["candidate_sl"] > 3900.50             # tighter than the flat BE stop
+
+
+def test_gated_be_lock_never_lowers_the_stop_that_is_already_in_place():
+    """The forward-only invariant survives the gate."""
+    res = _gated_stop(
+        entry_price=3900.0,
+        live_price=3911.0,
+        atr=12.0,
+        current_sl=3900.50,       # already at the flat breakeven stop
+        initial_r=22.0,
+        r_lock_floor=3900.0,
+    )
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+    assert res["should_update"] is False
+
+
+def test_gated_be_lock_is_mirrored_for_a_sell():
+    res = _gated_stop(
+        direction="SELL",
+        entry_price=3900.0,
+        live_price=3889.0,        # MFE 11.00 = 0.5R
+        atr=12.0,
+        current_sl=3922.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,      # the 0.5R tier locks the stop at the entry
+    )
+    assert res["be_armed"] is True
+    assert res["be_sl"] == pytest.approx(3900.0)
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+
+
+def test_gated_be_armed_flag_still_drives_the_pending_sweep():
+    """The BE arming flag still drives the pending sweep, gated or not."""
+    below = _gated_stop(live_price=3905.0, initial_r=22.0)
+    assert below["be_armed"] is False
+    assert below["should_sweep_pending"] is False
+
+    at = _gated_stop(
+        live_price=3911.0,
+        atr=12.0,
+        initial_r=22.0,
+        r_lock_floor=3900.0,
+    )
+    assert at["be_armed"] is True
+    assert at["should_sweep_pending"] is True
+
+
+def test_gated_be_lock_never_produces_a_stop_on_the_wrong_side_of_the_current_stop():
+    """No gated case may propose a stop looser than the one already in place."""
+    for direction in ("BUY", "SELL"):
+        for atr in (2.0, 4.0, 12.0, 23.0):
+            for mfe in (0.5, 2.5, 5.0, 11.0, 22.0):
+                for current_sl in (0.0, 3878.0, 3900.50, 3922.0):
+                    entry = 3900.0
+                    live = entry + mfe if direction == "BUY" else entry - mfe
+                    res = _gated_stop(
+                        direction=direction,
+                        entry_price=entry,
+                        live_price=live,
+                        atr=atr,
+                        current_sl=current_sl,
+                        initial_r=22.0,
+                        r_lock_floor=entry,
+                    )
+                    cand = res["candidate_sl"]
+                    if cand is None or current_sl <= 0.0:
+                        continue
+                    if direction == "BUY":
+                        assert cand >= current_sl or res["should_update"] is False
+                    else:
+                        assert cand <= current_sl or res["should_update"] is False
+
+
+# --- executor: the R-gated BE lock ---------------------------------------
+
+def _gated_executor(monkeypatch, atr, r_lock_enabled):
+    """Build a dry-run executor with the R lock on or off."""
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", r_lock_enabled)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", r_lock_enabled)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = atr
+    return ex
+
+
+def test_executor_passes_the_initial_r_only_when_the_r_lock_is_enabled(monkeypatch):
+    """With the R lock off the engine must not receive an initial R at all."""
+    import mt5_executor
+    from types import SimpleNamespace
+
+    captured = []
+    original = mt5_executor.compute_dynamic_atr_trail_stop
+
+    def spy(**kwargs):
+        captured.append(kwargs.get("initial_r"))
+        return original(**kwargs)
+
+    monkeypatch.setattr(mt5_executor, "compute_dynamic_atr_trail_stop", spy)
+
+    ex = _gated_executor(monkeypatch, atr=20.0, r_lock_enabled=True)
+    sig = _atr_signal(3895.0, 3880.0)          # R = 15.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert captured[-1] == pytest.approx(15.0)
+
+    ex_off = _gated_executor(monkeypatch, atr=20.0, r_lock_enabled=False)
+    sig_off = _atr_signal(3895.0, 3880.0)
+    ex_off.evaluate_dynamic_atr_engine(sig_off, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert captured[-1] is None
+
+
+def test_executor_does_not_be_lock_a_wide_stop_before_half_r(monkeypatch):
+    """A wide stop (R = $22) must not be BE-locked before MFE $11."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=4.0, r_lock_enabled=True)
+    sig = _atr_signal(3900.0, 3878.0)          # R = 22.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3905.0, ask=3905.2, time=1700000000.0))
+
+    # The flat BE lock would have moved the stop to $3900.50 at MFE $5.00.
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3899.40)
+    assert sig.get("active_stop_source") == "ATR_TRAIL"
+    assert not sig["layers"]["L1"].get("be_locked")
+
+
+def test_executor_keeps_the_flat_be_lock_when_the_r_lock_is_off(monkeypatch):
+    """The control case: with the R lock off the flat BE lock still arms."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=4.0, r_lock_enabled=False)
+    sig = _atr_signal(3900.0, 3878.0)          # R = 22.0
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3905.0, ask=3905.2, time=1700000000.0))
+
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.50)
+    assert sig.get("active_stop_source") == "BE_LOCK"
+
+
+def test_executor_r_lock_wins_the_picker_from_half_r_upward(monkeypatch):
+    """With a wide ATR the R ladder owns the stop from the 0.5R tier upward."""
+    from types import SimpleNamespace
+
+    ex = _gated_executor(monkeypatch, atr=23.0, r_lock_enabled=True)
+
+    half_r = _atr_signal(3900.0, 3878.0)       # R = 22.0, MFE 11.00 = 0.5R
+    ex.evaluate_dynamic_atr_engine(half_r, tick=SimpleNamespace(bid=3911.0, ask=3911.2, time=1700000000.0))
+    assert half_r.get("active_stop_source") == "R_LOCK"
+    assert half_r["layers"]["L1"]["broker_sl"] == pytest.approx(3900.0)     # entry
+
+    one_r = _atr_signal(3900.0, 3878.0)        # R = 22.0, MFE 22.00 = 1.0R
+    ex.evaluate_dynamic_atr_engine(one_r, tick=SimpleNamespace(bid=3922.0, ask=3922.2, time=1700000000.0))
+    assert one_r.get("active_stop_source") == "R_LOCK"
+    assert one_r["layers"]["L1"]["broker_sl"] == pytest.approx(3905.5)      # entry + 0.25R
+    # the BE lock now carries the R floor price, not the flat entry + $0.50
+    assert one_r["layers"]["L1"]["be_sl"] == pytest.approx(3905.5)

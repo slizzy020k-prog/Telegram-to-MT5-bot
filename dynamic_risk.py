@@ -483,6 +483,7 @@ def compute_dynamic_atr_trail_stop(
     apply_milestone_floor: bool = True,
     *,
     r_lock_floor: Optional[float] = None,
+    initial_r: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
 
@@ -503,6 +504,15 @@ def compute_dynamic_atr_trail_stop(
     the price after the broker minimum-distance clamp was applied. The two can
     differ; a consumer must take the price from `"candidate_sl"` and use
     `"r_lock_floor"` only as the provenance signal.
+
+    `initial_r` is the trade's initial risk per ounce (`|entry - initial SL|`).
+    When it is a positive number the BE lock becomes **R-gated**: it then waits
+    for `max(0.5 * R, 0.75 * ATR, $2.50)` of favourable excursion instead of the
+    flat `max(0.75 * ATR, $3.50)`, so a wide-stop trade is not locked at
+    breakeven long before the R ladder could matter. While the gate is active
+    the R ladder REPLACES the flat BE lock: the BE candidate then carries the
+    same price as the R floor, and `R_LOCK` (picker priority 0) wins the tie.
+    When `initial_r` is `None` or non-positive the behaviour is unchanged.
     """
     atr_f = _safe_float(atr, 0.0)
     if not policy.trail_enabled or atr_f <= 0.0 or entry_price <= 0.0 or live_price <= 0.0:
@@ -532,9 +542,36 @@ def compute_dynamic_atr_trail_stop(
     peak_px = (max(prev_f, live_price) if sign > 0 else min(prev_f, live_price)) if prev_f > 0.0 else live_price
     mfe = sign * (peak_px - entry_price)
 
-    be_threshold = max(max(0.0, policy.be_activation_atr_mult) * atr_f, max(0.0, policy.be_min_mfe_dollars))
+    # Validate the R floor ONCE, defensively, and reuse the validated value in
+    # the candidate list and in every return path. The candidate guard must
+    # never raise on a value the echo would happily `float()`.
+    r_lock_val = _safe_float(r_lock_floor, 0.0)
+    r_lock_candidate: Optional[float] = round(r_lock_val, digits) if r_lock_val > 0.0 else None
+
+    # The BE lock is R-gated when the trade's own initial risk is known. The
+    # gate only ever DELAYS the flat breakeven lock until the trade has earned
+    # half of its own risk, so it can never loosen a stop.
+    r_val = _safe_float(initial_r, 0.0)
+    r_gated = r_val > 0.0
+    if r_gated:
+        # The BE lock waits for half the trade's own risk, and never arms closer
+        # than the trail's minimum distance ($2.50).
+        be_threshold = max(
+            0.5 * r_val,
+            max(0.0, policy.be_activation_atr_mult) * atr_f,
+            max(0.0, policy.trail_min_dollars),
+        )
+    else:
+        be_threshold = max(max(0.0, policy.be_activation_atr_mult) * atr_f, max(0.0, policy.be_min_mfe_dollars))
     be_armed = mfe + 1e-9 >= be_threshold
-    be_sl = round(entry_price + sign * max(0.0, policy.be_lock_offset_dollars), digits) if be_armed else None
+    if not be_armed:
+        be_sl = None
+    elif r_gated and r_lock_candidate is not None:
+        # The R ladder REPLACES the flat BE lock while R is valid: both candidates
+        # then carry the same price, and R_LOCK (picker priority 0) wins the tie.
+        be_sl = r_lock_candidate
+    else:
+        be_sl = round(entry_price + sign * max(0.0, policy.be_lock_offset_dollars), digits)
     should_sweep_pending = be_armed
 
     eff_mult, trail_zone = select_progressive_trail_mult(max(0.0, mfe), policy)
@@ -547,12 +584,6 @@ def compute_dynamic_atr_trail_stop(
         if apply_milestone_floor
         else None
     )
-
-    # Validate the R floor ONCE, defensively, and reuse the validated value in
-    # the candidate list and in every return path. The candidate guard must
-    # never raise on a value the echo would happily `float()`.
-    r_lock_val = _safe_float(r_lock_floor, 0.0)
-    r_lock_candidate: Optional[float] = round(r_lock_val, digits) if r_lock_val > 0.0 else None
 
     candidates: List[Tuple[int, str, float]] = []
     if r_lock_candidate is not None:

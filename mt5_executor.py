@@ -126,6 +126,7 @@ from risk_lifecycle import (
     ACTION_NONE,
     ACTION_SESSION_FLATTEN,
     LifecyclePolicy,
+    compute_initial_r,
     compute_r_lock_floor,
     read_lifecycle_policy,
     stamp_fill_times,
@@ -8685,9 +8686,14 @@ class MT5Executor:
             # stop, and it scales with the trade's own initial risk R so a wide
             # stop is not protected after the same absolute move as a scalp.
             r_lock_floor = None
+            initial_r = None
             lifecycle_pol = self._get_lifecycle_policy()
             initial_sl = _num(lv.get("initial_sl"), 0.0)
             if lifecycle_pol.r_lock_enabled and initial_sl > 0.0:
+                # The trade's own initial risk per ounce. It gates the BE lock,
+                # so a wide stop is not BE-locked long before the R ladder could
+                # matter. None keeps the flat (pre-R) behaviour byte-for-byte.
+                initial_r = compute_initial_r(entry_px, initial_sl)
                 r_lock_floor = compute_r_lock_floor(
                     direction=direction,
                     entry_price=entry_px,
@@ -8720,6 +8726,7 @@ class MT5Executor:
                 tp_levels=tp_levels,
                 apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
                 r_lock_floor=r_lock_floor,
+                initial_r=initial_r,
             )
             if trail_step.get("peak_price") is not None:
                 lv["dynamic_atr_trail_peak"] = trail_step["peak_price"]
