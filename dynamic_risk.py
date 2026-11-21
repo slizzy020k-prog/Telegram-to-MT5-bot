@@ -57,7 +57,13 @@ class DynamicRiskPolicy:
     trail_homerun_atr_mult: float = 0.80
     trail_activation_atr_mult: float = 1.00
     trail_min_dollars: float = 2.50
-    trail_max_dollars: float = 12.00
+    trail_max_dollars: float = 8.00
+    # v3.9.0 per-stage clamps: EXTENDED ($10 <= MFE < $18) and HOME_RUN (MFE >= $18)
+    # each own a tighter min/max pair instead of the single global [min, max] clamp.
+    trail_extended_min_dollars: float = 2.20
+    trail_extended_max_dollars: float = 5.50
+    trail_homerun_min_dollars: float = 2.00
+    trail_homerun_max_dollars: float = 4.00
     trail_step_dollars: float = 0.25
     be_activation_atr_mult: float = 0.75
     be_min_mfe_dollars: float = 3.50
@@ -103,7 +109,11 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
     sc_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_SLTP_SCALE_MIN", 0.75), 0.75))
     sc_hi = max(sc_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_SLTP_SCALE_MAX", 1.75), 1.75))
     tr_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50), 2.50))
-    tr_hi = max(tr_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00), 12.00))
+    tr_hi = max(tr_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00), 8.00))
+    ext_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", 2.20), 2.20))
+    ext_hi = max(ext_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS", 5.50), 5.50))
+    home_lo = max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", 2.00), 2.00))
+    home_hi = max(home_lo, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS", 4.00), 4.00))
     raw_per = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_PERIOD", 14), 14.0)
     ext_mfe_raw = max(0.50, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00), 10.00))
     home_mfe_raw = max(0.50, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00), 18.00))
@@ -137,6 +147,10 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         trail_activation_atr_mult=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00), 1.00)),
         trail_min_dollars=tr_lo,
         trail_max_dollars=tr_hi,
+        trail_extended_min_dollars=ext_lo,
+        trail_extended_max_dollars=ext_hi,
+        trail_homerun_min_dollars=home_lo,
+        trail_homerun_max_dollars=home_hi,
         trail_step_dollars=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25), 0.25)),
         be_activation_atr_mult=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75), 0.75)),
         be_min_mfe_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50), 3.50)),
@@ -458,7 +472,11 @@ def select_progressive_trail_mult(mfe_dollars: float, policy: DynamicRiskPolicy)
     can only advance STANDARD -> EXTENDED -> HOME_RUN. The min(...) guard keeps the effective
     multiplier non-increasing even when a user configures an aggressive base multiplier, so
     trail_dist is non-increasing and atr_sl = peak - sign * trail_dist can only ever move
-    forward. The trail therefore never loosens a stop.
+    forward. The trail therefore never loosens a stop. The v3.9.0 per-stage dollar
+    clamps (trail_zone_clamp) are ordered the same way (Stage A [2.50, 8.00] ->
+    B [2.20, 5.50] -> C [2.00, 4.00] by default), so trail_dist stays non-increasing
+    across zone transitions; the should_update step guard remains the ultimate
+    forward-only backstop for any custom configuration.
     """
     mfe_f = max(0.0, _safe_float(mfe_dollars, 0.0))
     if mfe_f + 1e-9 >= policy.trail_homerun_mfe_dollars:
@@ -466,6 +484,28 @@ def select_progressive_trail_mult(mfe_dollars: float, policy: DynamicRiskPolicy)
     if mfe_f + 1e-9 >= policy.trail_extended_mfe_dollars:
         return (min(policy.trail_atr_mult, policy.trail_extended_atr_mult), "EXTENDED")
     return (policy.trail_atr_mult, "STANDARD")
+
+
+def trail_zone_clamp(mfe_dollars: float, policy: DynamicRiskPolicy) -> Tuple[float, float]:
+    """Return the (min, max) dollar clamp owned by the trail zone at `mfe_dollars`.
+
+    v3.9.0 per-stage compression: each stage clamps its ATR distance with its OWN
+    pair instead of one global [trail_min, trail_max]:
+        STANDARD (MFE <  extended threshold) -> [trail_min, trail_max]     ($2.50-$8.00)
+        EXTENDED (MFE >= extended threshold) -> [extended_min, extended_max] ($2.20-$5.50)
+        HOME_RUN (MFE >= homerun threshold)  -> [homerun_min, homerun_max]   ($2.00-$4.00)
+
+    Boundary logic mirrors select_progressive_trail_mult exactly (inclusive at the
+    tabulated $10.00 / $18.00 boundaries, 1e-9 epsilon). The shipped clamps tighten
+    monotonically across zones, so a rising peak can only shrink trail_dist and raise
+    the stop; the engine's should_update step guard enforces forward-only regardless.
+    """
+    mfe_f = max(0.0, _safe_float(mfe_dollars, 0.0))
+    if mfe_f + 1e-9 >= policy.trail_homerun_mfe_dollars:
+        return (policy.trail_homerun_min_dollars, policy.trail_homerun_max_dollars)
+    if mfe_f + 1e-9 >= policy.trail_extended_mfe_dollars:
+        return (policy.trail_extended_min_dollars, policy.trail_extended_max_dollars)
+    return (policy.trail_min_dollars, policy.trail_max_dollars)
 
 
 def compute_dynamic_atr_trail_stop(
@@ -578,7 +618,10 @@ def compute_dynamic_atr_trail_stop(
     should_sweep_pending = be_armed
 
     eff_mult, trail_zone = select_progressive_trail_mult(max(0.0, mfe), policy)
-    trail_dist = round(_clamp(atr_f * eff_mult, policy.trail_min_dollars, policy.trail_max_dollars), digits)
+    # v3.9.0: per-stage dollar clamp (Stage A [2.50, 8.00], B [2.20, 5.50],
+    # C [2.00, 4.00] by default) replaces the single global [min, max] clamp.
+    zlo, zhi = trail_zone_clamp(max(0.0, mfe), policy)
+    trail_dist = round(_clamp(atr_f * eff_mult, zlo, zhi), digits)
     trail_armed = mfe + 1e-9 >= max(0.0, policy.trail_activation_atr_mult * atr_f)
     atr_sl = round(peak_px - sign * trail_dist, digits) if trail_armed else None
 

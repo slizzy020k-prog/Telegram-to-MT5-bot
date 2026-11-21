@@ -518,8 +518,22 @@ DYNAMIC_ATR_TRAIL_ACTIVATION_MULT: float = _env_float(
 DYNAMIC_ATR_TRAIL_MIN_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50, min_val=0.20, max_val=100.0, positive_only=True
 )
+# v3.9.0: Stage A (MFE < $10) max tightened 12.00 -> 8.00; the EXTENDED and HOME_RUN
+# stages below own their own min/max clamps instead of one global [MIN, MAX] pair.
 DYNAMIC_ATR_TRAIL_MAX_DOLLARS: float = _env_float(
-    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00, min_val=0.50, max_val=200.0, positive_only=True
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00, min_val=0.50, max_val=200.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", 2.20, min_val=0.20, max_val=100.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS", 5.50, min_val=0.50, max_val=200.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", 2.00, min_val=0.20, max_val=100.0, positive_only=True
+)
+DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS", 4.00, min_val=0.50, max_val=200.0, positive_only=True
 )
 DYNAMIC_ATR_TRAIL_STEP_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, min_val=0.05, max_val=20.0, positive_only=True
@@ -561,6 +575,8 @@ def validate_dynamic_risk_pairs() -> None:
         ("DYNAMIC_TP_MIN_DOLLARS", "DYNAMIC_TP_MAX_DOLLARS"),
         ("DYNAMIC_SLTP_SCALE_MIN", "DYNAMIC_SLTP_SCALE_MAX"),
         ("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_MAX_DOLLARS"),
+        ("DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS"),
+        ("DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS"),
         ("DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS"),
     )
     for min_k, max_k in pairs:

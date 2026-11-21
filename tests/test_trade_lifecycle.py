@@ -210,9 +210,9 @@ def test_trail_stop_unchanged_when_r_lock_floor_is_none():
     )
     assert res["r_lock_floor"] is None
     assert res["stop_source"] == "ATR_TRAIL"
-    # MFE 10.00 -> EXTENDED zone -> mult 1.00 -> trail_dist = clamp(2.00, 2.50, 12.00)
-    # = 2.50 -> atr_sl = 3905.00 - 2.50 = 3902.50 (pinned from the pre-R_LOCK baseline).
-    assert res["candidate_sl"] == pytest.approx(3902.50)
+    # MFE 10.00 -> EXTENDED zone -> mult 1.00 -> v3.9.0 per-stage clamp [2.20, 5.50]:
+    # trail_dist = clamp(2.00, 2.20, 5.50) = 2.20 -> atr_sl = 3905.00 - 2.20 = 3902.80.
+    assert res["candidate_sl"] == pytest.approx(3902.80)
     assert res["should_update"] is True
 
 
@@ -228,7 +228,8 @@ def test_trail_stop_is_unchanged_across_a_baseline_grid():
     # SELL never reaches a positive MFE here, so it is never armed.
     expected = {
         ("BUY", 0.0): (None, None, 1.4, "STANDARD"),
-        ("BUY", 2.0): (3902.5, "ATR_TRAIL", 1.0, "EXTENDED"),
+        # v3.9.0: Stage-B floor $2.20 (was the $2.50 global floor) -> 3905.00 - 2.20.
+        ("BUY", 2.0): (3902.8, "ATR_TRAIL", 1.0, "EXTENDED"),
         ("BUY", 20.0): (None, None, 1.0, "EXTENDED"),
         ("SELL", 0.0): (None, None, 1.4, "STANDARD"),
         ("SELL", 2.0): (None, None, 1.4, "STANDARD"),

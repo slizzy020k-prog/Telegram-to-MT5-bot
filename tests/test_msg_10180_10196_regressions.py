@@ -105,14 +105,19 @@ class FakeEvent:
 
 
 def _pin_progressive_trail_policy(monkeypatch) -> None:
-    """Pin the spec ladder (1.40 / 1.00 @ $10 / 0.80 @ $18, floor $2.50, cap $12.00)."""
+    """Pin the spec ladder (1.40 / 1.00 @ $10 / 0.80 @ $18) with the v3.9.0 per-stage clamps."""
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.40, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MULT", 1.00, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MULT", 0.80, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50, raising=False)
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00, raising=False)
+    # v3.9.0: Stage A cap 12.00 -> 8.00; EXTENDED/HOME_RUN own tighter clamps.
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", 2.20, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS", 5.50, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", 2.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS", 4.00, raising=False)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, raising=False)
 
 
@@ -518,12 +523,13 @@ def test_progressive_trail_tightening_zones(monkeypatch):
     assert home["trail_zone"] == "HOME_RUN" and home["trail_mult"] == pytest.approx(0.80)
     assert home["trail_dist"] == pytest.approx(3.20)
 
-    # The $2.50 floor is honoured in EVERY zone (ATR 0.50 x mult would be below it).
-    for mfe, zone, mult in ((5.00, "STANDARD", 1.40), (12.00, "EXTENDED", 1.00), (20.00, "HOME_RUN", 0.80)):
+    # v3.9.0: each zone honours its OWN floor (ATR 0.50 x mult would be below it):
+    # STANDARD $2.50, EXTENDED $2.20, HOME_RUN $2.00.
+    for mfe, zone, mult, floor in ((5.00, "STANDARD", 1.40, 2.50), (12.00, "EXTENDED", 1.00, 2.20), (20.00, "HOME_RUN", 0.80, 2.00)):
         res = _trail(3850.0, mfe, 0.50)
         assert res["trail_zone"] == zone
         assert res["trail_mult"] == pytest.approx(mult)
-        assert res["trail_dist"] == pytest.approx(2.50), f"{zone} must honour the $2.50 floor"
+        assert res["trail_dist"] == pytest.approx(floor), f"{zone} must honour the ${floor:.2f} floor"
 
 
 # ---------------------------------------------------------------------------

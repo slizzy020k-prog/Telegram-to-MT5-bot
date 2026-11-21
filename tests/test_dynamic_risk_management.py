@@ -416,7 +416,8 @@ def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch):
     assert pol.tp_max_dollars == pytest.approx(50.00)
     assert pol.trail_enabled is True
     assert pol.trail_min_dollars == pytest.approx(2.50)
-    assert pol.trail_max_dollars == pytest.approx(12.00)
+    # v3.9.0: Stage A trail max default tightened 12.00 -> 8.00 (per-stage clamps).
+    assert pol.trail_max_dollars == pytest.approx(8.00)
     assert pol.trail_step_dollars == pytest.approx(0.25)
     assert pol.be_activation_atr_mult == pytest.approx(0.75)
     assert pol.be_min_mfe_dollars == pytest.approx(3.50)
@@ -556,7 +557,7 @@ def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
         atr=1.0,
         policy=pol,
         digits=2,
-        stops_buffer=2.00,  # live=3901 - 2.00 = 3899.00 < raw (3905 - 2.50 = 3902.50)
+        stops_buffer=2.00,  # live=3901 - 2.00 = 3899.00 < raw (3905 - 2.20 = 3902.80, v3.9.0 Stage-B floor)
     )
     assert clamped["should_update"] is True
     assert clamped["candidate_sl"] == pytest.approx(3899.00)
