@@ -7082,20 +7082,32 @@ and in the `/status` reply:
 
 **Files:**
 - Modify: `scripts/ab_replay_proof.py:52` (`ARM_B_CALIBRATED_PARAMS` — add the Arm C params)
-- Modify: `scripts/ab_replay_proof.py:792-814` (`_pin_arm_b_params` — add `_pin_arm_c_params`)
-- Modify: `scripts/ab_replay_proof.py:993-1022` (`_run_worker_main` — handle `arm_mode == "c"`)
-- Modify: `scripts/ab_replay_proof.py:1105-1126` (`_run_arm_subprocess` — accept `"c"`)
-- Modify: `scripts/ab_replay_proof.py:1154-1190` (`_evaluate_gates` — add the C-vs-B gate)
-- Modify: `scripts/ab_replay_proof.py:1275-1326` (`main` — add the `--arm c` branch)
-- Modify: `scripts/ab_replay_proof.py:1192-1273` (`_render_markdown` — render Arm C)
+- Modify: `scripts/ab_replay_proof.py:684` (`_build_signal_record` — stamp `initial_sl` on the replayed layers)
+- Modify: `scripts/ab_replay_proof.py:828` (`_pin_arm_b_params` — add `_pin_arm_c_params`)
+- Modify: `scripts/ab_replay_proof.py:846` (add `_ReplayClock` / `_install_replay_clock`)
+- Modify: `scripts/ab_replay_proof.py:922` / `:940` (`_run_single_trade_worker` — drive the simulated clock)
+- Modify: `scripts/ab_replay_proof.py:1080-1111` (`_run_worker_main` — handle `arm_mode == "c"`)
+- Modify: `scripts/ab_replay_proof.py:1243-1262` (`_evaluate_gates` — add the C-vs-B gate `g5`)
+- Modify: `scripts/ab_replay_proof.py:1300-1396` (`_render_markdown` — render Arm C)
+- Modify: `scripts/ab_replay_proof.py:1403-1470` (`main` — add the `--arm c` branch)
 
 **Interfaces:**
 - Consumes: every feature from Tasks 1-9.
 - Produces: `--arm c` runs the same 12 recorded trades with the R lock and the age guard enabled, and the gate `g5` asserts Arm C ≥ Arm B on net P&L and ≤ Arm B on tail loss.
 
+> **Deviation from the original task text (recorded 2026-11-21).** The task text
+> assumed the trade-age guard reads the replayed week. It does not: the guard
+> reads the WALL clock, so on a replay of the recorded Nov 17-19 week every
+> recorded trade would look four days old and the guard would flatten it on its
+> first tick. The replay therefore runs Arms B and C on a SIMULATED clock that
+> follows the M1 bars (Step 3). Arm A keeps the wall clock because it is the
+> frozen historical baseline. The replayed layers also need `initial_sl`
+> (Step 5): without it the R lock is silently skipped and Arm C would not
+> exercise the R-relative profit floor at all.
+
 - [ ] **Step 1: Add the Arm C parameter block**
 
-In `scripts/ab_replay_proof.py`, immediately after the `ARM_B_CALIBRATED_PARAMS` dict (which starts at line 52), add:
+In `scripts/ab_replay_proof.py`, immediately after the `ARM_B_CALIBRATED_PARAMS` dict, add:
 
 ```python
 # Arm C params: Arm B plus the R-relative profit floor and the trade-age guard.
@@ -7111,7 +7123,7 @@ ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
 
 - [ ] **Step 2: Add the Arm C pinning function**
 
-In `scripts/ab_replay_proof.py`, immediately after `_pin_arm_b_params` (which ends at line 814), add:
+In `scripts/ab_replay_proof.py`, immediately after `_pin_arm_b_params`, add:
 
 ```python
 def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None:
@@ -7129,11 +7141,78 @@ def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None
             raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual!r} != {expected!r}")
 ```
 
-- [ ] **Step 3: Handle `arm_mode == "c"` in the worker**
+- [ ] **Step 3: Add the simulated replay clock**
 
-In `scripts/ab_replay_proof.py`, inside `_run_worker_main` (line 993), change the branch at line 1019-1022:
+The trade-age guard calls `datetime.now(timezone.utc)` inside `main.py`, so the
+replay has to hand `main` a clock that follows the recorded bars. Add this
+immediately after `_pin_arm_c_params`:
 
 ```python
+class _ReplayClock:
+    """The simulated UTC clock of a replay worker.
+
+    The trade-age guard reads the wall clock (datetime.now(timezone.utc)),
+    but the replay simulates the RECORDED Nov 17-19 week. Without a simulated
+    clock every recorded trade would look days old and the guard would flatten
+    it on its very first tick, which is not a replay of the recorded week at
+    all. The clock therefore follows the M1 bars, and Arm A keeps the wall
+    clock because it is the frozen historical baseline.
+    """
+
+    def __init__(self) -> None:
+        self._now: Optional[datetime] = None
+
+    def set_epoch(self, epoch_sec: int) -> None:
+        """Move the simulated clock to the given UTC epoch second."""
+        self._now = datetime.fromtimestamp(int(epoch_sec), tz=timezone.utc)
+
+    def now(self, tz: Optional[Any] = None) -> datetime:
+        """Return the simulated time (the wall clock when no bar was seen yet)."""
+        base = self._now or datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        if tz is None:
+            return base.replace(tzinfo=None)
+        return base.astimezone(tz)
+
+
+_REPLAY_CLOCK = _ReplayClock()
+
+
+def _install_replay_clock(main_mod: Any) -> None:
+    """Make main read the simulated replay clock instead of the wall clock."""
+    real_datetime = datetime
+
+    class _SimulatedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz: Optional[Any] = None) -> datetime:
+            return _REPLAY_CLOCK.now(tz)
+
+    main_mod.datetime = _SimulatedDatetime
+```
+
+- [ ] **Step 4: Handle `arm_mode == "c"` in the worker**
+
+In `scripts/ab_replay_proof.py`, inside `_run_worker_main`, the Arm C branch pins
+the Arm B params, then the Arm C params, and installs the simulated clock:
+
+```python
+        if arm_mode in ("b", "c"):
+            for k, v in ARM_B_CALIBRATED_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        if arm_mode == "c":
+            for k, v in ARM_C_CALIBRATED_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+
+        import config  # noqa: E402
+        import main  # noqa: E402
+        import mt5_executor  # noqa: E402
+        from state_manager import StateManager  # noqa: E402
+        from trade_ledger import TradeLedger  # noqa: E402
+
+        assert config.DRY_RUN is True, "DRY_RUN must be True in replay worker"
+        assert Path(config.STATE_FILE_PATH).parent == rdir, "STATE_FILE_PATH isolation failed"
+
         if arm_mode == "a":
             if hasattr(config, "PROFIT_RATCHET_ENABLED"):
                 raise RuntimeError("Arm A contamination: PROFIT_RATCHET_ENABLED found in 4544f7f worktree!")
@@ -7142,11 +7221,48 @@ In `scripts/ab_replay_proof.py`, inside `_run_worker_main` (line 993), change th
         else:
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
+
+        # Arms B and C run on the simulated replay clock: the trade-age guard
+        # reads the wall clock, and the replay simulates the RECORDED week.
+        if arm_mode in ("b", "c"):
+            _install_replay_clock(main)
 ```
 
-- [ ] **Step 4: Extend the gate evaluation**
+- [ ] **Step 5: Make the replayed layers carry `initial_sl` and the simulated clock**
 
-In `scripts/ab_replay_proof.py`, in `_evaluate_gates` (line 1154), add the Arm C gate. Change the function signature to accept `arm_c` and add the gate:
+The live path captures the stop the order was placed with as `initial_sl`
+(`mt5_executor`), and the R-relative profit floor reads it to compute R. The
+replay built its layer records without it, so the R lock was silently skipped
+and Arm C would not have exercised the feature. In `_build_signal_record`:
+
+```python
+            # The live path captures the stop the order was placed with as
+            # `initial_sl` (mt5_executor); the R-relative profit floor reads
+            # it to compute R. Without it the R lock is silently skipped and
+            # Arm C would not exercise the feature at all.
+            "initial_sl": sl,
+```
+
+In `_run_single_trade_worker`, start the simulated clock at the entry bar and
+advance it with every bar:
+
+```python
+    # The simulated clock starts at the entry bar and follows the M1 bars,
+    # so the trade-age guard measures the age of the RECORDED trade.
+    _REPLAY_CLOCK.set_epoch(int(bars[idx0]["time_utc"]))
+```
+
+and, inside the bar loop:
+
+```python
+            _REPLAY_CLOCK.set_epoch(int(bar["time_utc"]))
+```
+
+- [ ] **Step 6: Extend the gate evaluation**
+
+In `scripts/ab_replay_proof.py`, `_evaluate_gates` accepts `arm_c` and computes
+the C-vs-B gate BEFORE the A/B branches, so the gate is present in both the
+"both" and the single-arm modes:
 
 ```python
 def _evaluate_gates(
@@ -7154,11 +7270,9 @@ def _evaluate_gates(
     arm_b: Optional[Dict[str, Any]],
     arm_c: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-```
-
-and, after the existing `g4_single` computation, add:
-
-```python
+    # Arm C is compared against ARM B (not against Arm A): the R lock and the
+    # trade-age guard are an increment on Arm B, and the gate is absent when
+    # Arm C was not run.
     if arm_c and arm_b:
         sc = arm_c["summary"]
         sb2 = arm_b["summary"]
@@ -7171,15 +7285,32 @@ and, after the existing `g4_single` computation, add:
         g5 = None
 ```
 
-Add `"g5": g5` to the returned gates dict.
-
-> The arm summary key is **`tail_loss_gbp_13078_9953`** (see `_summarize_arm` in `scripts/ab_replay_proof.py:1092`). The other keys used above are `net_gbp` (:1089), `error_count` (:1100), `trade_count` (:1088), `choke_trio_gbp_13153_9934_13167` (:1093) and `unflagged_rollover_exits` (:1099).
-
-- [ ] **Step 5: Extend `main()` and the markdown renderer**
-
-In `scripts/ab_replay_proof.py` `main()` (line 1275):
+Add `"g5": g5` to both returned gates dicts and let a failing `g5` fail
+`all_gates_passed`:
 
 ```python
+            "g5": g5,
+            "all_gates_passed": bool(g1 and g2 and g3 and g4 and g5 is not False),
+```
+
+> The arm summary key is **`tail_loss_gbp_13078_9953`** (see `_summarize_arm` in
+> `scripts/ab_replay_proof.py:1092`). The other keys used above are `net_gbp`
+> (:1089), `error_count` (:1100), `trade_count` (:1088),
+> `choke_trio_gbp_13153_9934_13167` (:1093) and `unflagged_rollover_exits`
+> (:1099).
+>
+> `g5` compares ARM C against ARM B (never against Arm A) and is `None` when
+> Arm C was not run.
+
+- [ ] **Step 7: Extend `main()` and the markdown renderer**
+
+In `scripts/ab_replay_proof.py` `main()`:
+
+```python
+        arm_a_res: Optional[Dict[str, Any]] = None
+        arm_b_res: Optional[Dict[str, Any]] = None
+        arm_c_res: Optional[Dict[str, Any]] = None
+
         if args.arm in ("a", "both"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
         if args.arm in ("b", "both"):
@@ -7188,35 +7319,45 @@ In `scripts/ab_replay_proof.py` `main()` (line 1275):
             arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
 ```
 
-declare `arm_c_res: Optional[Dict[str, Any]] = None` next to `arm_a_res` / `arm_b_res`, pass it into `_evaluate_gates(arm_a_res, arm_b_res, arm_c_res)`, and add `"arm_c": arm_c_res` to the report dict.
+and pass the result into `_evaluate_gates(arm_a_res, arm_b_res, arm_c_res)` and
+add `"arm_c": arm_c_res` to the report dict.
 
 In `_render_markdown`, add an Arm C section after the existing Arm A/B table:
 
 ```python
     if arm_c:
         sc = arm_c["summary"]
+        sb_c = arm_b["summary"] if arm_b else None
+        net_b = f"`£{sb_c['net_gbp']}`" if sb_c else "`n/a`"
+        tail_b = f"`£{sb_c['tail_loss_gbp_13078_9953']}`" if sb_c else "`n/a`"
         lines += [
             "",
             "### Arm C (v3.8.0 Trade Lifecycle Guard)",
             "",
-            f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: `£{sb['net_gbp']}`)",
+            f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: {net_b})",
             f"- **Tail Loss (13078 + 9953):** `£{sc['tail_loss_gbp_13078_9953']}` "
-            f"(Arm B: `£{sb['tail_loss_gbp_13078_9953']}`)",
+            f"(Arm B: {tail_b})",
+            f"- **Trade Count:** `{sc['trade_count']}` | Errors: `{sc['error_count']}`",
         ]
 ```
 
-- [ ] **Step 6: Run the replay proof**
+- [ ] **Step 8: Run the replay proof**
 
 ```powershell
 cd C:\Users\kambo\Code\telegram-mt5-copier
-python scripts/ab_replay_proof.py --arm c
+python scripts/ab_replay_proof.py --arm both
 ```
 
-Expected: the script writes the Arm C report and prints the gate table. If the bars must be fetched from MT5, run it with the MT5 terminal open; if a saved bars JSON exists, pass it with the script's existing `--bars` option.
+The bars are fetched read-only from the connected MT5 terminal. To reuse a
+previously saved bar set, pass `--bars-json <path>` (the flag is `--bars-json`,
+not `--bars`) and `--save-bars <path>` to persist a fetched set.
 
-**If gate `g5` fails** (Arm C net P&L below Arm B, or a worse tail loss), do **not** enable the feature. Adjust `ARM_C_CALIBRATED_PARAMS` / `R_LOCK_TIERS` and re-run. Record the outcome in the commit message.
+**If gate `g5` fails** (Arm C net P&L below Arm B, or a worse tail loss), do
+**not** enable the feature and **do not** touch the gate logic, the summary
+numbers or the comparison. Diagnose the cause, fix only what is genuinely a
+bug, re-run, and record the real numbers in the commit message.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```powershell
 git add scripts/ab_replay_proof.py
@@ -7224,8 +7365,65 @@ git commit -m "feat(replay): add Arm C (R lock + trade-age guard) to the A/B rep
 
 Arm C replays the same 12 recorded trades with R_LOCK_ENABLED and
 LIFECYCLE_ENABLED on, and gate g5 requires Arm C >= Arm B on net P&L and
-<= Arm B on tail loss. This is the pre-live acceptance evidence."
+<= Arm B on tail loss. This is the pre-live acceptance evidence.
+
+g5 FAILED on the recorded tape: Arm C net GBP -16.85 vs Arm B +0.14 (tail
+loss identical at -61.99, 0 errors). The whole delta is the 2 h de-risk
+scratching the two trades the harness holds open past 2 h (9937 and 9943);
+on the recorded live tape every trade closed within 47.1 min, so the guard
+could never have fired live. The R lock never wins the stop picker on these
+trades. The feature stays disabled.
 ```
+
+### Task 10 outcome (2026-11-21)
+
+`python scripts/ab_replay_proof.py --arm both` (bars fetched from the connected
+MT5 terminal, 3477 M1 bars, `2026-11-16T23:00Z` -> `2026-11-19T11:00Z`):
+
+| Arm | Net P&L | Trades | Tail loss (`13078+9953`) | Errors |
+|---|---:|---:|---:|---:|
+| A (`4544f7f`) | `£+11.89` | 12 | `£-61.99` | 0 |
+| B (`v3.6.0` calibrated) | `£+0.14` | 12 | `£-61.99` | 0 |
+| C (`R lock` + `age guard`) | `£-16.85` | 12 | `£-61.99` | 0 |
+
+| Gate | Result |
+|---|---|
+| `gate_1_net_profit` | `False` (pre-existing, Arm B vs Arm A) |
+| `gate_2_tail_protection` | `False` (pre-existing, Arm B vs Arm A) |
+| `gate_3_mfe_capture_and_13153_stage2` | `False` (pre-existing, Arm B vs Arm A) |
+| `gate_4_zero_regression` | `True` |
+| **`g5` (Arm C vs Arm B)** | **`False`** |
+| `all_gates_passed` | `False` |
+
+**Why `g5` fails.** The 2 h de-risk fired on exactly two of the twelve trades —
+`9937` and `9943`, the only two the harness keeps open past two hours — and
+scratched both at breakeven: `£+4.44 -> £+0.76` and `£+14.07 -> £+0.76`,
+i.e. `-£16.99` against Arm B. The tail loss is unchanged because both tail
+trades died inside an hour (`13078` after 47.1 min, `9953` after 19.9 min), so
+no age threshold could have reached them.
+
+**Why that is a harness artefact, not a verdict on the live feature.** On the
+recorded live tape every one of the twelve trades closed within **47.1 minutes**,
+so a 2 h de-risk could never have fired live; and both affected trades were in
+fact closed at breakeven in the live market (`9937` `BROKER_SL BE`, `9943`
+`BROKER_SL BE`), while the replay's Arm B lets them run to `EOD_MTM` / `TP1`
+because the harness replays a generic FSM instead of the recorded message
+flow. Arm C reproduces the live scratch; Arm B does not.
+
+**R lock.** With the `initial_sl` stamp of Step 5 in place the R lock is
+exercised, but it never wins the stop picker on these twelve trades: the
+existing `BE_LOCK`/`ATR_TRAIL` candidates are always tighter than the default
+`0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75` floor (a measured run with an engaging
+`1.0:0.25,1.5:0.50,2.0:0.75,2.5:1.00` ladder changed no trade either).
+
+**Sensitivity (measured, NOT shipped).** `LIFECYCLE_DERISK_SECONDS=10800`
+(3 h) makes `g5` pass (Arm C net `£+9.77`), and `21600` (6 h) makes the guard
+never fire (Arm C identical to Arm B). Both are fitted to the two aged trades
+of this twelve-trade sample and are therefore not shipped: the honest verdict
+on this tape is that the gate cannot be won with the shipped parameters, and
+the feature must stay disabled.
+
+---
 
 ---
 
