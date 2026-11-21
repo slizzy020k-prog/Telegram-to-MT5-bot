@@ -4162,6 +4162,386 @@ def test_apply_lifecycle_action_dispatches_every_action(monkeypatch):
     assert ex.apply_lifecycle_action(_lifecycle_signal(), "FLATTEN")["action"] == "FLATTEN"
     assert ex.apply_lifecycle_action(_lifecycle_signal(), "SESSION_FLATTEN")["action"] == "FLATTEN"
     assert ex.apply_lifecycle_action(_lifecycle_signal(), "EXPIRE_PENDING")["action"] == "EXPIRE_PENDING"
+
+
+# --- fix round 1 (Task 5): the fail-closed guards ---------------------------
+
+
+def _live_lifecycle_executor():
+    """A LIVE executor: the market-side guards only run against a broker."""
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=False)
+    ex._connected = True
+    return ex
+
+
+def test_apply_lifecycle_flatten_treats_an_unverified_close_as_a_failure(monkeypatch):
+    """A close that could not be VERIFIED is a failed close, never a success.
+
+    When the broker is unreachable the position query returns nothing, so the
+    "is the position still open?" check cannot see the open position. The
+    flatten used to report success, reset `lifecycle_retry_count` to 0 and
+    silently disable the retry/alert path.
+    """
+    ex = _live_lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [], "cancelled_orders": []},
+    )
+
+    def _query_failed(symbol=None):
+        # The broker is unreachable: the query returns nothing AND records the
+        # failure -- exactly what `get_live_positions` does in real life.
+        ex._last_live_pos_query_ok = False
+        return []
+
+    monkeypatch.setattr(ex, "get_live_positions", _query_failed)
+
+    sig = _lifecycle_signal()
+    sig["lifecycle_retry_count"] = 0
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is False, "an unverified close must never be reported as a success"
+    assert "close:unverified" in res["failed"]
+    assert res.get("gave_up") is not True
+    assert sig["lifecycle_retry_count"] == 1, "the retry counter must be incremented, not reset"
+
+
+def test_apply_lifecycle_flatten_never_resets_the_retry_count_on_an_unverified_close(monkeypatch):
+    """An unverified close must never zero the retry counter."""
+    ex = _live_lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [], "cancelled_orders": []},
+    )
+
+    def _query_failed(symbol=None):
+        ex._last_live_pos_query_ok = False
+        return []
+
+    monkeypatch.setattr(ex, "get_live_positions", _query_failed)
+
+    sig = _lifecycle_signal()
+    sig["lifecycle_retry_count"] = 2
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is False
+    assert sig["lifecycle_retry_count"] == 3, "the counter must keep counting, never reset to 0"
+
+
+def test_apply_lifecycle_flatten_accepts_a_verified_close(monkeypatch):
+    """The broker answered and the position is gone: the flatten is a success.
+
+    This is the counterpart of the unverified close: the SAME empty position
+    list is a success when the query itself succeeded.
+    """
+    ex = _live_lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [], "cancelled_orders": []},
+    )
+
+    def _query_ok(symbol=None):
+        ex._last_live_pos_query_ok = True    # the broker answered: no positions
+        return []
+
+    monkeypatch.setattr(ex, "get_live_positions", _query_ok)
+
+    sig = _lifecycle_signal()
+    sig["lifecycle_retry_count"] = 2
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is True
+    assert res["failed"] == []
+    assert sig["lifecycle_retry_count"] == 0
+
+
+def test_apply_lifecycle_flatten_in_dry_run_never_reports_an_unverified_close(monkeypatch):
+    """A dry run has no broker to verify against: the flatten still succeeds."""
+    # In dry run `get_live_positions` returns [] AND flags the query as failed,
+    # so the dry run must not turn every flatten into a failure.
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [], "cancelled_orders": []},
+    )
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is True, "a dry run must not turn every flatten into a failure"
+    assert "close:unverified" not in res["failed"]
+    assert sig["lifecycle_retry_count"] == 0
+
+
+def test_apply_lifecycle_derisk_skips_the_be_move_when_the_live_price_is_unavailable(monkeypatch):
+    """No tick -> no market validation -> the BE stop is NOT sent (fail closed).
+
+    A BUY whose price has fallen below the entry would be moved to a stop
+    above the market, which the broker rejects with retcode 10016.
+    """
+    from types import SimpleNamespace
+
+    ex = _live_lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: None)
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == [], "a stop that cannot be validated must never reach the broker"
+    assert res["moved"] == []
+    assert res["ok"] is True, "an unavailable price is a skip, not a failure"
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_apply_lifecycle_derisk_skips_a_sell_stop_on_the_wrong_side_of_the_market(monkeypatch):
+    """The SELL mirror of the BUY case: a stop BELOW the market is invalid.
+
+    The price moved against the SELL (it rose), so the breakeven stop
+    (entry - 0.50) now sits below the market -- the broker rejects that with
+    retcode 10016 (invalid stops).
+    """
+    from types import SimpleNamespace
+
+    ex = _live_lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: SimpleNamespace(bid=3910.0, ask=3910.2))
+
+    sig = _lifecycle_signal()
+    sig["direction"] = "SELL"
+    sig["layers"]["L1"]["entry_price"] = 3905.0
+    sig["layers"]["L1"]["broker_sl"] = 3920.0
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == [], "an invalid stop must never reach the broker"
+    assert res["moved"] == []
+    assert res["ok"] is True
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3920.0)
+
+
+def test_apply_lifecycle_derisk_skips_a_stop_inside_the_broker_freeze_level(monkeypatch):
+    """A stop inside the broker freeze level is skipped, and the check runs."""
+    from types import SimpleNamespace
+
+    ex = _live_lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(
+            digits=2, point=0.01, trade_stops_level=50, trade_freeze_level=200
+        ),
+    )
+    # A fixed buffer keeps the test independent of the broker's stops level.
+    monkeypatch.setattr(ex, "_compute_stops_buffer", lambda sym_info: 0.55)
+    # The market is $1.00 above the BE stop: far enough for a valid stop, but
+    # inside the 200-point ($2.00) freeze level.
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: SimpleNamespace(bid=3896.5, ask=3896.7))
+
+    freeze_calls = []
+    real_freeze = ex.is_within_freeze_level
+
+    def _spy(symbol, target_price, tick=None, sym_info=None):
+        freeze_calls.append(target_price)
+        return real_freeze(symbol, target_price, tick=tick, sym_info=sym_info)
+
+    monkeypatch.setattr(ex, "is_within_freeze_level", _spy)
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert freeze_calls == [3895.50], "the freeze level must be consulted"
+    assert calls == [], "a stop inside the freeze level must never reach the broker"
+    assert res["moved"] == []
+    assert res["ok"] is True
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_apply_lifecycle_derisk_sell_never_loosens_a_tighter_existing_stop(monkeypatch):
+    """A SELL stop already TIGHTER than the breakeven price must be left alone.
+
+    The BUY comparison copied verbatim (`cur_sl >= be_sl`) would read a SELL
+    stop of 3904.00 as looser than the 3904.50 breakeven and would move it --
+    which would LOOSEN the broker stop.
+    """
+    ex = _lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [])
+
+    sig = _lifecycle_signal()
+    sig["direction"] = "SELL"
+    sig["layers"]["L1"]["entry_price"] = 3905.0
+    sig["layers"]["L1"]["broker_sl"] = 3904.00   # tighter than the BE (3904.50)
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == []
+    assert res["moved"] == []
+    assert res["ok"] is True
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3904.00)
+
+
+def test_apply_lifecycle_derisk_publishes_the_risk_of_the_filled_layers_only(monkeypatch):
+    """A PENDING layer's PLANNED risk must not be averaged into the signal R."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L2"]["initial_sl"] = 3880.0    # a planned stop on an unfilled limit
+    ex.apply_lifecycle_derisk(sig)
+
+    # Only L1 holds a position (entry 3895.00, initial stop 3880.00) -> R = 15.00
+    assert sig["initial_r_per_oz"] == pytest.approx(15.0)
+
+
+def test_apply_lifecycle_derisk_never_uses_a_planned_price_as_the_entry(monkeypatch):
+    """A layer without a REAL entry must not contribute its planned risk.
+
+    The `target_price` fallback is a planned price for an unfilled layer, so
+    it must never stand in for the layer's actual entry price.
+    """
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L4"] = {
+        "ticket": 104,
+        "status": "OPEN",
+        "lot": 0.01,
+        "remaining_lot": 0.01,
+        "target_price": 3900.0,      # a PLANNED price, not a realised entry
+        "initial_sl": 3880.0,
+        "broker_sl": 3880.0,
+    }
+    ex.apply_lifecycle_derisk(sig)
+
+    # Only L1 has a real entry (3895.00) and an initial stop (3880.00) -> R = 15.00
+    assert sig["initial_r_per_oz"] == pytest.approx(15.0)
+
+
+def test_apply_lifecycle_derisk_ignores_a_layer_without_any_risk(monkeypatch):
+    """A layer whose entry equals its initial stop has no risk to average in."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L1"]["initial_sl"] = 3895.0    # entry == stop -> risk 0
+    ex.apply_lifecycle_derisk(sig)
+
+    assert "initial_r_per_oz" not in sig, "a zero R must never be published"
+
+
+def test_apply_lifecycle_derisk_does_not_dilute_the_risk_with_a_zero_risk_layer(monkeypatch):
+    """A zero-risk layer must not drag the published mean down."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L3"] = {
+        "ticket": 103,
+        "status": "OPEN",
+        "lot": 0.01,
+        "remaining_lot": 0.01,
+        "entry_price": 3900.0,
+        "initial_sl": 3900.0,     # entry == stop -> risk 0
+        "broker_sl": 3900.0,
+    }
+    ex.apply_lifecycle_derisk(sig)
+
+    # L1 risk = 15.00, L3 risk = 0.00 (ignored) -> mean 15.00
+    assert sig["initial_r_per_oz"] == pytest.approx(15.0)
+
+
+def test_apply_lifecycle_flatten_publishes_the_mean_initial_risk(monkeypatch):
+    """A signal flattened before any de-risk still has to carry its R."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [101], "cancelled_orders": [102]},
+    )
+
+    sig = _lifecycle_signal()
+    ex.apply_lifecycle_flatten(sig)
+
+    assert sig["initial_r_per_oz"] == pytest.approx(15.0)
+
+
+def test_apply_lifecycle_flatten_gives_up_on_the_call_that_reaches_the_budget(monkeypatch):
+    """The call that exhausts the retry budget reports the give-up itself."""
+    from types import SimpleNamespace
+
+    import config
+    import mt5_executor
+
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(config, "LIFECYCLE_MAX_CLOSE_RETRIES", 3)
+    monkeypatch.setattr(mt5_executor, "LIFECYCLE_MAX_CLOSE_RETRIES", 3)
+
+    attempts = []
+
+    def _fail(sig):
+        attempts.append(1)
+        return {"closed_tickets": [], "cancelled_orders": []}
+
+    monkeypatch.setattr(ex, "close_signal_exposure", _fail)
+    monkeypatch.setattr(ex, "get_live_positions", lambda symbol=None: [SimpleNamespace(ticket=101)])
+
+    sig = _lifecycle_signal()
+    results = [ex.apply_lifecycle_flatten(sig) for _ in range(3)]
+
+    assert len(attempts) == 3
+    assert results[0].get("gave_up") is not True
+    assert results[1].get("gave_up") is not True
+    assert results[2].get("gave_up") is True, "the call that reaches the budget must report the give-up"
+    assert results[2]["ok"] is False
+    assert sig["lifecycle_retry_count"] == 3
+
+    # The next call must not attempt another close.
+    res = ex.apply_lifecycle_flatten(sig)
+    assert len(attempts) == 3, "the give-up path must not close anything"
+    assert res.get("gave_up") is True
+    assert res["failed"] == ["close:give_up"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -4232,6 +4612,40 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
                     _add(lv.get("ticket"))
         return tickets
 
+    def _publish_lifecycle_initial_r(self, signal_data: Dict[str, Any]) -> Optional[float]:
+        """Publish the signal's mean initial risk per ounce (`initial_r_per_oz`).
+
+        Only the layers that HOLD a position contribute: a PENDING layer has
+        no entry yet, so its planned `target_price` is a planned price and not
+        a realised risk. A layer whose risk is zero (entry == initial stop) is
+        ignored, and the field is only written when the mean is greater than
+        zero -- a zero R would make the ledger's `r_at_exit` meaningless.
+        """
+        layers = signal_data.get("layers") or {}
+        if not isinstance(layers, dict):
+            return None
+        risks: List[float] = []
+        for lv in layers.values():
+            if not isinstance(lv, dict):
+                continue
+            if str(lv.get("status") or "").strip().upper() in ("PENDING", "CANCELLED", "CLOSED"):
+                continue
+            entry = _num(lv.get("entry_price") or lv.get("entry"), 0.0)
+            stop = _num(lv.get("initial_sl"), 0.0)
+            if entry <= 0.0 or stop <= 0.0:
+                continue
+            risk = abs(entry - stop)
+            if risk <= 0.0:
+                continue
+            risks.append(risk)
+        if not risks:
+            return None
+        mean_r = round(sum(risks) / len(risks), 4)
+        if mean_r <= 0.0:
+            return None
+        signal_data["initial_r_per_oz"] = mean_r
+        return mean_r
+
     def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """Cancel unfilled pending limits and move every open layer to breakeven.
 
@@ -4277,16 +4691,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
 
         # Publish the signal's initial risk (per ounce) so the ledger can record
         # `initial_r_per_oz` and `r_at_exit` at close time.
-        _risks: List[float] = []
-        for _lv in layers.values():
-            if not isinstance(_lv, dict):
-                continue
-            _e = _num(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
-            _s = _num(_lv.get("initial_sl"), 0.0)
-            if _e > 0.0 and _s > 0.0:
-                _risks.append(abs(_e - _s))
-        if _risks:
-            signal_data["initial_r_per_oz"] = round(sum(_risks) / len(_risks), 4)
+        self._publish_lifecycle_initial_r(signal_data)
 
         # The market decides whether the breakeven stop is even a valid stop: a
         # BUY stop above the market (or a SELL stop below it) is rejected by the
@@ -4294,15 +4699,20 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
         # live broker only -- a dry run has nothing that could reject it.
         tick = None
         live_price = 0.0
+        price_unavailable = False
         if not self.dry_run:
             try:
                 tick = self.get_tick(symbol)
             except Exception as exc:
                 logger.warning(f"[LIFECYCLE DERISK] tick for {symbol} failed: {exc}")
                 result["failed"].append(f"tick:{exc}")
-            if tick is not None:
+            if tick is None:
+                price_unavailable = True
+            else:
                 _raw_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
                 live_price = _num(_raw_px, 0.0)
+                if not (live_price > 0.0):
+                    price_unavailable = True
         stops_buffer = self._compute_stops_buffer(sym_info)
 
         for lk, lv in list(layers.items()):
@@ -4328,6 +4738,16 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
                 if already_tighter:
                     continue
             try:
+                # Fail closed: without a usable live price the breakeven stop
+                # cannot be validated against the market, so it is NOT sent.
+                # The layer keeps its existing (already valid) stop and the
+                # next tick tries again.
+                if price_unavailable:
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: no live price for {symbol}; "
+                        f"the BE stop {be_sl} is not sent and the existing stop is kept."
+                    )
+                    continue
                 # The breakeven stop has to sit on the correct side of the
                 # market and far enough away from it, otherwise the broker
                 # rejects the modify with retcode 10016 (invalid stops).
@@ -4374,6 +4794,10 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
             result["ok"] = False
             return result
 
+        # A signal that is flattened before any de-risk still has to carry
+        # its initial risk for the ledger.
+        self._publish_lifecycle_initial_r(signal_data)
+
         max_attempts = max(1, self._get_lifecycle_policy().max_close_retries)
         retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
 
@@ -4403,14 +4827,33 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
             # retry (and eventually give up) instead of claiming a flatten that
             # never happened.
             closed_set = set(result["closed"])
+            live_ids: Set[int] = set()
+            query_ok = True
             try:
+                live_positions = self.get_live_positions() or []
+                # `get_live_positions` records whether the broker query really
+                # succeeded. A FAILED query returns an empty list, which is
+                # indistinguishable from "the account has no positions" unless
+                # the flag is read.
+                query_ok = bool(self._last_live_pos_query_ok)
                 live_ids = {
                     _int_num(getattr(p, "ticket", 0), 0)
-                    for p in (self.get_live_positions() or [])
+                    for p in live_positions
                 }
             except Exception as exc:
                 logger.warning(f"[LIFECYCLE FLATTEN] live position check failed: {exc}")
                 live_ids = set()
+                query_ok = False
+            unverified = [t for t in expected_open if t not in closed_set]
+            if unverified and not self.dry_run and not query_ok:
+                # The broker could not be asked, so the close cannot be
+                # verified: an unverified close is a FAILED close. The retry
+                # counter must never be reset on it.
+                logger.warning(
+                    f"[LIFECYCLE FLATTEN] the live position query failed; the close of "
+                    f"{','.join(str(t) for t in unverified)} could not be verified."
+                )
+                result["failed"].append("close:unverified")
             still_open = [t for t in expected_open if t not in closed_set and t in live_ids]
             if still_open:
                 result["failed"].append(
@@ -4505,6 +4948,23 @@ breakeven without ever loosening an existing stop. apply_lifecycle_flatten
 reuses close_signal_exposure so the validated market-close path is shared with
 /closeall. Every action returns a structured result for logging and alerting."
 ```
+
+- [ ] **Shipped notes (the deviations that shipped)**
+
+The implementation above shipped with four deliberate deviations from the plan as written:
+
+1. **The retry threshold is "`LIFECYCLE_MAX_CLOSE_RETRIES` attempts, then give up"**,
+   matching the design spec, rather than the original "retries > max_retries" which gave up on
+   attempt max+1.
+2. **A close that leaves the position OPEN counts as a failure** (checked against the live
+   positions), because "`close_signal_exposure`" swallows per-ticket failures and the counter would
+   otherwise never increment in production. A close that cannot be VERIFIED at all -- the live
+   position query failed, so the open position is invisible -- is a failure too, and it never
+   resets "`lifecycle_retry_count`".
+3. **The de-risk refuses to send a BE stop on the wrong side of the market, inside the broker
+   freeze level, or when the live price is unavailable**, because the original code would have
+   emitted retcode 10016 on a losing BUY.
+4. **The dispatch uses the "`risk_lifecycle.ACTION_*`" constants.**
 
 ---
 
