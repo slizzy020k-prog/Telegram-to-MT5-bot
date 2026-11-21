@@ -539,6 +539,11 @@ class MT5Executor:
         self._daily_drawdown_ref_balance: Optional[float] = None
         self._daily_drawdown_baseline_date: Optional[str] = None
         self._last_fill_prices: Dict[int, float] = {}
+        # Stop actually sent to the broker per ticket. The `sl` argument of an
+        # order is only a REQUEST: when it is None the executor computes a
+        # fallback stop and the broker holds that one, so the initial risk R
+        # has to be captured from here.
+        self._last_order_sls: Dict[int, float] = {}
         self.last_modify_result: Dict[str, Any] = {}
         self._lift_abort_warn_ts: Dict[str, float] = {}
         self._last_close_details: Dict[int, Dict[str, Any]] = {}
@@ -835,6 +840,17 @@ class MT5Executor:
         if _int_num(getattr(info, "digits", 5), 5) in (3, 5):
             return point * 10.0
         return point
+
+    def get_last_placed_sl(self, ticket: Optional[int]) -> Optional[float]:
+        """Return the stop that was actually sent to the broker for a ticket, if known.
+
+        This is pure bookkeeping: it RECORDS the stop an order was already
+        carrying, so the caller can capture the real initial risk R.
+        """
+        try:
+            return self._last_order_sls.get(int(ticket))
+        except (TypeError, ValueError):
+            return None
 
     def get_last_closed_m1_candle(self, symbol: str) -> Optional[Dict[str, float]]:
         """
@@ -1556,6 +1572,12 @@ class MT5Executor:
             self._last_fill_prices[ticket] = round(fill_px, digits)
             if len(self._last_fill_prices) > 512:
                 self._last_fill_prices = dict(list(self._last_fill_prices.items())[-256:])
+            # Record the stop that was actually sent to the broker (the `sl`
+            # argument is only a request -- the broker may hold a computed
+            # fallback stop instead).
+            self._last_order_sls[ticket] = float(final_sl)
+            if len(self._last_order_sls) > 512:
+                self._last_order_sls = dict(list(self._last_order_sls.items())[-256:])
             self._record_ticket_placed(ticket)
             logger.info(
                 f"Opened Market {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
@@ -1765,6 +1787,11 @@ class MT5Executor:
                     "kind": kind_upper,
                 }
             self._record_ticket_placed(ticket)
+            # Record the stop that was actually sent to the broker (see
+            # `execute_market_order`): the `sl` argument is only a request.
+            self._last_order_sls[ticket] = float(final_sl)
+            if len(self._last_order_sls) > 512:
+                self._last_order_sls = dict(list(self._last_order_sls.items())[-256:])
             logger.info(
                 f"Placed {kind_upper.title()} {direction_norm} Order #{ticket} | Symbol={resolved_sym}, "
                 f"TargetPrice={target_price}, Lot={final_lot}, SL={final_sl}, TP={final_tp}"
@@ -2315,6 +2342,10 @@ class MT5Executor:
         market_tickets: List[int] = []
         pending_tickets: List[int] = []
         layers_data: Dict[str, Dict[str, Any]] = {}
+        # The broker's price precision for this symbol: the captured stop is
+        # rounded to it, exactly like the stop that is sent to the broker.
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
         eff_exclude: List[int] = [_int_num(x, 0) for x in (exclude_tickets or []) if _int_num(x, 0) > 0]
 
         for l_name, target_px, l_lot, l_tp in layer_specs:
@@ -2349,6 +2380,18 @@ class MT5Executor:
                     pending_tickets.append(t)
                     eff_exclude.append(t)
                     status = "PENDING"
+                # The stop the broker actually holds for this ticket. The
+                # `sl` argument is only a REQUEST: when it is None (or 0.0)
+                # the executor computes an ATR-based or FALLBACK_SL_PIPS stop
+                # and sends THAT to the broker, so the recorded broker stop is
+                # the authoritative initial risk R.
+                placed_sl = self.get_last_placed_sl(t)
+                if placed_sl is not None:
+                    initial_sl = round(float(placed_sl), digits)
+                elif sl is not None:
+                    initial_sl = round(float(sl), digits)
+                else:
+                    initial_sl = None
                 layer_dict: Dict[str, Any] = {
                     "lot": l_lot,
                     "remaining_lot": l_lot,
@@ -2358,11 +2401,14 @@ class MT5Executor:
                     "ticket": t,
                     "order_type": o_type,
                     "status": status,
-                    # The stop the order was actually placed with. The trailing
-                    # engine overwrites `sl`/`broker_sl`, so the initial risk R
-                    # must be captured here to stay available for the R-relative
-                    # profit floor.
-                    "initial_sl": (round(float(sl), 2) if sl is not None else None),
+                    # The stop the order was ACTUALLY placed with. The `sl`
+                    # argument is only a request: when it is None the executor
+                    # computes a fallback stop and the broker holds that one, so
+                    # the recorded broker stop wins. The trailing engine
+                    # overwrites `sl`/`broker_sl`, so the initial risk R must be
+                    # captured here to stay available for the R-relative profit
+                    # floor.
+                    "initial_sl": initial_sl,
                 }
                 if o_type == "MARKET":
                     # A MARKET layer fills immediately at placement, so this is the
@@ -4921,6 +4967,12 @@ class MT5Executor:
                     mk_tickets.append(ticket)
                 if layer_name and isinstance(layers.get(layer_name), dict):
                     layers[layer_name]["status"] = "FILLED"
+                    # This ticket is about to leave `pending_tickets`, so the
+                    # 1-second reconciler will never see it again. Stamp the fill
+                    # HERE, otherwise the promoted position has no fill time at
+                    # all and the trade-age guard falls back to the signal
+                    # timestamp -- making a brand-new position look hours old.
+                    stamp_fill_times(signal_data, layers[layer_name])
                     if p_open > 0.0:
                         layers[layer_name]["entry_price"] = round(p_open, digits)
                         layers[layer_name]["entry"] = round(p_open, digits)

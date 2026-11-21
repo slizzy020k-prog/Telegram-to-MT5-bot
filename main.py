@@ -5784,6 +5784,29 @@ def _populate_fill_entry_from_exec(
         l_data.setdefault("remaining_lot", round(float(lot), 4))
 
 
+def _resolve_edit_initial_sl(ticket: Any, sl: Optional[float], digits: int) -> Optional[float]:
+    """Return the stop an edit-placed layer was actually given, for `initial_sl`.
+
+    The executor records the stop it sent to the broker per ticket; that is the
+    authoritative value. The `sl` argument is only the fallback for orders the
+    executor did not place (or when the record is unavailable).
+    """
+    getter = getattr(executor, "get_last_placed_sl", None)
+    if callable(getter):
+        placed = getter(ticket)
+        if placed is not None:
+            try:
+                return round(float(placed), digits)
+            except (TypeError, ValueError):
+                pass
+    if sl is not None:
+        try:
+            return round(float(sl), digits)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional[str], bool]]:
     """Unlocked core implementation of handle_message_edited (caller holds signal lock)."""
     if session_trading_blocked():
@@ -5967,6 +5990,10 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
         return
 
     pip_size = await _mt5_call(executor.get_pip_size, symbol)
+    # The broker's price precision for this symbol: the captured stop is rounded
+    # to it, exactly like the stop that is sent to the broker.
+    _sym_info = await _mt5_call(executor.get_symbol_info, symbol)
+    symbol_digits = int(getattr(_sym_info, "digits", 2) or 2) if _sym_info else 2
     new_sl = parsed.sl if (parsed.sl_valid and parsed.sl is not None) else existing_signal.get("sl")
 
     was_fallback_tp = bool(existing_signal.get("fallback_tp_applied"))
@@ -6597,9 +6624,17 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                         "ticket": new_t,
                         "order_type": new_otype,
                         "status": l_status,
+                        # The stop the order was actually placed with: the R
+                        # floor needs the original risk, and the trailing
+                        # engine later overwrites `sl`/`broker_sl`.
+                        "initial_sl": _resolve_edit_initial_sl(new_t, new_sl, symbol_digits),
                     }
                     if new_otype == "MARKET":
                         _populate_fill_entry_from_exec(existing_signal, new_l_rec, new_t, l_lot, tick, direction, desired_px)
+                        # A MARKET layer fills at placement and never goes through
+                        # the PENDING -> FILLED transition, so its fill time has to
+                        # be stamped here.
+                        stamp_fill_times(existing_signal, new_l_rec)
                     layers[l_name] = new_l_rec
                 else:
                     l_data["status"] = "CANCELLED"
@@ -6824,10 +6859,18 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                         "ticket": t,
                         "order_type": o_type,
                         "status": "OPEN" if o_type == "MARKET" else "PENDING",
+                        # The stop the order was actually placed with: the R
+                        # floor needs the original risk, and the trailing
+                        # engine later overwrites `sl`/`broker_sl`.
+                        "initial_sl": _resolve_edit_initial_sl(t, new_sl, symbol_digits),
                     }
                     if o_type == "MARKET":
                         market_tickets.append(t)
                         _populate_fill_entry_from_exec(existing_signal, new_l_rec_a, t, l_lot, tick, direction, target_px)
+                        # A MARKET layer fills at placement and never goes through
+                        # the PENDING -> FILLED transition, so its fill time has to
+                        # be stamped here.
+                        stamp_fill_times(existing_signal, new_l_rec_a)
                     else:
                         pending_tickets.append(t)
                         occupied_prices.append(target_px_rounded)
@@ -6871,6 +6914,10 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
     }
     if _is_num(existing_signal.get("recorded_entry_price")):
         signal_updates["recorded_entry_price"] = existing_signal["recorded_entry_price"]
+    if existing_signal.get("first_fill_at"):
+        # A MARKET layer created by the edit stamps the signal-level first fill;
+        # persist it so the trade-age guard has a fill clock to read.
+        signal_updates["first_fill_at"] = existing_signal["first_fill_at"]
     if parsed.single_price is not None and not parsed.zone:
         signal_updates["single_price"] = parsed.single_price
     if dyn_edit_snap_applied is not None:
