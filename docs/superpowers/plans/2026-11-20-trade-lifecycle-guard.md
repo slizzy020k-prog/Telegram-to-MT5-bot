@@ -3690,7 +3690,7 @@ with the default the trail engine behaves exactly as before."
 ## Task 5: `mt5_executor.py` — the lifecycle actions
 
 **Files:**
-- Modify: `mt5_executor.py` (add four methods after `close_signal_exposure`, which starts at line 5507)
+- Modify: `mt5_executor.py` (add four methods after `close_signal_exposure`, which starts at line 5512)
 - Modify: `tests/test_trade_lifecycle.py` (append the action tests)
 
 **Interfaces:**
@@ -3864,6 +3864,304 @@ def test_apply_lifecycle_action_dispatches(monkeypatch):
     res_none = ex.apply_lifecycle_action(_lifecycle_signal(), "NONE")
     assert res_none["action"] == "NONE"
     assert res_none["ok"] is True
+
+
+# --- lifecycle actions: the extra invariants -------------------------------
+
+def _lifecycle_executor():
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    return ex
+
+
+def test_apply_lifecycle_derisk_sell_moves_to_breakeven_below_the_entry(monkeypatch):
+    """The SELL mirror of the BUY case: the stop goes to entry - offset."""
+    ex = _lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["direction"] = "SELL"
+    sig["layers"]["L1"]["entry_price"] = 3905.0
+    sig["layers"]["L1"]["broker_sl"] = 3920.0
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert res["ok"] is True
+    assert [t for t, _ in calls] == [101]
+    assert calls[0][1] == pytest.approx(3904.50)   # entry - the $0.50 BE offset
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3904.50)
+
+
+def test_apply_lifecycle_derisk_sell_never_loosens_an_existing_stop(monkeypatch):
+    """A SELL stop at (or below) the breakeven price is already tight enough."""
+    ex = _lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [])
+
+    sig = _lifecycle_signal()
+    sig["direction"] = "SELL"
+    sig["layers"]["L1"]["entry_price"] = 3905.0
+    sig["layers"]["L1"]["broker_sl"] = 3904.50    # already tighter than BE (3904.50)
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == []
+    assert res["moved"] == []
+    assert res["ok"] is True
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3904.50)
+
+
+def test_apply_lifecycle_derisk_uses_the_configured_breakeven_offset(monkeypatch):
+    """The offset comes from DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS; 0 means exactly breakeven."""
+    import config
+    import mt5_executor
+
+    ex = _lifecycle_executor()
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    monkeypatch.setattr(config, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.0)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.0)
+    res = ex.apply_lifecycle_derisk(_lifecycle_signal())
+    assert res["ok"] is True
+    assert calls[0][1] == pytest.approx(3895.0)   # offset 0 -> exactly the entry price
+
+    calls.clear()
+    monkeypatch.setattr(config, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 1.25)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 1.25)
+    res = ex.apply_lifecycle_derisk(_lifecycle_signal())
+    assert res["ok"] is True
+    assert calls[0][1] == pytest.approx(3896.25)
+
+
+def test_apply_lifecycle_derisk_publishes_the_mean_initial_risk_per_ounce(monkeypatch):
+    """`initial_r_per_oz` is the mean of the per-layer initial risks."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L3"] = {
+        "ticket": 103,
+        "status": "OPEN",
+        "lot": 0.01,
+        "remaining_lot": 0.01,
+        "entry_price": 3900.0,
+        "initial_sl": 3880.0,
+        "broker_sl": 3880.0,
+    }
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert res["ok"] is True
+    # L1 risk = 15.00, L3 risk = 20.00 -> mean 17.50
+    assert sig["initial_r_per_oz"] == pytest.approx(17.5)
+
+
+def test_apply_lifecycle_derisk_does_not_publish_a_zero_initial_risk(monkeypatch):
+    """With no layer that has both an entry and an initial stop there is no R to publish."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L1"].pop("initial_sl")
+    ex.apply_lifecycle_derisk(sig)
+
+    assert "initial_r_per_oz" not in sig
+
+
+def test_apply_lifecycle_derisk_reports_a_rejected_stop_as_a_failure(monkeypatch):
+    """A broker rejection is reported, and the existing stop is left in place."""
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: False)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert res["ok"] is False
+    assert res["failed"] == ["L1:modify_failed"]
+    assert res["moved"] == []
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_apply_lifecycle_derisk_never_raises_a_broker_error(monkeypatch):
+    """An exception from the broker is recorded in `failed`, never propagated."""
+    ex = _lifecycle_executor()
+
+    def _boom(t, sl=None, tp=None):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(ex, "modify_position_sltp", _boom)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert res["ok"] is False
+    assert res["failed"] and res["failed"][0].startswith("L1:")
+    assert res["moved"] == []
+
+
+def test_apply_lifecycle_derisk_skips_a_stop_on_the_wrong_side_of_the_market(monkeypatch):
+    """A BUY stop above the market is invalid (retcode 10016) and must not be sent."""
+    from types import SimpleNamespace
+
+    ex = _lifecycle_executor()
+    ex.dry_run = False   # the market-side guard only runs against a live broker
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "get_symbol_info",
+        lambda symbol: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    # The market fell BELOW the entry: entry + 0.50 is above the market now.
+    monkeypatch.setattr(ex, "get_tick", lambda symbol: SimpleNamespace(bid=3890.0, ask=3890.2))
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == [], "an invalid stop must never reach the broker"
+    assert res["moved"] == []
+    assert res["ok"] is True
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_apply_lifecycle_flatten_counts_a_failed_close_as_a_retry(monkeypatch):
+    """A close that leaves the position open is a failure, not a success."""
+    from types import SimpleNamespace
+
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [], "cancelled_orders": []},
+    )
+    # The broker still shows the position: the close did not happen.
+    monkeypatch.setattr(ex, "get_live_positions", lambda symbol=None: [SimpleNamespace(ticket=101)])
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is False
+    assert res["failed"]
+    assert res.get("gave_up") is not True
+    assert sig["lifecycle_retry_count"] == 1
+
+
+def test_apply_lifecycle_flatten_gives_up_after_max_close_retries(monkeypatch):
+    """After the retry budget the guard stops closing and leaves the position to its broker SL."""
+    from types import SimpleNamespace
+
+    import config
+    import mt5_executor
+
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(config, "LIFECYCLE_MAX_CLOSE_RETRIES", 3)
+    monkeypatch.setattr(mt5_executor, "LIFECYCLE_MAX_CLOSE_RETRIES", 3)
+
+    attempts = []
+
+    def _fail(sig):
+        attempts.append(1)
+        return {"closed_tickets": [], "cancelled_orders": []}
+
+    monkeypatch.setattr(ex, "close_signal_exposure", _fail)
+    monkeypatch.setattr(ex, "get_live_positions", lambda symbol=None: [SimpleNamespace(ticket=101)])
+
+    sig = _lifecycle_signal()
+    results = [ex.apply_lifecycle_flatten(sig) for _ in range(4)]
+
+    assert len(attempts) == 3, "the guard must not exceed the retry budget"
+    assert results[-1].get("gave_up") is True
+    assert results[-1]["ok"] is False
+    assert sig["lifecycle_retry_count"] == 3
+    # The give-up path closes nothing by another route.
+    assert results[-1]["closed"] == []
+
+
+def test_apply_lifecycle_flatten_resets_the_retry_count_after_a_success(monkeypatch):
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [101], "cancelled_orders": [102]},
+    )
+
+    sig = _lifecycle_signal()
+    sig["lifecycle_retry_count"] = 2
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is True
+    assert sig["lifecycle_retry_count"] == 0
+
+
+def test_apply_lifecycle_actions_reject_a_signal_that_is_not_a_dict():
+    """Every action returns a well-formed result, even for a malformed signal."""
+    ex = _lifecycle_executor()
+
+    for action in (ex.apply_lifecycle_derisk, ex.apply_lifecycle_flatten, ex.apply_lifecycle_pending_expire):
+        res = action(None)
+        assert res["ok"] is False
+        assert res["moved"] == []
+        assert res["closed"] == []
+        assert res["cancelled"] == []
+        assert res["failed"] == []
+
+
+def test_apply_lifecycle_action_ignores_an_unknown_action(monkeypatch):
+    """An unknown action is a no-op: no broker call, no failure."""
+    ex = _lifecycle_executor()
+
+    called = []
+    monkeypatch.setattr(ex, "close_signal_exposure", lambda sig: called.append(1) or {})
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: called.append(1) or [])
+
+    res = ex.apply_lifecycle_action(_lifecycle_signal(), "BANANA")
+
+    assert res == {
+        "action": "NONE",
+        "ok": True,
+        "moved": [],
+        "closed": [],
+        "cancelled": [],
+        "failed": [],
+    }
+    assert called == []
+
+
+def test_apply_lifecycle_action_dispatches_every_action(monkeypatch):
+    ex = _lifecycle_executor()
+
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [101], "cancelled_orders": [102]},
+    )
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: True)
+
+    assert ex.apply_lifecycle_action(_lifecycle_signal(), "DERISK")["action"] == "DERISK"
+    assert ex.apply_lifecycle_action(_lifecycle_signal(), "FLATTEN")["action"] == "FLATTEN"
+    assert ex.apply_lifecycle_action(_lifecycle_signal(), "SESSION_FLATTEN")["action"] == "FLATTEN"
+    assert ex.apply_lifecycle_action(_lifecycle_signal(), "EXPIRE_PENDING")["action"] == "EXPIRE_PENDING"
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3876,9 +4174,64 @@ Expected: FAIL — `AttributeError: 'MT5Executor' object has no attribute 'apply
 
 - [ ] **Step 3: Implement the four methods**
 
-Add the following to `mt5_executor.py`, immediately after `close_signal_exposure` (which starts at line 5507):
+Add the following to `mt5_executor.py`, immediately after `close_signal_exposure` (which starts at line 5512):
 
 ```python
+    # --- trade lifecycle actions (age-based de-risk / flatten) -------------
+
+    @staticmethod
+    def _lifecycle_tickets(values: Any) -> List[int]:
+        """Normalise a ticket collection into positive integers (never raises)."""
+        out: List[int] = []
+        try:
+            items = list(values or [])
+        except Exception:
+            return out
+        for v in items:
+            try:
+                t = int(v)
+            except Exception:
+                continue
+            if t > 0:
+                out.append(t)
+        return out
+
+    def _lifecycle_open_tickets(self, signal_data: Dict[str, Any]) -> List[int]:
+        """The market tickets this signal believes are open.
+
+        Mirrors the ticket selection of `close_signal_exposure` (pending orders
+        excluded) so the flatten can tell "the close did not happen" from
+        "there was nothing left to close".
+        """
+        accounted = {
+            _int_num(x, 0)
+            for x in (signal_data.get("accounted_tickets") or [])
+            if _int_num(x, 0) > 0
+        }
+        tickets: List[int] = []
+        seen: Set[int] = set()
+
+        def _add(val: Any) -> None:
+            t = _int_num(val, 0)
+            if t > 0 and t not in seen and t not in accounted:
+                seen.add(t)
+                tickets.append(t)
+
+        for t in (signal_data.get("market_tickets") or []):
+            _add(t)
+        for t in (signal_data.get("runner_tickets") or []):
+            _add(t)
+        if signal_data.get("runner_ticket") is not None:
+            _add(signal_data.get("runner_ticket"))
+        layers = signal_data.get("layers")
+        if isinstance(layers, dict):
+            for lv in layers.values():
+                if not isinstance(lv, dict):
+                    continue
+                if str(lv.get("status") or "").strip().upper() in ("OPEN", "FILLED", "RUNNER"):
+                    _add(lv.get("ticket"))
+        return tickets
+
     def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """Cancel unfilled pending limits and move every open layer to breakeven.
 
@@ -3886,7 +4239,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
         tighter than the breakeven price is left untouched.
         """
         result: Dict[str, Any] = {
-            "action": "DERISK",
+            "action": ACTION_DERISK,
             "ok": True,
             "moved": [],
             "closed": [],
@@ -3899,7 +4252,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
 
         try:
             cancelled = self.cancel_signal_pending_orders(signal_data) or []
-            result["cancelled"] = [int(t) for t in cancelled if int(t) > 0]
+            result["cancelled"] = self._lifecycle_tickets(cancelled)
         except Exception as exc:
             logger.warning(f"[LIFECYCLE DERISK] cancel pending failed: {exc}")
             result["failed"].append(f"cancel:{exc}")
@@ -3907,15 +4260,25 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
         symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
         direction = (signal_data.get("direction") or "BUY").strip().upper()
         is_buy = direction == "BUY"
-        sym_info = self.get_symbol_info(symbol)
+        sign = 1.0 if is_buy else -1.0
+
+        sym_info = None
+        try:
+            sym_info = self.get_symbol_info(symbol)
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE DERISK] symbol info for {symbol} failed: {exc}")
+            result["failed"].append(f"sym_info:{exc}")
         digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
-        offset = max(0.0, _cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS))
+        offset = max(
+            0.0,
+            _cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
+        )
         layers = signal_data.get("layers") or {}
 
         # Publish the signal's initial risk (per ounce) so the ledger can record
         # `initial_r_per_oz` and `r_at_exit` at close time.
-        _risks = []
-        for _lk, _lv in layers.items():
+        _risks: List[float] = []
+        for _lv in layers.values():
             if not isinstance(_lv, dict):
                 continue
             _e = _num(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
@@ -3925,13 +4288,30 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
         if _risks:
             signal_data["initial_r_per_oz"] = round(sum(_risks) / len(_risks), 4)
 
+        # The market decides whether the breakeven stop is even a valid stop: a
+        # BUY stop above the market (or a SELL stop below it) is rejected by the
+        # broker with retcode 10016 (invalid stops). The check runs against a
+        # live broker only -- a dry run has nothing that could reject it.
+        tick = None
+        live_price = 0.0
+        if not self.dry_run:
+            try:
+                tick = self.get_tick(symbol)
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE DERISK] tick for {symbol} failed: {exc}")
+                result["failed"].append(f"tick:{exc}")
+            if tick is not None:
+                _raw_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+                live_price = _num(_raw_px, 0.0)
+        stops_buffer = self._compute_stops_buffer(sym_info)
+
         for lk, lv in list(layers.items()):
             if not isinstance(lv, dict):
                 continue
             # Only a layer that HOLDS a position can be moved to breakeven. A
             # PENDING layer is an unfilled limit that `cancel_signal_pending_orders`
-            # has just cancelled — modifying it would fail at the broker and would
-            # mark an otherwise successful de-risk as failed.
+            # has just cancelled -- modifying it would fail at the broker and
+            # would mark an otherwise successful de-risk as failed.
             if str(lv.get("status") or "").strip().upper() in ("PENDING", "CANCELLED", "CLOSED"):
                 continue
             ticket = _int_num(lv.get("ticket"), 0)
@@ -3948,6 +4328,21 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
                 if already_tighter:
                     continue
             try:
+                # The breakeven stop has to sit on the correct side of the
+                # market and far enough away from it, otherwise the broker
+                # rejects the modify with retcode 10016 (invalid stops).
+                if live_price > 0.0 and sign * (live_price - be_sl) < stops_buffer - 1e-9:
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is not a "
+                        f"valid stop at the market ({live_price}); the existing stop is kept."
+                    )
+                    continue
+                if self.is_within_freeze_level(symbol, be_sl, tick=tick, sym_info=sym_info):
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is inside the "
+                        f"broker freeze level; the existing stop is kept."
+                    )
+                    continue
                 if self.modify_position_sltp(ticket, sl=be_sl, tp=None):
                     lv["sl"] = be_sl
                     lv["broker_sl"] = be_sl
@@ -3968,7 +4363,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
     def apply_lifecycle_flatten(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """Close every open position at market and cancel every pending limit."""
         result: Dict[str, Any] = {
-            "action": "FLATTEN",
+            "action": ACTION_FLATTEN,
             "ok": True,
             "moved": [],
             "closed": [],
@@ -3978,28 +4373,59 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
         if not isinstance(signal_data, dict):
             result["ok"] = False
             return result
+
+        max_attempts = max(1, self._get_lifecycle_policy().max_close_retries)
+        retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
+
+        # The retry budget is spent: the guard stops closing and leaves the
+        # position to its broker SL (the safe fallback).
+        if retries >= max_attempts:
+            result["ok"] = False
+            result["gave_up"] = True
+            result["failed"].append("close:give_up")
+            logger.error(
+                f"[LIFECYCLE FLATTEN] giving up after {retries} failed attempts "
+                f"(max {max_attempts}); the position stays on its broker SL."
+            )
+            return result
+
+        expected_open = self._lifecycle_open_tickets(signal_data)
         try:
             exposure = self.close_signal_exposure(signal_data) or {}
-            result["closed"] = [int(t) for t in (exposure.get("closed_tickets") or []) if int(t) > 0]
-            result["cancelled"] = [int(t) for t in (exposure.get("cancelled_orders") or []) if int(t) > 0]
+            result["closed"] = self._lifecycle_tickets(exposure.get("closed_tickets") or [])
+            result["cancelled"] = self._lifecycle_tickets(exposure.get("cancelled_orders") or [])
         except Exception as exc:
             logger.warning(f"[LIFECYCLE FLATTEN] close failed: {exc}")
             result["failed"].append(f"close:{exc}")
-            result["ok"] = False
 
-        # Retry accounting: the guard gives up (and leaves the position to its
-        # broker SL, the safe fallback) after `max_close_retries` failures.
-        if not result["ok"]:
-            retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
+        if not result["failed"] and expected_open:
+            # A close that left the position open is a FAILURE: the guard has to
+            # retry (and eventually give up) instead of claiming a flatten that
+            # never happened.
+            closed_set = set(result["closed"])
+            try:
+                live_ids = {
+                    _int_num(getattr(p, "ticket", 0), 0)
+                    for p in (self.get_live_positions() or [])
+                }
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE FLATTEN] live position check failed: {exc}")
+                live_ids = set()
+            still_open = [t for t in expected_open if t not in closed_set and t in live_ids]
+            if still_open:
+                result["failed"].append(
+                    "close:still_open:" + ",".join(str(t) for t in still_open)
+                )
+
+        if result["failed"]:
+            result["ok"] = False
             retries += 1
             signal_data["lifecycle_retry_count"] = retries
-            max_retries = self._get_lifecycle_policy().max_close_retries
-            if retries > max_retries:
+            if retries >= max_attempts:
                 logger.error(
                     f"[LIFECYCLE FLATTEN] giving up after {retries} failed attempts "
-                    f"(max {max_retries}); the position stays on its broker SL."
+                    f"(max {max_attempts}); the position stays on its broker SL."
                 )
-                result["ok"] = False
                 result["gave_up"] = True
         else:
             signal_data["lifecycle_retry_count"] = 0
@@ -4013,7 +4439,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
     def apply_lifecycle_pending_expire(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
         """Cancel the unfilled pending limits of a signal that never filled."""
         result: Dict[str, Any] = {
-            "action": "EXPIRE_PENDING",
+            "action": ACTION_EXPIRE_PENDING,
             "ok": True,
             "moved": [],
             "closed": [],
@@ -4025,7 +4451,7 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
             return result
         try:
             cancelled = self.cancel_signal_pending_orders(signal_data) or []
-            result["cancelled"] = [int(t) for t in cancelled if int(t) > 0]
+            result["cancelled"] = self._lifecycle_tickets(cancelled)
         except Exception as exc:
             logger.warning(f"[LIFECYCLE EXPIRE_PENDING] cancel failed: {exc}")
             result["failed"].append(f"cancel:{exc}")
@@ -4036,13 +4462,20 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
     def apply_lifecycle_action(self, signal_data: Dict[str, Any], action: str) -> Dict[str, Any]:
         """Dispatch a lifecycle action. Unknown actions are a no-op."""
         token = str(action or "").strip().upper()
-        if token == "DERISK":
+        if token == ACTION_DERISK:
             return self.apply_lifecycle_derisk(signal_data)
-        if token in ("FLATTEN", "SESSION_FLATTEN"):
+        if token in (ACTION_FLATTEN, ACTION_SESSION_FLATTEN):
             return self.apply_lifecycle_flatten(signal_data)
-        if token == "EXPIRE_PENDING":
+        if token == ACTION_EXPIRE_PENDING:
             return self.apply_lifecycle_pending_expire(signal_data)
-        return {"action": "NONE", "ok": True, "moved": [], "closed": [], "cancelled": [], "failed": []}
+        return {
+            "action": ACTION_NONE,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
