@@ -3198,14 +3198,14 @@ guard on it immediately."
 ## Task 4: `mt5_executor.py` — compute and apply the R floor
 
 **Files:**
-- Modify: `mt5_executor.py:16-103` (the `from config import (...)` block — add the ten lifecycle knobs)
-- Modify: `mt5_executor.py:104-113` (the `dynamic_risk` / `risk_lifecycle` import block)
-- Modify: `mt5_executor.py:121-206` (`_CFG_IMPORT_SNAPSHOT` name list — add the new knobs)
-- Modify: `mt5_executor.py:1337-1373` (`_get_dynamic_risk_policy` — add a lifecycle policy resolver after it)
-- Modify: `mt5_executor.py:2388-2394` (`_execute_4layer_specs` — the `initial_sl` fallback: a zero stop is not a stop)
-- Modify: `mt5_executor.py:8206-8222` (`evaluate_dynamic_atr_engine` — the trail call)
-- Modify: `mt5_executor.py:8282` (`evaluate_dynamic_atr_engine` — the ATR-trail bookkeeping whitelist)
-- Modify: `tests/test_trade_lifecycle.py` (append the integration tests)
+- Modify: `mt5_executor.py:16-112` (the `from config import (...)` block — add the ten lifecycle knobs)
+- Modify: `mt5_executor.py:114-127` (the `dynamic_risk` / `risk_lifecycle` import block)
+- Modify: `mt5_executor.py:136-231` (`_CFG_IMPORT_SNAPSHOT` name list — add the new knobs)
+- Modify: `mt5_executor.py:1362-1399` (`_get_dynamic_risk_policy` — add a lifecycle policy resolver after it, at lines 1400-1422)
+- Modify: `mt5_executor.py:2437-2446` (`_execute_4layer_specs` — the `initial_sl` fallback: a zero stop is not a stop)
+- Modify: `mt5_executor.py:8258-8298` (`evaluate_dynamic_atr_engine` — the floor computation and the trail call)
+- Modify: `mt5_executor.py:8359` (`evaluate_dynamic_atr_engine` — the ATR-trail bookkeeping whitelist)
+- Modify: `tests/test_trade_lifecycle.py` (append the integration tests, lines 1482-1679)
 
 **Interfaces:**
 - Consumes: `risk_lifecycle.read_lifecycle_policy`, `risk_lifecycle.compute_r_lock_floor`, `LifecyclePolicy` (Task 1); `compute_dynamic_atr_trail_stop(..., r_lock_floor=...)` (Task 2); `layers[...]["initial_sl"]` (Task 3).
@@ -3236,7 +3236,10 @@ def _atr_signal(entry: float, sl: float, ticket: int = 101):
         },
         "market_tickets": [ticket],
         "pending_tickets": [],
-        "tp_levels": {"TP1": entry + 10.0, "TP2": entry + 20.0},
+        # The TP levels sit BEYOND the live price used by the tests below, so
+        # the milestone floor (which is locked to entry + $0.50 once TP1 is
+        # cleared) cannot win the picker. These tests are about the R floor.
+        "tp_levels": {"TP1": entry + 20.0, "TP2": entry + 30.0},
         "runner_cleared_milestones": [],
     }
 
@@ -3262,6 +3265,7 @@ def test_executor_applies_r_lock_floor(monkeypatch):
     assert res.get("updated_tickets"), "the R floor must move the stop"
     assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.0)
     assert sig["layers"]["L1"]["initial_sl"] == pytest.approx(3880.0)
+    assert sig.get("active_stop_source") == "R_LOCK"
 
 
 def test_executor_r_lock_is_inert_when_disabled(monkeypatch):
@@ -3321,6 +3325,96 @@ def test_execute_4layer_specs_treats_a_zero_stop_as_no_stop(monkeypatch):
         tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
     )
     assert layers["L1"]["initial_sl"] is None
+
+
+# --- executor R-floor: the invariants that make the floor safe ------------
+
+
+def test_executor_r_lock_never_loosens_an_existing_stop(monkeypatch):
+    """The R floor may only ever RAISE a stop.
+
+    The floor is 3895.00 (entry) but the broker already holds 3896.00, so the
+    R lock must not pull the stop back down to 3895.00.
+    """
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"]["broker_sl"] = 3896.0   # already tighter than the R floor
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert not res.get("updated_tickets"), "a looser stop must never be sent"
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3896.0)
+
+
+def test_executor_r_lock_skips_a_layer_without_initial_sl_and_logs_it_once(monkeypatch, caplog):
+    """A layer without an initial stop is skipped, and the skip is logged ONCE."""
+    import config
+    import json
+    import logging
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"].pop("initial_sl")
+
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+        ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+
+    skips = [rec for rec in caplog.records if "R-LOCK SKIPPED" in rec.getMessage()]
+    assert len(skips) == 1, "the skip must be logged exactly once per layer"
+    assert sig["layers"]["L1"].get("_r_lock_skipped_logged") is True
+    # The marker lives on the persisted layer record, so it must stay JSON-safe.
+    json.dumps(sig["layers"]["L1"])
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_executor_r_lock_records_the_trail_bookkeeping_when_it_wins(monkeypatch):
+    """A layer protected by an R-lock stop must still look trail-protected.
+
+    `dynamic_atr_trail_sl` drives the protection heuristics, so the R lock
+    has to write it; `_mult`/`_zone` stay the engine's live tier telemetry.
+    """
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    lv = sig["layers"]["L1"]
+    assert lv.get("dynamic_atr_trail_sl") == pytest.approx(3895.0)
+    # The tier telemetry describes the engine, not the author of the stop.
+    assert lv.get("dynamic_atr_trail_mult") is not None
+    assert lv.get("dynamic_atr_trail_zone") is not None
+
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -3329,23 +3423,30 @@ def test_execute_4layer_specs_treats_a_zero_stop_as_no_stop(monkeypatch):
 python -m pytest tests/test_trade_lifecycle.py -q
 ```
 
-Expected: FAIL — the stop is not moved to the R floor (the ATR trail candidate wins instead).
+Expected: FAIL — `mt5_executor` does not expose the new knobs yet, so every new test
+dies in `monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", ...)` with
+`AttributeError: module 'mt5_executor' has no attribute 'R_LOCK_ENABLED'`.
+
+Observed: `python -m pytest tests/test_trade_lifecycle.py -q -k "r_lock or zero_stop"` ->
+**7 failed**, 22 passed, 48 deselected.
 
 - [ ] **Step 3: Import the lifecycle module in `mt5_executor.py`**
 
-At the `from dynamic_risk import (...)` block (lines 104-110), add:
+At the `from dynamic_risk import (...)` block (lines 114-120), the existing
+`from risk_lifecycle import stamp_fill_times` becomes (lines 122-127):
 
 ```python
 from risk_lifecycle import (
     LifecyclePolicy,
     compute_r_lock_floor,
     read_lifecycle_policy,
+    stamp_fill_times,
 )
 ```
 
 - [ ] **Step 4: Register the new knobs in `_CFG_IMPORT_SNAPSHOT`**
 
-In `mt5_executor.py`, add the ten new knob names to the `_CFG_IMPORT_SNAPSHOT` name list (the tuple that ends at line 205 with `"MT5_PATH",`), immediately before the closing `)`:
+In `mt5_executor.py`, add the ten new knob names to the `_CFG_IMPORT_SNAPSHOT` name list (the tuple that ends at line 219 with `"MT5_PATH",`), immediately before the closing `)`:
 
 ```python
         "R_LOCK_ENABLED",
@@ -3360,27 +3461,33 @@ In `mt5_executor.py`, add the ten new knob names to the `_CFG_IMPORT_SNAPSHOT` n
         "LIFECYCLE_MAX_CLOSE_RETRIES",
 ```
 
-Then import the constants into the module globals so `_cfg()` can resolve them. `mt5_executor.py` already has `import config as _config` (line 15) and a `from config import (...)` block (line 16) — add the ten names to that existing `from config import (...)` block:
+Then import the constants into the module globals so `_cfg()` can resolve them. `mt5_executor.py` already has `import config as _config` (line 15) and a `from config import (...)` block (lines 16-112) — add the ten names to that existing block. The shipped file keeps the block alphabetical, so the names land in two hunks:
 
 ```python
 from config import (
     ...
-    R_LOCK_ENABLED,
-    R_LOCK_TIERS,
-    R_LOCK_MIN_R_DOLLARS,
-    LIFECYCLE_ENABLED,
+    LEGACY_LAYER_MAP,
     LIFECYCLE_DERISK_SECONDS,
+    LIFECYCLE_ENABLED,
     LIFECYCLE_FLATTEN_SECONDS,
-    LIFECYCLE_PENDING_EXPIRE_SECONDS,
-    LIFECYCLE_SESSION_FLATTEN_ENABLED,
-    LIFECYCLE_SESSION_FLATTEN_AT,
     LIFECYCLE_MAX_CLOSE_RETRIES,
+    LIFECYCLE_PENDING_EXPIRE_SECONDS,
+    LIFECYCLE_SESSION_FLATTEN_AT,
+    LIFECYCLE_SESSION_FLATTEN_ENABLED,
+    M1_ATR_PERIOD,
+    ...
+    RISK_LOT_MULTIPLIER,
+    R_LOCK_ENABLED,
+    R_LOCK_MIN_R_DOLLARS,
+    R_LOCK_TIERS,
+    RUNNER_DEEPEST_COUNT_FULL,
+    ...
 )
 ```
 
 - [ ] **Step 5: Add the lifecycle policy resolver**
 
-In `mt5_executor.py`, add this method immediately after `_get_dynamic_risk_policy` (which ends at line 1356):
+In `mt5_executor.py`, add this method immediately after `_get_dynamic_risk_policy` (which ends at line 1399 in the shipped file; the new method occupies lines 1400-1422):
 
 ```python
     def _get_lifecycle_policy(self) -> LifecyclePolicy:
@@ -3412,8 +3519,8 @@ In `mt5_executor.py`, add this method immediately after `_get_dynamic_risk_polic
 
 `main.py:_resolve_edit_initial_sl` already returns `None` for a zero stop, because the executor
 treats `sl == 0.0` as "no stop given" and computes a fallback instead (`_compute_fallback_sl`,
-`mt5_executor.py:1429`). The executor's own `initial_sl` fallback does not: at
-`mt5_executor.py:2391-2392` it records `sl == 0.0` as a stop.
+`mt5_executor.py:1463`). The executor's own `initial_sl` fallback does not: at
+`mt5_executor.py:2437-2446` it records `sl == 0.0` as a stop.
 
 A zero stop is not a stop. Record `None` for it, so the layer has no initial risk R and the
 R-lock is skipped for that layer (exactly like a missing `initial_sl`) rather than being given a
@@ -3451,11 +3558,11 @@ for that layer (the stop is not moved to a floor).
 
 - [ ] **Step 7: Compute and pass the R floor**
 
-In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor computation immediately before the `# 2) Dynamic Trailing SL` comment (around line 8206).
+In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor computation immediately before the `# 2) Dynamic Trailing SL` comment (the shipped block occupies lines 8258-8280).
 
 Use the layer's persisted `lv["mfe_dollars"]` as the maximum favourable excursion, NOT a fresh
 `sign * (layer_peak - entry_px)`. That field is already computed a few lines above
-(`mt5_executor.py:8087`) as the running, non-negative maximum over every tick, and it survives a
+(`mt5_executor.py:8139`) as the running, non-negative maximum over every tick, and it survives a
 restart; recomputing it would drop the monotonic guarantee.
 
 ```python
@@ -3484,7 +3591,7 @@ restart; recomputing it would drop the monotonic guarantee.
                 )
 ```
 
-Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call at lines 8139-8152:
+Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call (the shipped call occupies lines 8284-8298):
 
 ```python
             trail_step = compute_dynamic_atr_trail_stop(
@@ -3504,7 +3611,7 @@ Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call at li
             )
 ```
 
-**Also add `"R_LOCK"` to the ATR-trail bookkeeping whitelist.** `mt5_executor.py:8213` currently reads:
+**Also add `"R_LOCK"` to the ATR-trail bookkeeping whitelist.** Before this change the condition read:
 
 ```python
             if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR"):
@@ -3515,7 +3622,7 @@ Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call at li
                 lv["dynamic_atr_trail_zone"] = trail_step.get("trail_zone") or last_trail_zone
 ```
 
-When the R lock wins the picker, `stop_source == "R_LOCK"` and that block is skipped, so `lv["dynamic_atr_trail_sl"]` would lag the actual broker SL. That field drives the protection heuristics at `main.py:3372`, `main.py:5703-5710`, `mt5_executor.py:6912` and `mt5_executor.py:7234`, so a layer protected by an R-lock stop could be reported as not trail-protected. Change the condition to:
+When the R lock wins the picker, `stop_source == "R_LOCK"` and that block is skipped, so `lv["dynamic_atr_trail_sl"]` would lag the actual broker SL. That field drives the protection heuristics at `main.py:3372`, `main.py:5703-5710`, `mt5_executor.py:7033` and `mt5_executor.py:7355`, so a layer protected by an R-lock stop could be reported as not trail-protected. The shipped file reads (line 8359):
 
 ```python
             if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK"):
@@ -3523,13 +3630,15 @@ When the R lock wins the picker, `stop_source == "R_LOCK"` and that block is ski
 
 The `dynamic_atr_trail_mult` / `_zone` values reported for an R-lock stop are the trail's own telemetry (the trail may not have been the winning candidate); that is acceptable — they describe the engine's live tier, not the stop's author.
 
+Verified on the shipped implementation: with the R lock enabled and winning, `dynamic_atr_trail_mult`/`_zone` are `1.0`/`"EXTENDED"` both with and without `"R_LOCK"` in the whitelist — the whitelist only adds `dynamic_atr_trail_sl`/`_dist`/`_atr`. (Both `_mult` and `_zone` are also written unconditionally right after the whitelist block, so they can never describe the stop's author.)
+
 - [ ] **Step 8: Run the tests to verify they pass**
 
 ```powershell
 python -m pytest tests/test_trade_lifecycle.py -q
 ```
 
-Expected: PASS.
+Expected: PASS — 77 passed (70 pre-existing + 7 new).
 
 - [ ] **Step 9: Run the full suite**
 
@@ -3538,6 +3647,8 @@ python -m pytest -q
 ```
 
 Expected: **0 failed**. Pay attention to `tests/test_dynamic_risk_management.py` and `tests/test_msg_10180_10196_regressions.py` — they assert on `stop_source` values; with `R_LOCK_ENABLED=false` by default the tie-break change must not alter them.
+
+Observed on the shipped implementation: **318 passed**, 0 failed (311 before this task + 7 new).
 
 - [ ] **Step 10: Commit**
 
@@ -3551,8 +3662,28 @@ still owns the tight stop and the never-loosens invariant holds. Layers without
 initial_sl (signals opened before the upgrade) are skipped and logged once.
 
 A zero stop is recorded as no stop, matching the executor's own treatment of
-sl == 0.0 as a request to compute a fallback."
+sl == 0.0 as a request to compute a fallback.
+
+The feature ships DISABLED: R_LOCK_ENABLED defaults to False in config.py, so
+with the default the trail engine behaves exactly as before."
 ```
+
+**Shipped notes — deviations from the original plan and their reasons:**
+
+1. **The test fixture's TP levels moved beyond the live price.** The plan's fixture used
+   `TP1 = entry + 10.0` / `TP2 = entry + 20.0` with a live price of `entry + 11.0`, which clears
+   TP1. Clearing TP1 arms the **milestone floor** at `entry + $0.50` — *tighter* than the R floor
+   (`entry`) — so the milestone floor wins the picker and the R lock is never exercised. The
+   shipped fixture uses `TP1 = entry + 20.0` / `TP2 = entry + 30.0` so TP1 is not cleared and the
+   R floor is the only candidate. The live price, the entry, the stop and every assertion are
+   unchanged.
+2. **`from risk_lifecycle import (...)` keeps `stamp_fill_times`.** The plan's block listed only
+   the three new names; the shipped file already imported `stamp_fill_times`, so it is kept in
+   the same parenthesised import.
+3. **Three extra tests** cover the invariants this task has to prove end-to-end: the R floor
+   never loosens an existing stop, a layer without `initial_sl` is skipped and logged exactly
+   once (and the `_r_lock_skipped_logged` marker stays JSON-serialisable), and an R-lock stop
+   still writes the `dynamic_atr_trail_*` protection fields.
 
 ---
 
