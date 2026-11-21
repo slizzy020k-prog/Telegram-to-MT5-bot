@@ -71,6 +71,13 @@ from config import (
     LAYER_LOTS,
     LAYER_NAMES,
     LEGACY_LAYER_MAP,
+    LIFECYCLE_DERISK_SECONDS,
+    LIFECYCLE_ENABLED,
+    LIFECYCLE_FLATTEN_SECONDS,
+    LIFECYCLE_MAX_CLOSE_RETRIES,
+    LIFECYCLE_PENDING_EXPIRE_SECONDS,
+    LIFECYCLE_SESSION_FLATTEN_AT,
+    LIFECYCLE_SESSION_FLATTEN_ENABLED,
     M1_ATR_PERIOD,
     MAGIC_NUMBER,
     MAX_ORDERS_PER_SIGNAL,
@@ -84,6 +91,9 @@ from config import (
     PENDING_DUPLICATE_ORDER_TOLERANCE,
     PENDING_DUPLICATE_PRICE_TOLERANCE,
     RISK_LOT_MULTIPLIER,
+    R_LOCK_ENABLED,
+    R_LOCK_MIN_R_DOLLARS,
+    R_LOCK_TIERS,
     RUNNER_DEEPEST_COUNT_FULL,
     RUNNER_MAX_TP_STAGE,
     SINGLE_PRICE_CONSOLIDATE_ORDERS,
@@ -109,7 +119,12 @@ from dynamic_risk import (
     read_dynamic_risk_policy,
     scale_sl_tp_by_atr,
 )
-from risk_lifecycle import stamp_fill_times
+from risk_lifecycle import (
+    LifecyclePolicy,
+    compute_r_lock_floor,
+    read_lifecycle_policy,
+    stamp_fill_times,
+)
 
 logger = logging.getLogger("copier.mt5")
 
@@ -202,6 +217,16 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "MT5_PASSWORD",
         "MT5_SERVER",
         "MT5_PATH",
+        "R_LOCK_ENABLED",
+        "R_LOCK_TIERS",
+        "R_LOCK_MIN_R_DOLLARS",
+        "LIFECYCLE_ENABLED",
+        "LIFECYCLE_DERISK_SECONDS",
+        "LIFECYCLE_FLATTEN_SECONDS",
+        "LIFECYCLE_PENDING_EXPIRE_SECONDS",
+        "LIFECYCLE_SESSION_FLATTEN_ENABLED",
+        "LIFECYCLE_SESSION_FLATTEN_AT",
+        "LIFECYCLE_MAX_CLOSE_RETRIES",
     )
 }
 
@@ -1372,6 +1397,30 @@ class MT5Executor:
         )
         return read_dynamic_risk_policy(proxy)
 
+    def _get_lifecycle_policy(self) -> LifecyclePolicy:
+        """Resolve the LifecyclePolicy respecting monkeypatches on either config or mt5_executor."""
+        proxy = SimpleNamespace(
+            R_LOCK_ENABLED=_cfg("R_LOCK_ENABLED", R_LOCK_ENABLED),
+            R_LOCK_TIERS=_cfg("R_LOCK_TIERS", R_LOCK_TIERS),
+            R_LOCK_MIN_R_DOLLARS=_cfg("R_LOCK_MIN_R_DOLLARS", R_LOCK_MIN_R_DOLLARS),
+            LIFECYCLE_ENABLED=_cfg("LIFECYCLE_ENABLED", LIFECYCLE_ENABLED),
+            LIFECYCLE_DERISK_SECONDS=_cfg("LIFECYCLE_DERISK_SECONDS", LIFECYCLE_DERISK_SECONDS),
+            LIFECYCLE_FLATTEN_SECONDS=_cfg("LIFECYCLE_FLATTEN_SECONDS", LIFECYCLE_FLATTEN_SECONDS),
+            LIFECYCLE_PENDING_EXPIRE_SECONDS=_cfg(
+                "LIFECYCLE_PENDING_EXPIRE_SECONDS", LIFECYCLE_PENDING_EXPIRE_SECONDS
+            ),
+            LIFECYCLE_SESSION_FLATTEN_ENABLED=_cfg(
+                "LIFECYCLE_SESSION_FLATTEN_ENABLED", LIFECYCLE_SESSION_FLATTEN_ENABLED
+            ),
+            LIFECYCLE_SESSION_FLATTEN_AT=_cfg(
+                "LIFECYCLE_SESSION_FLATTEN_AT", LIFECYCLE_SESSION_FLATTEN_AT
+            ),
+            LIFECYCLE_MAX_CLOSE_RETRIES=_cfg(
+                "LIFECYCLE_MAX_CLOSE_RETRIES", LIFECYCLE_MAX_CLOSE_RETRIES
+            ),
+        )
+        return read_lifecycle_policy(proxy)
+
     def apply_dynamic_atr_sl_tp(
         self,
         symbol: str,
@@ -2386,11 +2435,14 @@ class MT5Executor:
                 # and sends THAT to the broker, so the recorded broker stop is
                 # the authoritative initial risk R.
                 placed_sl = self.get_last_placed_sl(t)
-                if placed_sl is not None:
+                if placed_sl is not None and float(placed_sl) > 0.0:
                     initial_sl = round(float(placed_sl), digits)
-                elif sl is not None:
+                elif sl is not None and float(sl) > 0.0:
                     initial_sl = round(float(sl), digits)
                 else:
+                    # A zero stop is not a stop: the executor treats `sl == 0.0` as
+                    # "no stop given" and computes a fallback instead, so there is
+                    # no initial risk R to record.
                     initial_sl = None
                 layer_dict: Dict[str, Any] = {
                     "lot": l_lot,
@@ -8203,6 +8255,30 @@ class MT5Executor:
                                     "atr": round(atr, 4),
                                 })
 
+            # 1b) R-relative profit floor.
+            # The ATR trail owns the tight stop; this floor only ever raises the
+            # stop, and it scales with the trade's own initial risk R so a wide
+            # stop is not protected after the same absolute move as a scalp.
+            r_lock_floor = None
+            lifecycle_pol = self._get_lifecycle_policy()
+            initial_sl = _num(lv.get("initial_sl"), 0.0)
+            if lifecycle_pol.r_lock_enabled and initial_sl > 0.0:
+                r_lock_floor = compute_r_lock_floor(
+                    direction=direction,
+                    entry_price=entry_px,
+                    initial_sl=initial_sl,
+                    mfe_dollars=_num(lv.get("mfe_dollars"), 0.0),
+                    live_price=live_price,
+                    policy=lifecycle_pol,
+                    digits=digits,
+                )
+            elif lifecycle_pol.r_lock_enabled and not lv.get("_r_lock_skipped_logged"):
+                lv["_r_lock_skipped_logged"] = True
+                logger.info(
+                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (signal opened before the upgrade); "
+                    "ATR trail only."
+                )
+
             # 2) Dynamic Trailing SL (BE Lock + Forward-Only ATR Trail + Milestone Floor)
             cur_sl = self._resolve_ticket_current_sl(signal_data, t_int, lv, is_buy, digits)
             trail_step = compute_dynamic_atr_trail_stop(
@@ -8218,6 +8294,7 @@ class MT5Executor:
                 cleared_milestones=sig_cleared,
                 tp_levels=tp_levels,
                 apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
+                r_lock_floor=r_lock_floor,
             )
             if trail_step.get("peak_price") is not None:
                 lv["dynamic_atr_trail_peak"] = trail_step["peak_price"]
@@ -8279,7 +8356,7 @@ class MT5Executor:
                     "atr": trail_step.get("atr", round(atr, 4)),
                     "pending_swept": [],
                 })
-            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR"):
+            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK"):
                 lv["dynamic_atr_trail_sl"] = cand_sl
                 lv["dynamic_atr_trail_dist"] = trail_step["trail_dist"]
                 lv["dynamic_atr_trail_atr"] = trail_step["atr"]

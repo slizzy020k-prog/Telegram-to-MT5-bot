@@ -1478,3 +1478,202 @@ def test_resolve_edit_initial_sl_treats_zero_as_no_stop(monkeypatch):
     assert main._resolve_edit_initial_sl(4242, 0.0, 2) is None, "0.0 is not a stop"
     assert main._resolve_edit_initial_sl(4242, None, 2) is None, "no stop stays no stop"
     assert main._resolve_edit_initial_sl(4242, 3870.0, 2) == pytest.approx(3870.0), "a real stop is kept"
+
+# --- executor R-floor wiring ---------------------------------------------
+
+def _atr_signal(entry: float, sl: float, ticket: int = 101):
+    return {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "layers": {
+            "L1": {
+                "ticket": ticket,
+                "status": "OPEN",
+                "lot": 0.01,
+                "remaining_lot": 0.01,
+                "entry_price": entry,
+                "initial_sl": sl,
+                "broker_sl": sl,
+            },
+        },
+        "market_tickets": [ticket],
+        "pending_tickets": [],
+        # The TP levels sit BEYOND the live price used by the tests below, so
+        # the milestone floor (which is locked to entry + $0.50 once TP1 is
+        # cleared) cannot win the picker. These tests are about the R floor.
+        "tp_levels": {"TP1": entry + 20.0, "TP2": entry + 30.0},
+        "runner_cleared_milestones": [],
+    }
+
+
+def test_executor_applies_r_lock_floor(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0     # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+
+    sig = _atr_signal(3895.0, 3880.0)   # R = 15.0
+    # Live price is $11.00 in favour -> 0.73R -> tier 0.5R reached -> floor = entry
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert res.get("updated_tickets"), "the R floor must move the stop"
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.0)
+    assert sig["layers"]["L1"]["initial_sl"] == pytest.approx(3880.0)
+    assert sig.get("active_stop_source") == "R_LOCK"
+
+
+def test_executor_r_lock_is_inert_when_disabled(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", False)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_executor_r_lock_skipped_without_initial_sl(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"].pop("initial_sl")     # a signal opened before the upgrade
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_execute_4layer_specs_treats_a_zero_stop_as_no_stop(monkeypatch):
+    """The executor computes a fallback when sl == 0.0, so 0.0 is not a stop."""
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    monkeypatch.setattr(ex, "_execute_layer_price", lambda **kwargs: (9002, "MARKET"))
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=0.0,
+        tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
+    )
+    assert layers["L1"]["initial_sl"] is None
+
+
+# --- executor R-floor: the invariants that make the floor safe ------------
+
+
+def test_executor_r_lock_never_loosens_an_existing_stop(monkeypatch):
+    """The R floor may only ever RAISE a stop.
+
+    The floor is 3895.00 (entry) but the broker already holds 3896.00, so the
+    R lock must not pull the stop back down to 3895.00.
+    """
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"]["broker_sl"] = 3896.0   # already tighter than the R floor
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert not res.get("updated_tickets"), "a looser stop must never be sent"
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3896.0)
+
+
+def test_executor_r_lock_skips_a_layer_without_initial_sl_and_logs_it_once(monkeypatch, caplog):
+    """A layer without an initial stop is skipped, and the skip is logged ONCE."""
+    import config
+    import json
+    import logging
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"].pop("initial_sl")
+
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+        ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+
+    skips = [rec for rec in caplog.records if "R-LOCK SKIPPED" in rec.getMessage()]
+    assert len(skips) == 1, "the skip must be logged exactly once per layer"
+    assert sig["layers"]["L1"].get("_r_lock_skipped_logged") is True
+    # The marker lives on the persisted layer record, so it must stay JSON-safe.
+    json.dumps(sig["layers"]["L1"])
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_executor_r_lock_records_the_trail_bookkeeping_when_it_wins(monkeypatch):
+    """A layer protected by an R-lock stop must still look trail-protected.
+
+    `dynamic_atr_trail_sl` drives the protection heuristics, so the R lock
+    has to write it; `_mult`/`_zone` stay the engine's live tier telemetry.
+    """
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    lv = sig["layers"]["L1"]
+    assert lv.get("dynamic_atr_trail_sl") == pytest.approx(3895.0)
+    # The tier telemetry describes the engine, not the author of the stop.
+    assert lv.get("dynamic_atr_trail_mult") is not None
+    assert lv.get("dynamic_atr_trail_zone") is not None
