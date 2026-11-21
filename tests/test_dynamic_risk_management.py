@@ -397,7 +397,7 @@ def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch):
     assert config.DYNAMIC_TP_MAX_DOLLARS == pytest.approx(50.00)
     assert config.DYNAMIC_ATR_TRAIL_ENABLED is True
     assert config.DYNAMIC_ATR_TRAIL_MIN_DOLLARS == pytest.approx(2.50)
-    assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == pytest.approx(12.00)
+    assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == pytest.approx(8.00)  # v3.9.0 Stage-A cap
     assert config.DYNAMIC_ATR_TRAIL_STEP_DOLLARS == pytest.approx(0.25)
     assert config.DYNAMIC_ATR_BE_ACTIVATION_MULT == pytest.approx(0.75)
     assert config.DYNAMIC_ATR_BE_MIN_MFE_DOLLARS == pytest.approx(3.50)

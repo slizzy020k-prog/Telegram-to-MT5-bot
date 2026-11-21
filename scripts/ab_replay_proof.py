@@ -115,6 +115,9 @@ ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "RATCHET_STAGE4_MAX_CUSHION": 4.50,
     "PEAK_HARVEST_MIN_VIRT_CUSHION": 2.25,
     "BANK_HARVEST_ALT_ARM_PCT": 0.80,
+    # Arm B is the no-R-lock baseline: pin it explicitly so an R_LOCK_ENABLED=true
+    # in the ambient .env cannot contaminate the A/B/C comparison.
+    "R_LOCK_ENABLED": False,
 }
 
 # Arm C params: Arm B plus the R-relative profit floor (R lock only).

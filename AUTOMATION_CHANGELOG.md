@@ -4,6 +4,71 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ---
 
+## [2026-11-21] — v3.9.0 Remove timer exits, enable R_LOCK, tight-yet-breathable ATR compression
+
+- **Baseline Commit:** `09aa054` (v3.8.2)
+- **Commits:** `f0da936` (timer removal), `7791a25` (per-stage ATR clamps).
+- **Verification:** `391/391` pytest PASS (`0` failures); `check_algo.py` ALL CHECKS PASSED;
+  `startup_checks.validate_environment()` clean; imports OK. Replay: R-lock precedence verified,
+  `g5=True`, Arm C beats Arm B on net AND tail.
+
+### 1. Complete removal of time-based auto-close / lifecycle timers (`f0da936`)
+
+- Deleted `evaluate_trade_age`, the de-risk / hard-flatten loops, pending-order auto-expiry, and the
+  session-flatten clock; all `LIFECYCLE_*` config, the `/lifecycle` command, and the timer tests.
+- **Trades and pending zone limits are now never closed or cancelled by a clock** — only by hitting
+  TP, hitting the trailed / R-locked SL, or an explicit signal-provider command.
+- **Kept intact:** the R-relative floor (`compute_initial_r`, `compute_r_lock_floor`, `R_LOCK_*`,
+  `/rlock`) and ALL telemetry (`initial_sl` capture, fill stamps, `resolve_fill_time`, ledger
+  schema-4 GBP MFE / giveback / R-multiple). 104 timer tests removed; every R-lock/telemetry test kept.
+
+### 2. R_LOCK enabled
+
+- `R_LOCK_ENABLED=true` in the local `.env`. The R-gated BE foundation arms at
+  `max(0.5R, 0.75 x M5_ATR, $2.50)`, locks the server SL at breakeven (entry ± $0.50) and sweeps
+  unfilled lower pending limits; the R_LOCK staircase raises the floor 1.0R→+0.25R, 1.5R→+0.50R,
+  2.0R→+0.75R.
+
+### 3. Tight-yet-breathable 3-stage ATR trailing compression (`7791a25`)
+
+| Stage | MFE ($/oz) | Multiplier | Clamp |
+|---|---|---|---|
+| A — early breathing room | < $10 | 1.40 x M5_ATR | [$2.50, $8.00] |
+| B — profit-lock tightening | $10 – $18 | 1.00 x M5_ATR | [$2.20, $5.50] |
+| C — peak harvest hug | >= $18 | 0.80 x M5_ATR | [$2.00, $4.00] |
+
+- The $2.50 Stage-A floor (25 pips) absorbs the $0.52 spread + normal retest wicks so runners survive
+  TP1→TP2; the tighter Stage-B/C clamps bank the bulk of extended moves instead of surrendering
+  $8–$10/oz on reversal. Per-stage clamps replace the old single global [2.50, 12.00] clamp.
+- New knobs `DYNAMIC_ATR_TRAIL_EXTENDED_MIN/MAX_DOLLARS` (2.20/5.50) and
+  `DYNAMIC_ATR_TRAIL_HOMERUN_MIN/MAX_DOLLARS` (2.00/4.00); `DYNAMIC_ATR_TRAIL_MAX_DOLLARS` 12→8.
+- **Critical wiring:** the executor filters config through an explicit whitelist, so the four new
+  knobs were added to the import block, `_CFG_IMPORT_SNAPSHOT`, and `_get_dynamic_risk_policy` —
+  without this they would never reach the live engine.
+- Invariants preserved: forward-only (>= $0.25 step), tightest-candidate picker, every modify gated on
+  `SYMBOL_TRADE_STOPS_LEVEL` + `SYMBOL_TRADE_FREEZE_LEVEL` (0 retcode 10016), spread-spike ceiling $0.80.
+
+### 4. Replay evidence (final config, engine live for B and C)
+
+| Arm | Net P&L | Tail loss (13078+9953) | Errors |
+|---|---:|---:|---:|
+| A (`4544f7f`, frozen) | `£+15.62` | `£-61.99` | 0 |
+| B (calibrated, R-lock OFF) | `£+49.91` | `£-26.08` | 0 |
+| **C (R-lock ON)** | **`£+52.73`** | **`£-21.74`** | 0 |
+
+- **R-lock precedence verified:** 7240 production picker calls; `R_LOCK` won 36 times, 16 on wide
+  stops (R >= $5) — trade `9937` (R=$11.155) 6 wide wins, `9953` (R=$6.028) 10 wide wins.
+- **g5=True** (C >= B on net AND C tail no worse). gate_1/2/4 True; gate_3 (pre-existing choke-trio)
+  still False, so `all_gates_passed` is False — expected, not a regression.
+- Arm B is explicitly pinned `R_LOCK_ENABLED=false` in the replay so the ambient `.env` cannot
+  contaminate the baseline.
+
+### 5. Local `.env` activation
+
+- `R_LOCK_ENABLED=true`, `DYNAMIC_ATR_TRAIL_ENABLED=true`, `DYNAMIC_ATR_SLTP_ENABLED=true`,
+  `DYNAMIC_ATR_TRAIL_MULT=1.40`; `DYNAMIC_ATR_TRAIL_MAX_DOLLARS=8.00` + the four new clamp knobs;
+  all `LIFECYCLE_*` keys removed. `DRY_RUN=false` (live).
+
 ## [2026-11-21] — v3.8.2 Replay-Proof Fidelity: the harness now drives the production ATR engine
 
 - **Baseline Commit:** `4a6073f` (v3.8.1)

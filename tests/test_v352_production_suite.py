@@ -453,7 +453,7 @@ def test_12_v352_config_defaults_and_safety_invariants():
     assert config.DYNAMIC_TP_MAX_DOLLARS == 50.00
     assert config.DYNAMIC_ATR_TRAIL_ENABLED is True
     assert config.DYNAMIC_ATR_TRAIL_MIN_DOLLARS == 2.50
-    assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == 12.00
+    assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == 8.00  # v3.9.0 Stage-A cap
     assert config.DYNAMIC_ATR_TRAIL_STEP_DOLLARS == 0.25
     assert config.DYNAMIC_ATR_BE_ACTIVATION_MULT == 0.75
     assert config.DYNAMIC_ATR_BE_MIN_MFE_DOLLARS == 3.50
