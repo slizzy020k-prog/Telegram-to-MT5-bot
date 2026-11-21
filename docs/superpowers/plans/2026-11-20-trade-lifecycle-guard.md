@@ -4971,12 +4971,14 @@ The implementation above shipped with four deliberate deviations from the plan a
 ## Task 6: `main.py` — run the age guard every second
 
 **Files:**
-- Modify: `main.py:4111-4120` (`_process_pre_tp1_or_backstop_tick`)
+- Modify: `main.py:4121-4129` (`_process_pre_tp1_or_backstop_tick` — the age guard hook)
+- Modify: `mt5_executor.py` (`apply_lifecycle_derisk` — report a `"skipped"` result when the action could not be attempted)
 - Modify: `tests/test_trade_lifecycle.py` (append the watcher tests)
 
 **Interfaces:**
 - Consumes: `risk_lifecycle.evaluate_trade_age`, `risk_lifecycle.read_lifecycle_policy` (Task 1); `MT5Executor.apply_lifecycle_action` (Task 5).
 - Produces: the age guard runs inside `_process_pre_tp1_or_backstop_tick`, stamping `sig["lifecycle_derisk_at"]`, `sig["lifecycle_flatten_at"]`, `sig["lifecycle_pending_expired_at"]`.
+- Consumes (new): the action result's optional `"skipped"` key — a short reason string set when the action could NOT be attempted (for example `"no_live_price"`). A skipped action is NOT done and must be retried on the next tick.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5041,6 +5043,192 @@ async def test_age_guard_derisks_an_old_signal(monkeypatch, tmp_path):
     assert applied == ["DERISK"]
 ```
 
+Add the following helpers and tests to the same block. The stub executor records the signal dict it
+is handed, so the assertions can read the stamp and the status the guard wrote:
+
+```python
+def _age_guard_signal(hours_old: float = 3.0):
+    from datetime import datetime, timedelta, timezone
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=hours_old)).isoformat()
+    sig["first_fill_at"] = sig["timestamp"]
+    return sig
+
+
+class _StubExecutor:
+    """An executor whose lifecycle action returns scripted results."""
+
+    def __init__(self, results):
+        self._results = list(results)
+        self.calls = []
+        self.seen = []
+
+    def get_tick(self, symbol):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0)
+
+    def get_pip_size(self, symbol):
+        return 0.1
+
+    def get_server_time_offset_seconds(self):
+        return 0
+
+    def apply_lifecycle_action(self, signal_data, action):
+        self.calls.append(action)
+        self.seen.append(signal_data)
+        if self._results:
+            return self._results.pop(0)
+        return {
+            "action": action,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_stamp_a_failed_dersisk(monkeypatch, tmp_path):
+    """A failed action is not done: the next tick must retry it."""
+    import main
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "DERISK",
+            "ok": False,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["L1:boom"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.calls == ["DERISK"]
+    assert not stub.seen[0].get("lifecycle_derisk_at"), "a failed action must not be stamped"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK", "DERISK"], "the next tick must retry"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_stamp_a_skipped_dersisk(monkeypatch, tmp_path):
+    """A skipped action (no live price) is not done either."""
+    import main
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "DERISK",
+            "ok": True,
+            "skipped": "no_live_price",
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert not stub.seen[0].get("lifecycle_derisk_at"), "a skipped action must not be stamped"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK", "DERISK"], "the next tick must retry"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_closes_the_signal_only_after_a_successful_flatten(monkeypatch, tmp_path):
+    """A failed flatten must not close the signal: the position may still be open."""
+    import main
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([
+        {
+            "action": "FLATTEN",
+            "ok": False,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["close:boom"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.seen[0].get("status") != "CLOSED", "a failed flatten must not close the signal"
+    assert not stub.seen[0].get("lifecycle_flatten_at")
+
+
+@pytest.mark.asyncio
+async def test_age_guard_alerts_once_when_the_flatten_gives_up(monkeypatch, tmp_path):
+    """The give-up path must be reachable, alert once, and stop retrying."""
+    import main
+
+    sig = _age_guard_signal(7.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    alerts = []
+
+    async def _notify(text, *args, **kwargs):
+        alerts.append(text)
+
+    monkeypatch.setattr(main_mod, "notify_saved_messages", _notify)
+
+    stub = _StubExecutor([
+        {
+            "action": "FLATTEN",
+            "ok": False,
+            "gave_up": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": ["close:give_up"],
+        },
+    ])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert len(alerts) == 1, "the give-up must be reported once"
+    assert "gave up" in alerts[0]
+    assert stub.seen[0].get("status") != "CLOSED", "a gave-up flatten must not close the signal"
+    assert stub.seen[0].get("lifecycle_flatten_at"), "the give-up must stop the retries"
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert len(alerts) == 1, "the give-up alert must not repeat"
+    assert stub.calls == ["FLATTEN"], "a gave-up flatten must not be retried"
+
+
+@pytest.mark.asyncio
+async def test_age_guard_does_not_repeat_a_completed_action(monkeypatch, tmp_path):
+    """A completed action is stamped, so the guard does not run it again."""
+    import main
+
+    sig = _age_guard_signal(3.0)
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    stub = _StubExecutor([])
+    monkeypatch.setattr(main_mod, "executor", stub)
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+    assert stub.calls == ["DERISK"]
+    assert stub.seen[0].get("lifecycle_derisk_at")
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(stub.seen[-1]))
+    assert stub.calls == ["DERISK"], "a completed action must not run again"
+```
+
 > The repo already uses `@pytest.mark.asyncio` for async tests (see `tests/test_v3_concurrency_and_ops.py:89`), so use that marker exactly as shown. If pytest-asyncio is not installed in the environment, `pip install pytest-asyncio` is required — check with `python -m pytest tests/test_v3_concurrency_and_ops.py -q` first.
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -5053,7 +5241,13 @@ Expected: FAIL — the watcher does not call `apply_lifecycle_action`.
 
 - [ ] **Step 3: Implement the age guard**
 
-In `main.py`, at the top of `_process_pre_tp1_or_backstop_tick` (after the `direction` assignment at line 4116 and **before** the `tick = await _mt5_call(executor.get_tick, symbol)` call at line 4118), insert:
+In `main.py`, at the top of `_process_pre_tp1_or_backstop_tick` (after the `direction` assignment at line 4127 and **before** the `tick = await _mt5_call(executor.get_tick, symbol)` call at line 4129), insert:
+
+**The action is stamped on the signal only when it actually COMPLETED.** A skipped action (the
+de-risk could not read a live price) and a failed action (the broker refused the close) are NOT
+done: the stamp stays unset, the signal is not closed in the state manager, and the next tick
+retries. Stamping unconditionally would permanently disable the de-risk after one unavailable tick
+and would make the retry/give-up path unreachable.
 
 ```python
     # Trade Lifecycle Guard: age-based de-risk / flatten, evaluated every second.
@@ -5079,36 +5273,59 @@ In `main.py`, at the top of `_process_pre_tp1_or_backstop_tick` (after the `dire
             res: Optional[Dict[str, Any]] = None
             try:
                 res = await _mt5_call(executor.apply_lifecycle_action, sig, action)
-                sig[stamp_key] = now_utc.isoformat()
-                sig["lifecycle_action"] = action
-                sig["lifecycle_reason"] = age_res.get("reason")
-                state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
-                logger.info(
-                    f"[LIFECYCLE {action}] msg={msg_id} reason={age_res.get('reason')} "
-                    f"result={res}"
-                )
-                if action in ("FLATTEN", "SESSION_FLATTEN", "EXPIRE_PENDING"):
-                    sig["status"] = "CLOSED"
-                    sig["closed_at"] = now_utc.isoformat()
-                    state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
-                    await notify_saved_messages(
-                        f"⏱ **Trade Lifecycle Guard — `{action}`**\n"
-                        f"• Signal: `{msg_id}` ({direction} {symbol})\n"
-                        f"• Reason: {age_res.get('reason')}\n"
-                        f"• Closed: `{res.get('closed')}` | Cancelled: `{res.get('cancelled')}`"
-                    )
-                    return
             except Exception as exc:
                 logger.warning(f"[LIFECYCLE {action}] msg={msg_id} failed: {exc}")
-
-            if isinstance(res, dict) and res.get("gave_up"):
-                await notify_saved_messages(
-                    f"⚠️ **Trade Lifecycle Guard gave up** on signal `{msg_id}` ({direction} {symbol})\n"
-                    f"• Reason: {age_res.get('reason')}\n"
-                    f"• The position keeps its broker SL and the bot stops retrying "
-                    f"({lifecycle_pol.max_close_retries} attempts)."
-                )
-                return
+                res = None
+            if isinstance(res, dict):
+                gave_up = bool(res.get("gave_up"))
+                skipped = bool(res.get("skipped"))
+                ok = bool(res.get("ok"))
+                if gave_up:
+                    # The retry budget is spent. Stop retrying and alert ONCE.
+                    # The signal is NOT marked CLOSED: the position may still be
+                    # open, and it keeps its broker SL. The tick CONTINUES so the
+                    # still-open position is managed normally.
+                    sig[stamp_key] = now_utc.isoformat()
+                    sig["lifecycle_action"] = action
+                    sig["lifecycle_reason"] = age_res.get("reason")
+                    sig["lifecycle_gave_up_at"] = now_utc.isoformat()
+                    state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+                    await notify_saved_messages(
+                        f"⚠️ **Trade Lifecycle Guard gave up** on signal `{msg_id}` ({direction} {symbol})\n"
+                        f"• Reason: {age_res.get('reason')}\n"
+                        f"• The position keeps its broker SL and the bot stops retrying "
+                        f"({lifecycle_pol.max_close_retries} attempts)."
+                    )
+                elif ok and not skipped:
+                    # The action COMPLETED. Stamp it so the guard does not run it
+                    # again, and persist the outcome.
+                    sig[stamp_key] = now_utc.isoformat()
+                    sig["lifecycle_action"] = action
+                    sig["lifecycle_reason"] = age_res.get("reason")
+                    state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+                    logger.info(
+                        f"[LIFECYCLE {action}] msg={msg_id} reason={age_res.get('reason')} "
+                        f"result={res}"
+                    )
+                    if action in ("FLATTEN", "SESSION_FLATTEN", "EXPIRE_PENDING"):
+                        sig["status"] = "CLOSED"
+                        sig["closed_at"] = now_utc.isoformat()
+                        state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+                        await notify_saved_messages(
+                            f"⏱ **Trade Lifecycle Guard — `{action}`**\n"
+                            f"• Signal: `{msg_id}` ({direction} {symbol})\n"
+                            f"• Reason: {age_res.get('reason')}\n"
+                            f"• Closed: `{res.get('closed')}` | Cancelled: `{res.get('cancelled')}`"
+                        )
+                        return
+                else:
+                    # NOT done: a skip (no live price) or a failed action. The
+                    # stamp stays unset, so the next tick retries. Nothing is
+                    # closed and nothing is closed-out in the state manager.
+                    logger.info(
+                        f"[LIFECYCLE {action}] msg={msg_id} not completed "
+                        f"(ok={ok} skipped={skipped}); retrying next tick. result={res}"
+                    )
 ```
 
 Add the required imports to `main.py`:
@@ -5119,7 +5336,31 @@ from risk_lifecycle import evaluate_trade_age, read_lifecycle_policy
 
 If `datetime` / `timezone` are not already imported in `main.py`, add `from datetime import datetime, timezone`.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Report a "skipped" action from the executor**
+
+`apply_lifecycle_derisk` must tell the watcher that the action could not be ATTEMPTED, as opposed
+to having failed. Today a de-risk that cannot read a live price simply moves nothing, and the
+watcher would read that as "done" and never retry — which would silently disable the de-risk for
+the rest of the trade's life.
+
+In `mt5_executor.py`, inside `apply_lifecycle_derisk`:
+
+1. When the live price is unusable (the tick is None, the tick raised, or the price is not
+   positive), set `result["skipped"] = "no_live_price"`.
+2. A tick fetch that RAISES is a skip, not a failure: record it as `skipped` and do NOT append a
+   `failed` entry for it. A terminal that is briefly unreachable must not make the de-risk report
+   a failure every second.
+3. The per-layer skip that the unusable price causes stays a skip: the layer keeps its existing
+   stop and no `failed` entry is recorded for it.
+
+The action result contract is now:
+
+- `ok` — True when nothing went wrong.
+- `skipped` — a short reason string when the action could not be attempted. The action is NOT
+  done and must be retried.
+- `gave_up` — the retry budget is spent. Stop retrying and alert.
+
+- [ ] **Step 5: Run the tests to verify they pass**
 
 ```powershell
 python -m pytest tests/test_trade_lifecycle.py -q
@@ -5127,7 +5368,7 @@ python -m pytest tests/test_trade_lifecycle.py -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 6: Run the full suite**
 
 ```powershell
 python -m pytest -q
@@ -5135,15 +5376,20 @@ python -m pytest -q
 
 Expected: **0 failed**.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```powershell
-git add main.py tests/test_trade_lifecycle.py
+git add main.py mt5_executor.py tests/test_trade_lifecycle.py
 git commit -m "feat(main): run the trade-age guard every second
 
 _process_pre_tp1_or_backstop_tick now evaluates the age guard before the TP1
-branches, so an aged trade is de-risked or flattened first. Each action is
-stamped on the signal, which makes it idempotent across repeated ticks."
+branches, so an aged trade is de-risked or flattened first.
+
+The action is stamped on the signal only when it actually COMPLETED, so a
+skipped or failed action is retried on the next tick instead of being
+silently marked done. The signal is marked CLOSED only after a successful
+flatten; when the retry budget is spent the guard alerts once and leaves the
+position to its broker SL."
 ```
 
 ---
