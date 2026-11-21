@@ -97,8 +97,8 @@ class LifecyclePolicy:
     r_lock_tiers: Tuple[Tuple[float, float], ...]   # ((0.5, 0.00), (1.0, 0.25), (1.5, 0.50), (2.0, 0.75))
     r_lock_min_r_dollars: float          # default 0.50
     lifecycle_enabled: bool              # default False
-    derisk_after_seconds: int            # default 7200   (2 h)
-    flatten_after_seconds: int           # default 21600  (6 h)
+    derisk_after_seconds: int            # default 14400  (4 h)
+    flatten_after_seconds: int           # default 28800  (8 h)
     pending_expire_seconds: int          # default 43200  (12 h)
     session_flatten_enabled: bool        # default False
     session_flatten_at: str              # "23:30" broker server time
@@ -155,8 +155,8 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
 | `R_LOCK_TIERS` | `0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75` | `r_threshold:lock_fraction` pairs |
 | `R_LOCK_MIN_R_DOLLARS` | `0.50` | Ignore trades whose initial risk per oz is below this |
 | `LIFECYCLE_ENABLED` | `false` | Master switch for the age guard |
-| `LIFECYCLE_DERISK_SECONDS` | `7200` | Fill age at which pending is cancelled and open layers move to BE |
-| `LIFECYCLE_FLATTEN_SECONDS` | `21600` | Fill age at which everything is closed at market |
+| `LIFECYCLE_DERISK_SECONDS` | `14400` | Fill age at which pending is cancelled and open layers move to BE |
+| `LIFECYCLE_FLATTEN_SECONDS` | `28800` | Fill age at which everything is closed at market |
 | `LIFECYCLE_PENDING_EXPIRE_SECONDS` | `43200` | Signal age at which unfilled pending limits are cancelled |
 | `LIFECYCLE_SESSION_FLATTEN_ENABLED` | `false` | Session cut (off by default) |
 | `LIFECYCLE_SESSION_FLATTEN_AT` | `23:30` | Broker server time-of-day for the session cut |
