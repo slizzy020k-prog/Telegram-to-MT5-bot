@@ -239,9 +239,12 @@ def compute_r_lock_floor(
       would be rejected by the broker with retcode 10016. The consumer's own
       stops-buffer clamp is a second line of defence, not the only one.
 
-    Note: the existing ``BE_LOCK`` candidate in `dynamic_risk.py` may sit
-    slightly tighter than this floor (it adds the $0.50 breakeven offset), and
-    the candidate picker keeps the tightest stop.
+    Note: while the R lock is enabled the ``BE_LOCK`` candidate is itself
+    R-gated (it arms at 0.5R and then carries this same R-relative floor),
+    so the two coincide and the picker reports ``R_LOCK``. With the R lock
+    disabled the flat ``BE_LOCK`` candidate still adds the $0.50 breakeven
+    offset and can sit slightly tighter than this floor; the candidate picker
+    keeps the tightest stop either way.
     """
     if not policy.r_lock_enabled:
         return None

@@ -4,6 +4,84 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ---
 
+## [2026-11-21] — v3.8.1 Trade Lifecycle Guard Calibration (R-gated BE lock + wider age timers)
+
+- **Baseline Commit:** `6526e39` (v3.8.0)
+- **Target Version:** `v3.8.1`
+- **Verification Status:** `451/451` pytest PASS (`0` failures); `check_algo.py` → `ALL CHECKS PASSED`;
+  `startup_checks.validate_environment()` → `{'ok': True, 'errors': [], 'warnings': []}`;
+  `R_LOCK_ENABLED=False`, `LIFECYCLE_ENABLED=False` (both still ship **disabled**).
+- **Replay Proof (Arm C):** gate `g5` **still FAILS** — Arm C `£-0.63` vs Arm B `£+0.13`.
+  The drag fell from `£16.99` to `£0.76`, but it is not zero. See §4.
+
+### 1. The BE lock is now R-gated (`dynamic_risk.py`, `mt5_executor.py`)
+
+- v3.8.0's finding: the flat BE lock armed at `max(0.75 x ATR, $3.50)` regardless of the trade's
+  own risk `R`, so a wide stop (`R = $15–$22`) was BE-locked at `$3.50` of MFE and the R ladder
+  could never matter. The picker keeps the TIGHTEST candidate, so a floor that is merely added
+  can never displace that lock.
+- With `R_LOCK_ENABLED=true` and a valid `R`, the BE lock now arms only at
+  `MFE >= max(0.5 * R, 0.75 * ATR, $2.50)`. The `$2.50` floor is `DYNAMIC_ATR_TRAIL_MIN_DOLLARS`
+  (the smallest stop distance the engine will use), so a tight scalp still respects it.
+- **The gate changes WHEN the BE lock arms, never WHERE it locks.** The stop stays at the classic
+  `entry ± $0.50`, so the R-gated path can never be less protective than the flat lock it replaced.
+  Consequently `BE_LOCK` wins the picker at the 0.5R tier (it is the tighter, more protective
+  stop) and the R ladder takes over from the **1.0R tier upward**, where `entry + 0.25R` is tighter
+  than `entry + $0.50` for any `R > $2`.
+- With `R_LOCK_ENABLED=false` — the shipped default — the engine is byte-identical to v3.8.0: a
+  2304-case pure-engine differential and a 144-case executor differential, **0 differences**.
+
+### 2. The age timers were widened (`config.py`, `risk_lifecycle.py`, `startup_checks.py`)
+
+- `LIFECYCLE_DERISK_SECONDS`: `7200` (2 h) → **`14400` (4 h)**
+- `LIFECYCLE_FLATTEN_SECONDS`: `21600` (6 h) → **`28800` (8 h)**
+- `LIFECYCLE_PENDING_EXPIRE_SECONDS` stays `43200` (12 h).
+- Every default was updated in lockstep: the `config.py` definitions, the `getattr` fallbacks in
+  `read_lifecycle_policy` and in `startup_checks._validate_lifecycle_config`, `.env.example`, the
+  `ARM_C_CALIBRATED_PARAMS` block in the replay harness, the design spec's knob table, and the
+  LOCAL `.env`. A stale default in any one of them would have been a real bug.
+- The local `.env` now carries the whole lifecycle block with both features **off**, the new timer
+  values, and `DYNAMIC_ATR_TRAIL_MULT=1.40` (it was already correct). The `.env` is gitignored and
+  was never staged or committed.
+
+### 3. The de-risk still overrides the R-gate — STILL OPEN
+
+- `apply_lifecycle_derisk` moves layers to `entry ± $0.50` with **no R input**. It therefore
+  overrides the R-gated engine's "no protection until 0.5R" rule: any trade aged past the
+  de-risk threshold with more than `$0.50/oz` of open profit is moved to flat breakeven and its
+  pending limits are cancelled, regardless of R.
+- This is the mechanism behind the residual `£0.76` in §4, and it is the next thing to decide.
+  It was left unchanged here on purpose — making the de-risk R-aware is a product decision, not
+  a calibration one.
+
+### 4. Replay evidence — the gate still fails
+
+| Arm | Net P&L | Trades | Tail loss (`13078+9953`) | Errors |
+|---|---:|---:|---:|---:|
+| A (`4544f7f`) | `£+15.62` | 12 | `£-61.99` | 0 |
+| B (calibrated) | `£+0.13` | 12 | `£-61.99` | 0 |
+| **C (R lock + age guard)** | **`£-0.63`** | 12 | `£-61.99` | 0 |
+
+- `g5` (Arm C >= Arm B on net P&L, <= on tail loss) **FAILS** by `£0.76`. The timer change
+  removed `£16.23` of the `£16.99` drag; the residual is the age guard's flat BE.
+- **The harness CANNOT evidence the R-gated BE lock.** It replays a generic FSM and never calls
+  the production ATR engine — an instrumented clone produced **zero** calls into
+  `compute_dynamic_atr_trail_stop`. So Arm C measures the AGE GUARD only. The R-gate's effect
+  has to be evidenced by the engine's own differential and unit tests, not by this harness.
+- **The Arm A / Arm B baselines drift between runs** (Arm A `£+15.62` here vs `£+11.89` in
+  v3.8.0; Arm B `£+0.13` vs `£+0.14`) because the M1 tape is fetched LIVE from the broker.
+  The replay is therefore a directional instrument, not a byte-reproducible regression gate.
+
+### 5. Deploy readiness
+
+- **Both features ship DISABLED** (`R_LOCK_ENABLED=false`, `LIFECYCLE_ENABLED=false`) in
+  `config.py`, in `.env.example` and in the local `.env`. `/rlock on` and `/lifecycle on` remain
+  the runtime switches, and they are in-memory only — they reset on a restart.
+- **No VPS deployment was performed.** Everything above ran locally.
+- Before enabling, three things still need a decision: the de-risk's flat-BE override (§3),
+  whether `g5` is the right gate given the live-tape drift (§4), and a replay harness that
+  actually drives the production ATR engine.
+
 ## [2026-11-21] — v3.8.0 Trade Lifecycle Guard (R-Relative Profit Floor + Trade-Age Guard)
 
 - **Baseline Commit:** `a64156f` (design spec) — branch base `a64156f..c184b47`
@@ -121,7 +199,7 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
   the tape it was designed for. It does engage for a narrow R (~<= $6).
 - **The `2 h` de-risk threshold is not yet justified by evidence.** Measured sensitivity (not
   shipped): `DERISK=10800` makes `g5` pass; `DERISK=21600` means the guard never fires.
-- Both features therefore ship **disabled** and must stay disabled until the BE lock is made
+  R-relative, the tiers are re-derived, the de-risk threshold is re-derived, and `g5` passes.
   R-relative, the tiers are re-derived, the de-risk threshold is re-derived, and `g5` passes.
 - The ledger file format is schema `4` even with both features DISABLED, so a fresh clone writes
   schema-4 records. TRADING behaviour is identical to v3.7.0; the ledger FILE is not.

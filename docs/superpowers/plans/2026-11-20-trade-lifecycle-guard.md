@@ -774,8 +774,8 @@ class LifecyclePolicy:
     r_lock_tiers: Tuple[Tuple[float, float], ...] = DEFAULT_R_LOCK_TIERS
     r_lock_min_r_dollars: float = 0.50
     lifecycle_enabled: bool = False
-    derisk_after_seconds: int = 7200
-    flatten_after_seconds: int = 21600
+    derisk_after_seconds: int = 14400
+    flatten_after_seconds: int = 28800
     pending_expire_seconds: int = 43200
     session_flatten_enabled: bool = False
     session_flatten_at: str = "23:30"
@@ -825,8 +825,8 @@ def read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy:
     if not tiers:
         tiers = DEFAULT_R_LOCK_TIERS
 
-    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 7200), 7200))
-    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 21600), 21600))
+    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 14400), 14400))
+    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 28800), 28800))
     if flatten < derisk:
         flatten = derisk
 
@@ -900,9 +900,12 @@ def compute_r_lock_floor(
       would be rejected by the broker with retcode 10016. The consumer's own
       stops-buffer clamp is a second line of defence, not the only one.
 
-    Note: the existing ``BE_LOCK`` candidate in `dynamic_risk.py` may sit
-    slightly tighter than this floor (it adds the $0.50 breakeven offset), and
-    the candidate picker keeps the tightest stop.
+    Note: while the R lock is enabled the ``BE_LOCK`` candidate is itself
+    R-gated (it arms at 0.5R and then carries this same R-relative floor),
+    so the two coincide and the picker reports ``R_LOCK``. With the R lock
+    disabled the flat ``BE_LOCK`` candidate still adds the $0.50 breakeven
+    offset and can sit slightly tighter than this floor; the candidate picker
+    keeps the tightest stop either way.
     """
     if not policy.r_lock_enabled:
         return None
@@ -1143,10 +1146,10 @@ R_LOCK_MIN_R_DOLLARS: float = _env_float(
 )
 LIFECYCLE_ENABLED: bool = _env_bool("LIFECYCLE_ENABLED", False)
 LIFECYCLE_DERISK_SECONDS: int = _env_int(
-    "LIFECYCLE_DERISK_SECONDS", 7200, min_val=0, max_val=604800
+    "LIFECYCLE_DERISK_SECONDS", 14400, min_val=0, max_val=604800
 )
 LIFECYCLE_FLATTEN_SECONDS: int = _env_int(
-    "LIFECYCLE_FLATTEN_SECONDS", 21600, min_val=0, max_val=604800
+    "LIFECYCLE_FLATTEN_SECONDS", 28800, min_val=0, max_val=604800
 )
 LIFECYCLE_PENDING_EXPIRE_SECONDS: int = _env_int(
     "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200, min_val=0, max_val=604800
@@ -1196,8 +1199,8 @@ def _validate_lifecycle_config(cfg: Any, errors: List[str]) -> None:
             if not isinstance(flag_val, bool):
                 errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
 
-    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 7200)
-    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 21600)
+    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 14400)
+    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 28800)
     if not isinstance(derisk, int) or isinstance(derisk, bool) or derisk < 0:
         errors.append(f"LIFECYCLE_DERISK_SECONDS must be a non-negative int, got {derisk!r}.")
     if not isinstance(flatten, int) or isinstance(flatten, bool) or flatten < 0:
@@ -1253,8 +1256,8 @@ R_LOCK_ENABLED=false
 R_LOCK_TIERS=0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75
 R_LOCK_MIN_R_DOLLARS=0.50
 LIFECYCLE_ENABLED=false
-LIFECYCLE_DERISK_SECONDS=7200
-LIFECYCLE_FLATTEN_SECONDS=21600
+LIFECYCLE_DERISK_SECONDS=14400
+LIFECYCLE_FLATTEN_SECONDS=28800
 LIFECYCLE_PENDING_EXPIRE_SECONDS=43200
 LIFECYCLE_SESSION_FLATTEN_ENABLED=false
 LIFECYCLE_SESSION_FLATTEN_AT=23:30
@@ -8167,8 +8170,8 @@ In `scripts/ab_replay_proof.py`, immediately after the `ARM_B_CALIBRATED_PARAMS`
 ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
     "R_LOCK_ENABLED": True,
     "LIFECYCLE_ENABLED": True,
-    "LIFECYCLE_DERISK_SECONDS": 7200,
-    "LIFECYCLE_FLATTEN_SECONDS": 21600,
+    "LIFECYCLE_DERISK_SECONDS": 14400,
+    "LIFECYCLE_FLATTEN_SECONDS": 28800,
     "LIFECYCLE_PENDING_EXPIRE_SECONDS": 43200,
     "LIFECYCLE_SESSION_FLATTEN_ENABLED": False,
 }
