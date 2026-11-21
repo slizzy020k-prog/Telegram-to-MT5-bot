@@ -72,6 +72,16 @@ ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "BANK_HARVEST_ALT_ARM_PCT": 0.80,
 }
 
+# Arm C params: Arm B plus the R-relative profit floor and the trade-age guard.
+ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
+    "R_LOCK_ENABLED": True,
+    "LIFECYCLE_ENABLED": True,
+    "LIFECYCLE_DERISK_SECONDS": 7200,
+    "LIFECYCLE_FLATTEN_SECONDS": 21600,
+    "LIFECYCLE_PENDING_EXPIRE_SECONDS": 43200,
+    "LIFECYCLE_SESSION_FLATTEN_ENABLED": False,
+}
+
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
     {
@@ -674,6 +684,11 @@ def _build_signal_record(
             "fill_price": float(fill_px),
             "entry_price": float(fill_px),
             "sl": sl,
+            # The live path captures the stop the order was placed with as
+            # `initial_sl` (mt5_executor); the R-relative profit floor reads
+            # it to compute R. Without it the R lock is silently skipped and
+            # Arm C would not exercise the feature at all.
+            "initial_sl": sl,
             "tp": final_tp,
             "tp_stage": "TP1",
             "ticket": tkt,
@@ -813,6 +828,64 @@ def _pin_arm_b_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None
             raise RuntimeError(f"Arm B calibration mismatch for {key}: {actual!r} != {expected!r}")
 
 
+def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None:
+    """Explicitly pin and verify the Arm C lifecycle parameters across config, executor, and main."""
+    targets = (config_mod, executor_mod, main_mod)
+    for key, expected in ARM_C_CALIBRATED_PARAMS.items():
+        for mod in targets:
+            if hasattr(mod, key):
+                setattr(mod, key, expected)
+        actual = getattr(config_mod, key, None)
+        if isinstance(expected, float):
+            if abs(float(actual or 0.0) - expected) > 1e-9:
+                raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual} != {expected}")
+        elif actual != expected:
+            raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual!r} != {expected!r}")
+
+
+class _ReplayClock:
+    """The simulated UTC clock of a replay worker.
+
+    The trade-age guard reads the wall clock (datetime.now(timezone.utc)),
+    but the replay simulates the RECORDED Nov 17-19 week. Without a simulated
+    clock every recorded trade would look days old and the guard would flatten
+    it on its very first tick, which is not a replay of the recorded week at
+    all. The clock therefore follows the M1 bars, and Arm A keeps the wall
+    clock because it is the frozen historical baseline.
+    """
+
+    def __init__(self) -> None:
+        self._now: Optional[datetime] = None
+
+    def set_epoch(self, epoch_sec: int) -> None:
+        """Move the simulated clock to the given UTC epoch second."""
+        self._now = datetime.fromtimestamp(int(epoch_sec), tz=timezone.utc)
+
+    def now(self, tz: Optional[Any] = None) -> datetime:
+        """Return the simulated time (the wall clock when no bar was seen yet)."""
+        base = self._now or datetime.now(timezone.utc)
+        if base.tzinfo is None:
+            base = base.replace(tzinfo=timezone.utc)
+        if tz is None:
+            return base.replace(tzinfo=None)
+        return base.astimezone(tz)
+
+
+_REPLAY_CLOCK = _ReplayClock()
+
+
+def _install_replay_clock(main_mod: Any) -> None:
+    """Make main read the simulated replay clock instead of the wall clock."""
+    real_datetime = datetime
+
+    class _SimulatedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz: Optional[Any] = None) -> datetime:
+            return _REPLAY_CLOCK.now(tz)
+
+    main_mod.datetime = _SimulatedDatetime
+
+
 async def _run_single_trade_worker(
     main_mod: Any,
     state_cls: Any,
@@ -849,6 +922,10 @@ async def _run_single_trade_worker(
     idx0 = _find_entry_bar_index(bars, trade["open_utc"])
     pot_mfe = _compute_potential_mfe_before_sl(trade, bars, idx0)
 
+    # The simulated clock starts at the entry bar and follows the M1 bars,
+    # so the trade-age guard measures the age of the RECORDED trade.
+    _REPLAY_CLOCK.set_epoch(int(bars[idx0]["time_utc"]))
+
     sig = _build_signal_record(main_mod, trade, base_ticket=100000 + trade_idx * 100, spy=spy)
     sig["msg_id"] = msg_id
 
@@ -863,6 +940,7 @@ async def _run_single_trade_worker(
             bar = bars[b_idx]
             prev_bar = bars[b_idx - 1]
             bar_utc = _utc_iso(bar["time_utc"])
+            _REPLAY_CLOCK.set_epoch(int(bar["time_utc"]))
             main_mod.executor._dry_run_m1_atr = float(bar.get("atr14") or 0.0)
             main_mod.executor._dry_run_last_m1_candle = {
                 "open": float(prev_bar["open"]),
@@ -1002,8 +1080,11 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         os.environ["TRADES_LEDGER_PATH"] = str(rdir / "trades_ledger.jsonl")
         os.environ["LOCK_FILE_PATH"] = str(rdir / "copier.lock")
 
-        if arm_mode == "b":
+        if arm_mode in ("b", "c"):
             for k, v in ARM_B_CALIBRATED_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        if arm_mode == "c":
+            for k, v in ARM_C_CALIBRATED_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
@@ -1018,8 +1099,16 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         if arm_mode == "a":
             if hasattr(config, "PROFIT_RATCHET_ENABLED"):
                 raise RuntimeError("Arm A contamination: PROFIT_RATCHET_ENABLED found in 4544f7f worktree!")
+        elif arm_mode == "b":
+            _pin_arm_b_params(config, mt5_executor, main)
         else:
             _pin_arm_b_params(config, mt5_executor, main)
+            _pin_arm_c_params(config, mt5_executor, main)
+
+        # Arms B and C run on the simulated replay clock: the trade-age guard
+        # reads the wall clock, and the replay simulates the RECORDED week.
+        if arm_mode in ("b", "c"):
+            _install_replay_clock(main)
 
         async def _no_notify(*_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1151,7 +1240,25 @@ def _run_arm_a_isolated(bars_path: Path, out_path: Path) -> Dict[str, Any]:
         shutil.rmtree(wt_parent, ignore_errors=True)
 
 
-def _evaluate_gates(arm_a: Optional[Dict[str, Any]], arm_b: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _evaluate_gates(
+    arm_a: Optional[Dict[str, Any]],
+    arm_b: Optional[Dict[str, Any]],
+    arm_c: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    # Arm C is compared against ARM B (not against Arm A): the R lock and the
+    # trade-age guard are an increment on Arm B, and the gate is absent when
+    # Arm C was not run.
+    if arm_c and arm_b:
+        sc = arm_c["summary"]
+        sb2 = arm_b["summary"]
+        g5 = (
+            sc["net_gbp"] >= sb2["net_gbp"]
+            and sc["tail_loss_gbp_13078_9953"] <= sb2["tail_loss_gbp_13078_9953"]
+            and sc["error_count"] == 0
+        )
+    else:
+        g5 = None
+
     if arm_a and arm_b:
         sa = arm_a["summary"]
         sb = arm_b["summary"]
@@ -1175,17 +1282,19 @@ def _evaluate_gates(arm_a: Optional[Dict[str, Any]], arm_b: Optional[Dict[str, A
             "gate_2_tail_protection": g2,
             "gate_3_mfe_capture_and_13153_stage2": g3,
             "gate_4_zero_regression": g4,
-            "all_gates_passed": bool(g1 and g2 and g3 and g4),
+            "g5": g5,
+            "all_gates_passed": bool(g1 and g2 and g3 and g4 and g5 is not False),
         }
 
-    single = arm_a or arm_b
+    single = arm_a or arm_b or arm_c
     assert single is not None
     ss = single["summary"]
     g4_single = ss["error_count"] == 0 and len(ss["unflagged_rollover_exits"]) == 0
     return {
         "mode": f"single_{single['arm']}",
         "gate_4_zero_regression": g4_single,
-        "all_gates_passed": bool(g4_single),
+        "g5": g5,
+        "all_gates_passed": bool(g4_single and g5 is not False),
     }
 
 
@@ -1193,6 +1302,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     bars_meta = report["bars_meta"]
     arm_a = report.get("arm_a")
     arm_b = report.get("arm_b")
+    arm_c = report.get("arm_c")
     gates = report["gates"]
 
     lines: List[str] = [
@@ -1238,10 +1348,14 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 f"`£{rb['sim_gbp']:+.2f}` | `{rb['exit_reason']}` (S{rb['max_stage']}) | `{cap_b}` | `{ro}` |"
             )
     else:
-        single = arm_a or arm_b
+        single = arm_a or arm_b or arm_c
         assert single is not None
         ss = single["summary"]
-        label = "Arm A (`4544f7f`)" if single["arm"] == "a" else "Arm B (`v3.6.0` Calibrated)"
+        label = {
+            "a": "Arm A (`4544f7f`)",
+            "b": "Arm B (`v3.6.0` Calibrated)",
+            "c": "Arm C (v3.8.0 Trade Lifecycle Guard)",
+        }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
             "",
@@ -1265,6 +1379,21 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 f"`{r['exit_reason']}` | `S{r['max_stage']}` | `{cap}` | `{ro}` |"
             )
 
+    if arm_c:
+        sc = arm_c["summary"]
+        sb_c = arm_b["summary"] if arm_b else None
+        net_b = f"`£{sb_c['net_gbp']}`" if sb_c else "`n/a`"
+        tail_b = f"`£{sb_c['tail_loss_gbp_13078_9953']}`" if sb_c else "`n/a`"
+        lines += [
+            "",
+            "### Arm C (v3.8.0 Trade Lifecycle Guard)",
+            "",
+            f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: {net_b})",
+            f"- **Tail Loss (13078 + 9953):** `£{sc['tail_loss_gbp_13078_9953']}` "
+            f"(Arm B: {tail_b})",
+            f"- **Trade Count:** `{sc['trade_count']}` | Errors: `{sc['error_count']}`",
+        ]
+
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():
         lines.append(f"- **{k}:** `{v}`")
@@ -1274,7 +1403,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
-    parser.add_argument("--arm", choices=("a", "b", "both"), default="both")
+    parser.add_argument("--arm", choices=("a", "b", "c", "both"), default="both")
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
     parser.add_argument("--save-bars", type=Path, default=None)
@@ -1282,7 +1411,7 @@ def main() -> int:
     parser.add_argument("--spread-override", type=float, default=None)
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1304,13 +1433,16 @@ def main() -> int:
 
         arm_a_res: Optional[Dict[str, Any]] = None
         arm_b_res: Optional[Dict[str, Any]] = None
+        arm_c_res: Optional[Dict[str, Any]] = None
 
         if args.arm in ("a", "both"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
         if args.arm in ("b", "both"):
             arm_b_res = _run_arm_subprocess("b", REPO_ROOT, bars_file, io_dir / "arm_b.json")
+        if args.arm in ("c", "both"):
+            arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
 
-    gates = _evaluate_gates(arm_a_res, arm_b_res)
+    gates = _evaluate_gates(arm_a_res, arm_b_res, arm_c_res)
     report: Dict[str, Any] = {
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "symbol": SYMBOL,
@@ -1323,6 +1455,7 @@ def main() -> int:
         },
         "arm_a": arm_a_res,
         "arm_b": arm_b_res,
+        "arm_c": arm_c_res,
         "gates": gates,
     }
     md_text = _render_markdown(report)
