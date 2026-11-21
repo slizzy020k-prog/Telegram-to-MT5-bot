@@ -98,11 +98,13 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ### 6. Known Limitations (read before enabling)
 
-- **The default `R_LOCK_TIERS` is effectively INERT.** The R-lock candidate sits at picker
-  priority 0 and is dominated by the existing `BE_LOCK` / `ATR_TRAIL` candidates, so on the
-  recorded tape the R floor never wins the stop picker. As configured the R floor would not
-  change any stop. The tiers must be re-derived against real tape before the feature is
-  enabled.
+- **The R floor never won the stop picker on the recorded replay tape**, so Arm C measured the
+  age guard alone and says nothing about the floor. The picker keeps the TIGHTEST stop and the
+  R-lock candidate only wins a TIE against the other candidates, so the floor engages exactly
+  when the ATR trail is looser than the floor — which does happen (Task 4's own test proves
+  `stop_source == "R_LOCK"` at `R = 15`, `ATR = 20`, `MFE = 0.73R`). Whether it engages on LIVE
+  tape is NOT established, because the replay harness does not reproduce the live ATR trail.
+  The tiers must be re-derived against real tape before the feature is enabled.
 - **The `2 h` de-risk threshold is not yet justified by evidence.** On the recorded tape it
   fires on trades that closed well inside two hours. Measured sensitivity (not shipped):
   `DERISK=10800` makes `g5` pass; `DERISK=21600` means the guard never fires.
