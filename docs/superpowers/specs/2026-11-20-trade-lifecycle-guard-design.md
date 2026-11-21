@@ -222,7 +222,7 @@ stamps `lifecycle_flatten_at` so it cannot fire twice on the same broker day.
 
 Clocks:
 
-- **fill age** = `now_utc − signal_data["first_fill_at"]` (new stamp set on first fill)
+- **fill age** = `now_utc − resolve_fill_time(signal_data)` — the EARLIEST known fill, resolved by `risk_lifecycle.resolve_fill_time` (the signal-level `first_fill_at` stamp together with every layer's `filled_at`), never the raw `first_fill_at` key alone
 - **signal age** = `now_utc − signal_data["timestamp"]` (the existing signal receipt time)
 
 **Server time** is derived from the existing `get_server_time_offset_seconds()` /
