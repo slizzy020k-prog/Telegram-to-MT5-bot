@@ -582,6 +582,70 @@ def test_trail_stop_ignores_a_non_numeric_or_invalid_floor():
         )
         assert res["r_lock_floor"] is None
         assert res["stop_source"] != "R_LOCK"
+
+
+def test_the_picker_trusts_the_floor_and_the_producer_guards_the_market():
+    """Document the split of responsibility for the R-lock floor.
+
+    `risk_lifecycle.compute_r_lock_floor` is the market guard: it returns None
+    when the floor is not valid against the live price, so a floor that reaches
+    the picker has already been validated by the producer. The picker itself
+    only checks that the floor is a positive price -- it does not re-validate
+    it against the market -- and the executor applies its own broker
+    minimum-distance check before sending any stop. This test pins that
+    contract, so a future change to either side is deliberate.
+    """
+    import dynamic_risk
+
+    # The producer refuses the floor: it is not valid against the live price.
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, 3899.0, _policy()) is None
+
+    # The picker trusts it -- it only checks that the floor is a positive price.
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3900.0,
+        live_price=3899.0,
+        prev_peak=3900.0,
+        current_sl=3880.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3900.0,
+    )
+    assert res["stop_source"] == "R_LOCK"
+    assert res["r_lock_floor"] == pytest.approx(3900.0)
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+
+
+def test_the_reported_r_lock_floor_is_pre_clamp_and_the_candidate_is_post_clamp():
+    """The reported floor and the effective stop can differ.
+
+    `"r_lock_floor"` is the R floor that won the picker, before the broker
+    minimum-distance clamp is applied; `"candidate_sl"` is the effective stop
+    price that would actually be sent. A consumer must take the price from
+    `"candidate_sl"` and use `"r_lock_floor"` only as the provenance signal.
+    """
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3900.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        stops_buffer=2.0,
+        r_lock_floor=3904.0,
+    )
+    # The floor won the picker and is reported unchanged...
+    assert res["stop_source"] == "R_LOCK"
+    assert res["r_lock_floor"] == pytest.approx(3904.0)
+    # ...but the broker minimum-distance clamp moved the effective stop.
+    assert res["candidate_sl"] == pytest.approx(3903.0)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1452,6 +1516,70 @@ def test_trail_stop_ignores_a_non_numeric_or_invalid_floor():
         )
         assert res["r_lock_floor"] is None
         assert res["stop_source"] != "R_LOCK"
+
+
+def test_the_picker_trusts_the_floor_and_the_producer_guards_the_market():
+    """Document the split of responsibility for the R-lock floor.
+
+    `risk_lifecycle.compute_r_lock_floor` is the market guard: it returns None
+    when the floor is not valid against the live price, so a floor that reaches
+    the picker has already been validated by the producer. The picker itself
+    only checks that the floor is a positive price -- it does not re-validate
+    it against the market -- and the executor applies its own broker
+    minimum-distance check before sending any stop. This test pins that
+    contract, so a future change to either side is deliberate.
+    """
+    import dynamic_risk
+
+    # The producer refuses the floor: it is not valid against the live price.
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, 3899.0, _policy()) is None
+
+    # The picker trusts it -- it only checks that the floor is a positive price.
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3900.0,
+        live_price=3899.0,
+        prev_peak=3900.0,
+        current_sl=3880.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3900.0,
+    )
+    assert res["stop_source"] == "R_LOCK"
+    assert res["r_lock_floor"] == pytest.approx(3900.0)
+    assert res["candidate_sl"] == pytest.approx(3900.0)
+
+
+def test_the_reported_r_lock_floor_is_pre_clamp_and_the_candidate_is_post_clamp():
+    """The reported floor and the effective stop can differ.
+
+    `"r_lock_floor"` is the R floor that won the picker, before the broker
+    minimum-distance clamp is applied; `"candidate_sl"` is the effective stop
+    price that would actually be sent. A consumer must take the price from
+    `"candidate_sl"` and use `"r_lock_floor"` only as the provenance signal.
+    """
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3900.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        stops_buffer=2.0,
+        r_lock_floor=3904.0,
+    )
+    # The floor won the picker and is reported unchanged...
+    assert res["stop_source"] == "R_LOCK"
+    assert res["r_lock_floor"] == pytest.approx(3904.0)
+    # ...but the broker minimum-distance clamp moved the effective stop.
+    assert res["candidate_sl"] == pytest.approx(3903.0)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1496,6 +1624,12 @@ def compute_dynamic_atr_trail_stop(
     otherwise (the floor was rejected as invalid, or another candidate was
     tighter). A consumer can therefore treat `res["r_lock_floor"] is not None`
     as exactly "the R lock is the active stop".
+
+    `"r_lock_floor"` is the **pre-clamp** floor, i.e. the price the R lock
+    itself produced. `"candidate_sl"` is the **post-clamp** effective stop, i.e.
+    the price after the broker minimum-distance clamp was applied. The two can
+    differ; a consumer must take the price from `"candidate_sl"` and use
+    `"r_lock_floor"` only as the provenance signal.
     """
 ```
 

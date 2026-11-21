@@ -497,6 +497,12 @@ def compute_dynamic_atr_trail_stop(
     otherwise (the floor was rejected as invalid, or another candidate was
     tighter). A consumer can therefore treat `res["r_lock_floor"] is not None`
     as exactly "the R lock is the active stop".
+
+    `"r_lock_floor"` is the **pre-clamp** floor, i.e. the price the R lock
+    itself produced. `"candidate_sl"` is the **post-clamp** effective stop, i.e.
+    the price after the broker minimum-distance clamp was applied. The two can
+    differ; a consumer must take the price from `"candidate_sl"` and use
+    `"r_lock_floor"` only as the provenance signal.
     """
     atr_f = _safe_float(atr, 0.0)
     if not policy.trail_enabled or atr_f <= 0.0 or entry_price <= 0.0 or live_price <= 0.0:
