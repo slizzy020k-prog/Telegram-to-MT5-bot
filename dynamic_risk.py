@@ -481,6 +481,7 @@ def compute_dynamic_atr_trail_stop(
     cleared_milestones: Optional[Sequence[str]] = None,
     tp_levels: Optional[Dict[str, float]] = None,
     apply_milestone_floor: bool = True,
+    *,
     r_lock_floor: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
@@ -490,6 +491,12 @@ def compute_dynamic_atr_trail_stop(
     as the milestone floor, the ATR trail and the BE lock, so the picker keeps the
     tightest stop and the forward-only invariant is preserved. Passing `None`
     (the default) leaves every existing caller byte-for-byte unchanged.
+
+    The returned `"r_lock_floor"` key means **the R floor that won the picker**:
+    it is the rounded floor only when `stop_source == "R_LOCK"`, and `None`
+    otherwise (the floor was rejected as invalid, or another candidate was
+    tighter). A consumer can therefore treat `res["r_lock_floor"] is not None`
+    as exactly "the R lock is the active stop".
     """
     atr_f = _safe_float(atr, 0.0)
     if not policy.trail_enabled or atr_f <= 0.0 or entry_price <= 0.0 or live_price <= 0.0:
@@ -535,9 +542,15 @@ def compute_dynamic_atr_trail_stop(
         else None
     )
 
+    # Validate the R floor ONCE, defensively, and reuse the validated value in
+    # the candidate list and in every return path. The candidate guard must
+    # never raise on a value the echo would happily `float()`.
+    r_lock_val = _safe_float(r_lock_floor, 0.0)
+    r_lock_candidate: Optional[float] = round(r_lock_val, digits) if r_lock_val > 0.0 else None
+
     candidates: List[Tuple[int, str, float]] = []
-    if r_lock_floor is not None and _safe_float(r_lock_floor, 0.0) > 0.0:
-        candidates.append((0, "R_LOCK", round(float(r_lock_floor), digits)))
+    if r_lock_candidate is not None:
+        candidates.append((0, "R_LOCK", r_lock_candidate))
     if milestone_floor is not None:
         candidates.append((1, "MILESTONE_FLOOR", milestone_floor))
     if atr_sl is not None:
@@ -559,7 +572,7 @@ def compute_dynamic_atr_trail_stop(
             "be_sl": None,
             "atr_sl": None,
             "milestone_floor": None,
-            "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
+            "r_lock_floor": None,
             "stop_source": None,
             "atr": round(atr_f, 4),
             "mfe_dollars": round(max(0.0, mfe), 4),
@@ -573,6 +586,8 @@ def compute_dynamic_atr_trail_stop(
         candidates,
         key=lambda item: (-round(item[2], digits) if sign > 0 else round(item[2], digits), item[0]),
     )
+    # The R floor is "in effect" only when it won the picker.
+    active_r_lock = r_lock_candidate if stop_source == "R_LOCK" else None
     buf = max(0.0, _safe_float(stops_buffer, 0.0))
     if buf > 0.0:
         raw_sl = min(raw_sl, live_price - buf) if sign > 0 else max(raw_sl, live_price + buf)
@@ -592,7 +607,7 @@ def compute_dynamic_atr_trail_stop(
         "be_sl": be_sl,
         "atr_sl": atr_sl,
         "milestone_floor": milestone_floor,
-        "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
+        "r_lock_floor": active_r_lock,
         "stop_source": stop_source,
         "atr": round(atr_f, 4),
         "mfe_dollars": round(max(0.0, mfe), 4),
