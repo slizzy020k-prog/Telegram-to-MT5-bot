@@ -365,7 +365,7 @@ Telegram signal ──► parser ──► main._handle_new_message_unlocked
 | Exception inside the lifecycle branch | Caught, logged, **never** propagates out of the 1-second watcher; the rest of the tick continues |
 | Market close returns a failing retcode | Position left open, `lifecycle_retry_count` incremented, retried next tick; after `LIFECYCLE_MAX_CLOSE_RETRIES` (3) the guard stops retrying, sends a Saved-Messages alert, and leaves the position to its broker SL (the safe fallback) |
 | `initial_sl` missing on a layer | R lock skipped for that layer, logged once per signal; age guard unaffected |
-| `first_fill_at` missing | Fill age falls back to signal age; logged once |
+| No fill stamp known (no signal-level `first_fill_at` and no layer `filled_at`) | Fill age falls back to signal age; logged once |
 | Broker `trade_stops_level` rejects the BE move | Move skipped, layer left at its existing (already valid) SL, logged |
 | Ledger file missing / corrupt | `/stats` reports "no ledger data" instead of raising |
 
