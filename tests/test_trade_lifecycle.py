@@ -1,0 +1,198 @@
+"""Unit tests for the pure trade-lifecycle domain module (`risk_lifecycle.py`)."""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import risk_lifecycle as rl
+
+
+def _policy(**overrides):
+    base = dict(
+        r_lock_enabled=True,
+        r_lock_tiers=rl.DEFAULT_R_LOCK_TIERS,
+        r_lock_min_r_dollars=0.50,
+        lifecycle_enabled=True,
+        derisk_after_seconds=7200,
+        flatten_after_seconds=21600,
+        pending_expire_seconds=43200,
+        session_flatten_enabled=False,
+        session_flatten_at="23:30",
+        max_close_retries=3,
+    )
+    base.update(overrides)
+    return rl.LifecyclePolicy(**base)
+
+
+# --- parse_r_lock_tiers -------------------------------------------------
+
+def test_parse_r_lock_tiers_from_string():
+    assert rl.parse_r_lock_tiers("0.5:0.00,1.0:0.25") == ((0.5, 0.0), (1.0, 0.25))
+
+
+def test_parse_r_lock_tiers_sorts_ascending_and_skips_malformed():
+    parsed = rl.parse_r_lock_tiers("1.0:0.25,garbage,0.5:0.00,0.2:1.5,-1:0.5")
+    assert parsed == ((0.5, 0.0), (1.0, 0.25))
+
+
+def test_parse_r_lock_tiers_empty_returns_empty_tuple():
+    assert rl.parse_r_lock_tiers("") == ()
+
+
+# --- compute_initial_r --------------------------------------------------
+
+def test_compute_initial_r_is_direction_agnostic():
+    assert rl.compute_initial_r(3900.0, 3880.0) == pytest.approx(20.0)
+    assert rl.compute_initial_r(3900.0, 3920.0) == pytest.approx(20.0)
+
+
+def test_compute_initial_r_returns_none_for_invalid_inputs():
+    assert rl.compute_initial_r(0.0, 3880.0) is None
+    assert rl.compute_initial_r(3900.0, 0.0) is None
+    assert rl.compute_initial_r(3900.0, 3900.0) is None
+
+
+# --- compute_r_lock_floor ----------------------------------------------
+
+def test_r_lock_floor_none_below_first_tier():
+    # R = 20.0, first tier 0.5R -> needs MFE 10.0
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 9.99, _policy()) is None
+
+
+def test_r_lock_floor_locks_entry_at_half_r():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, _policy()) == pytest.approx(3900.0)
+
+
+def test_r_lock_floor_ladder_boundaries():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 20.0, _policy()) == pytest.approx(3905.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 30.0, _policy()) == pytest.approx(3910.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy()) == pytest.approx(3915.0)
+
+
+def test_r_lock_floor_scales_with_stop_distance():
+    wide = rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 11.0, _policy())   # R = 22.0
+    tight = rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 1.0, _policy())    # R = 2.00
+    assert wide == pytest.approx(3900.0)
+    assert tight == pytest.approx(3900.0)
+    # 1R on the wide stop locks a much larger absolute distance than on the tight stop
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 22.0, _policy()) == pytest.approx(3905.5)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 2.0, _policy()) == pytest.approx(3900.5)
+
+
+def test_r_lock_floor_sell_is_mirrored():
+    assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, _policy()) == pytest.approx(3895.0)
+
+
+def test_r_lock_floor_disabled_returns_none():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy(r_lock_enabled=False)) is None
+
+
+def test_r_lock_floor_below_min_r_returns_none():
+    # R = 0.20 which is under r_lock_min_r_dollars = 0.50
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3899.8, 1.0, _policy()) is None
+
+
+# --- evaluate_trade_age --------------------------------------------------
+
+def _sig(**overrides):
+    base = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_evaluate_trade_age_none_when_disabled():
+    res = rl.evaluate_trade_age(_sig(), datetime.now(timezone.utc), _policy(lifecycle_enabled=False))
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_none_when_young():
+    sig = _sig(timestamp=datetime.now(timezone.utc).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_derisk_after_two_hours():
+    sig = _sig(timestamp=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_DERISK
+
+
+def test_evaluate_trade_age_flatten_beats_derisk():
+    sig = _sig(timestamp=(datetime.now(timezone.utc) - timedelta(hours=9)).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+
+
+def test_evaluate_trade_age_expires_unfilled_pending():
+    sig = _sig(
+        timestamp=(datetime.now(timezone.utc) - timedelta(hours=20)).isoformat(),
+        market_tickets=[],
+        pending_tickets=[201],
+    )
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_EXPIRE_PENDING
+
+
+def test_evaluate_trade_age_never_expires_a_filled_signal():
+    sig = _sig(
+        timestamp=(datetime.now(timezone.utc) - timedelta(hours=20)).isoformat(),
+        market_tickets=[101],
+        pending_tickets=[201],
+    )
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+
+
+def test_evaluate_trade_age_none_without_orders():
+    sig = _sig(market_tickets=[], pending_tickets=[])
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_reports_ages():
+    now = datetime.now(timezone.utc)
+    sig = _sig(timestamp=(now - timedelta(hours=3)).isoformat())
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["signal_age_seconds"] >= 10800
+
+
+# --- command handlers ----------------------------------------------------
+
+def test_apply_rlock_command_toggles(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    changed, msg = rl.apply_rlock_command(config, ["on"])
+    assert changed is True
+    assert config.R_LOCK_ENABLED is True
+    changed, msg = rl.apply_rlock_command(config, ["off"])
+    assert changed is True
+    assert config.R_LOCK_ENABLED is False
+
+
+def test_apply_rlock_command_status_does_not_change(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    changed, msg = rl.apply_rlock_command(config, [])
+    assert changed is False
+    assert config.R_LOCK_ENABLED is True
+    assert "R_LOCK" in msg
+
+
+def test_apply_lifecycle_command_toggles(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    changed, msg = rl.apply_lifecycle_command(config, ["on"])
+    assert changed is True
+    assert config.LIFECYCLE_ENABLED is True
+
+
+def test_apply_lifecycle_command_rejects_garbage(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    changed, msg = rl.apply_lifecycle_command(config, ["banana"])
+    assert changed is False
+    assert config.LIFECYCLE_ENABLED is False
