@@ -1,4 +1,4 @@
-"""Trade lifecycle guards: R-relative profit floor and trade-age management.
+"""R-relative profit floor (R lock) and fill-time telemetry.
 
 Pure domain module (standard library only, no MT5 import, no I/O), following the
 discipline of `dynamic_risk.py` and `risk_controls.py`. It decides *what* should
@@ -17,38 +17,24 @@ multiple before it is protected.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-import logging
+from datetime import datetime, timezone
 import math
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 
-logger = logging.getLogger("copier.lifecycle")
 
 __all__ = [
-    "ACTION_NONE",
-    "ACTION_DERISK",
-    "ACTION_FLATTEN",
-    "ACTION_EXPIRE_PENDING",
-    "ACTION_SESSION_FLATTEN",
     "DEFAULT_R_LOCK_TIERS",
     "LifecyclePolicy",
-    "apply_lifecycle_command",
     "apply_rlock_command",
     "compute_initial_r",
     "compute_r_lock_floor",
-    "evaluate_trade_age",
     "parse_r_lock_tiers",
     "read_lifecycle_policy",
     "resolve_fill_time",
     "stamp_fill_times",
 ]
 
-ACTION_NONE = "NONE"
-ACTION_DERISK = "DERISK"
-ACTION_FLATTEN = "FLATTEN"
-ACTION_EXPIRE_PENDING = "EXPIRE_PENDING"
-ACTION_SESSION_FLATTEN = "SESSION_FLATTEN"
 
 #: ``(r_threshold, lock_fraction)`` pairs. The floor locks ``lock_fraction * R``
 #: above entry once the trade has travelled ``r_threshold * R`` in its favour.
@@ -62,10 +48,6 @@ DEFAULT_R_LOCK_TIERS: Tuple[Tuple[float, float], ...] = (
 _ON_TOKENS = frozenset({"on", "true", "1", "enable", "enabled"})
 _OFF_TOKENS = frozenset({"off", "false", "0", "disable", "disabled", "none"})
 
-_LIFECYCLE_USAGE = (
-    "⚠️ **Invalid value.** Usage: `/lifecycle on|off`\n"
-    "Examples: `/lifecycle on` or `/lifecycle off`."
-)
 _RLOCK_USAGE = (
     "⚠️ **Invalid value.** Usage: `/rlock on|off`\n"
     "Examples: `/rlock on` or `/rlock off`."
@@ -107,18 +89,11 @@ def _safe_bool(value: Any, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class LifecyclePolicy:
-    """Immutable snapshot of the R-lock and trade-age guard settings."""
+    """Immutable snapshot of the R-lock settings."""
 
     r_lock_enabled: bool = False
     r_lock_tiers: Tuple[Tuple[float, float], ...] = DEFAULT_R_LOCK_TIERS
     r_lock_min_r_dollars: float = 0.50
-    lifecycle_enabled: bool = False
-    derisk_after_seconds: int = 14400
-    flatten_after_seconds: int = 28800
-    pending_expire_seconds: int = 43200
-    session_flatten_enabled: bool = False
-    session_flatten_at: str = "23:30"
-    max_close_retries: int = 3
 
 
 def parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
@@ -155,42 +130,19 @@ def parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
 
 
 def read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy:
-    """Read the lifecycle policy from a config-like module.
+    """Read the R-lock policy from a config-like module.
 
-    Every value is normalised defensively: an inverted or malformed setting is
-    repaired rather than rejected, so the bot always boots.
+    Every value is normalised defensively: a malformed setting is repaired
+    rather than rejected, so the bot always boots.
     """
     tiers = parse_r_lock_tiers(getattr(cfg_mod, "R_LOCK_TIERS", DEFAULT_R_LOCK_TIERS))
     if not tiers:
         tiers = DEFAULT_R_LOCK_TIERS
 
-    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 14400), 14400))
-    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 28800), 28800))
-    if flatten < derisk:
-        flatten = derisk
-
-    session_at = str(getattr(cfg_mod, "LIFECYCLE_SESSION_FLATTEN_AT", "23:30") or "23:30").strip()
-    parts = session_at.split(":")
-    try:
-        hh = int(parts[0])
-        mm = int(parts[1]) if len(parts) > 1 else 0
-    except (TypeError, ValueError):
-        hh, mm = 23, 30
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        hh, mm = 23, 30
-    session_at = f"{hh:02d}:{mm:02d}"
-
     return LifecyclePolicy(
         r_lock_enabled=_safe_bool(getattr(cfg_mod, "R_LOCK_ENABLED", False), False),
         r_lock_tiers=tiers,
         r_lock_min_r_dollars=max(0.0, _safe_float(getattr(cfg_mod, "R_LOCK_MIN_R_DOLLARS", 0.50), 0.50)),
-        lifecycle_enabled=_safe_bool(getattr(cfg_mod, "LIFECYCLE_ENABLED", False), False),
-        derisk_after_seconds=derisk,
-        flatten_after_seconds=flatten,
-        pending_expire_seconds=max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200), 43200)),
-        session_flatten_enabled=_safe_bool(getattr(cfg_mod, "LIFECYCLE_SESSION_FLATTEN_ENABLED", False), False),
-        session_flatten_at=session_at,
-        max_close_retries=max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_MAX_CLOSE_RETRIES", 3), 3)),
     )
 
 
@@ -347,106 +299,6 @@ def resolve_fill_time(signal_data: Dict[str, Any]) -> Optional[datetime]:
     return best
 
 
-def _parse_session_at(session_at: str) -> Tuple[int, int]:
-    """Parse ``"23:30"`` into ``(hour, minute)``."""
-    parts = str(session_at or "23:30").split(":")
-    try:
-        hh = int(parts[0])
-        mm = int(parts[1]) if len(parts) > 1 else 0
-    except (TypeError, ValueError):
-        return 23, 30
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        return 23, 30
-    return hh, mm
-
-
-def evaluate_trade_age(
-    signal_data: Dict[str, Any],
-    now_utc: datetime,
-    policy: LifecyclePolicy,
-    server_offset_seconds: int = 0,
-) -> Dict[str, Any]:
-    """Decide which lifecycle action (if any) applies to a signal right now.
-
-    Returns a dict with ``action`` (one of the ``ACTION_*`` constants),
-    ``reason``, ``signal_age_seconds``, ``fill_age_seconds`` and ``server_time``.
-
-    Precedence: ``SESSION_FLATTEN`` > ``FLATTEN`` > ``DERISK`` > ``EXPIRE_PENDING``.
-    """
-    sig = signal_data if isinstance(signal_data, dict) else {}
-    has_market = bool(sig.get("market_tickets"))
-    has_pending = bool(sig.get("pending_tickets"))
-
-    now = _parse_iso_utc(now_utc) or datetime.now(timezone.utc)
-    signal_dt = _parse_iso_utc(sig.get("timestamp"))
-    # The fill clock is the EARLIEST known fill (the signal stamp or any layer
-    # stamp). Fall back to the signal timestamp when no fill time is known: the
-    # position is at least as old as the signal, so the age guard must not stand down.
-    resolved_fill = resolve_fill_time(sig)
-    if resolved_fill is None and signal_dt is not None and not sig.get("_fill_age_fallback_logged"):
-        # `evaluate_trade_age` runs for EVERY active signal on EVERY tick, so
-        # the fallback is logged ONCE per signal (the marker rides on the
-        # signal dict, exactly like `_r_lock_skipped_logged` does).
-        sig["_fill_age_fallback_logged"] = True
-        logger.info(
-            "[FILL-AGE FALLBACK] Signal %s carries no fill stamp; falling back to "
-            "the signal timestamp for the trade age.",
-            sig.get("message_id") or sig.get("chat_id") or "unknown",
-        )
-    fill_dt = resolved_fill or signal_dt
-    signal_age = int((now - signal_dt).total_seconds()) if signal_dt else 0
-    fill_age = int((now - fill_dt).total_seconds()) if fill_dt else None
-
-    server_dt = now + timedelta(seconds=int(server_offset_seconds or 0))
-    server_time = server_dt.strftime("%H:%M")
-    hh, mm = _parse_session_at(policy.session_flatten_at)
-    server_minutes = server_dt.hour * 60 + server_dt.minute
-    session_minutes = hh * 60 + mm
-
-    result: Dict[str, Any] = {
-        "action": ACTION_NONE,
-        "reason": "",
-        "signal_age_seconds": signal_age,
-        "fill_age_seconds": fill_age,
-        "server_time": server_time,
-    }
-
-    if not policy.lifecycle_enabled:
-        result["reason"] = "lifecycle guard disabled"
-        return result
-
-    if not has_market and not has_pending:
-        result["reason"] = "no open or pending orders"
-        return result
-
-    if policy.session_flatten_enabled and has_market and server_minutes >= session_minutes:
-        result["action"] = ACTION_SESSION_FLATTEN
-        result["reason"] = f"session cut reached ({server_time} >= {policy.session_flatten_at} broker time)"
-        return result
-
-    if has_market and fill_age is not None and fill_age >= policy.flatten_after_seconds:
-        result["action"] = ACTION_FLATTEN
-        result["reason"] = f"position age {fill_age}s >= {policy.flatten_after_seconds}s"
-        return result
-
-    if has_market and fill_age is not None and fill_age >= policy.derisk_after_seconds:
-        result["action"] = ACTION_DERISK
-        result["reason"] = f"position age {fill_age}s >= {policy.derisk_after_seconds}s"
-        return result
-
-    if not has_market and has_pending and signal_age >= policy.pending_expire_seconds:
-        result["action"] = ACTION_EXPIRE_PENDING
-        result["reason"] = f"signal age {signal_age}s >= {policy.pending_expire_seconds}s and never filled"
-        return result
-
-    if signal_dt is None and fill_dt is None:
-        result["reason"] = "unknown age (signal carries no timestamp)"
-        return result
-
-    result["reason"] = "within thresholds"
-    return result
-
-
 def _format_tiers(policy: LifecyclePolicy) -> str:
     parts = []
     for r_threshold, fraction in policy.r_lock_tiers:
@@ -482,38 +334,3 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
         setattr(cfg_mod, "R_LOCK_ENABLED", False)
         return True, "⚪ **R-Relative Profit Floor Disabled → `OFF`** (ATR trail only)."
     return False, _RLOCK_USAGE
-
-
-def apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
-    """Query or toggle the trade-age guard via Saved Messages (`/lifecycle`)."""
-    cleaned = [str(a).strip() for a in (args or []) if str(a).strip()]
-    policy = read_lifecycle_policy(cfg_mod)
-    if not cleaned:
-        badge = "🟢 ON" if policy.lifecycle_enabled else "⚪ OFF"
-        session = (
-            f"`{policy.session_flatten_at}` broker time"
-            if policy.session_flatten_enabled
-            else "⚪ OFF"
-        )
-        return False, (
-            f"⏱ **Trade Lifecycle Guard (`/lifecycle`): {badge}**\n"
-            f"• De-risk at: `{policy.derisk_after_seconds}s` (cancel pending + move to BE)\n"
-            f"• Flatten at: `{policy.flatten_after_seconds}s` (close at market)\n"
-            f"• Pending expiry: `{policy.pending_expire_seconds}s`\n"
-            f"• Session cut: {session}\n"
-            f"• Max close retries: `{policy.max_close_retries}`\n"
-            "• Toggles `LIFECYCLE_ENABLED`\n"
-            "• Change: `/lifecycle on` | `/lifecycle off`"
-        )
-    token = cleaned[0].lower()
-    if token in _ON_TOKENS:
-        setattr(cfg_mod, "LIFECYCLE_ENABLED", True)
-        return True, (
-            "⏱ **Trade Lifecycle Guard Enabled → `ON`**\n"
-            f"• De-risk at `{policy.derisk_after_seconds}s`, flatten at `{policy.flatten_after_seconds}s`, "
-            f"pending expiry `{policy.pending_expire_seconds}s`."
-        )
-    if token in _OFF_TOKENS:
-        setattr(cfg_mod, "LIFECYCLE_ENABLED", False)
-        return True, "⚪ **Trade Lifecycle Guard Disabled → `OFF`** (no age-based de-risk or flatten)."
-    return False, _LIFECYCLE_USAGE

@@ -530,47 +530,6 @@ def _validate_dynamic_risk_config(cfg: Any, errors: List[str]) -> None:
             errors.append(f"{lo_field} ({lo_v}) cannot exceed {hi_field} ({hi_v}).")
 
 
-def _validate_lifecycle_config(cfg: Any, errors: List[str]) -> None:
-    """Validate the Trade Lifecycle Guard knobs (R floor + trade-age guard)."""
-    for bool_flag in ("R_LOCK_ENABLED", "LIFECYCLE_ENABLED", "LIFECYCLE_SESSION_FLATTEN_ENABLED"):
-        if hasattr(cfg, bool_flag):
-            flag_val = getattr(cfg, bool_flag)
-            if not isinstance(flag_val, bool):
-                errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
-
-    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 14400)
-    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 28800)
-    if not isinstance(derisk, int) or isinstance(derisk, bool) or derisk < 0:
-        errors.append(f"LIFECYCLE_DERISK_SECONDS must be a non-negative int, got {derisk!r}.")
-    if not isinstance(flatten, int) or isinstance(flatten, bool) or flatten < 0:
-        errors.append(f"LIFECYCLE_FLATTEN_SECONDS must be a non-negative int, got {flatten!r}.")
-    if isinstance(derisk, int) and isinstance(flatten, int) and not isinstance(derisk, bool) and not isinstance(flatten, bool):
-        if flatten < derisk:
-            errors.append(
-                f"LIFECYCLE_FLATTEN_SECONDS ({flatten}) must be >= LIFECYCLE_DERISK_SECONDS ({derisk})."
-            )
-
-    tiers_raw = getattr(cfg, "R_LOCK_TIERS", "")
-    if str(tiers_raw).strip():
-        from risk_lifecycle import parse_r_lock_tiers
-
-        parsed = parse_r_lock_tiers(tiers_raw)
-        if not parsed:
-            errors.append(
-                f"R_LOCK_TIERS ({tiers_raw!r}) contains no valid 'r:fraction' pair."
-            )
-
-    session_at = str(getattr(cfg, "LIFECYCLE_SESSION_FLATTEN_AT", "23:30")).strip()
-    parts = session_at.split(":")
-    try:
-        hh = int(parts[0])
-        mm = int(parts[1]) if len(parts) > 1 else 0
-        if not (0 <= hh <= 23 and 0 <= mm <= 59):
-            raise ValueError
-    except (TypeError, ValueError, IndexError):
-        errors.append(f"LIFECYCLE_SESSION_FLATTEN_AT must be 'HH:MM', got {session_at!r}.")
-
-
 def validate_environment(check_packages: bool = True, cfg: Any = None) -> Dict[str, Any]:
     """Validate local packages, trading configuration invariants, and writable paths."""
     errors: List[str] = []
@@ -605,7 +564,6 @@ def validate_environment(check_packages: bool = True, cfg: Any = None) -> Dict[s
     _validate_lots_and_orders(cfg, errors, warnings)
     _validate_tp_and_runner_buffers(cfg, errors, warnings)
     _validate_dynamic_risk_config(cfg, errors)
-    _validate_lifecycle_config(cfg, errors)
 
     _check_writable_file_path("LOG_FILE_PATH", getattr(cfg, "LOG_FILE_PATH", None), errors)
     _check_writable_file_path("STATE_FILE_PATH", getattr(cfg, "STATE_FILE_PATH", None), errors)

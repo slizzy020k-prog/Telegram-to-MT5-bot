@@ -117,14 +117,9 @@ ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "BANK_HARVEST_ALT_ARM_PCT": 0.80,
 }
 
-# Arm C params: Arm B plus the R-relative profit floor and the trade-age guard.
+# Arm C params: Arm B plus the R-relative profit floor (R lock only).
 ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
     "R_LOCK_ENABLED": True,
-    "LIFECYCLE_ENABLED": True,
-    "LIFECYCLE_DERISK_SECONDS": 14400,
-    "LIFECYCLE_FLATTEN_SECONDS": 28800,
-    "LIFECYCLE_PENDING_EXPIRE_SECONDS": 43200,
-    "LIFECYCLE_SESSION_FLATTEN_ENABLED": False,
 }
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
@@ -911,7 +906,7 @@ def _pin_arm_b_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None
 
 
 def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None:
-    """Explicitly pin and verify the Arm C lifecycle parameters across config, executor, and main."""
+    """Explicitly pin and verify the Arm C R-lock parameters across config, executor, and main."""
     targets = (config_mod, executor_mod, main_mod)
     for key, expected in ARM_C_CALIBRATED_PARAMS.items():
         for mod in targets:
@@ -1353,9 +1348,8 @@ def _evaluate_gates(
     arm_b: Optional[Dict[str, Any]],
     arm_c: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # Arm C is compared against ARM B (not against Arm A): the R lock and the
-    # trade-age guard are an increment on Arm B, and the gate is absent when
-    # Arm C was not run.
+    # Arm C is compared against ARM B (not against Arm A): the R lock is an
+    # increment on Arm B, and the gate is absent when Arm C was not run.
     if arm_c and arm_b:
         sc = arm_c["summary"]
         sb2 = arm_b["summary"]
@@ -1465,7 +1459,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         label = {
             "a": "Arm A (`4544f7f`)",
             "b": "Arm B (`v3.6.0` Calibrated)",
-            "c": "Arm C (v3.8.0 Trade Lifecycle Guard)",
+            "c": "Arm C (R Lock Only)",
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -1497,7 +1491,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         tail_b = f"`£{sb_c['tail_loss_gbp_13078_9953']}`" if sb_c else "`n/a`"
         lines += [
             "",
-            "### Arm C (v3.8.0 Trade Lifecycle Guard)",
+            "### Arm C (R Lock Only)",
             "",
             f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: {net_b})",
             f"- **Tail Loss (13078 + 9953):** `£{sc['tail_loss_gbp_13078_9953']}` "

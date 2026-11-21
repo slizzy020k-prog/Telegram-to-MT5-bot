@@ -544,27 +544,12 @@ DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT: float = _env_float(
     "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", 0.50, min_val=0.05, max_val=0.99
 )
 
-# Trade Lifecycle Guard (R-relative profit floor + trade-age management)
-# Both features ship DISABLED: enable live with `/rlock on` and `/lifecycle on`.
+# R-Relative Profit Floor (R lock)
+# Ships DISABLED: enable live with `/rlock on`.
 R_LOCK_ENABLED: bool = _env_bool("R_LOCK_ENABLED", False)
 R_LOCK_TIERS: str = os.getenv("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75").strip()
 R_LOCK_MIN_R_DOLLARS: float = _env_float(
     "R_LOCK_MIN_R_DOLLARS", 0.50, min_val=0.0, max_val=100.0
-)
-LIFECYCLE_ENABLED: bool = _env_bool("LIFECYCLE_ENABLED", False)
-LIFECYCLE_DERISK_SECONDS: int = _env_int(
-    "LIFECYCLE_DERISK_SECONDS", 14400, min_val=0, max_val=604800
-)
-LIFECYCLE_FLATTEN_SECONDS: int = _env_int(
-    "LIFECYCLE_FLATTEN_SECONDS", 28800, min_val=0, max_val=604800
-)
-LIFECYCLE_PENDING_EXPIRE_SECONDS: int = _env_int(
-    "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200, min_val=0, max_val=604800
-)
-LIFECYCLE_SESSION_FLATTEN_ENABLED: bool = _env_bool("LIFECYCLE_SESSION_FLATTEN_ENABLED", False)
-LIFECYCLE_SESSION_FLATTEN_AT: str = os.getenv("LIFECYCLE_SESSION_FLATTEN_AT", "23:30").strip()
-LIFECYCLE_MAX_CLOSE_RETRIES: int = _env_int(
-    "LIFECYCLE_MAX_CLOSE_RETRIES", 3, min_val=0, max_val=50
 )
 
 
@@ -587,18 +572,3 @@ def validate_dynamic_risk_pairs() -> None:
 
 validate_dynamic_risk_pairs()
 
-
-def validate_lifecycle_pairs() -> None:
-    """Ensure the trade-age guard thresholds are ordered (flatten must not precede de-risk)."""
-    g = globals()
-    derisk = int(g.get("LIFECYCLE_DERISK_SECONDS", 0))
-    flatten = int(g.get("LIFECYCLE_FLATTEN_SECONDS", 0))
-    if flatten < derisk:
-        _cfg_logger.warning(
-            f"LIFECYCLE_FLATTEN_SECONDS ({flatten}) < LIFECYCLE_DERISK_SECONDS ({derisk}); "
-            "raising the flatten threshold to match."
-        )
-        g["LIFECYCLE_FLATTEN_SECONDS"] = derisk
-
-
-validate_lifecycle_pairs()
