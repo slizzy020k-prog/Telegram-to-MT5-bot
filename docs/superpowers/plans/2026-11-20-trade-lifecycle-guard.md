@@ -1715,9 +1715,19 @@ existing caller unchanged."
 ## Task 3: `mt5_executor.py` — capture `initial_sl` and `first_fill_at`
 
 **Files:**
-- Modify: `mt5_executor.py:2340-2364` (`_execute_4layer_specs` — the layer dict)
-- Modify: `mt5_executor.py:6073-6075` (`hydrate_signal_layers_from_mt5` — the startup fill transition)
-- Modify: `main.py:3554` (`_reconcile_live_mt5_signals` — the LIVE fill transition)
+- Modify: `mt5_executor.py:541-546` (`MT5Executor.__init__` — the `_last_order_sls` side-channel)
+- Modify: `mt5_executor.py:844-853` (`MT5Executor.get_last_placed_sl` — the new accessor)
+- Modify: `mt5_executor.py:1575-1580` (`execute_market_order` — record the stop that was sent)
+- Modify: `mt5_executor.py:1790-1794` (`_place_pending_order` — record the stop that was sent)
+- Modify: `mt5_executor.py:2345-2394` (`_execute_4layer_specs` — the layer dict and its `initial_sl`)
+- Modify: `mt5_executor.py:4968-4975` (`apply_signal_breakeven` — the BE fill-race promotion)
+- Modify: `mt5_executor.py:6138-6144` (`hydrate_signal_layers_from_mt5` — the startup fill transition)
+- Modify: `main.py:3554-3562` (`_reconcile_live_mt5_signals` — the LIVE fill transition)
+- Modify: `main.py:5787-5807` (`_resolve_edit_initial_sl` — the new helper)
+- Modify: `main.py:5992-5996` (`_handle_message_edited_unlocked` — the symbol digits)
+- Modify: `main.py:6620-6637` (the retiered-order branch layer record)
+- Modify: `main.py:6855-6873` (the fresh-limit branch layer record)
+- Modify: `main.py:6917-6920` (persist the signal-level `first_fill_at`)
 - Modify: `risk_lifecycle.py` (add `stamp_fill_times` + `resolve_fill_time`; use `resolve_fill_time` in `evaluate_trade_age`)
 - Modify: `tests/test_trade_lifecycle.py` (append the capture tests)
 
@@ -1730,12 +1740,12 @@ existing caller unchanged."
   - `risk_lifecycle.stamp_fill_times(signal_data, layer_data=None, now=None) -> bool`
   - `risk_lifecycle.resolve_fill_time(signal_data) -> Optional[datetime]`
 
-**Why all three fill sites matter (do not skip Steps 4-6):**
+**Why every fill site matters (do not skip Steps 5-8):**
 
-`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3420`, inside
+`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3421`, inside
 `_startup_hydrate_and_backfill_ledger()` — so it only runs at STARTUP. The LIVE
 `PENDING -> FILLED` transition happens in `main.py:3554`, inside `_reconcile_live_mt5_signals`
-(`async def` at `main.py:3449`), which sets `l_data["status"] = "FILLED"` directly and never
+(`async def` at `main.py:3450`), which sets `l_data["status"] = "FILLED"` directly and never
 calls `hydrate_signal_layers_from_mt5`. Stamping only in the executor leaves the live path
 unstamped, and `evaluate_trade_age` then falls back to the SIGNAL timestamp — so a limit order
 that filled hours after the signal was created makes a brand-new position look hours old and
@@ -1745,6 +1755,22 @@ MARKET fills never go through `PENDING -> FILLED` at all: `_execute_4layer_specs
 `status = "OPEN"` immediately for MARKET layers. A zone signal normally fills L1 at market and
 L2-L4 later as limits, so the MARKET fill is the FIRST fill of the trade and has to be stamped
 where the order is placed.
+
+There are TWO MORE places that can fill a layer, and both have to stamp:
+
+- `apply_signal_breakeven` (`mt5_executor.py:4968-4975`) promotes a pending limit that filled
+  in the sub-second window BEFORE the 1-second reconciler ran, and then drops the ticket from
+  `pending_tickets`. The reconciler's stamping loop lives inside `for t in pd_tickets:`, so a
+  ticket removed here is never revisited and never stamped — the promoted position would have
+  NO fill time at all, and the age guard would fall back to the signal timestamp.
+- The signal-edit path in `main.py` builds its own layer records (`new_l_rec` at
+  `main.py:6620`, `new_l_rec_a` at `main.py:6855`). Without a stamp, a MARKET layer created
+  by an edit has no fill time, and every layer created by an edit has no `initial_sl`.
+
+The stop that goes to the broker is NOT always the `sl` argument: when `sl` is `None` or
+`0.0`, `_compute_fallback_sl` (`mt5_executor.py:1398`) computes an ATR-based or
+`FALLBACK_SL_PIPS`-based stop and THAT is what the broker holds. `initial_sl` must therefore
+record the stop that was actually sent — see Step 4.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2015,6 +2041,345 @@ async def test_live_reconcile_stamps_the_fill_time_on_the_filled_layer(monkeypat
     res = rl.evaluate_trade_age(stored, datetime.now(timezone.utc), _policy())
     assert res["fill_age_seconds"] < 600
     assert res["action"] == rl.ACTION_NONE
+
+
+# --- fix round 1: BE fill-race promotion, broker stop capture, edit path ---
+
+
+def test_apply_signal_breakeven_stamps_the_fill_time_when_it_promotes_a_pending_layer(monkeypatch):
+    """A pending limit that filled before the 1s reconciler must still be stamped.
+
+    `apply_signal_breakeven` promotes the layer to FILLED and drops the ticket
+    from `pending_tickets`, so the reconciler's stamping loop never sees it
+    again. Without a stamp here the promoted position has NO fill time at all:
+    the trade-age guard falls back to the signal timestamp and treats a
+    brand-new position as hours old.
+    """
+    from types import SimpleNamespace
+
+    import MetaTrader5 as mt5
+    import mt5_executor as ex_mod
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=False)
+    ex._connected = True
+
+    position = SimpleNamespace(
+        ticket=7002,
+        symbol="XAUUSD.s",
+        type=0,
+        volume=0.01,
+        price_open=3890.0,
+        sl=3880.0,
+        tp=3905.0,
+        profit=0.0,
+    )
+    monkeypatch.setattr(
+        ex_mod.mt5,
+        "positions_get",
+        lambda *a, **k: [position],
+    )
+    monkeypatch.setattr(
+        ex_mod.mt5,
+        "symbol_info",
+        lambda sym: SimpleNamespace(digits=2, point=0.01, trade_stops_level=50),
+    )
+    monkeypatch.setattr(
+        ex_mod.mt5,
+        "terminal_info",
+        lambda: SimpleNamespace(connected=True, trade_allowed=True),
+    )
+    monkeypatch.setattr(
+        ex_mod.mt5,
+        "order_send",
+        lambda req: SimpleNamespace(retcode=mt5.TRADE_RETCODE_DONE, order=7002, comment="Mock done"),
+    )
+
+    sig = {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "market_tickets": [],
+        "pending_tickets": [7002],
+        "layers": {
+            "L2": {
+                "lot": 0.01,
+                "target_price": 3890.0,
+                "tp": 3905.0,
+                "ticket": 7002,
+                "order_type": "BUY_LIMIT",
+                "status": "PENDING",
+            },
+        },
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat(),
+    }
+
+    res = ex.apply_signal_breakeven(sig, be_layers=["L2"])
+
+    assert 7002 in res["promoted_tickets"], "the pending ticket must be promoted"
+    assert sig["layers"]["L2"]["status"] == "FILLED"
+    assert sig["layers"]["L2"].get("filled_at"), "the promoted layer must record its fill time"
+    assert sig.get("first_fill_at"), "the promoted layer must stamp the signal-level first fill"
+    # The age guard must read the fill clock, not the 9-hour-old signal timestamp.
+    age = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert age["fill_age_seconds"] < 600
+    assert age["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_uses_the_earliest_fill_when_the_signal_stamp_is_later():
+    """The MARKET fill (L1) is OLDER than the LIMIT fill the signal stamped.
+
+    The trade-age guard must measure from the MARKET fill, so the position is
+    already past the de-risk threshold and must be de-risked. The later signal
+    stamp must not hide the age.
+    """
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        # The signal-level stamp records the FIRST LIMIT fill (L2), 5 minutes ago...
+        "first_fill_at": (now - timedelta(minutes=5)).isoformat(),
+        # ...but L1 filled at MARKET three hours ago.
+        "layers": {
+            "L1": {"filled_at": (now - timedelta(hours=3)).isoformat()},
+            "L2": {"filled_at": (now - timedelta(minutes=5)).isoformat()},
+        },
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_DERISK, "the earlier MARKET fill must win"
+    assert res["fill_age_seconds"] == 3 * 3600
+
+
+def test_evaluate_trade_age_reports_none_when_the_market_fill_is_young_and_the_signal_is_old():
+    """The reverse direction: the SIGNAL is old, but the position only filled now.
+
+    The guard measures the position, not the signal: a position that opened ten
+    minutes ago must not be de-risked because the signal was posted hours ago.
+    """
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "first_fill_at": (now - timedelta(minutes=10)).isoformat(),
+        "layers": {
+            "L1": {"filled_at": (now - timedelta(minutes=10)).isoformat()},
+            "L2": {"status": "PENDING"},
+        },
+        "market_tickets": [101],
+        "pending_tickets": [201],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_NONE
+    assert res["fill_age_seconds"] == 600
+
+
+def test_evaluate_trade_age_keeps_the_old_signal_stamp_when_the_market_fill_is_young():
+    """An OLD signal-level stamp is never ignored: the EARLIEST fill wins.
+
+    This is the mirror of the mixed case above: here the signal-level stamp is
+    the older fill, so the guard must act on it even though a layer carries a
+    younger fill.
+    """
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "first_fill_at": (now - timedelta(hours=5)).isoformat(),
+        "layers": {"L1": {"filled_at": (now - timedelta(minutes=10)).isoformat()}},
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_DERISK
+    assert res["fill_age_seconds"] == 5 * 3600
+
+
+def test_execute_4layer_specs_records_the_stop_the_broker_actually_got(monkeypatch):
+    """`sl=None` means the executor computes a fallback stop for the broker.
+
+    `initial_sl` must capture THAT stop, not the `None` argument, otherwise the
+    R-relative floor has no initial risk R to work with and is silently skipped.
+    """
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    sent = []
+    real_send = ex.send_order_with_filling_fallback
+
+    def _capture(request):
+        sent.append(dict(request))
+        return real_send(request)
+
+    monkeypatch.setattr(ex, "send_order_with_filling_fallback", _capture)
+
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=None,
+        tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
+    )
+
+    assert len(sent) == 1, "the L1 layer must place exactly one order"
+    broker_sl = sent[0]["sl"]
+    assert broker_sl and broker_sl > 0.0, "the broker must have received a real stop"
+    assert layers["L1"]["initial_sl"] is not None, "initial_sl must capture the broker stop"
+    assert layers["L1"]["initial_sl"] == pytest.approx(broker_sl)
+    assert ex.get_last_placed_sl(layers["L1"]["ticket"]) == pytest.approx(broker_sl)
+
+
+def test_execute_4layer_specs_records_the_stop_of_a_pending_layer(monkeypatch):
+    """The pending path records the same broker stop as the market path."""
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    sent = []
+    real_send = ex.send_order_with_filling_fallback
+
+    def _capture(request):
+        sent.append(dict(request))
+        return real_send(request)
+
+    monkeypatch.setattr(ex, "send_order_with_filling_fallback", _capture)
+
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L2", 3850.0, 0.01, 3905.0)],
+        sl=None,
+        tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
+    )
+
+    assert len(sent) == 1
+    broker_sl = sent[0]["sl"]
+    assert broker_sl and broker_sl > 0.0
+    assert layers["L2"]["initial_sl"] == pytest.approx(broker_sl)
+    assert layers["L2"].get("filled_at") is None
+
+
+def test_execute_4layer_specs_rounds_the_captured_stop_to_the_symbol_digits(monkeypatch):
+    """The captured stop must use the broker's `digits`, not a hardcoded 2."""
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    sym_info = SimpleNamespace(
+        digits=3,
+        point=0.001,
+        spread=15,
+        trade_mode=4,
+        filling_mode=2,
+        visible=True,
+        trade_stops_level=50,
+        volume_min=0.01,
+        volume_max=100.0,
+        volume_step=0.01,
+    )
+    monkeypatch.setattr(ex, "get_symbol_info", lambda symbol: sym_info)
+
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=3880.126,
+        tick=SimpleNamespace(bid=3894.8, ask=3895.0, time=1700000000.0),
+    )
+
+    assert layers["L1"]["initial_sl"] == pytest.approx(3880.126)
+
+
+@pytest.mark.asyncio
+async def test_edit_path_records_the_placed_stop_and_the_fill_time_on_the_new_layers(monkeypatch, tmp_path):
+    """The signal-edit path builds its own layer records.
+
+    A layer created by an edit must carry the stop it was placed with and, for a
+    MARKET layer, its fill time -- otherwise the R floor has no R and the
+    trade-age guard falls back to the (possibly hours-old) signal timestamp.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    import main
+    from mt5_executor import MT5Executor
+    from state_manager import StateManager
+    from trade_ledger import TradeLedger
+
+    class _FakeMsg:
+        def __init__(self, msg_id, text, date=None, edit_date=None):
+            self.id = msg_id
+            self.message = text
+            self.raw_text = text
+            self.reply_to_msg_id = None
+            self.reply_to = None
+            self.forward = None
+            self.fwd_from = None
+            self.out = False
+            self.date = date or datetime.now(timezone.utc)
+            self.edit_date = edit_date
+
+    class _FakeEvent:
+        def __init__(self, msg_id, text, chat_id=-1004369388188, date=None, edit_date=None):
+            self.message = _FakeMsg(msg_id, text, date=date, edit_date=edit_date)
+            self.chat_id = chat_id
+            self.is_private = False
+            self.is_reply = False
+            self.replies = []
+
+        async def reply(self, txt):
+            self.replies.append(txt)
+
+    executor = MT5Executor(dry_run=True)
+    monkeypatch.setattr(main, "executor", executor)
+    monkeypatch.setattr(main, "state_mgr", StateManager(str(tmp_path / "edit_state.json")))
+    monkeypatch.setattr(main, "trade_ledger", TradeLedger(str(tmp_path / "edit_ledger.jsonl")))
+    executor.connect()
+
+    chat_id = -1004369388188
+    msg_id = 9755
+    t0 = datetime.now(timezone.utc) - timedelta(minutes=5)
+    tick = SimpleNamespace(bid=3856.00, ask=3856.20, time=1700000000)
+
+    with patch.object(main, "notify_saved_messages", new_callable=AsyncMock), patch.object(
+        executor, "get_tick", return_value=tick
+    ):
+        # A SELL limit above the market stays pending.
+        await main.handle_new_message(
+            _FakeEvent(msg_id, "SELL XAUUSD 3860\nTP 3800\nSL 3870", chat_id=chat_id, date=t0)
+        )
+        # The edit re-tiers L1 into the zone. With the market at 3856 the new L1
+        # tier (3856) executes at MARKET and L2-L4 are placed as limits.
+        await main.handle_message_edited(
+            _FakeEvent(
+                msg_id,
+                "SELL XAUUSD 3856-3860\nTP 3800\nSL 3870",
+                chat_id=chat_id,
+                date=t0,
+                edit_date=datetime.now(timezone.utc),
+            )
+        )
+
+    sig = main.state_mgr.get_signal(msg_id, chat_id=chat_id)
+    assert sig is not None
+    l1 = sig["layers"]["L1"]
+    assert l1["order_type"] == "MARKET", "the re-tiered L1 must execute at market"
+    assert l1["initial_sl"] == pytest.approx(3870.0), "the layer must carry the stop it was placed with"
+    assert l1.get("filled_at"), "a MARKET layer created by an edit must record its fill time"
+    assert sig.get("first_fill_at"), "the edit must stamp the signal-level first fill"
+
+    # The fresh LIMIT layers must carry the stop too -- and no fill time.
+    for name in ("L2", "L3", "L4"):
+        assert sig["layers"][name]["initial_sl"] == pytest.approx(3870.0)
+        assert sig["layers"][name].get("filled_at") is None
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -2023,13 +2388,39 @@ async def test_live_reconcile_stamps_the_fill_time_on_the_filled_layer(monkeypat
 python -m pytest tests/test_trade_lifecycle.py -q
 ```
 
-Expected: FAIL — `KeyError: 'initial_sl'` and `first_fill_at` is `None`.
+Expected: FAIL — `KeyError: 'initial_sl'` and `first_fill_at` is `None`. The
+fix-round-1 tests fail as well: the BE fill-race promotion leaves no `filled_at`,
+`initial_sl` is `None` when the executor computed a fallback stop, the symbol digits are
+ignored, and the signal-edit path records neither `initial_sl` nor `filled_at`.
 
 - [ ] **Step 3: Capture `initial_sl` at placement**
 
-In `mt5_executor.py`, inside `_execute_4layer_specs`, extend the `layer_dict` construction at lines 2351-2364 to:
+In `mt5_executor.py`, inside `_execute_4layer_specs`, the broker's price precision is
+needed first — the captured stop is rounded to the SYMBOL's digits, exactly like the stop
+that is sent to the broker. Add at lines 2345-2348 (right after `layers_data` is created):
 
 ```python
+        # The broker's price precision for this symbol: the captured stop is
+        # rounded to it, exactly like the stop that is sent to the broker.
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+```
+
+Then extend the `layer_dict` construction at lines 2383-2412 to:
+
+```python
+                # The stop the broker actually holds for this ticket. The
+                # `sl` argument is only a REQUEST: when it is None (or 0.0)
+                # the executor computes an ATR-based or FALLBACK_SL_PIPS stop
+                # and sends THAT to the broker, so the recorded broker stop is
+                # the authoritative initial risk R.
+                placed_sl = self.get_last_placed_sl(t)
+                if placed_sl is not None:
+                    initial_sl = round(float(placed_sl), digits)
+                elif sl is not None:
+                    initial_sl = round(float(sl), digits)
+                else:
+                    initial_sl = None
                 layer_dict: Dict[str, Any] = {
                     "lot": l_lot,
                     "remaining_lot": l_lot,
@@ -2039,11 +2430,14 @@ In `mt5_executor.py`, inside `_execute_4layer_specs`, extend the `layer_dict` co
                     "ticket": t,
                     "order_type": o_type,
                     "status": status,
-                    # The stop the order was actually placed with. The trailing
-                    # engine overwrites `sl`/`broker_sl`, so the initial risk R
-                    # must be captured here to stay available for the R-relative
-                    # profit floor.
-                    "initial_sl": (round(float(sl), 2) if sl is not None else None),
+                    # The stop the order was ACTUALLY placed with. The `sl`
+                    # argument is only a request: when it is None the executor
+                    # computes a fallback stop and the broker holds that one, so
+                    # the recorded broker stop wins. The trailing engine
+                    # overwrites `sl`/`broker_sl`, so the initial risk R must be
+                    # captured here to stay available for the R-relative profit
+                    # floor.
+                    "initial_sl": initial_sl,
                 }
                 if o_type == "MARKET":
                     # A MARKET layer fills immediately at placement, so this is the
@@ -2054,9 +2448,69 @@ In `mt5_executor.py`, inside `_execute_4layer_specs`, extend the `layer_dict` co
                     layer_dict["filled_at"] = datetime.now(timezone.utc).isoformat()
 ```
 
-- [ ] **Step 4: Stamp `first_fill_at` on the first fill**
+- [ ] **Step 4: Record the stop that was actually sent to the broker**
 
-In `mt5_executor.py`, inside `hydrate_signal_layers_from_mt5`, replace the fill transition at lines 6073-6075:
+`initial_sl` must be the stop the BROKER holds, not the `sl` argument: when `sl` is
+`None` or `0.0`, `_compute_fallback_sl` computes an ATR-based or
+`FALLBACK_SL_PIPS`-based stop, and that is the stop the broker gets. Mirror the
+`_last_fill_prices` idiom with a side-channel.
+
+In `mt5_executor.py`, in `MT5Executor.__init__`, add at lines 542-546:
+
+```python
+        # Stop actually sent to the broker per ticket. The `sl` argument of an
+        # order is only a REQUEST: when it is None the executor computes a
+        # fallback stop and the broker holds that one, so the initial risk R
+        # has to be captured from here.
+        self._last_order_sls: Dict[int, float] = {}
+```
+
+In `execute_market_order`, record the stop right after the fill price, at lines 1575-1580:
+
+```python
+            # Record the stop that was actually sent to the broker (the `sl`
+            # argument is only a request -- the broker may hold a computed
+            # fallback stop instead).
+            self._last_order_sls[ticket] = float(final_sl)
+            if len(self._last_order_sls) > 512:
+                self._last_order_sls = dict(list(self._last_order_sls.items())[-256:])
+```
+
+In `_place_pending_order`, do the same for the pending path, at lines 1790-1794:
+
+```python
+            # Record the stop that was actually sent to the broker (see
+            # `execute_market_order`): the `sl` argument is only a request.
+            self._last_order_sls[ticket] = float(final_sl)
+            if len(self._last_order_sls) > 512:
+                self._last_order_sls = dict(list(self._last_order_sls.items())[-256:])
+```
+
+`_place_pending_with_stops_fallback` needs no change: its LIMIT path goes through
+`_place_pending_order` and its MARKET fallback goes through `execute_market_order`, so
+both record the stop.
+
+Add the accessor next to the other accessors, at lines 844-853:
+
+```python
+    def get_last_placed_sl(self, ticket: Optional[int]) -> Optional[float]:
+        """Return the stop that was actually sent to the broker for a ticket, if known.
+
+        This is pure bookkeeping: it RECORDS the stop an order was already
+        carrying, so the caller can capture the real initial risk R.
+        """
+        try:
+            return self._last_order_sls.get(int(ticket))
+        except (TypeError, ValueError):
+            return None
+```
+
+This is PURE bookkeeping: the `request` dict, `final_sl` and everything that is sent to
+the broker stay exactly as they were.
+
+- [ ] **Step 5: Stamp `first_fill_at` on the first fill**
+
+In `mt5_executor.py`, inside `hydrate_signal_layers_from_mt5`, replace the fill transition at lines 6138-6140:
 
 ```python
                 if st_u == "PENDING":
@@ -2083,12 +2537,12 @@ timedelta, timezone`). Add the `risk_lifecycle` import next to the other local i
 from risk_lifecycle import stamp_fill_times
 ```
 
-- [ ] **Step 5: Stamp the LIVE fill path in `main.py`**
+- [ ] **Step 6: Stamp the LIVE fill path in `main.py`**
 
-`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3420`, inside
+`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3421`, inside
 `_startup_hydrate_and_backfill_ledger()` — so it only runs at STARTUP. The live
 `PENDING -> FILLED` transition happens in `main.py:3554`, inside `_reconcile_live_mt5_signals`
-(`async def` at `main.py:3449`), which sets `l_data["status"] = "FILLED"` directly and never
+(`async def` at `main.py:3450`), which sets `l_data["status"] = "FILLED"` directly and never
 calls `hydrate_signal_layers_from_mt5`.
 
 In `main.py`, inside `_reconcile_live_mt5_signals`, replace the fill transition:
@@ -2126,7 +2580,138 @@ not the whole signal record, so the signal-level stamp has to be copied into it 
                 updates["first_fill_at"] = sig["first_fill_at"]
 ```
 
-- [ ] **Step 6: Add the fill-time helpers to `risk_lifecycle.py`**
+- [ ] **Step 7: Stamp the BE fill-race promotion in `mt5_executor.py`**
+
+`apply_signal_breakeven` promotes a pending limit that filled in the sub-second window
+BEFORE the 1-second reconciler ran, and then drops the ticket from `pending_tickets`.
+The reconciler's stamping loop lives inside `for t in pd_tickets:`, so a ticket removed
+here is NEVER revisited and never stamped: the promoted position would have no fill time
+at all, and the age guard would fall back to the signal timestamp.
+
+In `mt5_executor.py`, inside `apply_signal_breakeven`, extend the promotion branch at
+lines 4968-4975 to:
+
+```python
+                if layer_name and isinstance(layers.get(layer_name), dict):
+                    layers[layer_name]["status"] = "FILLED"
+                    # This ticket is about to leave `pending_tickets`, so the
+                    # 1-second reconciler will never see it again. Stamp the fill
+                    # HERE, otherwise the promoted position has no fill time at
+                    # all and the trade-age guard falls back to the signal
+                    # timestamp -- making a brand-new position look hours old.
+                    stamp_fill_times(signal_data, layers[layer_name])
+                    if p_open > 0.0:
+                        layers[layer_name]["entry_price"] = round(p_open, digits)
+                        layers[layer_name]["entry"] = round(p_open, digits)
+                    if p_vol > 0.0:
+                        layers[layer_name]["remaining_lot"] = p_vol
+```
+
+- [ ] **Step 8: Give the signal-edit path its `initial_sl` and `filled_at`**
+
+The signal-edit path builds its own layer records, so it needs the same treatment as
+`_execute_4layer_specs`: the stop the order was actually placed with, and — for a MARKET
+layer — the fill time.
+
+In `main.py`, add the helper at lines 5787-5807 (next to `_populate_fill_entry_from_exec`):
+
+```python
+def _resolve_edit_initial_sl(ticket: Any, sl: Optional[float], digits: int) -> Optional[float]:
+    """Return the stop an edit-placed layer was actually given, for `initial_sl`.
+
+    The executor records the stop it sent to the broker per ticket; that is the
+    authoritative value. The `sl` argument is only the fallback for orders the
+    executor did not place (or when the record is unavailable).
+    """
+    getter = getattr(executor, "get_last_placed_sl", None)
+    if callable(getter):
+        placed = getter(ticket)
+        if placed is not None:
+            try:
+                return round(float(placed), digits)
+            except (TypeError, ValueError):
+                pass
+    if sl is not None:
+        try:
+            return round(float(sl), digits)
+        except (TypeError, ValueError):
+            return None
+    return None
+```
+
+In `main.py`, inside `_handle_message_edited_unlocked`, resolve the symbol digits at
+lines 5992-5996:
+
+```python
+    pip_size = await _mt5_call(executor.get_pip_size, symbol)
+    # The broker's price precision for this symbol: the captured stop is rounded
+    # to it, exactly like the stop that is sent to the broker.
+    _sym_info = await _mt5_call(executor.get_symbol_info, symbol)
+    symbol_digits = int(getattr(_sym_info, "digits", 2) or 2) if _sym_info else 2
+```
+
+In the retiered-order branch, extend the record at lines 6620-6637:
+
+```python
+                    new_l_rec = {
+                        "lot": l_lot,
+                        "target_price": desired_px,
+                        "tp": l_tp_target,
+                        "tp_stage": "TP1",
+                        "ticket": new_t,
+                        "order_type": new_otype,
+                        "status": l_status,
+                        # The stop the order was actually placed with: the R
+                        # floor needs the original risk, and the trailing
+                        # engine later overwrites `sl`/`broker_sl`.
+                        "initial_sl": _resolve_edit_initial_sl(new_t, new_sl, symbol_digits),
+                    }
+                    if new_otype == "MARKET":
+                        _populate_fill_entry_from_exec(existing_signal, new_l_rec, new_t, l_lot, tick, direction, desired_px)
+                        # A MARKET layer fills at placement and never goes through
+                        # the PENDING -> FILLED transition, so its fill time has to
+                        # be stamped here.
+                        stamp_fill_times(existing_signal, new_l_rec)
+                    layers[l_name] = new_l_rec
+```
+
+In the fresh-limit branch, do the same at lines 6855-6873:
+
+```python
+                    new_l_rec_a = {
+                        "lot": l_lot,
+                        "target_price": target_px,
+                        "tp": l_tp,
+                        "tp_stage": "TP1",
+                        "ticket": t,
+                        "order_type": o_type,
+                        "status": "OPEN" if o_type == "MARKET" else "PENDING",
+                        # The stop the order was actually placed with: the R
+                        # floor needs the original risk, and the trailing
+                        # engine later overwrites `sl`/`broker_sl`.
+                        "initial_sl": _resolve_edit_initial_sl(t, new_sl, symbol_digits),
+                    }
+                    if o_type == "MARKET":
+                        market_tickets.append(t)
+                        _populate_fill_entry_from_exec(existing_signal, new_l_rec_a, t, l_lot, tick, direction, target_px)
+                        # A MARKET layer fills at placement and never goes through
+                        # the PENDING -> FILLED transition, so its fill time has to
+                        # be stamped here.
+                        stamp_fill_times(existing_signal, new_l_rec_a)
+                    else:
+```
+
+The reconciler persists a field-wise `updates` dict, so the signal-level stamp the edit
+creates has to be copied into it explicitly — at lines 6917-6920:
+
+```python
+    if existing_signal.get("first_fill_at"):
+        # A MARKET layer created by the edit stamps the signal-level first fill;
+        # persist it so the trade-age guard has a fill clock to read.
+        signal_updates["first_fill_at"] = existing_signal["first_fill_at"]
+```
+
+- [ ] **Step 9: Add the fill-time helpers to `risk_lifecycle.py`**
 
 In `risk_lifecycle.py`, add:
 
@@ -2199,7 +2784,7 @@ Export the two new helpers from the module's `__all__`:
 ]
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 10: Run the tests to verify they pass**
 
 ```powershell
 python -m pytest tests/test_trade_lifecycle.py -q
@@ -2207,7 +2792,7 @@ python -m pytest tests/test_trade_lifecycle.py -q
 
 Expected: PASS.
 
-- [ ] **Step 8: Run the full suite**
+- [ ] **Step 11: Run the full suite**
 
 ```powershell
 python -m pytest -q
@@ -2215,21 +2800,23 @@ python -m pytest -q
 
 Expected: **0 failed**.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 12: Commit**
 
 ```powershell
 git add mt5_executor.py main.py risk_lifecycle.py tests/test_trade_lifecycle.py
 git commit -m "feat(mt5_executor): capture initial_sl and stamp fill times on every fill path
 
-initial_sl records the stop the order was placed with, because the trailing
-engine overwrites sl/broker_sl and the R-relative floor needs the original
-risk.
+initial_sl records the stop the order was ACTUALLY placed with -- the
+executor may compute a fallback stop when the sl argument is None -- because
+the trailing engine overwrites sl/broker_sl and the R-relative floor needs
+the original risk.
 
-Fill timestamps are recorded at all three fill sites: MARKET placement, the
-startup hydration path and the live reconcile path. The live path is the one
-that matters: a limit order that fills hours after the signal was created
-would otherwise inherit the signal timestamp and make a new position look
-hours old, firing the age guard on it immediately."
+Fill timestamps are recorded at every fill site: MARKET placement, the
+startup hydration path, the live reconcile path, the BE fill-race promotion
+and the signal-edit path. The live path is the one that matters: a limit
+order that fills hours after the signal was created would otherwise inherit
+the signal timestamp and make a new position look hours old, firing the age
+guard on it immediately."
 ```
 
 ---
@@ -3217,11 +3804,20 @@ kill switches for the rollout."
 **Files:**
 - Modify: `trade_ledger.py:456-488` (`build_trade_record`)
 - Modify: `trade_ledger.py:502` (`append_trade` — the `schema_version` default)
+- Modify: `trade_ledger.py` (import `risk_lifecycle.resolve_fill_time`)
 - Modify: `tests/test_trade_lifecycle.py` (append the ledger tests)
 
 **Interfaces:**
-- Consumes: nothing from earlier tasks (independent).
+- Consumes: nothing from earlier tasks (independent), except `risk_lifecycle.resolve_fill_time` for the exit age (see the fill-time rule below).
 - Produces: every closed-signal record gains `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action`; `schema_version` becomes `4`.
+
+**Fill-time rule:** the ledger records the RESOLVED fill time via
+`risk_lifecycle.resolve_fill_time(signal_data)` — NEVER the raw
+`signal_data["first_fill_at"]` key. The signal-level stamp records the first
+`PENDING -> FILLED` transition, which for a normal zone signal is the first LIMIT fill
+(L2) and is therefore LATER than the MARKET fill of L1 that is stamped on the layer.
+`resolve_fill_time` returns the EARLIEST known fill, so `exit_age_seconds` measures the
+TRADE and not its first limit fill.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3327,13 +3923,18 @@ In `trade_ledger.py`, in `build_trade_record`, insert the computation block **be
             r_at_exit = round(mfe_cash / risk_cash, 4)
 
     exit_age_seconds: Optional[int] = None
-    _filled_at = signal_data.get("first_fill_at")
+    # The RESOLVED fill time -- never the raw `first_fill_at` key. For a normal
+    # zone signal L1 fills at MARKET (stamped on the LAYER) and L2-L4 later as
+    # limits (stamped on the SIGNAL), so the raw signal-level stamp can be
+    # LATER than the true first fill. `risk_lifecycle.resolve_fill_time`
+    # returns the EARLIEST known fill.
+    _filled_at = resolve_fill_time(signal_data)
     _closed_at = signal_data.get("closed_at") or datetime.now(timezone.utc).isoformat()
     if _filled_at and _closed_at:
         try:
             from datetime import datetime as _dt
 
-            _f = _dt.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
+            _f = _filled_at if isinstance(_filled_at, _dt) else _dt.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
             _c = _dt.fromisoformat(str(_closed_at).replace("Z", "+00:00"))
             exit_age_seconds = int((_c - _f).total_seconds())
         except (TypeError, ValueError):
