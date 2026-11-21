@@ -1715,15 +1715,36 @@ existing caller unchanged."
 ## Task 3: `mt5_executor.py` — capture `initial_sl` and `first_fill_at`
 
 **Files:**
-- Modify: `mt5_executor.py:2351-2364` (`_execute_4layer_specs` — the layer dict)
-- Modify: `mt5_executor.py:6073-6075` (`hydrate_signal_layers_from_mt5` — the fill transition)
+- Modify: `mt5_executor.py:2340-2364` (`_execute_4layer_specs` — the layer dict)
+- Modify: `mt5_executor.py:6073-6075` (`hydrate_signal_layers_from_mt5` — the startup fill transition)
+- Modify: `main.py:3554` (`_reconcile_live_mt5_signals` — the LIVE fill transition)
+- Modify: `risk_lifecycle.py` (add `stamp_fill_times` + `resolve_fill_time`; use `resolve_fill_time` in `evaluate_trade_age`)
 - Modify: `tests/test_trade_lifecycle.py` (append the capture tests)
 
 **Interfaces:**
 - Consumes: nothing from Task 1-2.
 - Produces:
   - `signal_data["layers"][<layer>]["initial_sl"]` — `Optional[float]`, the stop the order was placed with.
-  - `signal_data["first_fill_at"]` — `Optional[str]`, ISO-8601 UTC timestamp of the first fill.
+  - `signal_data["layers"][<layer>]["filled_at"]` — `Optional[str]`, ISO-8601 UTC timestamp of that layer's fill.
+  - `signal_data["first_fill_at"]` — `Optional[str]`, ISO-8601 UTC timestamp of the first fill (written only when unset).
+  - `risk_lifecycle.stamp_fill_times(signal_data, layer_data=None, now=None) -> bool`
+  - `risk_lifecycle.resolve_fill_time(signal_data) -> Optional[datetime]`
+
+**Why all three fill sites matter (do not skip Steps 4-6):**
+
+`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3420`, inside
+`_startup_hydrate_and_backfill_ledger()` — so it only runs at STARTUP. The LIVE
+`PENDING -> FILLED` transition happens in `main.py:3554`, inside `_reconcile_live_mt5_signals`
+(`async def` at `main.py:3449`), which sets `l_data["status"] = "FILLED"` directly and never
+calls `hydrate_signal_layers_from_mt5`. Stamping only in the executor leaves the live path
+unstamped, and `evaluate_trade_age` then falls back to the SIGNAL timestamp — so a limit order
+that filled hours after the signal was created makes a brand-new position look hours old and
+fires the de-risk/flatten guard on it immediately.
+
+MARKET fills never go through `PENDING -> FILLED` at all: `_execute_4layer_specs` sets
+`status = "OPEN"` immediately for MARKET layers. A zone signal normally fills L1 at market and
+L2-L4 later as limits, so the MARKET fill is the FIRST fill of the trade and has to be stamped
+where the order is placed.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1756,6 +1777,8 @@ def test_execute_4layer_specs_records_initial_sl(monkeypatch):
     )
     assert captured["sl"] == 3880.0
     assert layers["L1"]["initial_sl"] == pytest.approx(3880.0)
+    # A MARKET layer fills at placement, so the fill time is stamped right here.
+    assert layers["L1"].get("filled_at"), "a MARKET layer must record its fill time"
 
 
 def test_hydrate_signal_layers_stamps_first_fill_at(monkeypatch):
@@ -1789,6 +1812,71 @@ def test_hydrate_signal_layers_stamps_first_fill_at(monkeypatch):
     ex.hydrate_signal_layers_from_mt5(sig, live_positions_by_ticket=positions)
     assert sig["layers"]["L1"]["status"] == "FILLED"
     assert sig.get("first_fill_at"), "first_fill_at must be stamped on the first fill"
+    assert sig["layers"]["L1"].get("filled_at"), "the layer must record its fill time"
+
+
+def test_stamp_fill_times_never_overwrites_the_first_fill():
+    sig = {"first_fill_at": "2026-11-19T06:00:00+00:00"}
+    layer = {"filled_at": "2026-11-19T05:00:00+00:00"}
+    changed = rl.stamp_fill_times(sig, layer, now=datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc))
+    assert changed is False
+    assert sig["first_fill_at"] == "2026-11-19T06:00:00+00:00"
+    assert layer["filled_at"] == "2026-11-19T05:00:00+00:00"
+
+
+def test_stamp_fill_times_sets_both_when_missing():
+    sig = {}
+    layer = {}
+    now = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    assert rl.stamp_fill_times(sig, layer, now=now) is True
+    assert sig["first_fill_at"] == now.isoformat()
+    assert layer["filled_at"] == now.isoformat()
+
+
+def test_resolve_fill_time_prefers_the_earliest_known_fill():
+    sig = {
+        # The signal stamp records the FIRST LIMIT fill, hours after L1 filled
+        # at market. The trade age must run from the market fill.
+        "first_fill_at": "2026-11-19T09:00:00+00:00",
+        "layers": {
+            "L1": {"filled_at": "2026-11-19T06:00:00+00:00"},
+            "L2": {"filled_at": "2026-11-19T09:00:00+00:00"},
+        },
+    }
+    assert rl.resolve_fill_time(sig) == datetime(2026, 11, 19, 6, 0, tzinfo=timezone.utc)
+
+
+def test_resolve_fill_time_ignores_layers_without_a_fill():
+    sig = {"layers": {"L1": {"status": "PENDING"}, "L2": {"filled_at": "2026-11-19T09:00:00+00:00"}}}
+    assert rl.resolve_fill_time(sig) == datetime(2026, 11, 19, 9, 0, tzinfo=timezone.utc)
+
+
+def test_evaluate_trade_age_uses_the_fill_clock_not_the_signal_stamp():
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        # The position filled 10 minutes ago; the signal is 9 hours old.
+        "first_fill_at": (now - timedelta(minutes=10)).isoformat(),
+        "layers": {"L1": {"filled_at": (now - timedelta(minutes=10)).isoformat()}},
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_NONE
+    assert res["fill_age_seconds"] < 600
+
+
+def test_evaluate_trade_age_still_flattens_an_old_fill():
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "first_fill_at": (now - timedelta(hours=7)).isoformat(),
+        "layers": {"L1": {"filled_at": (now - timedelta(hours=7)).isoformat()}},
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -1819,6 +1907,13 @@ In `mt5_executor.py`, inside `_execute_4layer_specs`, extend the `layer_dict` co
                     # profit floor.
                     "initial_sl": (round(float(sl), 2) if sl is not None else None),
                 }
+                if o_type == "MARKET":
+                    # A MARKET layer fills immediately at placement, so this is the
+                    # fill time. MARKET layers never go through the PENDING ->
+                    # FILLED transition, so without this stamp the first fill of a
+                    # normal zone signal (L1 at market, L2-L4 as limits) would
+                    # never be recorded.
+                    layer_dict["filled_at"] = datetime.now(timezone.utc).isoformat()
 ```
 
 - [ ] **Step 4: Stamp `first_fill_at` on the first fill**
@@ -1839,14 +1934,116 @@ with:
                     changed = True
                     # First fill of this signal: start the position-age clock used
                     # by the trade-age guard (`risk_lifecycle.evaluate_trade_age`).
-                    if not signal_data.get("first_fill_at"):
-                        signal_data["first_fill_at"] = datetime.now(timezone.utc).isoformat()
+                    if stamp_fill_times(signal_data, lv):
                         changed = True
 ```
 
-If `datetime` / `timezone` are not already imported in `mt5_executor.py`, add `from datetime import datetime, timezone` to the imports at the top of the file.
+`mt5_executor.py` already imports `datetime` and `timezone` (`from datetime import datetime,
+timedelta, timezone`). Add the `risk_lifecycle` import next to the other local imports:
 
-- [ ] **Step 5: Run the tests to verify they pass**
+```python
+from risk_lifecycle import stamp_fill_times
+```
+
+- [ ] **Step 5: Stamp the LIVE fill path in `main.py`**
+
+`hydrate_signal_layers_from_mt5` is called from exactly ONE place — `main.py:3420`, inside
+`_startup_hydrate_and_backfill_ledger()` — so it only runs at STARTUP. The live
+`PENDING -> FILLED` transition happens in `main.py:3554`, inside `_reconcile_live_mt5_signals`
+(`async def` at `main.py:3449`), which sets `l_data["status"] = "FILLED"` directly and never
+calls `hydrate_signal_layers_from_mt5`.
+
+In `main.py`, inside `_reconcile_live_mt5_signals`, replace the fill transition:
+
+```python
+                        if isinstance(l_data, dict) and _safe_ticket_int(l_data.get("ticket")) == ti:
+                            l_data["status"] = "FILLED"
+```
+
+with:
+
+```python
+                        if isinstance(l_data, dict) and _safe_ticket_int(l_data.get("ticket")) == ti:
+                            l_data["status"] = "FILLED"
+                            # First fill of this signal: start the position-age clock
+                            # used by the trade-age guard. Without this stamp a limit
+                            # order that filled hours after the signal was created
+                            # falls back to the signal timestamp, which makes a
+                            # brand-new position look hours old.
+                            if stamp_fill_times(sig, l_data):
+                                updated = True
+```
+
+Add the import to `main.py` next to the other local imports:
+
+```python
+from risk_lifecycle import stamp_fill_times
+```
+
+- [ ] **Step 6: Add the fill-time helpers to `risk_lifecycle.py`**
+
+In `risk_lifecycle.py`, add:
+
+```python
+def stamp_fill_times(
+    signal_data: Optional[Dict[str, Any]],
+    layer_data: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Record a fill timestamp on a layer and on its signal.
+
+    The layer always gets ``filled_at``. The signal gets ``first_fill_at`` only when it is
+    unset, so the first fill of the trade wins. Returns True when something changed.
+    """
+    changed = False
+    ts = (now or datetime.now(timezone.utc)).isoformat()
+    if isinstance(layer_data, dict) and not layer_data.get("filled_at"):
+        layer_data["filled_at"] = ts
+        changed = True
+    if isinstance(signal_data, dict) and not signal_data.get("first_fill_at"):
+        signal_data["first_fill_at"] = ts
+        changed = True
+    return changed
+
+
+def resolve_fill_time(signal_data: Dict[str, Any]) -> Optional[datetime]:
+    """Return the EARLIEST known fill time for a signal, or None.
+
+    A zone signal normally fills L1 at market and L2-L4 later as limits, so the
+    trade age must be measured from the FIRST fill — never from the signal
+    timestamp, and never from the latest fill.
+    """
+    sig = signal_data if isinstance(signal_data, dict) else {}
+    best = _parse_iso_utc(sig.get("first_fill_at"))
+    layers = sig.get("layers")
+    if isinstance(layers, dict):
+        for lv in layers.values():
+            if not isinstance(lv, dict):
+                continue
+            ldt = _parse_iso_utc(lv.get("filled_at"))
+            if ldt is not None and (best is None or ldt < best):
+                best = ldt
+    return best
+```
+
+Then change `evaluate_trade_age` to use it. Replace:
+
+```python
+    # Fall back to the signal timestamp when the fill time is unknown: the position
+    # is at least as old as the signal, so the age guard must not stand down.
+    fill_dt = _parse_iso_utc(sig.get("first_fill_at")) or signal_dt
+```
+
+with:
+
+```python
+    # The fill clock is the EARLIEST known fill (the signal stamp or any layer
+    # stamp). Fall back to the signal timestamp when no fill time is known: the
+    # position is at least as old as the signal, so the age guard must not stand down.
+    fill_dt = resolve_fill_time(sig) or signal_dt
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
 
 ```powershell
 python -m pytest tests/test_trade_lifecycle.py -q
@@ -1854,7 +2051,7 @@ python -m pytest tests/test_trade_lifecycle.py -q
 
 Expected: PASS.
 
-- [ ] **Step 6: Run the full suite**
+- [ ] **Step 8: Run the full suite**
 
 ```powershell
 python -m pytest -q
@@ -1862,15 +2059,21 @@ python -m pytest -q
 
 Expected: **0 failed**.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 9: Commit**
 
 ```powershell
-git add mt5_executor.py tests/test_trade_lifecycle.py
-git commit -m "feat(mt5_executor): capture initial_sl per layer and stamp first_fill_at
+git add mt5_executor.py main.py risk_lifecycle.py tests/test_trade_lifecycle.py
+git commit -m "feat(mt5_executor): capture initial_sl and stamp fill times on every fill path
 
 initial_sl records the stop the order was placed with, because the trailing
 engine overwrites sl/broker_sl and the R-relative floor needs the original
-risk. first_fill_at starts the position-age clock for the trade-age guard."
+risk.
+
+Fill timestamps are recorded at all three fill sites: MARKET placement, the
+startup hydration path and the live reconcile path. The live path is the one
+that matters: a limit order that fills hours after the signal was created
+would otherwise inherit the signal timestamp and make a new position look
+hours old, firing the age guard on it immediately."
 ```
 
 ---
