@@ -225,6 +225,8 @@ def compute_r_lock_floor(
     - the R lock is disabled, the direction is not ``BUY``/``SELL``, or the
       initial risk is unknown / below ``r_lock_min_r_dollars``;
     - no tier has been reached yet;
+    - the live price is unusable (missing, non-numeric or non-positive), so
+      no floor can be validated against the market;
     - the floor is not valid against the current market (for a BUY the floor
       must stay strictly below ``live_price``, for a SELL strictly above it).
       The floor is derived from the peak excursion, so a retracement can carry
@@ -268,11 +270,12 @@ def compute_r_lock_floor(
     floor_px = round(entry + sign * (lock_fraction * r), digits)
 
     live = _safe_float(live_price, 0.0)
-    if live > 0.0:
-        if sign > 0 and floor_px >= live:
-            return None
-        if sign < 0 and floor_px <= live:
-            return None
+    if live <= 0.0:
+        return None
+    if sign > 0 and floor_px >= live:
+        return None
+    if sign < 0 and floor_px <= live:
+        return None
 
     return floor_px
 

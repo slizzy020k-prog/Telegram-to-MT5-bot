@@ -215,6 +215,13 @@ def test_r_lock_floor_rejects_an_unknown_direction():
     assert rl.compute_r_lock_floor("", 3900.0, 3880.0, 40.0, 3920.0, _policy()) is None
 
 
+def test_r_lock_floor_is_none_when_the_live_price_is_unusable():
+    # An unknown price cannot validate the floor -> fail closed (no floor at all)
+    for unusable in (0, -1.0, None, float("nan"), "not-a-price"):
+        assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, unusable, _policy()) is None
+        assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, unusable, _policy()) is None
+
+
 def test_r_lock_floor_is_order_independent():
     unsorted_policy = _policy(r_lock_tiers=((2.0, 0.75), (0.5, 0.0)))
     assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, unsorted_policy) == pytest.approx(3915.0)
