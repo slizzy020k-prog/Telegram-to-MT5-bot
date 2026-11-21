@@ -288,3 +288,87 @@ def test_signal_without_a_timestamp_reports_an_unknown_age():
     res = rl.evaluate_trade_age({"market_tickets": [101]}, datetime.now(timezone.utc), pol)
     assert res["action"] == rl.ACTION_NONE
     assert "unknown age" in res["reason"]
+
+
+# --- dynamic_risk R_LOCK candidate ---------------------------------------
+
+def _atr_policy():
+    import dynamic_risk
+    import config
+
+    return dynamic_risk.read_dynamic_risk_policy(config)
+
+
+def test_trail_stop_unchanged_when_r_lock_floor_is_none():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=2.0,
+        policy=pol,
+        digits=2,
+    )
+    assert res["r_lock_floor"] is None
+    assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR")
+
+
+def test_trail_stop_uses_r_lock_floor_when_tighter():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=20.0,              # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+        policy=pol,
+        digits=2,
+        r_lock_floor=3898.0,
+    )
+    assert res["r_lock_floor"] == pytest.approx(3898.0)
+    assert res["candidate_sl"] == pytest.approx(3898.0)
+    assert res["stop_source"] == "R_LOCK"
+
+
+def test_trail_stop_r_lock_never_loosens_an_existing_stop():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3900.0,     # already tighter than the R floor
+        atr=2.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3898.0,
+    )
+    assert res["candidate_sl"] >= 3900.0
+
+
+def test_trail_stop_sell_r_lock_is_mirrored():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="SELL",
+        entry_price=3905.0,
+        live_price=3895.0,
+        prev_peak=3895.0,
+        current_sl=3920.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3902.0,
+    )
+    assert res["candidate_sl"] == pytest.approx(3902.0)
+    assert res["stop_source"] == "R_LOCK"
