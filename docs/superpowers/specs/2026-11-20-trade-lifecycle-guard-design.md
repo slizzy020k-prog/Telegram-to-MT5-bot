@@ -118,10 +118,11 @@ def compute_r_lock_floor(
     entry_price: float,
     initial_sl: float,
     mfe_dollars: float,
+    live_price: float,
     policy: LifecyclePolicy,
     digits: int = 2,
 ) -> Optional[float]:
-    """SL price for the highest R tier the current MFE has reached. None if no tier reached."""
+    """SL price for the reached R tier, or None when no valid floor exists."""
 
 def evaluate_trade_age(
     signal_data: Dict[str, Any],
@@ -142,10 +143,9 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
 `compute_r_lock_floor` semantics:
 
 - `R = |entry − initial_sl|`; `None` if `R <= 0` or `R < policy.r_lock_min_r_dollars`.
-- Tiers are `(r_threshold, lock_fraction)` pairs, sorted ascending by threshold at policy-read time.
-- The active tier is the **highest** tier whose `r_threshold × R ≤ mfe_dollars`.
+- The active fraction is the **greatest lock fraction among the tiers whose `r_threshold × R ≤ mfe_dollars`**. Taking the greatest reached fraction keeps the floor order-independent and monotone — the lock can never loosen as the excursion grows, even if a caller builds `LifecyclePolicy` directly with unsorted tiers. For the default ladder this is exactly "the highest threshold reached".
 - Floor price = `entry + sign × (lock_fraction × R)`, rounded to `digits`.
-- `None` when no tier is reached (MFE below the first threshold).
+- `None` when no tier is reached (MFE below the first threshold), when the direction is not `BUY`/`SELL`, or **when the floor is not valid against the current market** — for a BUY the floor must stay strictly below `live_price`, for a SELL strictly above it. The floor is derived from the peak excursion, so a retracement can carry price back past it; a stop on the wrong side of the market would be rejected by the broker with retcode `10016`. The consumer's stops-buffer clamp is a second line of defence, not the only one.
 
 ### 4.3 Config knobs (all new, all default to safe)
 
@@ -213,7 +213,7 @@ New per-signal state keys (all additive): `first_fill_at`, `lifecycle_derisk_at`
 | Fill age ≥ `LIFECYCLE_DERISK_SECONDS` | `DERISK` | Cancel unfilled pending limits for the signal; move every open layer to `entry ± DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS` (default `$0.50`, i.e. BE) — only when that is *tighter* than the current SL |
 | Fill age ≥ `LIFECYCLE_FLATTEN_SECONDS` | `FLATTEN` | Close all open positions at market; cancel all pending limits; mark the signal `CLOSED` |
 | Signal age ≥ `LIFECYCLE_PENDING_EXPIRE_SECONDS`, nothing filled | `EXPIRE_PENDING` | Cancel pending limits; mark the signal `CLOSED` |
-| Broker server time-of-day ≥ `LIFECYCLE_SESSION_FLATTEN_AT` | `SESSION_FLATTEN` | *(disabled by default)* close all open positions at market; fires at most once per broker day |
+| Broker server time-of-day ≥ `LIFECYCLE_SESSION_FLATTEN_AT` | `SESSION_FLATTEN` | *(disabled by default)* close all open positions at market; fires at most once per broker day. Requires at least one **open position** — it never fires on a pending-only signal |
 
 Precedence when several conditions hold: `SESSION_FLATTEN` > `FLATTEN` > `DERISK` > `EXPIRE_PENDING`.
 `EXPIRE_PENDING` only applies when there are no market tickets, so it can never collide with the

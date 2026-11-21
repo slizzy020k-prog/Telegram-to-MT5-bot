@@ -271,6 +271,86 @@ def test_apply_lifecycle_command_rejects_garbage(monkeypatch):
     changed, msg = rl.apply_lifecycle_command(config, ["banana"])
     assert changed is False
     assert config.LIFECYCLE_ENABLED is False
+
+
+# --- market-side guard, direction validation, policy normalisation ---------
+
+def test_r_lock_floor_is_none_when_price_retraced_past_it():
+    # entry 3900, R = 20, MFE 40 (2.0R) -> floor 3915; live price back at 3905
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3905.0, _policy()) is None
+
+
+def test_r_lock_floor_survives_a_retrace_that_keeps_it_below_market():
+    # entry 3900, R = 20, MFE 40 -> floor 3915; live price 3920 still above it
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, _policy()) == pytest.approx(3915.0)
+
+
+def test_r_lock_floor_rejects_an_unknown_direction():
+    assert rl.compute_r_lock_floor("FOOP", 3900.0, 3880.0, 40.0, 3920.0, _policy()) is None
+    assert rl.compute_r_lock_floor("", 3900.0, 3880.0, 40.0, 3920.0, _policy()) is None
+
+
+def test_r_lock_floor_is_order_independent():
+    unsorted_policy = _policy(r_lock_tiers=((2.0, 0.75), (0.5, 0.0)))
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, unsorted_policy) == pytest.approx(3915.0)
+
+
+def test_r_lock_floor_never_loosens_as_mfe_grows():
+    pol = _policy()
+    floors = [
+        rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, mfe, 3999.0, pol)
+        for mfe in (10.0, 20.0, 30.0, 40.0, 80.0)
+    ]
+    values = [f for f in floors if f is not None]
+    assert values == sorted(values)
+
+
+def test_read_lifecycle_policy_repairs_an_inverted_threshold_pair():
+    import config
+
+    class _Cfg:
+        LIFECYCLE_DERISK_SECONDS = 7200
+        LIFECYCLE_FLATTEN_SECONDS = 3600
+        LIFECYCLE_SESSION_FLATTEN_AT = "99:99"
+        R_LOCK_TIERS = ""
+
+    pol = rl.read_lifecycle_policy(_Cfg())
+    assert pol.flatten_after_seconds >= pol.derisk_after_seconds
+    assert pol.session_flatten_at == "23:30"
+    assert pol.r_lock_tiers == rl.DEFAULT_R_LOCK_TIERS
+
+
+def test_session_flatten_fires_only_with_an_open_position():
+    pol = _policy(session_flatten_enabled=True, session_flatten_at="00:00")
+    now = datetime.now(timezone.utc)
+    pending_only = {
+        "timestamp": now.isoformat(),
+        "market_tickets": [],
+        "pending_tickets": [201],
+    }
+    res = rl.evaluate_trade_age(pending_only, now, pol, server_offset_seconds=0)
+    assert res["action"] != rl.ACTION_SESSION_FLATTEN
+
+
+def test_session_flatten_respects_the_server_time_offset():
+    pol = _policy(session_flatten_enabled=True, session_flatten_at="12:00")
+    now = datetime(2026, 11, 20, 12, 30, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": now.isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    on = rl.evaluate_trade_age(sig, now, pol, server_offset_seconds=0)
+    off = rl.evaluate_trade_age(sig, now, pol, server_offset_seconds=-3600)
+    assert on["action"] == rl.ACTION_SESSION_FLATTEN
+    assert off["action"] != rl.ACTION_SESSION_FLATTEN
+
+
+def test_signal_without_a_timestamp_reports_an_unknown_age():
+    pol = _policy()
+    res = rl.evaluate_trade_age({"market_tickets": [101]}, datetime.now(timezone.utc), pol)
+    assert res["action"] == rl.ACTION_NONE
+    assert "unknown age" in res["reason"]
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -494,25 +574,45 @@ def compute_r_lock_floor(
     entry_price: float,
     initial_sl: float,
     mfe_dollars: float,
+    live_price: float,
     policy: LifecyclePolicy,
     digits: int = 2,
 ) -> Optional[float]:
     """Return the R-relative stop floor for the current favourable excursion.
 
-    The active tier is the highest tier whose ``r_threshold * R`` has been
-    reached. The floor is ``entry + sign * (lock_fraction * R)`` -- never below
-    entry for a BUY and never above entry for a SELL.
+    The active fraction is the **greatest lock fraction among the tiers whose
+    ``r_threshold * R`` has been reached**. Taking the greatest reached fraction
+    (rather than "the highest threshold reached") keeps the floor order-
+    independent and monotone: the lock can never loosen as the excursion grows,
+    even if a caller builds ``LifecyclePolicy`` directly with unsorted tiers.
+    For the default ladder the two rules agree exactly:
+    ``0.5R -> entry``, ``1.0R -> +0.25R``, ``1.5R -> +0.50R``, ``2.0R -> +0.75R``.
 
-    Returns ``None`` when the R lock is disabled, when the initial risk is
-    unknown, or when no tier has been reached yet.
+    The floor is ``entry + sign * (lock_fraction * R)`` -- never below entry for
+    a BUY and never above entry for a SELL.
+
+    Returns ``None`` when:
+    - the R lock is disabled, the direction is not ``BUY``/``SELL``, or the
+      initial risk is unknown / below ``r_lock_min_r_dollars``;
+    - no tier has been reached yet;
+    - the floor is not valid against the current market (for a BUY the floor
+      must stay strictly below ``live_price``, for a SELL strictly above it).
+      The floor is derived from the peak excursion, so a retracement can carry
+      price back past it; submitting a stop on the wrong side of the market
+      would be rejected by the broker with retcode 10016. The consumer's own
+      stops-buffer clamp is a second line of defence, not the only one.
 
     Note: the existing ``BE_LOCK`` candidate in `dynamic_risk.py` may sit
-    slightly tighter than this floor (it adds the $0.50 breakeven offset). The
-    candidate picker keeps the tightest stop, so the R floor can only ever make
-    protection *better*, never worse.
+    slightly tighter than this floor (it adds the $0.50 breakeven offset), and
+    the candidate picker keeps the tightest stop.
     """
     if not policy.r_lock_enabled:
         return None
+
+    dir_token = str(direction or "").strip().upper()
+    if dir_token not in ("BUY", "SELL"):
+        return None
+    sign = 1.0 if dir_token == "BUY" else -1.0
 
     entry = _safe_float(entry_price, 0.0)
     if entry <= 0.0:
@@ -526,19 +626,25 @@ def compute_r_lock_floor(
     if mfe <= 0.0:
         return None
 
-    lock_fraction = 0.0
-    reached = False
-    for r_threshold, fraction in policy.r_lock_tiers:
-        if mfe + 1e-9 >= r_threshold * r:
-            lock_fraction = fraction
-            reached = True
-        else:
-            break
+    reached = [
+        fraction
+        for r_threshold, fraction in policy.r_lock_tiers
+        if mfe + 1e-9 >= r_threshold * r
+    ]
     if not reached:
         return None
+    lock_fraction = max(reached)
 
-    sign = 1.0 if str(direction or "BUY").strip().upper() == "BUY" else -1.0
-    return round(entry + sign * (lock_fraction * r), digits)
+    floor_px = round(entry + sign * (lock_fraction * r), digits)
+
+    live = _safe_float(live_price, 0.0)
+    if live > 0.0:
+        if sign > 0 and floor_px >= live:
+            return None
+        if sign < 0 and floor_px <= live:
+            return None
+
+    return floor_px
 
 
 def _parse_iso_utc(value: Any) -> Optional[datetime]:
@@ -616,7 +722,7 @@ def evaluate_trade_age(
         result["reason"] = "no open or pending orders"
         return result
 
-    if policy.session_flatten_enabled and server_minutes >= session_minutes:
+    if policy.session_flatten_enabled and has_market and server_minutes >= session_minutes:
         result["action"] = ACTION_SESSION_FLATTEN
         result["reason"] = f"session cut reached ({server_time} >= {policy.session_flatten_at} broker time)"
         return result
@@ -636,12 +742,20 @@ def evaluate_trade_age(
         result["reason"] = f"signal age {signal_age}s >= {policy.pending_expire_seconds}s and never filled"
         return result
 
+    if signal_dt is None and fill_dt is None:
+        result["reason"] = "unknown age (signal carries no timestamp)"
+        return result
+
     result["reason"] = "within thresholds"
     return result
 
 
 def _format_tiers(policy: LifecyclePolicy) -> str:
-    return ", ".join(f"{r_threshold:g}R -> {fraction:.0%}" for r_threshold, fraction in policy.r_lock_tiers)
+    parts = []
+    for r_threshold, fraction in policy.r_lock_tiers:
+        label = "BE" if fraction <= 0.0 else f"{fraction:.0%}"
+        parts.append(f"{r_threshold:g}R -> {label}")
+    return ", ".join(parts)
 
 
 def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
@@ -655,6 +769,8 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
             f"• Tiers: `{_format_tiers(policy)}`\n"
             f"• Minimum R: `${policy.r_lock_min_r_dollars:.2f}` per ounce\n"
             "• Change: `/rlock on` | `/rlock off`"
+            "• The floor is a peak-derived level: it disappears if price retraces past it,"
+            " so it can never place a stop on the wrong side of the market."
         )
     token = cleaned[0].lower()
     if token in _ON_TOKENS:
@@ -662,7 +778,7 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
         return True, (
             f"📐 **R-Relative Profit Floor Enabled → `ON`**\n"
             f"• Tiers: `{_format_tiers(policy)}`\n"
-            "• The floor is only ever tighter than the existing ATR trail stop."
+            "• The floor only ever raises the stop, and it disappears if price retraces past it."
         )
     if token in _OFF_TOKENS:
         setattr(cfg_mod, "R_LOCK_ENABLED", False)
@@ -1448,6 +1564,7 @@ In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor com
                     entry_price=entry_px,
                     initial_sl=initial_sl,
                     mfe_dollars=sign * (layer_peak - entry_px),
+                    live_price=live_price,
                     policy=lifecycle_pol,
                     digits=digits,
                 )
