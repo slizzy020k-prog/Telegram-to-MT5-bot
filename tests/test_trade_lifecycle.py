@@ -3448,3 +3448,175 @@ async def test_rlock_toggle_is_visible_to_the_executor_policy(monkeypatch, tmp_p
 
     assert mt5_executor._cfg("LIFECYCLE_ENABLED", False) is True
     assert ex._get_lifecycle_policy().lifecycle_enabled is True
+
+
+# --- trade ledger schema 4 -----------------------------------------------
+
+def _schema4_signal():
+    """A representative closed signal carrying the schema-4 inputs."""
+    return {
+        "timestamp": "2026-11-19T06:19:09+00:00",
+        "chat_id": -100,
+        "message_id": 42,
+        "symbol": "XAUUSD.s",
+        "direction": "SELL",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "layers": {
+            "L1": {"ticket": 1, "status": "CLOSED", "lot": 0.01, "entry_price": 3740.0},
+        },
+        "max_favorable_excursion": {"peak_price": 3728.55, "peak_profit_per_oz": 11.12},
+        "realized_pnl": 0.56,
+        "initial_r_per_oz": 20.0,
+        "first_fill_at": "2026-11-19T06:19:09+00:00",
+        "closed_at": "2026-11-19T09:19:51+00:00",
+    }
+
+
+def test_build_trade_record_adds_cash_mfe_and_giveback():
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_schema4_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+    )
+
+    assert rec["schema_version"] == 4
+    # 11.12 $/oz * 0.05 lots * 100 oz/lot = 55.60
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["giveback_cash"] == pytest.approx(55.04)
+    assert rec["initial_r_per_oz"] == pytest.approx(20.0)
+    # R at exit = MFE cash / risk cash = 55.60 / (20.0 * 0.05 * 100) = 0.556.
+    # (The plan's draft expectation of 0.278 is inconsistent with its own
+    #  mfe_cash/initial_r_per_oz expectations: 11.12 / 20.0 = 0.556.)
+    assert rec["r_at_exit"] == pytest.approx(0.556)
+    # 06:19:09 -> 09:19:51 = 3h00m42s
+    assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2)
+    assert rec["lifecycle_action"] is None
+
+
+def test_build_trade_record_tolerates_missing_new_fields():
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:7",
+        signal_data={"chat_id": -100, "message_id": 7, "direction": "BUY"},
+        realized_pnl=1.0,
+        exit_reason="MANUAL",
+    )
+    assert rec["schema_version"] == 4
+    assert rec["mfe_cash"] is None
+    assert rec["giveback_cash"] is None
+    assert rec["exit_age_seconds"] is None
+    assert rec["initial_r_per_oz"] is None
+    assert rec["r_at_exit"] is None
+
+
+def test_build_trade_record_keeps_every_schema_3_field():
+    """Schema 4 is an UPGRADE: the old fields must not be dropped."""
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        signal_key="-100:42",
+        signal_data=_schema4_signal(),
+        realized_pnl=0.56,
+        exit_reason="ATR_TRAIL",
+    )
+
+    for key in (
+        "schema_version",
+        "closed_at",
+        "opened_at",
+        "signal_key",
+        "chat_id",
+        "message_id",
+        "symbol",
+        "direction",
+        "entry_type",
+        "total_lots",
+        "filled_lots",
+        "tickets",
+        "layers_filled",
+        "exit_reason",
+        "exit_reason_code",
+        "exit_price",
+        "max_favorable_excursion",
+        "giveback_from_peak",
+        "layer_exits",
+        "realized_pnl",
+        "currency",
+        "dry_run",
+    ):
+        assert key in rec, f"schema 4 dropped the schema 3 field {key}"
+    assert rec["realized_pnl"] == pytest.approx(0.56)
+    assert rec["max_favorable_excursion"]["peak_profit_per_oz"] == pytest.approx(11.12)
+
+
+def test_build_trade_record_exit_age_uses_the_earliest_resolved_fill():
+    """The L1 MARKET fill (on the layer) precedes the signal's LIMIT stamp."""
+    from trade_ledger import build_trade_record
+
+    sig = _schema4_signal()
+    # The signal-level stamp is the first LIMIT fill (L2) and is LATER.
+    sig["first_fill_at"] = "2026-11-19T07:19:09+00:00"
+    sig["layers"]["L1"]["filled_at"] = "2026-11-19T06:19:09+00:00"
+    sig["closed_at"] = "2026-11-19T09:19:51+00:00"
+
+    rec = build_trade_record(
+        signal_key="-100:42", signal_data=sig, realized_pnl=0.56, exit_reason="ATR_TRAIL"
+    )
+
+    assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2), (
+        "the trade age must be measured from the EARLIEST fill, not the signal stamp"
+    )
+
+
+def test_trade_ledger_reads_legacy_schema_3_records(tmp_path):
+    """A record written by the old code must still be readable and complete."""
+    import json
+
+    from trade_ledger import TradeLedger
+
+    path = tmp_path / "trades_ledger.jsonl"
+    legacy = {
+        "schema_version": 3,
+        "closed_at": "2026-11-18T09:19:51+00:00",
+        "opened_at": "2026-11-18T06:19:09+00:00",
+        "signal_key": "-100:1",
+        "chat_id": -100,
+        "message_id": 1,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "realized_pnl": 12.34,
+        "currency": "GBP",
+    }
+    path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+    ledger = TradeLedger(path)
+    trades = ledger.read_trades()
+
+    assert len(trades) == 1
+    rec = trades[0]
+    assert rec["schema_version"] == 3
+    assert rec["realized_pnl"] == pytest.approx(12.34)
+    assert rec["symbol"] == "XAUUSD.s"
+    # The new fields are simply absent on an old record -- never an error.
+    assert rec.get("mfe_cash") is None
+    assert rec.get("exit_age_seconds") is None
+    stats = ledger.get_stats()
+    assert stats["total_trades"] == 1
+    assert stats["total_realized_pnl"] == pytest.approx(12.34)
+
+
+def test_append_trade_defaults_to_schema_4(tmp_path):
+    from trade_ledger import TradeLedger
+
+    ledger = TradeLedger(tmp_path / "trades_ledger.jsonl")
+    entry = ledger.append_trade({"realized_pnl": 1.0})
+
+    assert entry["schema_version"] == 4
+

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import config as _config
+from risk_lifecycle import resolve_fill_time
 
 logger = logging.getLogger("copier.ledger")
 
@@ -313,7 +314,7 @@ def build_trade_record(
     dry_run: bool = False,
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build a canonical v3.5.0 trades_ledger.jsonl record for a closed signal (schema_version=3)."""
+    """Build a canonical trades_ledger.jsonl record for a closed signal (schema_version=4)."""
     total_lots, filled_lots, layers_filled, tickets = _extract_layers_summary(signal_data)
     cleared = list(signal_data.get("runner_cleared_milestones") or [])
     if cleared:
@@ -453,8 +454,69 @@ def build_trade_record(
                 "exit_deal_tickets": list(lv.get("exit_deal_tickets") or []),
             })
 
+    # --- Schema 4 telemetry: cash excursion, giveback, R and exit age -------
+    # `max_favorable_excursion.peak_profit_per_oz` is a PER-OUNCE figure; it is
+    # converted to cash here (contract = 100 oz per lot) so giveback is finally
+    # measurable.
+    CONTRACT_OZ_PER_LOT = 100.0
+    mfe_per_oz = _safe_float((mfe_dict or {}).get("peak_profit_per_oz"), 0.0) if mfe_dict else 0.0
+    lots_for_mfe = _safe_float(signal_data.get("total_lots"), 0.0)
+    if lots_for_mfe <= 0.0:
+        # Fall back to the layer-derived total when the signal carries no size.
+        lots_for_mfe = _safe_float(total_lots, 0.0)
+    mfe_cash: Optional[float] = None
+    if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
+        mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)
+
+    realized_for_giveback = _safe_float(realized_pnl, 0.0)
+    giveback_cash: Optional[float] = None
+    if mfe_cash is not None:
+        giveback_cash = round(mfe_cash - realized_for_giveback, 2)
+
+    initial_r = _safe_float(signal_data.get("initial_r_per_oz"), 0.0)
+    if initial_r <= 0.0:
+        # Fallback: derive the signal's initial risk per ounce from its layers.
+        _layer_risks = []
+        for _lv in (signal_data.get("layers") or {}).values():
+            if not isinstance(_lv, dict):
+                continue
+            _e = _safe_float(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
+            _s = _safe_float(_lv.get("initial_sl"), 0.0)
+            if _e > 0.0 and _s > 0.0:
+                _layer_risks.append(abs(_e - _s))
+        if _layer_risks:
+            initial_r = sum(_layer_risks) / len(_layer_risks)
+    initial_r_per_oz: Optional[float] = round(initial_r, 4) if initial_r > 0.0 else None
+    r_at_exit: Optional[float] = None
+    if initial_r_per_oz and mfe_cash is not None and initial_r_per_oz > 0.0:
+        risk_cash = initial_r_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT
+        if risk_cash > 0.0:
+            r_at_exit = round(mfe_cash / risk_cash, 4)
+
+    exit_age_seconds: Optional[int] = None
+    # The RESOLVED fill time -- never the raw `first_fill_at` key. For a normal
+    # zone signal L1 fills at MARKET (stamped on the LAYER) and L2-L4 later as
+    # limits (stamped on the SIGNAL), so the raw signal-level stamp can be
+    # LATER than the true first fill. `risk_lifecycle.resolve_fill_time`
+    # returns the EARLIEST known fill.
+    _filled_at = resolve_fill_time(signal_data)
+    _closed_at = signal_data.get("closed_at") or datetime.now(timezone.utc).isoformat()
+    if _filled_at and _closed_at:
+        try:
+            _f = _filled_at if isinstance(_filled_at, datetime) else datetime.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
+            _c = datetime.fromisoformat(str(_closed_at).replace("Z", "+00:00"))
+            if _f.tzinfo is None:
+                _f = _f.replace(tzinfo=timezone.utc)
+            if _c.tzinfo is None:
+                _c = _c.replace(tzinfo=timezone.utc)
+            exit_age_seconds = int((_c - _f).total_seconds())
+        except (TypeError, ValueError):
+            exit_age_seconds = None
+
+    lifecycle_action = signal_data.get("lifecycle_action")
+
     record: Dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "closed_at": datetime.now(timezone.utc).isoformat(),
         "opened_at": signal_data.get("timestamp"),
         "signal_key": str(signal_key),
@@ -477,6 +539,12 @@ def build_trade_record(
         "exit_price": exit_price,
         "max_favorable_excursion": mfe_dict,
         "giveback_from_peak": giveback_from_peak,
+        "mfe_cash": mfe_cash,
+        "giveback_cash": giveback_cash,
+        "initial_r_per_oz": initial_r_per_oz,
+        "r_at_exit": r_at_exit,
+        "exit_age_seconds": exit_age_seconds,
+        "lifecycle_action": (str(lifecycle_action) if lifecycle_action else None),
         "trail_tier_used": trail_tier_used,
         "layer_exits": layer_exits,
         "realized_pnl": round(_safe_float(realized_pnl, 0.0), 2),
@@ -499,7 +567,7 @@ class TradeLedger:
     def append_trade(self, record: Dict[str, Any]) -> Dict[str, Any]:
         """Append a single closed-trade record atomically as one JSON line."""
         entry = dict(record)
-        entry.setdefault("schema_version", 3)
+        entry.setdefault("schema_version", 4)
         entry.setdefault("closed_at", datetime.now(timezone.utc).isoformat())
         entry["realized_pnl"] = round(_safe_float(entry.get("realized_pnl"), 0.0), 2)
 
