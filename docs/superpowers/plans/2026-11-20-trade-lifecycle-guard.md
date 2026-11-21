@@ -713,41 +713,6 @@ In `config.py`, immediately after the `DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT` bl
 # Trade Lifecycle Guard (R-relative profit floor + trade-age management)
 # Both features ship DISABLED: enable live with `/rlock on` and `/lifecycle on`.
 R_LOCK_ENABLED: bool = _env_bool("R_LOCK_ENABLED", False)
-R_LOCK_TIERS: str = _env_choice("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75", ())
-R_LOCK_MIN_R_DOLLARS: float = _env_float(
-    "R_LOCK_MIN_R_DOLLARS", 0.50, min_val=0.0, max_val=100.0
-)
-LIFECYCLE_ENABLED: bool = _env_bool("LIFECYCLE_ENABLED", False)
-LIFECYCLE_DERISK_SECONDS: int = _env_int(
-    "LIFECYCLE_DERISK_SECONDS", 7200, min_val=0, max_val=604800
-)
-LIFECYCLE_FLATTEN_SECONDS: int = _env_int(
-    "LIFECYCLE_FLATTEN_SECONDS", 21600, min_val=0, max_val=604800
-)
-LIFECYCLE_PENDING_EXPIRE_SECONDS: int = _env_int(
-    "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200, min_val=0, max_val=604800
-)
-LIFECYCLE_SESSION_FLATTEN_ENABLED: bool = _env_bool("LIFECYCLE_SESSION_FLATTEN_ENABLED", False)
-LIFECYCLE_SESSION_FLATTEN_AT: str = _env_choice("LIFECYCLE_SESSION_FLATTEN_AT", "23:30", ())
-LIFECYCLE_MAX_CLOSE_RETRIES: int = _env_int(
-    "LIFECYCLE_MAX_CLOSE_RETRIES", 3, min_val=0, max_val=50
-)
-```
-
-> **Note on `_env_choice`:** it validates against a tuple of allowed values and falls back to the default when the value is not in that tuple. Passing `()` would reject every value, so **do not** use `_env_choice` for `R_LOCK_TIERS` or `LIFECYCLE_SESSION_FLATTEN_AT`. Replace those two lines with plain `os.getenv` reads:
-
-```python
-R_LOCK_TIERS: str = os.getenv("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75").strip()
-LIFECYCLE_SESSION_FLATTEN_AT: str = os.getenv("LIFECYCLE_SESSION_FLATTEN_AT", "23:30").strip()
-```
-
-The final knob block in `config.py` must therefore read exactly:
-
-```python
-
-# Trade Lifecycle Guard (R-relative profit floor + trade-age management)
-# Both features ship DISABLED: enable live with `/rlock on` and `/lifecycle on`.
-R_LOCK_ENABLED: bool = _env_bool("R_LOCK_ENABLED", False)
 R_LOCK_TIERS: str = os.getenv("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75").strip()
 R_LOCK_MIN_R_DOLLARS: float = _env_float(
     "R_LOCK_MIN_R_DOLLARS", 0.50, min_val=0.0, max_val=100.0
@@ -768,6 +733,8 @@ LIFECYCLE_MAX_CLOSE_RETRIES: int = _env_int(
     "LIFECYCLE_MAX_CLOSE_RETRIES", 3, min_val=0, max_val=50
 )
 ```
+
+> **Do not use `_env_choice` for `R_LOCK_TIERS` or `LIFECYCLE_SESSION_FLATTEN_AT`.** `_env_choice` validates the value against a tuple of allowed values and falls back to the default when the value is not in that tuple — it cannot hold a free-form string like `"0.5:0.00,1.0:0.25"`. Both knobs above therefore use `os.getenv` directly. `config.py` already imports `os`.
 
 Then append after the existing `validate_dynamic_risk_pairs()` function and its call (i.e. after line 565):
 
@@ -1415,7 +1382,7 @@ In `mt5_executor.py`, add the ten new knob names to the `_CFG_IMPORT_SNAPSHOT` n
         "LIFECYCLE_MAX_CLOSE_RETRIES",
 ```
 
-Then import the constants into the module globals so `_cfg()` can resolve them. Add them next to the existing `DYNAMIC_ATR_*` imports at the top of `mt5_executor.py`:
+Then import the constants into the module globals so `_cfg()` can resolve them. `mt5_executor.py` already has `import config as _config` (line 15) and a `from config import (...)` block (line 16) — add the ten names to that existing `from config import (...)` block:
 
 ```python
 from config import (
@@ -1432,8 +1399,6 @@ from config import (
     LIFECYCLE_MAX_CLOSE_RETRIES,
 )
 ```
-
-> If `mt5_executor.py` does not import `config` names one-by-one, instead read them through `getattr(_config, ...)` in the policy resolver below — the resolver is the single place that matters.
 
 - [ ] **Step 5: Add the lifecycle policy resolver**
 
@@ -1975,7 +1940,7 @@ async def test_age_guard_derisks_an_old_signal(monkeypatch, tmp_path):
     assert applied == ["DERISK"]
 ```
 
-> If the project does not already use `pytest-asyncio`, use `asyncio.run(...)` inside a plain `def` test instead of `@pytest.mark.asyncio`. Check `python -m pytest tests/test_v3_concurrency_and_ops.py -q` — that file already contains async tests, so follow whatever pattern it uses.
+> The repo already uses `@pytest.mark.asyncio` for async tests (see `tests/test_v3_concurrency_and_ops.py:89`), so use that marker exactly as shown. If pytest-asyncio is not installed in the environment, `pip install pytest-asyncio` is required — check with `python -m pytest tests/test_v3_concurrency_and_ops.py -q` first.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2715,7 +2680,7 @@ and, after the existing `g4_single` computation, add:
         sb2 = arm_b["summary"]
         g5 = (
             sc["net_gbp"] >= sb2["net_gbp"]
-            and sc["tail_loss_gbp"] <= sb2["tail_loss_gbp"]
+            and sc["tail_loss_gbp_13078_9953"] <= sb2["tail_loss_gbp_13078_9953"]
             and sc["error_count"] == 0
         )
     else:
@@ -2724,7 +2689,7 @@ and, after the existing `g4_single` computation, add:
 
 Add `"g5": g5` to the returned gates dict.
 
-> If `tail_loss_gbp` is not a key of the arm summary, use the summary's actual worst-trade key. Inspect `sc` keys with `print(sorted(arm_b["summary"].keys()))` in a scratch run first and use the real key name.
+> The arm summary key is **`tail_loss_gbp_13078_9953`** (see `_summarize_arm` in `scripts/ab_replay_proof.py:1092`). The other keys used above are `net_gbp` (:1089), `error_count` (:1100), `trade_count` (:1088), `choke_trio_gbp_13153_9934_13167` (:1093) and `unflagged_rollover_exits` (:1099).
 
 - [ ] **Step 5: Extend `main()` and the markdown renderer**
 
@@ -2751,7 +2716,8 @@ In `_render_markdown`, add an Arm C section after the existing Arm A/B table:
             "### Arm C (v3.8.0 Trade Lifecycle Guard)",
             "",
             f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: `£{sb['net_gbp']}`)",
-            f"- **Tail Loss:** `£{sc.get('tail_loss_gbp')}` (Arm B: `£{sb.get('tail_loss_gbp')}`)",
+            f"- **Tail Loss (13078 + 9953):** `£{sc['tail_loss_gbp_13078_9953']}` "
+            f"(Arm B: `£{sb['tail_loss_gbp_13078_9953']}`)",
         ]
 ```
 
