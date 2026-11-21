@@ -120,6 +120,11 @@ from dynamic_risk import (
     scale_sl_tp_by_atr,
 )
 from risk_lifecycle import (
+    ACTION_DERISK,
+    ACTION_EXPIRE_PENDING,
+    ACTION_FLATTEN,
+    ACTION_NONE,
+    ACTION_SESSION_FLATTEN,
     LifecyclePolicy,
     compute_r_lock_floor,
     read_lifecycle_policy,
@@ -5635,6 +5640,306 @@ class MT5Executor:
 
         return {"closed_tickets": closed_tickets, "cancelled_orders": cancelled_orders}
 
+    # --- trade lifecycle actions (age-based de-risk / flatten) -------------
+
+    @staticmethod
+    def _lifecycle_tickets(values: Any) -> List[int]:
+        """Normalise a ticket collection into positive integers (never raises)."""
+        out: List[int] = []
+        try:
+            items = list(values or [])
+        except Exception:
+            return out
+        for v in items:
+            try:
+                t = int(v)
+            except Exception:
+                continue
+            if t > 0:
+                out.append(t)
+        return out
+
+    def _lifecycle_open_tickets(self, signal_data: Dict[str, Any]) -> List[int]:
+        """The market tickets this signal believes are open.
+
+        Mirrors the ticket selection of `close_signal_exposure` (pending orders
+        excluded) so the flatten can tell "the close did not happen" from
+        "there was nothing left to close".
+        """
+        accounted = {
+            _int_num(x, 0)
+            for x in (signal_data.get("accounted_tickets") or [])
+            if _int_num(x, 0) > 0
+        }
+        tickets: List[int] = []
+        seen: Set[int] = set()
+
+        def _add(val: Any) -> None:
+            t = _int_num(val, 0)
+            if t > 0 and t not in seen and t not in accounted:
+                seen.add(t)
+                tickets.append(t)
+
+        for t in (signal_data.get("market_tickets") or []):
+            _add(t)
+        for t in (signal_data.get("runner_tickets") or []):
+            _add(t)
+        if signal_data.get("runner_ticket") is not None:
+            _add(signal_data.get("runner_ticket"))
+        layers = signal_data.get("layers")
+        if isinstance(layers, dict):
+            for lv in layers.values():
+                if not isinstance(lv, dict):
+                    continue
+                if str(lv.get("status") or "").strip().upper() in ("OPEN", "FILLED", "RUNNER"):
+                    _add(lv.get("ticket"))
+        return tickets
+
+    def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel unfilled pending limits and move every open layer to breakeven.
+
+        Never loosens an existing stop: a layer whose broker SL is already
+        tighter than the breakeven price is left untouched.
+        """
+        result: Dict[str, Any] = {
+            "action": ACTION_DERISK,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+
+        try:
+            cancelled = self.cancel_signal_pending_orders(signal_data) or []
+            result["cancelled"] = self._lifecycle_tickets(cancelled)
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE DERISK] cancel pending failed: {exc}")
+            result["failed"].append(f"cancel:{exc}")
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        sign = 1.0 if is_buy else -1.0
+
+        sym_info = None
+        try:
+            sym_info = self.get_symbol_info(symbol)
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE DERISK] symbol info for {symbol} failed: {exc}")
+            result["failed"].append(f"sym_info:{exc}")
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        offset = max(
+            0.0,
+            _cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
+        )
+        layers = signal_data.get("layers") or {}
+
+        # Publish the signal's initial risk (per ounce) so the ledger can record
+        # `initial_r_per_oz` and `r_at_exit` at close time.
+        _risks: List[float] = []
+        for _lv in layers.values():
+            if not isinstance(_lv, dict):
+                continue
+            _e = _num(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
+            _s = _num(_lv.get("initial_sl"), 0.0)
+            if _e > 0.0 and _s > 0.0:
+                _risks.append(abs(_e - _s))
+        if _risks:
+            signal_data["initial_r_per_oz"] = round(sum(_risks) / len(_risks), 4)
+
+        # The market decides whether the breakeven stop is even a valid stop: a
+        # BUY stop above the market (or a SELL stop below it) is rejected by the
+        # broker with retcode 10016 (invalid stops). The check runs against a
+        # live broker only -- a dry run has nothing that could reject it.
+        tick = None
+        live_price = 0.0
+        if not self.dry_run:
+            try:
+                tick = self.get_tick(symbol)
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE DERISK] tick for {symbol} failed: {exc}")
+                result["failed"].append(f"tick:{exc}")
+            if tick is not None:
+                _raw_px = getattr(tick, "bid", None) if is_buy else getattr(tick, "ask", None)
+                live_price = _num(_raw_px, 0.0)
+        stops_buffer = self._compute_stops_buffer(sym_info)
+
+        for lk, lv in list(layers.items()):
+            if not isinstance(lv, dict):
+                continue
+            # Only a layer that HOLDS a position can be moved to breakeven. A
+            # PENDING layer is an unfilled limit that `cancel_signal_pending_orders`
+            # has just cancelled -- modifying it would fail at the broker and
+            # would mark an otherwise successful de-risk as failed.
+            if str(lv.get("status") or "").strip().upper() in ("PENDING", "CANCELLED", "CLOSED"):
+                continue
+            ticket = _int_num(lv.get("ticket"), 0)
+            if ticket <= 0:
+                continue
+            entry = _num(lv.get("entry_price") or lv.get("entry") or lv.get("target_price"), 0.0)
+            if entry <= 0.0:
+                result["failed"].append(f"{lk}:no_entry")
+                continue
+            be_sl = round(entry + offset if is_buy else entry - offset, digits)
+            cur_sl = _num(lv.get("broker_sl") or lv.get("sl"), 0.0)
+            if cur_sl > 0.0:
+                already_tighter = (cur_sl >= be_sl - 1e-6) if is_buy else (cur_sl <= be_sl + 1e-6)
+                if already_tighter:
+                    continue
+            try:
+                # The breakeven stop has to sit on the correct side of the
+                # market and far enough away from it, otherwise the broker
+                # rejects the modify with retcode 10016 (invalid stops).
+                if live_price > 0.0 and sign * (live_price - be_sl) < stops_buffer - 1e-9:
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is not a "
+                        f"valid stop at the market ({live_price}); the existing stop is kept."
+                    )
+                    continue
+                if self.is_within_freeze_level(symbol, be_sl, tick=tick, sym_info=sym_info):
+                    logger.info(
+                        f"[LIFECYCLE DERISK] {lk} ticket {ticket}: BE stop {be_sl} is inside the "
+                        f"broker freeze level; the existing stop is kept."
+                    )
+                    continue
+                if self.modify_position_sltp(ticket, sl=be_sl, tp=None):
+                    lv["sl"] = be_sl
+                    lv["broker_sl"] = be_sl
+                    result["moved"].append({"layer": lk, "ticket": ticket, "sl": be_sl})
+                else:
+                    result["failed"].append(f"{lk}:modify_failed")
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE DERISK] layer {lk} ticket {ticket} failed: {exc}")
+                result["failed"].append(f"{lk}:{exc}")
+
+        result["ok"] = not result["failed"]
+        logger.info(
+            f"[LIFECYCLE DERISK] moved={len(result['moved'])} cancelled={len(result['cancelled'])} "
+            f"failed={len(result['failed'])}"
+        )
+        return result
+
+    def apply_lifecycle_flatten(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Close every open position at market and cancel every pending limit."""
+        result: Dict[str, Any] = {
+            "action": ACTION_FLATTEN,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+
+        max_attempts = max(1, self._get_lifecycle_policy().max_close_retries)
+        retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
+
+        # The retry budget is spent: the guard stops closing and leaves the
+        # position to its broker SL (the safe fallback).
+        if retries >= max_attempts:
+            result["ok"] = False
+            result["gave_up"] = True
+            result["failed"].append("close:give_up")
+            logger.error(
+                f"[LIFECYCLE FLATTEN] giving up after {retries} failed attempts "
+                f"(max {max_attempts}); the position stays on its broker SL."
+            )
+            return result
+
+        expected_open = self._lifecycle_open_tickets(signal_data)
+        try:
+            exposure = self.close_signal_exposure(signal_data) or {}
+            result["closed"] = self._lifecycle_tickets(exposure.get("closed_tickets") or [])
+            result["cancelled"] = self._lifecycle_tickets(exposure.get("cancelled_orders") or [])
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE FLATTEN] close failed: {exc}")
+            result["failed"].append(f"close:{exc}")
+
+        if not result["failed"] and expected_open:
+            # A close that left the position open is a FAILURE: the guard has to
+            # retry (and eventually give up) instead of claiming a flatten that
+            # never happened.
+            closed_set = set(result["closed"])
+            try:
+                live_ids = {
+                    _int_num(getattr(p, "ticket", 0), 0)
+                    for p in (self.get_live_positions() or [])
+                }
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE FLATTEN] live position check failed: {exc}")
+                live_ids = set()
+            still_open = [t for t in expected_open if t not in closed_set and t in live_ids]
+            if still_open:
+                result["failed"].append(
+                    "close:still_open:" + ",".join(str(t) for t in still_open)
+                )
+
+        if result["failed"]:
+            result["ok"] = False
+            retries += 1
+            signal_data["lifecycle_retry_count"] = retries
+            if retries >= max_attempts:
+                logger.error(
+                    f"[LIFECYCLE FLATTEN] giving up after {retries} failed attempts "
+                    f"(max {max_attempts}); the position stays on its broker SL."
+                )
+                result["gave_up"] = True
+        else:
+            signal_data["lifecycle_retry_count"] = 0
+
+        logger.info(
+            f"[LIFECYCLE FLATTEN] closed={len(result['closed'])} cancelled={len(result['cancelled'])} "
+            f"failed={len(result['failed'])}"
+        )
+        return result
+
+    def apply_lifecycle_pending_expire(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel the unfilled pending limits of a signal that never filled."""
+        result: Dict[str, Any] = {
+            "action": ACTION_EXPIRE_PENDING,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+        try:
+            cancelled = self.cancel_signal_pending_orders(signal_data) or []
+            result["cancelled"] = self._lifecycle_tickets(cancelled)
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE EXPIRE_PENDING] cancel failed: {exc}")
+            result["failed"].append(f"cancel:{exc}")
+            result["ok"] = False
+        logger.info(f"[LIFECYCLE EXPIRE_PENDING] cancelled={len(result['cancelled'])}")
+        return result
+
+    def apply_lifecycle_action(self, signal_data: Dict[str, Any], action: str) -> Dict[str, Any]:
+        """Dispatch a lifecycle action. Unknown actions are a no-op."""
+        token = str(action or "").strip().upper()
+        if token == ACTION_DERISK:
+            return self.apply_lifecycle_derisk(signal_data)
+        if token in (ACTION_FLATTEN, ACTION_SESSION_FLATTEN):
+            return self.apply_lifecycle_flatten(signal_data)
+        if token == ACTION_EXPIRE_PENDING:
+            return self.apply_lifecycle_pending_expire(signal_data)
+        return {
+            "action": ACTION_NONE,
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+
     def _compute_initial_tp1_floor(
         self,
         signal_data: Dict[str, Any],
@@ -8275,8 +8580,8 @@ class MT5Executor:
             elif lifecycle_pol.r_lock_enabled and not lv.get("_r_lock_skipped_logged"):
                 lv["_r_lock_skipped_logged"] = True
                 logger.info(
-                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (signal opened before the upgrade); "
-                    "ATR trail only."
+                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (the layer was placed without a stop, "
+                    "or the signal predates the upgrade); ATR trail only."
                 )
 
             # 2) Dynamic Trailing SL (BE Lock + Forward-Only ATR Trail + Milestone Floor)
