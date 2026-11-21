@@ -1,0 +1,2941 @@
+# Trade Lifecycle Guard Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Add an R-relative profit-protection floor and a trade-age guard to the Telegram→MT5 copier, so a trade that runs far into profit can no longer round-trip to zero, and no trade can sit unattended for 20+ hours.
+
+**Architecture:** A new pure domain module `risk_lifecycle.py` decides *what* should happen (pure functions, no MT5 import, no I/O). `dynamic_risk.py` gains one additive keyword that accepts the R floor as an extra stop candidate inside the existing forward-only candidate picker. `mt5_executor.py` computes the floor per layer and gains three lifecycle actions. `main.py` evaluates the age guard once per second inside the existing pre-TP1 tick processor and exposes `/rlock`, `/lifecycle` and `/stats` as Saved Messages commands. `trade_ledger.py` records cash MFE, cash giveback, R at exit and exit age so the change can be measured.
+
+**Tech Stack:** Python 3 (stdlib only — `dataclasses`, `datetime`, `math`), pytest, Telethon, MetaTrader5. Windows / PowerShell.
+
+**Design spec:** `docs/superpowers/specs/2026-11-20-trade-lifecycle-guard-design.md`
+
+---
+
+## Global Constraints
+
+- **No new runtime dependencies.** `risk_lifecycle.py` imports only the Python standard library.
+- **Both features ship disabled.** `R_LOCK_ENABLED=false` and `LIFECYCLE_ENABLED=false` are the defaults in `config.py`, `.env.example` and every test fixture. A fresh clone must behave identically to v3.7.0.
+- **Never loosen a broker SL or TP.** Every new stop is a *floor candidate* in the existing picker; the age guard's breakeven move applies only when strictly tighter than the current SL.
+- **Never emit retcode `10016` (Invalid stops).** Every new SL change must pass the existing `is_within_freeze_level` + `stops_buffer` + `trade_stops_level` validation used by the ATR trail path.
+- **No public signature may be renamed or removed.** `compute_dynamic_atr_trail_stop` gains one keyword-only argument with a `None` default; every existing call site stays valid.
+- **Stdlib-only timestamps.** `signal_data["timestamp"]` is ISO-8601 with a timezone offset (e.g. `2026-11-17T19:31:51.123456+00:00`). New stamps use `datetime.now(timezone.utc).isoformat()`.
+- **Working tree uses LF**; do not rewrite existing line endings.
+- **Never commit runtime artifacts:** `.env`, `*.log`, `*.log.*`, `signals_state*.json`, `trades_ledger*.jsonl`, `*.session`, `*.session-journal`, `copier.lock`.
+- **No VPS deployment** in this plan. The new `.env` knobs must be added by hand on the server at deploy time.
+- **The full pytest suite must finish with 0 failures.** Baseline before any task: **241 passed**.
+- Do not modify `README.md` or `AI_HANDOVER.md` in this plan — the doc refresh is a separate change wave (spec §9.6).
+
+---
+
+## File Structure
+
+| File | Responsibility after this plan |
+|---|---|
+| `risk_lifecycle.py` | **New.** Pure lifecycle domain: policy dataclass, R-ladder math, age evaluation, Saved-Messages command handlers. No MT5, no I/O. |
+| `config.py` | Owns the 10 lifecycle knobs and their import-time validation. |
+| `startup_checks.py` | Fails startup on an invalid lifecycle configuration. |
+| `dynamic_risk.py` | Owns the ATR trail candidate picker; gains the `R_LOCK` candidate. |
+| `mt5_executor.py` | Carries out lifecycle actions against the broker; captures `initial_sl` / `first_fill_at`; computes the R floor per layer. |
+| `main.py` | Drives the age guard each second; exposes `/rlock`, `/lifecycle`, `/stats`. |
+| `trade_ledger.py` | Writes schema-4 records with cash MFE / giveback / R / age. |
+| `tests/test_trade_lifecycle.py` | **New.** Unit + integration coverage for every task in this plan. |
+
+---
+
+## Task 1: `risk_lifecycle.py` — the pure domain core
+
+**Files:**
+- Create: `risk_lifecycle.py`
+- Create: `tests/test_trade_lifecycle.py`
+- Modify: `config.py:545` (append the knob block after `DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT`)
+- Modify: `config.py:548-565` (append `validate_lifecycle_pairs()`)
+- Modify: `startup_checks.py:465` (add `_validate_lifecycle_config`)
+- Modify: `.env.example` (append the knob block)
+
+**Interfaces:**
+- Consumes: nothing (first task in the chain).
+- Produces:
+  - `LifecyclePolicy` — frozen dataclass, fields: `r_lock_enabled: bool`, `r_lock_tiers: Tuple[Tuple[float, float], ...]`, `r_lock_min_r_dollars: float`, `lifecycle_enabled: bool`, `derisk_after_seconds: int`, `flatten_after_seconds: int`, `pending_expire_seconds: int`, `session_flatten_enabled: bool`, `session_flatten_at: str`, `max_close_retries: int`.
+  - `DEFAULT_R_LOCK_TIERS: Tuple[Tuple[float, float], ...]` = `((0.50, 0.00), (1.00, 0.25), (1.50, 0.50), (2.00, 0.75))`.
+  - `parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]`
+  - `read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy`
+  - `compute_initial_r(entry_price: float, initial_sl: float) -> Optional[float]`
+  - `compute_r_lock_floor(direction: str, entry_price: float, initial_sl: float, mfe_dollars: float, policy: LifecyclePolicy, digits: int = 2) -> Optional[float]`
+  - `evaluate_trade_age(signal_data: Dict[str, Any], now_utc: datetime, policy: LifecyclePolicy, server_offset_seconds: int = 0) -> Dict[str, Any]`
+  - `apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]`
+  - `apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]`
+  - Action constants: `ACTION_NONE="NONE"`, `ACTION_DERISK="DERISK"`, `ACTION_FLATTEN="FLATTEN"`, `ACTION_EXPIRE_PENDING="EXPIRE_PENDING"`, `ACTION_SESSION_FLATTEN="SESSION_FLATTEN"`.
+  - Config constants: `R_LOCK_ENABLED`, `R_LOCK_TIERS`, `R_LOCK_MIN_R_DOLLARS`, `LIFECYCLE_ENABLED`, `LIFECYCLE_DERISK_SECONDS`, `LIFECYCLE_FLATTEN_SECONDS`, `LIFECYCLE_PENDING_EXPIRE_SECONDS`, `LIFECYCLE_SESSION_FLATTEN_ENABLED`, `LIFECYCLE_SESSION_FLATTEN_AT`, `LIFECYCLE_MAX_CLOSE_RETRIES`.
+
+- [ ] **Step 1: Write the failing unit tests**
+
+Create `tests/test_trade_lifecycle.py`:
+
+```python
+"""Unit tests for the pure trade-lifecycle domain module (`risk_lifecycle.py`)."""
+
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+import risk_lifecycle as rl
+
+
+def _policy(**overrides):
+    base = dict(
+        r_lock_enabled=True,
+        r_lock_tiers=rl.DEFAULT_R_LOCK_TIERS,
+        r_lock_min_r_dollars=0.50,
+        lifecycle_enabled=True,
+        derisk_after_seconds=7200,
+        flatten_after_seconds=21600,
+        pending_expire_seconds=43200,
+        session_flatten_enabled=False,
+        session_flatten_at="23:30",
+        max_close_retries=3,
+    )
+    base.update(overrides)
+    return rl.LifecyclePolicy(**base)
+
+
+# --- parse_r_lock_tiers -------------------------------------------------
+
+def test_parse_r_lock_tiers_from_string():
+    assert rl.parse_r_lock_tiers("0.5:0.00,1.0:0.25") == ((0.5, 0.0), (1.0, 0.25))
+
+
+def test_parse_r_lock_tiers_sorts_ascending_and_skips_malformed():
+    parsed = rl.parse_r_lock_tiers("1.0:0.25,garbage,0.5:0.00,0.2:1.5,-1:0.5")
+    assert parsed == ((0.5, 0.0), (1.0, 0.25))
+
+
+def test_parse_r_lock_tiers_empty_returns_empty_tuple():
+    assert rl.parse_r_lock_tiers("") == ()
+
+
+# --- compute_initial_r --------------------------------------------------
+
+def test_compute_initial_r_is_direction_agnostic():
+    assert rl.compute_initial_r(3900.0, 3880.0) == pytest.approx(20.0)
+    assert rl.compute_initial_r(3900.0, 3920.0) == pytest.approx(20.0)
+
+
+def test_compute_initial_r_returns_none_for_invalid_inputs():
+    assert rl.compute_initial_r(0.0, 3880.0) is None
+    assert rl.compute_initial_r(3900.0, 0.0) is None
+    assert rl.compute_initial_r(3900.0, 3900.0) is None
+
+
+# --- compute_r_lock_floor ----------------------------------------------
+
+def test_r_lock_floor_none_below_first_tier():
+    # R = 20.0, first tier 0.5R -> needs MFE 10.0
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 9.99, _policy()) is None
+
+
+def test_r_lock_floor_locks_entry_at_half_r():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, _policy()) == pytest.approx(3900.0)
+
+
+def test_r_lock_floor_ladder_boundaries():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 20.0, _policy()) == pytest.approx(3905.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 30.0, _policy()) == pytest.approx(3910.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy()) == pytest.approx(3915.0)
+
+
+def test_r_lock_floor_scales_with_stop_distance():
+    wide = rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 11.0, _policy())   # R = 22.0
+    tight = rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 1.0, _policy())    # R = 2.00
+    assert wide == pytest.approx(3900.0)
+    assert tight == pytest.approx(3900.0)
+    # 1R on the wide stop locks a much larger absolute distance than on the tight stop
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 22.0, _policy()) == pytest.approx(3905.5)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 2.0, _policy()) == pytest.approx(3900.5)
+
+
+def test_r_lock_floor_sell_is_mirrored():
+    assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, _policy()) == pytest.approx(3895.0)
+
+
+def test_r_lock_floor_disabled_returns_none():
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy(r_lock_enabled=False)) is None
+
+
+def test_r_lock_floor_below_min_r_returns_none():
+    # R = 0.20 which is under r_lock_min_r_dollars = 0.50
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3899.8, 1.0, _policy()) is None
+
+
+# --- evaluate_trade_age --------------------------------------------------
+
+def _sig(**overrides):
+    base = {
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_evaluate_trade_age_none_when_disabled():
+    res = rl.evaluate_trade_age(_sig(), datetime.now(timezone.utc), _policy(lifecycle_enabled=False))
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_none_when_young():
+    sig = _sig(timestamp=datetime.now(timezone.utc).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_derisk_after_two_hours():
+    sig = _sig(timestamp=(datetime.now(timezone.utc) - timedelta(hours=3)).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_DERISK
+
+
+def test_evaluate_trade_age_flatten_beats_derisk():
+    sig = _sig(timestamp=(datetime.now(timezone.utc) - timedelta(hours=9)).isoformat())
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+
+
+def test_evaluate_trade_age_expires_unfilled_pending():
+    sig = _sig(
+        timestamp=(datetime.now(timezone.utc) - timedelta(hours=20)).isoformat(),
+        market_tickets=[],
+        pending_tickets=[201],
+    )
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_EXPIRE_PENDING
+
+
+def test_evaluate_trade_age_never_expires_a_filled_signal():
+    sig = _sig(
+        timestamp=(datetime.now(timezone.utc) - timedelta(hours=20)).isoformat(),
+        market_tickets=[101],
+        pending_tickets=[201],
+    )
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+
+
+def test_evaluate_trade_age_none_without_orders():
+    sig = _sig(market_tickets=[], pending_tickets=[])
+    res = rl.evaluate_trade_age(sig, datetime.now(timezone.utc), _policy())
+    assert res["action"] == rl.ACTION_NONE
+
+
+def test_evaluate_trade_age_reports_ages():
+    now = datetime.now(timezone.utc)
+    sig = _sig(timestamp=(now - timedelta(hours=3)).isoformat())
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["signal_age_seconds"] >= 10800
+
+
+# --- command handlers ----------------------------------------------------
+
+def test_apply_rlock_command_toggles(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    changed, msg = rl.apply_rlock_command(config, ["on"])
+    assert changed is True
+    assert config.R_LOCK_ENABLED is True
+    changed, msg = rl.apply_rlock_command(config, ["off"])
+    assert changed is True
+    assert config.R_LOCK_ENABLED is False
+
+
+def test_apply_rlock_command_status_does_not_change(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    changed, msg = rl.apply_rlock_command(config, [])
+    assert changed is False
+    assert config.R_LOCK_ENABLED is True
+    assert "R_LOCK" in msg
+
+
+def test_apply_lifecycle_command_toggles(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    changed, msg = rl.apply_lifecycle_command(config, ["on"])
+    assert changed is True
+    assert config.LIFECYCLE_ENABLED is True
+
+
+def test_apply_lifecycle_command_rejects_garbage(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    changed, msg = rl.apply_lifecycle_command(config, ["banana"])
+    assert changed is False
+    assert config.LIFECYCLE_ENABLED is False
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run:
+
+```powershell
+cd C:\Users\kambo\Code\telegram-mt5-copier
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL with `ModuleNotFoundError: No module named 'risk_lifecycle'`.
+
+- [ ] **Step 3: Create `risk_lifecycle.py`**
+
+Create the file with exactly this content:
+
+```python
+"""Trade lifecycle guards: R-relative profit floor and trade-age management.
+
+Pure domain module (standard library only, no MT5 import, no I/O), following the
+discipline of `dynamic_risk.py` and `risk_controls.py`. It decides *what* should
+happen to a signal; `mt5_executor.py` carries the decision out against the broker.
+
+Why the R floor exists
+-----------------------
+The ATR engine arms its breakeven lock at ``max(0.75 * ATR, $3.50)`` of favourable
+excursion regardless of how far the trade can lose. A $22/oz stop and a $2.00 scalp
+therefore both become risk-free after the same $3.50 -- the wide trade risks $22 to
+make $3.50 risk-free. The R floor scales the lock to each trade's own initial risk
+(``R = |entry - initial SL|``), so a wide trade waits until it has earned a fair
+multiple before it is protected.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import math
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+__all__ = [
+    "ACTION_NONE",
+    "ACTION_DERISK",
+    "ACTION_FLATTEN",
+    "ACTION_EXPIRE_PENDING",
+    "ACTION_SESSION_FLATTEN",
+    "DEFAULT_R_LOCK_TIERS",
+    "LifecyclePolicy",
+    "apply_lifecycle_command",
+    "apply_rlock_command",
+    "compute_initial_r",
+    "compute_r_lock_floor",
+    "evaluate_trade_age",
+    "parse_r_lock_tiers",
+    "read_lifecycle_policy",
+]
+
+ACTION_NONE = "NONE"
+ACTION_DERISK = "DERISK"
+ACTION_FLATTEN = "FLATTEN"
+ACTION_EXPIRE_PENDING = "EXPIRE_PENDING"
+ACTION_SESSION_FLATTEN = "SESSION_FLATTEN"
+
+#: ``(r_threshold, lock_fraction)`` pairs. The floor locks ``lock_fraction * R``
+#: above entry once the trade has travelled ``r_threshold * R`` in its favour.
+DEFAULT_R_LOCK_TIERS: Tuple[Tuple[float, float], ...] = (
+    (0.50, 0.00),
+    (1.00, 0.25),
+    (1.50, 0.50),
+    (2.00, 0.75),
+)
+
+_ON_TOKENS = frozenset({"on", "true", "1", "enable", "enabled"})
+_OFF_TOKENS = frozenset({"off", "false", "0", "disable", "disabled", "none"})
+
+_LIFECYCLE_USAGE = (
+    "⚠️ **Invalid value.** Usage: `/lifecycle on|off`\n"
+    "Examples: `/lifecycle on` or `/lifecycle off`."
+)
+_RLOCK_USAGE = (
+    "⚠️ **Invalid value.** Usage: `/rlock on|off`\n"
+    "Examples: `/rlock on` or `/rlock off`."
+)
+
+
+def _safe_float(value: Any, default: float) -> float:
+    """Return ``float(value)`` when it is a finite real number, else ``default``."""
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_int(value: Any, default: int) -> int:
+    """Return ``int(value)`` when it is convertible, else ``default``."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    """Return a bool from a real bool, a numeric flag, or a known token."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return bool(value)
+    token = str(value or "").strip().lower()
+    if token in _ON_TOKENS:
+        return True
+    if token in _OFF_TOKENS:
+        return False
+    return default
+
+
+@dataclass(frozen=True)
+class LifecyclePolicy:
+    """Immutable snapshot of the R-lock and trade-age guard settings."""
+
+    r_lock_enabled: bool = False
+    r_lock_tiers: Tuple[Tuple[float, float], ...] = DEFAULT_R_LOCK_TIERS
+    r_lock_min_r_dollars: float = 0.50
+    lifecycle_enabled: bool = False
+    derisk_after_seconds: int = 7200
+    flatten_after_seconds: int = 21600
+    pending_expire_seconds: int = 43200
+    session_flatten_enabled: bool = False
+    session_flatten_at: str = "23:30"
+    max_close_retries: int = 3
+
+
+def parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
+    """Parse ``"0.5:0.00,1.0:0.25"`` into ascending ``((r_threshold, lock_fraction), ...)``.
+
+    Malformed entries are skipped rather than raising, so a typo in ``.env`` can
+    never stop the bot from booting. The result is always sorted ascending by
+    ``r_threshold`` so "the highest reached tier" is well defined.
+    """
+    if isinstance(raw, (list, tuple)):
+        items: Sequence[Any] = list(raw)
+    else:
+        items = str(raw or "").split(",")
+
+    parsed = []
+    for item in items:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            r_thr = _safe_float(item[0], -1.0)
+            frac = _safe_float(item[1], -1.0)
+        else:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            parts = text.split(":")
+            if len(parts) != 2:
+                continue
+            r_thr = _safe_float(parts[0], -1.0)
+            frac = _safe_float(parts[1], -1.0)
+        if r_thr <= 0.0 or frac < 0.0 or frac > 1.0:
+            continue
+        parsed.append((r_thr, frac))
+    parsed.sort(key=lambda pair: pair[0])
+    return tuple(parsed)
+
+
+def read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy:
+    """Read the lifecycle policy from a config-like module.
+
+    Every value is normalised defensively: an inverted or malformed setting is
+    repaired rather than rejected, so the bot always boots.
+    """
+    tiers = parse_r_lock_tiers(getattr(cfg_mod, "R_LOCK_TIERS", DEFAULT_R_LOCK_TIERS))
+    if not tiers:
+        tiers = DEFAULT_R_LOCK_TIERS
+
+    derisk = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_DERISK_SECONDS", 7200), 7200))
+    flatten = max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_FLATTEN_SECONDS", 21600), 21600))
+    if flatten < derisk:
+        flatten = derisk
+
+    session_at = str(getattr(cfg_mod, "LIFECYCLE_SESSION_FLATTEN_AT", "23:30") or "23:30").strip()
+    parts = session_at.split(":")
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        hh, mm = 23, 30
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        hh, mm = 23, 30
+    session_at = f"{hh:02d}:{mm:02d}"
+
+    return LifecyclePolicy(
+        r_lock_enabled=_safe_bool(getattr(cfg_mod, "R_LOCK_ENABLED", False), False),
+        r_lock_tiers=tiers,
+        r_lock_min_r_dollars=max(0.0, _safe_float(getattr(cfg_mod, "R_LOCK_MIN_R_DOLLARS", 0.50), 0.50)),
+        lifecycle_enabled=_safe_bool(getattr(cfg_mod, "LIFECYCLE_ENABLED", False), False),
+        derisk_after_seconds=derisk,
+        flatten_after_seconds=flatten,
+        pending_expire_seconds=max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200), 43200)),
+        session_flatten_enabled=_safe_bool(getattr(cfg_mod, "LIFECYCLE_SESSION_FLATTEN_ENABLED", False), False),
+        session_flatten_at=session_at,
+        max_close_retries=max(0, _safe_int(getattr(cfg_mod, "LIFECYCLE_MAX_CLOSE_RETRIES", 3), 3)),
+    )
+
+
+def compute_initial_r(entry_price: float, initial_sl: float) -> Optional[float]:
+    """Return the initial risk per ounce (``|entry - initial SL|``) or ``None``."""
+    entry = _safe_float(entry_price, 0.0)
+    stop = _safe_float(initial_sl, 0.0)
+    if entry <= 0.0 or stop <= 0.0:
+        return None
+    r = abs(entry - stop)
+    return r if r > 1e-9 else None
+
+
+def compute_r_lock_floor(
+    direction: str,
+    entry_price: float,
+    initial_sl: float,
+    mfe_dollars: float,
+    policy: LifecyclePolicy,
+    digits: int = 2,
+) -> Optional[float]:
+    """Return the R-relative stop floor for the current favourable excursion.
+
+    The active tier is the highest tier whose ``r_threshold * R`` has been
+    reached. The floor is ``entry + sign * (lock_fraction * R)`` -- never below
+    entry for a BUY and never above entry for a SELL.
+
+    Returns ``None`` when the R lock is disabled, when the initial risk is
+    unknown, or when no tier has been reached yet.
+
+    Note: the existing ``BE_LOCK`` candidate in `dynamic_risk.py` may sit
+    slightly tighter than this floor (it adds the $0.50 breakeven offset). The
+    candidate picker keeps the tightest stop, so the R floor can only ever make
+    protection *better*, never worse.
+    """
+    if not policy.r_lock_enabled:
+        return None
+
+    entry = _safe_float(entry_price, 0.0)
+    if entry <= 0.0:
+        return None
+
+    r = compute_initial_r(entry, initial_sl)
+    if r is None or r < policy.r_lock_min_r_dollars:
+        return None
+
+    mfe = _safe_float(mfe_dollars, 0.0)
+    if mfe <= 0.0:
+        return None
+
+    lock_fraction = 0.0
+    reached = False
+    for r_threshold, fraction in policy.r_lock_tiers:
+        if mfe + 1e-9 >= r_threshold * r:
+            lock_fraction = fraction
+            reached = True
+        else:
+            break
+    if not reached:
+        return None
+
+    sign = 1.0 if str(direction or "BUY").strip().upper() == "BUY" else -1.0
+    return round(entry + sign * (lock_fraction * r), digits)
+
+
+def _parse_iso_utc(value: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp into an aware UTC datetime, or ``None``."""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_session_at(session_at: str) -> Tuple[int, int]:
+    """Parse ``"23:30"`` into ``(hour, minute)``."""
+    parts = str(session_at or "23:30").split(":")
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        return 23, 30
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return 23, 30
+    return hh, mm
+
+
+def evaluate_trade_age(
+    signal_data: Dict[str, Any],
+    now_utc: datetime,
+    policy: LifecyclePolicy,
+    server_offset_seconds: int = 0,
+) -> Dict[str, Any]:
+    """Decide which lifecycle action (if any) applies to a signal right now.
+
+    Returns a dict with ``action`` (one of the ``ACTION_*`` constants),
+    ``reason``, ``signal_age_seconds``, ``fill_age_seconds`` and ``server_time``.
+
+    Precedence: ``SESSION_FLATTEN`` > ``FLATTEN`` > ``DERISK`` > ``EXPIRE_PENDING``.
+    """
+    sig = signal_data if isinstance(signal_data, dict) else {}
+    has_market = bool(sig.get("market_tickets"))
+    has_pending = bool(sig.get("pending_tickets"))
+
+    now = _parse_iso_utc(now_utc) or datetime.now(timezone.utc)
+    signal_dt = _parse_iso_utc(sig.get("timestamp"))
+    fill_dt = _parse_iso_utc(sig.get("first_fill_at"))
+    signal_age = int((now - signal_dt).total_seconds()) if signal_dt else 0
+    fill_age = int((now - fill_dt).total_seconds()) if fill_dt else None
+
+    server_dt = now + timedelta(seconds=int(server_offset_seconds or 0))
+    server_time = server_dt.strftime("%H:%M")
+    hh, mm = _parse_session_at(policy.session_flatten_at)
+    server_minutes = server_dt.hour * 60 + server_dt.minute
+    session_minutes = hh * 60 + mm
+
+    result: Dict[str, Any] = {
+        "action": ACTION_NONE,
+        "reason": "",
+        "signal_age_seconds": signal_age,
+        "fill_age_seconds": fill_age,
+        "server_time": server_time,
+    }
+
+    if not policy.lifecycle_enabled:
+        result["reason"] = "lifecycle guard disabled"
+        return result
+
+    if not has_market and not has_pending:
+        result["reason"] = "no open or pending orders"
+        return result
+
+    if policy.session_flatten_enabled and server_minutes >= session_minutes:
+        result["action"] = ACTION_SESSION_FLATTEN
+        result["reason"] = f"session cut reached ({server_time} >= {policy.session_flatten_at} broker time)"
+        return result
+
+    if has_market and fill_age is not None and fill_age >= policy.flatten_after_seconds:
+        result["action"] = ACTION_FLATTEN
+        result["reason"] = f"position age {fill_age}s >= {policy.flatten_after_seconds}s"
+        return result
+
+    if has_market and fill_age is not None and fill_age >= policy.derisk_after_seconds:
+        result["action"] = ACTION_DERISK
+        result["reason"] = f"position age {fill_age}s >= {policy.derisk_after_seconds}s"
+        return result
+
+    if not has_market and has_pending and signal_age >= policy.pending_expire_seconds:
+        result["action"] = ACTION_EXPIRE_PENDING
+        result["reason"] = f"signal age {signal_age}s >= {policy.pending_expire_seconds}s and never filled"
+        return result
+
+    result["reason"] = "within thresholds"
+    return result
+
+
+def _format_tiers(policy: LifecyclePolicy) -> str:
+    return ", ".join(f"{r_threshold:g}R -> {fraction:.0%}" for r_threshold, fraction in policy.r_lock_tiers)
+
+
+def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
+    """Query or toggle the R-relative profit floor via Saved Messages (`/rlock`)."""
+    cleaned = [str(a).strip() for a in (args or []) if str(a).strip()]
+    policy = read_lifecycle_policy(cfg_mod)
+    if not cleaned:
+        badge = "🟢 ON" if policy.r_lock_enabled else "⚪ OFF"
+        return False, (
+            f"📐 **R-Relative Profit Floor (`/rlock`): {badge}**\n"
+            f"• Tiers: `{_format_tiers(policy)}`\n"
+            f"• Minimum R: `${policy.r_lock_min_r_dollars:.2f}` per ounce\n"
+            "• Change: `/rlock on` | `/rlock off`"
+        )
+    token = cleaned[0].lower()
+    if token in _ON_TOKENS:
+        setattr(cfg_mod, "R_LOCK_ENABLED", True)
+        return True, (
+            f"📐 **R-Relative Profit Floor Enabled → `ON`**\n"
+            f"• Tiers: `{_format_tiers(policy)}`\n"
+            "• The floor is only ever tighter than the existing ATR trail stop."
+        )
+    if token in _OFF_TOKENS:
+        setattr(cfg_mod, "R_LOCK_ENABLED", False)
+        return True, "⚪ **R-Relative Profit Floor Disabled → `OFF`** (ATR trail only)."
+    return False, _RLOCK_USAGE
+
+
+def apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
+    """Query or toggle the trade-age guard via Saved Messages (`/lifecycle`)."""
+    cleaned = [str(a).strip() for a in (args or []) if str(a).strip()]
+    policy = read_lifecycle_policy(cfg_mod)
+    if not cleaned:
+        badge = "🟢 ON" if policy.lifecycle_enabled else "⚪ OFF"
+        session = (
+            f"`{policy.session_flatten_at}` broker time"
+            if policy.session_flatten_enabled
+            else "⚪ OFF"
+        )
+        return False, (
+            f"⏱ **Trade Lifecycle Guard (`/lifecycle`): {badge}**\n"
+            f"• De-risk at: `{policy.derisk_after_seconds}s` (cancel pending + move to BE)\n"
+            f"• Flatten at: `{policy.flatten_after_seconds}s` (close at market)\n"
+            f"• Pending expiry: `{policy.pending_expire_seconds}s`\n"
+            f"• Session cut: {session}\n"
+            f"• Max close retries: `{policy.max_close_retries}`\n"
+            "• Change: `/lifecycle on` | `/lifecycle off`"
+        )
+    token = cleaned[0].lower()
+    if token in _ON_TOKENS:
+        setattr(cfg_mod, "LIFECYCLE_ENABLED", True)
+        return True, (
+            "⏱ **Trade Lifecycle Guard Enabled → `ON`**\n"
+            f"• De-risk at `{policy.derisk_after_seconds}s`, flatten at `{policy.flatten_after_seconds}s`, "
+            f"pending expiry `{policy.pending_expire_seconds}s`."
+        )
+    if token in _OFF_TOKENS:
+        setattr(cfg_mod, "LIFECYCLE_ENABLED", False)
+        return True, "⚪ **Trade Lifecycle Guard Disabled → `OFF`** (no age-based de-risk or flatten)."
+    return False, _LIFECYCLE_USAGE
+```
+
+- [ ] **Step 4: Add the config knobs**
+
+In `config.py`, immediately after the `DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT` block (line 543-545), insert:
+
+```python
+
+# Trade Lifecycle Guard (R-relative profit floor + trade-age management)
+# Both features ship DISABLED: enable live with `/rlock on` and `/lifecycle on`.
+R_LOCK_ENABLED: bool = _env_bool("R_LOCK_ENABLED", False)
+R_LOCK_TIERS: str = _env_choice("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75", ())
+R_LOCK_MIN_R_DOLLARS: float = _env_float(
+    "R_LOCK_MIN_R_DOLLARS", 0.50, min_val=0.0, max_val=100.0
+)
+LIFECYCLE_ENABLED: bool = _env_bool("LIFECYCLE_ENABLED", False)
+LIFECYCLE_DERISK_SECONDS: int = _env_int(
+    "LIFECYCLE_DERISK_SECONDS", 7200, min_val=0, max_val=604800
+)
+LIFECYCLE_FLATTEN_SECONDS: int = _env_int(
+    "LIFECYCLE_FLATTEN_SECONDS", 21600, min_val=0, max_val=604800
+)
+LIFECYCLE_PENDING_EXPIRE_SECONDS: int = _env_int(
+    "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200, min_val=0, max_val=604800
+)
+LIFECYCLE_SESSION_FLATTEN_ENABLED: bool = _env_bool("LIFECYCLE_SESSION_FLATTEN_ENABLED", False)
+LIFECYCLE_SESSION_FLATTEN_AT: str = _env_choice("LIFECYCLE_SESSION_FLATTEN_AT", "23:30", ())
+LIFECYCLE_MAX_CLOSE_RETRIES: int = _env_int(
+    "LIFECYCLE_MAX_CLOSE_RETRIES", 3, min_val=0, max_val=50
+)
+```
+
+> **Note on `_env_choice`:** it validates against a tuple of allowed values and falls back to the default when the value is not in that tuple. Passing `()` would reject every value, so **do not** use `_env_choice` for `R_LOCK_TIERS` or `LIFECYCLE_SESSION_FLATTEN_AT`. Replace those two lines with plain `os.getenv` reads:
+
+```python
+R_LOCK_TIERS: str = os.getenv("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75").strip()
+LIFECYCLE_SESSION_FLATTEN_AT: str = os.getenv("LIFECYCLE_SESSION_FLATTEN_AT", "23:30").strip()
+```
+
+The final knob block in `config.py` must therefore read exactly:
+
+```python
+
+# Trade Lifecycle Guard (R-relative profit floor + trade-age management)
+# Both features ship DISABLED: enable live with `/rlock on` and `/lifecycle on`.
+R_LOCK_ENABLED: bool = _env_bool("R_LOCK_ENABLED", False)
+R_LOCK_TIERS: str = os.getenv("R_LOCK_TIERS", "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75").strip()
+R_LOCK_MIN_R_DOLLARS: float = _env_float(
+    "R_LOCK_MIN_R_DOLLARS", 0.50, min_val=0.0, max_val=100.0
+)
+LIFECYCLE_ENABLED: bool = _env_bool("LIFECYCLE_ENABLED", False)
+LIFECYCLE_DERISK_SECONDS: int = _env_int(
+    "LIFECYCLE_DERISK_SECONDS", 7200, min_val=0, max_val=604800
+)
+LIFECYCLE_FLATTEN_SECONDS: int = _env_int(
+    "LIFECYCLE_FLATTEN_SECONDS", 21600, min_val=0, max_val=604800
+)
+LIFECYCLE_PENDING_EXPIRE_SECONDS: int = _env_int(
+    "LIFECYCLE_PENDING_EXPIRE_SECONDS", 43200, min_val=0, max_val=604800
+)
+LIFECYCLE_SESSION_FLATTEN_ENABLED: bool = _env_bool("LIFECYCLE_SESSION_FLATTEN_ENABLED", False)
+LIFECYCLE_SESSION_FLATTEN_AT: str = os.getenv("LIFECYCLE_SESSION_FLATTEN_AT", "23:30").strip()
+LIFECYCLE_MAX_CLOSE_RETRIES: int = _env_int(
+    "LIFECYCLE_MAX_CLOSE_RETRIES", 3, min_val=0, max_val=50
+)
+```
+
+Then append after the existing `validate_dynamic_risk_pairs()` function and its call (i.e. after line 565):
+
+```python
+
+
+def validate_lifecycle_pairs() -> None:
+    """Ensure the trade-age guard thresholds are ordered (flatten must not precede de-risk)."""
+    g = globals()
+    derisk = int(g.get("LIFECYCLE_DERISK_SECONDS", 0))
+    flatten = int(g.get("LIFECYCLE_FLATTEN_SECONDS", 0))
+    if flatten < derisk:
+        _cfg_logger.warning(
+            f"LIFECYCLE_FLATTEN_SECONDS ({flatten}) < LIFECYCLE_DERISK_SECONDS ({derisk}); "
+            "raising the flatten threshold to match."
+        )
+        g["LIFECYCLE_FLATTEN_SECONDS"] = derisk
+
+
+validate_lifecycle_pairs()
+```
+
+- [ ] **Step 5: Add the startup validation**
+
+In `startup_checks.py`, add a new function immediately after `_validate_dynamic_risk_config` (which ends at line 563) and call it from `validate_environment` right after the `_validate_dynamic_risk_config(cfg, errors)` call at line 566:
+
+```python
+
+
+def _validate_lifecycle_config(cfg: Any, errors: List[str]) -> None:
+    """Validate the Trade Lifecycle Guard knobs (R floor + trade-age guard)."""
+    for bool_flag in ("R_LOCK_ENABLED", "LIFECYCLE_ENABLED", "LIFECYCLE_SESSION_FLATTEN_ENABLED"):
+        if hasattr(cfg, bool_flag):
+            flag_val = getattr(cfg, bool_flag)
+            if not isinstance(flag_val, bool):
+                errors.append(f"{bool_flag} must be a bool, got {flag_val!r}.")
+
+    derisk = getattr(cfg, "LIFECYCLE_DERISK_SECONDS", 7200)
+    flatten = getattr(cfg, "LIFECYCLE_FLATTEN_SECONDS", 21600)
+    if not isinstance(derisk, int) or isinstance(derisk, bool) or derisk < 0:
+        errors.append(f"LIFECYCLE_DERISK_SECONDS must be a non-negative int, got {derisk!r}.")
+    if not isinstance(flatten, int) or isinstance(flatten, bool) or flatten < 0:
+        errors.append(f"LIFECYCLE_FLATTEN_SECONDS must be a non-negative int, got {flatten!r}.")
+    if isinstance(derisk, int) and isinstance(flatten, int) and not isinstance(derisk, bool) and not isinstance(flatten, bool):
+        if flatten < derisk:
+            errors.append(
+                f"LIFECYCLE_FLATTEN_SECONDS ({flatten}) must be >= LIFECYCLE_DERISK_SECONDS ({derisk})."
+            )
+
+    tiers_raw = getattr(cfg, "R_LOCK_TIERS", "")
+    if str(tiers_raw).strip():
+        from risk_lifecycle import parse_r_lock_tiers
+
+        parsed = parse_r_lock_tiers(tiers_raw)
+        if not parsed:
+            errors.append(
+                f"R_LOCK_TIERS ({tiers_raw!r}) contains no valid 'r:fraction' pair."
+            )
+
+    session_at = str(getattr(cfg, "LIFECYCLE_SESSION_FLATTEN_AT", "23:30")).strip()
+    parts = session_at.split(":")
+    try:
+        hh = int(parts[0])
+        mm = int(parts[1]) if len(parts) > 1 else 0
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+    except (TypeError, ValueError, IndexError):
+        errors.append(f"LIFECYCLE_SESSION_FLATTEN_AT must be 'HH:MM', got {session_at!r}.")
+```
+
+And change the call site at line 566 from:
+
+```python
+    _validate_dynamic_risk_config(cfg, errors)
+```
+
+to:
+
+```python
+    _validate_dynamic_risk_config(cfg, errors)
+    _validate_lifecycle_config(cfg, errors)
+```
+
+- [ ] **Step 6: Add the knobs to `.env.example`**
+
+Append to `.env.example`:
+
+```
+# Trade Lifecycle Guard (R-relative profit floor + trade-age management)
+# Both ship DISABLED. Enable live from Saved Messages: /rlock on, /lifecycle on.
+R_LOCK_ENABLED=false
+R_LOCK_TIERS=0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75
+R_LOCK_MIN_R_DOLLARS=0.50
+LIFECYCLE_ENABLED=false
+LIFECYCLE_DERISK_SECONDS=7200
+LIFECYCLE_FLATTEN_SECONDS=21600
+LIFECYCLE_PENDING_EXPIRE_SECONDS=43200
+LIFECYCLE_SESSION_FLATTEN_ENABLED=false
+LIFECYCLE_SESSION_FLATTEN_AT=23:30
+LIFECYCLE_MAX_CLOSE_RETRIES=3
+```
+
+Do **not** modify the local `.env` in this task — `.env` is gitignored and is a runtime artifact.
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+```powershell
+cd C:\Users\kambo\Code\telegram-mt5-copier
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS (19 tests).
+
+- [ ] **Step 8: Run the full suite to confirm nothing regressed**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: `241 passed` plus the new tests, **0 failed**.
+
+- [ ] **Step 9: Commit**
+
+```powershell
+git add risk_lifecycle.py tests/test_trade_lifecycle.py config.py startup_checks.py .env.example
+git commit -m "feat(risk_lifecycle): pure trade-lifecycle domain core + config knobs
+
+Adds the R-relative profit floor and the trade-age guard as a pure, stdlib-only
+domain module. Both features ship disabled (R_LOCK_ENABLED=false,
+LIFECYCLE_ENABLED=false) so a fresh clone behaves identically to v3.7.0."
+```
+
+---
+
+## Task 2: `dynamic_risk.py` — the `R_LOCK` stop candidate
+
+**Files:**
+- Modify: `dynamic_risk.py:471-586` (`compute_dynamic_atr_trail_stop`)
+- Modify: `tests/test_trade_lifecycle.py` (append the candidate tests)
+
+**Interfaces:**
+- Consumes: nothing from Task 1 (this task is independent of `risk_lifecycle`).
+- Produces: `compute_dynamic_atr_trail_stop(..., r_lock_floor: Optional[float] = None) -> Dict[str, Any]` — the result dict gains `"r_lock_floor"`. Tie-break priority becomes `R_LOCK` > `MILESTONE_FLOOR` > `ATR_TRAIL` > `BE_LOCK`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- dynamic_risk R_LOCK candidate ---------------------------------------
+
+def _atr_policy():
+    import dynamic_risk
+    import config
+
+    return dynamic_risk.read_dynamic_risk_policy(config)
+
+
+def test_trail_stop_unchanged_when_r_lock_floor_is_none():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=2.0,
+        policy=pol,
+        digits=2,
+    )
+    assert res["r_lock_floor"] is None
+    assert res["stop_source"] in ("ATR_TRAIL", "BE_LOCK", "MILESTONE_FLOOR")
+
+
+def test_trail_stop_uses_r_lock_floor_when_tighter():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3880.0,
+        atr=20.0,              # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+        policy=pol,
+        digits=2,
+        r_lock_floor=3898.0,
+    )
+    assert res["r_lock_floor"] == pytest.approx(3898.0)
+    assert res["candidate_sl"] == pytest.approx(3898.0)
+    assert res["stop_source"] == "R_LOCK"
+
+
+def test_trail_stop_r_lock_never_loosens_an_existing_stop():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3895.0,
+        live_price=3905.0,
+        prev_peak=3905.0,
+        current_sl=3900.0,     # already tighter than the R floor
+        atr=2.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3898.0,
+    )
+    assert res["candidate_sl"] >= 3900.0
+
+
+def test_trail_stop_sell_r_lock_is_mirrored():
+    import dynamic_risk
+
+    pol = _atr_policy()
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="SELL",
+        entry_price=3905.0,
+        live_price=3895.0,
+        prev_peak=3895.0,
+        current_sl=3920.0,
+        atr=20.0,
+        policy=pol,
+        digits=2,
+        r_lock_floor=3902.0,
+    )
+    assert res["candidate_sl"] == pytest.approx(3902.0)
+    assert res["stop_source"] == "R_LOCK"
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — `TypeError: compute_dynamic_atr_trail_stop() got an unexpected keyword argument 'r_lock_floor'`.
+
+- [ ] **Step 3: Implement the candidate**
+
+In `dynamic_risk.py`, change the signature at line 471-484 to add the new keyword:
+
+```python
+def compute_dynamic_atr_trail_stop(
+    direction: str,
+    entry_price: float,
+    live_price: float,
+    prev_peak: Optional[float],
+    current_sl: Optional[float],
+    atr: float,
+    policy: DynamicRiskPolicy,
+    digits: int = 2,
+    stops_buffer: float = 0.0,
+    cleared_milestones: Optional[Sequence[str]] = None,
+    tp_levels: Optional[Dict[str, float]] = None,
+    apply_milestone_floor: bool = True,
+    r_lock_floor: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
+
+    `r_lock_floor` is an optional extra floor contributed by the R-relative profit
+    lock (`risk_lifecycle.compute_r_lock_floor`). It joins the same candidate list
+    as the milestone floor, the ATR trail and the BE lock, so the picker keeps the
+    tightest stop and the forward-only invariant is preserved. Passing `None`
+    (the default) leaves every existing caller byte-for-byte unchanged.
+    """
+```
+
+Then replace the candidate block at lines 529-535 with:
+
+```python
+    candidates: List[Tuple[int, str, float]] = []
+    if r_lock_floor is not None and _safe_float(r_lock_floor, 0.0) > 0.0:
+        candidates.append((0, "R_LOCK", round(float(r_lock_floor), digits)))
+    if milestone_floor is not None:
+        candidates.append((1, "MILESTONE_FLOOR", milestone_floor))
+    if atr_sl is not None:
+        candidates.append((2, "ATR_TRAIL", atr_sl))
+    if be_sl is not None:
+        candidates.append((3, "BE_LOCK", be_sl))
+```
+
+The tie-break comment above the picker at line 558 must be updated to record the new priority:
+
+```python
+    # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > BE_LOCK.
+    # The picker always keeps the tightest stop, so a floor can only tighten it.
+```
+
+Finally, add `"r_lock_floor": None` to the **early return** dict (the `not policy.trail_enabled or atr_f <= 0.0 ...` branch at lines 488-506) and to the **`not armed`** branch (lines 539-556), so the key is present in every return path:
+
+```python
+            "r_lock_floor": None,
+```
+
+in the early-return dict, and
+
+```python
+            "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
+```
+
+in the `not armed` dict.
+
+In the final return dict (lines 569-586), add:
+
+```python
+        "r_lock_floor": (round(float(r_lock_floor), digits) if r_lock_floor is not None else None),
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**. The existing trail tests must still pass — `r_lock_floor=None` keeps the previous behaviour exactly.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add dynamic_risk.py tests/test_trade_lifecycle.py
+git commit -m "feat(dynamic_risk): add R_LOCK stop candidate to the forward-only picker
+
+compute_dynamic_atr_trail_stop gains an additive r_lock_floor keyword. The
+floor joins the existing candidate list, so the picker keeps the tightest stop
+and the never-loosens invariant is preserved. Default None leaves every
+existing caller unchanged."
+```
+
+---
+
+## Task 3: `mt5_executor.py` — capture `initial_sl` and `first_fill_at`
+
+**Files:**
+- Modify: `mt5_executor.py:2351-2364` (`_execute_4layer_specs` — the layer dict)
+- Modify: `mt5_executor.py:6073-6075` (`hydrate_signal_layers_from_mt5` — the fill transition)
+- Modify: `tests/test_trade_lifecycle.py` (append the capture tests)
+
+**Interfaces:**
+- Consumes: nothing from Task 1-2.
+- Produces:
+  - `signal_data["layers"][<layer>]["initial_sl"]` — `Optional[float]`, the stop the order was placed with.
+  - `signal_data["first_fill_at"]` — `Optional[str]`, ISO-8601 UTC timestamp of the first fill.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- executor state capture ---------------------------------------------
+
+def test_execute_4layer_specs_records_initial_sl(monkeypatch):
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    captured = {}
+
+    def _fake_layer(symbol, direction, target_price, lot, sl, tp, tick, **kwargs):
+        captured["sl"] = sl
+        return 9001, "MARKET"
+
+    monkeypatch.setattr(ex, "_execute_layer_price", _fake_layer)
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=3880.0,
+        tick=SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0),
+    )
+    assert captured["sl"] == 3880.0
+    assert layers["L1"]["initial_sl"] == pytest.approx(3880.0)
+
+
+def test_hydrate_signal_layers_stamps_first_fill_at(monkeypatch):
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    sig = {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "layers": {
+            "L1": {"ticket": 101, "status": "PENDING", "lot": 0.01, "remaining_lot": 0.01},
+        },
+        "market_tickets": [],
+        "pending_tickets": [101],
+    }
+    positions = {
+        101: SimpleNamespace(
+            ticket=101,
+            type=0,
+            price_open=3895.0,
+            volume=0.01,
+            sl=3880.0,
+            tp=3905.0,
+            profit=0.0,
+        )
+    }
+    ex.hydrate_signal_layers_from_mt5(sig, live_positions_by_ticket=positions)
+    assert sig["layers"]["L1"]["status"] == "FILLED"
+    assert sig.get("first_fill_at"), "first_fill_at must be stamped on the first fill"
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — `KeyError: 'initial_sl'` and `first_fill_at` is `None`.
+
+- [ ] **Step 3: Capture `initial_sl` at placement**
+
+In `mt5_executor.py`, inside `_execute_4layer_specs`, extend the `layer_dict` construction at lines 2351-2364 to:
+
+```python
+                layer_dict: Dict[str, Any] = {
+                    "lot": l_lot,
+                    "remaining_lot": l_lot,
+                    "target_price": target_px,
+                    "tp": l_tp,
+                    "tp_stage": "TP1",
+                    "ticket": t,
+                    "order_type": o_type,
+                    "status": status,
+                    # The stop the order was actually placed with. The trailing
+                    # engine overwrites `sl`/`broker_sl`, so the initial risk R
+                    # must be captured here to stay available for the R-relative
+                    # profit floor.
+                    "initial_sl": (round(float(sl), 2) if sl is not None else None),
+                }
+```
+
+- [ ] **Step 4: Stamp `first_fill_at` on the first fill**
+
+In `mt5_executor.py`, inside `hydrate_signal_layers_from_mt5`, replace the fill transition at lines 6073-6075:
+
+```python
+                if st_u == "PENDING":
+                    lv["status"] = "FILLED"
+                    changed = True
+```
+
+with:
+
+```python
+                if st_u == "PENDING":
+                    lv["status"] = "FILLED"
+                    changed = True
+                    # First fill of this signal: start the position-age clock used
+                    # by the trade-age guard (`risk_lifecycle.evaluate_trade_age`).
+                    if not signal_data.get("first_fill_at"):
+                        signal_data["first_fill_at"] = datetime.now(timezone.utc).isoformat()
+                        changed = True
+```
+
+If `datetime` / `timezone` are not already imported in `mt5_executor.py`, add `from datetime import datetime, timezone` to the imports at the top of the file.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 7: Commit**
+
+```powershell
+git add mt5_executor.py tests/test_trade_lifecycle.py
+git commit -m "feat(mt5_executor): capture initial_sl per layer and stamp first_fill_at
+
+initial_sl records the stop the order was placed with, because the trailing
+engine overwrites sl/broker_sl and the R-relative floor needs the original
+risk. first_fill_at starts the position-age clock for the trade-age guard."
+```
+
+---
+
+## Task 4: `mt5_executor.py` — compute and apply the R floor
+
+**Files:**
+- Modify: `mt5_executor.py:104-110` (the `dynamic_risk` import block)
+- Modify: `mt5_executor.py:8137-8152` (`evaluate_dynamic_atr_engine` — the trail call)
+- Modify: `mt5_executor.py:1320-1356` (`_get_dynamic_risk_policy` — add a lifecycle policy resolver)
+- Modify: `mt5_executor.py:168-205` (`_CFG_IMPORT_SNAPSHOT` name list — add the new knobs)
+- Modify: `tests/test_trade_lifecycle.py` (append the integration tests)
+
+**Interfaces:**
+- Consumes: `risk_lifecycle.read_lifecycle_policy`, `risk_lifecycle.compute_r_lock_floor`, `LifecyclePolicy` (Task 1); `compute_dynamic_atr_trail_stop(..., r_lock_floor=...)` (Task 2); `layers[...]["initial_sl"]` (Task 3).
+- Produces: `MT5Executor._get_lifecycle_policy() -> LifecyclePolicy`; the trail engine now receives a per-layer `r_lock_floor`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- executor R-floor wiring ---------------------------------------------
+
+def _atr_signal(entry: float, sl: float, ticket: int = 101):
+    return {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "layers": {
+            "L1": {
+                "ticket": ticket,
+                "status": "OPEN",
+                "lot": 0.01,
+                "remaining_lot": 0.01,
+                "entry_price": entry,
+                "initial_sl": sl,
+                "broker_sl": sl,
+            },
+        },
+        "market_tickets": [ticket],
+        "pending_tickets": [],
+        "tp_levels": {"TP1": entry + 10.0, "TP2": entry + 20.0},
+        "runner_cleared_milestones": [],
+    }
+
+
+def test_executor_applies_r_lock_floor(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0     # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+
+    sig = _atr_signal(3895.0, 3880.0)   # R = 15.0
+    # Live price is $11.00 in favour -> 0.73R -> tier 0.5R reached -> floor = entry
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert res.get("updated_tickets"), "the R floor must move the stop"
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.0)
+    assert sig["layers"]["L1"]["initial_sl"] == pytest.approx(3880.0)
+
+
+def test_executor_r_lock_is_inert_when_disabled(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", False)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_executor_r_lock_skipped_without_initial_sl(monkeypatch):
+    import config
+    import mt5_executor
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 20.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    sig["layers"]["L1"].pop("initial_sl")     # a signal opened before the upgrade
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — the stop is not moved to the R floor (the ATR trail candidate wins instead).
+
+- [ ] **Step 3: Import the lifecycle module in `mt5_executor.py`**
+
+At the `from dynamic_risk import (...)` block (lines 104-110), add:
+
+```python
+from risk_lifecycle import (
+    LifecyclePolicy,
+    compute_r_lock_floor,
+    read_lifecycle_policy,
+)
+```
+
+- [ ] **Step 4: Register the new knobs in `_CFG_IMPORT_SNAPSHOT`**
+
+In `mt5_executor.py`, add the ten new knob names to the `_CFG_IMPORT_SNAPSHOT` name list (the tuple that ends at line 205 with `"MT5_PATH",`), immediately before the closing `)`:
+
+```python
+        "R_LOCK_ENABLED",
+        "R_LOCK_TIERS",
+        "R_LOCK_MIN_R_DOLLARS",
+        "LIFECYCLE_ENABLED",
+        "LIFECYCLE_DERISK_SECONDS",
+        "LIFECYCLE_FLATTEN_SECONDS",
+        "LIFECYCLE_PENDING_EXPIRE_SECONDS",
+        "LIFECYCLE_SESSION_FLATTEN_ENABLED",
+        "LIFECYCLE_SESSION_FLATTEN_AT",
+        "LIFECYCLE_MAX_CLOSE_RETRIES",
+```
+
+Then import the constants into the module globals so `_cfg()` can resolve them. Add them next to the existing `DYNAMIC_ATR_*` imports at the top of `mt5_executor.py`:
+
+```python
+from config import (
+    ...
+    R_LOCK_ENABLED,
+    R_LOCK_TIERS,
+    R_LOCK_MIN_R_DOLLARS,
+    LIFECYCLE_ENABLED,
+    LIFECYCLE_DERISK_SECONDS,
+    LIFECYCLE_FLATTEN_SECONDS,
+    LIFECYCLE_PENDING_EXPIRE_SECONDS,
+    LIFECYCLE_SESSION_FLATTEN_ENABLED,
+    LIFECYCLE_SESSION_FLATTEN_AT,
+    LIFECYCLE_MAX_CLOSE_RETRIES,
+)
+```
+
+> If `mt5_executor.py` does not import `config` names one-by-one, instead read them through `getattr(_config, ...)` in the policy resolver below — the resolver is the single place that matters.
+
+- [ ] **Step 5: Add the lifecycle policy resolver**
+
+In `mt5_executor.py`, add this method immediately after `_get_dynamic_risk_policy` (which ends at line 1356):
+
+```python
+    def _get_lifecycle_policy(self) -> LifecyclePolicy:
+        """Resolve the LifecyclePolicy respecting monkeypatches on either config or mt5_executor."""
+        proxy = SimpleNamespace(
+            R_LOCK_ENABLED=_cfg("R_LOCK_ENABLED", R_LOCK_ENABLED),
+            R_LOCK_TIERS=_cfg("R_LOCK_TIERS", R_LOCK_TIERS),
+            R_LOCK_MIN_R_DOLLARS=_cfg("R_LOCK_MIN_R_DOLLARS", R_LOCK_MIN_R_DOLLARS),
+            LIFECYCLE_ENABLED=_cfg("LIFECYCLE_ENABLED", LIFECYCLE_ENABLED),
+            LIFECYCLE_DERISK_SECONDS=_cfg("LIFECYCLE_DERISK_SECONDS", LIFECYCLE_DERISK_SECONDS),
+            LIFECYCLE_FLATTEN_SECONDS=_cfg("LIFECYCLE_FLATTEN_SECONDS", LIFECYCLE_FLATTEN_SECONDS),
+            LIFECYCLE_PENDING_EXPIRE_SECONDS=_cfg(
+                "LIFECYCLE_PENDING_EXPIRE_SECONDS", LIFECYCLE_PENDING_EXPIRE_SECONDS
+            ),
+            LIFECYCLE_SESSION_FLATTEN_ENABLED=_cfg(
+                "LIFECYCLE_SESSION_FLATTEN_ENABLED", LIFECYCLE_SESSION_FLATTEN_ENABLED
+            ),
+            LIFECYCLE_SESSION_FLATTEN_AT=_cfg(
+                "LIFECYCLE_SESSION_FLATTEN_AT", LIFECYCLE_SESSION_FLATTEN_AT
+            ),
+            LIFECYCLE_MAX_CLOSE_RETRIES=_cfg(
+                "LIFECYCLE_MAX_CLOSE_RETRIES", LIFECYCLE_MAX_CLOSE_RETRIES
+            ),
+        )
+        return read_lifecycle_policy(proxy)
+```
+
+- [ ] **Step 6: Compute and pass the R floor**
+
+In `mt5_executor.py`, inside `evaluate_dynamic_atr_engine`, insert the floor computation immediately before the `# 2) Dynamic Trailing SL` comment at line 8137:
+
+```python
+            # 1b) R-relative profit floor.
+            # The ATR trail owns the tight stop; this floor only ever raises the
+            # stop, and it scales with the trade's own initial risk R so a wide
+            # stop is not protected after the same absolute move as a scalp.
+            r_lock_floor = None
+            lifecycle_pol = self._get_lifecycle_policy()
+            initial_sl = _num(lv.get("initial_sl"), 0.0)
+            if lifecycle_pol.r_lock_enabled and initial_sl > 0.0:
+                r_lock_floor = compute_r_lock_floor(
+                    direction=direction,
+                    entry_price=entry_px,
+                    initial_sl=initial_sl,
+                    mfe_dollars=sign * (layer_peak - entry_px),
+                    policy=lifecycle_pol,
+                    digits=digits,
+                )
+            elif lifecycle_pol.r_lock_enabled and not lv.get("_r_lock_skipped_logged"):
+                lv["_r_lock_skipped_logged"] = True
+                logger.info(
+                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (signal opened before the upgrade); "
+                    "ATR trail only."
+                )
+```
+
+Then add the new keyword to the `compute_dynamic_atr_trail_stop(...)` call at lines 8139-8152:
+
+```python
+            trail_step = compute_dynamic_atr_trail_stop(
+                direction=direction,
+                entry_price=entry_px,
+                live_price=live_price,
+                prev_peak=lv.get("dynamic_atr_trail_peak"),
+                current_sl=cur_sl,
+                atr=atr,
+                policy=policy,
+                digits=digits,
+                stops_buffer=stops_buffer,
+                cleared_milestones=sig_cleared,
+                tp_levels=tp_levels,
+                apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
+                r_lock_floor=r_lock_floor,
+            )
+```
+
+- [ ] **Step 7: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 8: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**. Pay attention to `tests/test_dynamic_risk_management.py` and `tests/test_msg_10180_10196_regressions.py` — they assert on `stop_source` values; with `R_LOCK_ENABLED=false` by default the tie-break change must not alter them.
+
+- [ ] **Step 9: Commit**
+
+```powershell
+git add mt5_executor.py tests/test_trade_lifecycle.py
+git commit -m "feat(mt5_executor): wire the R-relative profit floor into the trail engine
+
+Each layer computes its own R floor from entry and the captured initial_sl and
+passes it to compute_dynamic_atr_trail_stop as an extra candidate. The ATR trail
+still owns the tight stop and the never-loosens invariant holds. Layers without
+initial_sl (signals opened before the upgrade) are skipped and logged once."
+```
+
+---
+
+## Task 5: `mt5_executor.py` — the lifecycle actions
+
+**Files:**
+- Modify: `mt5_executor.py` (add four methods after `close_signal_exposure`, which ends at line 5490)
+- Modify: `tests/test_trade_lifecycle.py` (append the action tests)
+
+**Interfaces:**
+- Consumes: `risk_lifecycle` action constants (Task 1); `close_signal_exposure`, `cancel_signal_pending_orders`, `modify_position_sltp`, `is_within_freeze_level` (existing).
+- Produces:
+  - `MT5Executor.apply_lifecycle_derisk(signal_data: Dict[str, Any]) -> Dict[str, Any]`
+  - `MT5Executor.apply_lifecycle_flatten(signal_data: Dict[str, Any]) -> Dict[str, Any]`
+  - `MT5Executor.apply_lifecycle_pending_expire(signal_data: Dict[str, Any]) -> Dict[str, Any]`
+  - `MT5Executor.apply_lifecycle_action(signal_data: Dict[str, Any], action: str) -> Dict[str, Any]`
+
+  All four return a dict with the keys `"action"`, `"moved"`, `"closed"`, `"cancelled"`, `"failed"`, `"ok"`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- lifecycle actions ----------------------------------------------------
+
+def _lifecycle_signal():
+    return {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "layers": {
+            "L1": {
+                "ticket": 101,
+                "status": "OPEN",
+                "lot": 0.01,
+                "remaining_lot": 0.01,
+                "entry_price": 3895.0,
+                "initial_sl": 3880.0,
+                "broker_sl": 3880.0,
+            },
+            "L2": {
+                "ticket": 102,
+                "status": "PENDING",
+                "lot": 0.01,
+                "remaining_lot": 0.01,
+                "target_price": 3890.0,
+            },
+        },
+        "market_tickets": [101],
+        "pending_tickets": [102],
+    }
+
+
+def test_apply_lifecycle_derisk_moves_open_layers_to_be(monkeypatch):
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert res["ok"] is True
+    assert res["action"] == "DERISK"
+    assert calls and calls[0][0] == 101
+    assert calls[0][1] == pytest.approx(3895.50)   # entry + the $0.50 BE offset
+    assert res["cancelled"] == [102]
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.50)
+
+
+def test_apply_lifecycle_derisk_never_loosens_an_existing_stop(monkeypatch):
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [])
+
+    sig = _lifecycle_signal()
+    sig["layers"]["L1"]["broker_sl"] = 3900.0    # already tighter than BE
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert calls == []
+    assert res["moved"] == []
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.0)
+
+
+def test_apply_lifecycle_flatten_closes_everything(monkeypatch):
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [101], "cancelled_orders": [102]},
+    )
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_flatten(sig)
+
+    assert res["ok"] is True
+    assert res["action"] == "FLATTEN"
+    assert res["closed"] == [101]
+    assert res["cancelled"] == [102]
+
+
+def test_apply_lifecycle_pending_expire_cancels_only(monkeypatch):
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    sig["market_tickets"] = []
+    res = ex.apply_lifecycle_pending_expire(sig)
+
+    assert res["ok"] is True
+    assert res["action"] == "EXPIRE_PENDING"
+    assert res["closed"] == []
+    assert res["cancelled"] == [102]
+
+
+def test_apply_lifecycle_action_dispatches(monkeypatch):
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+    monkeypatch.setattr(
+        ex,
+        "close_signal_exposure",
+        lambda sig: {"closed_tickets": [101], "cancelled_orders": [102]},
+    )
+
+    res = ex.apply_lifecycle_action(_lifecycle_signal(), "FLATTEN")
+    assert res["action"] == "FLATTEN"
+
+    res_none = ex.apply_lifecycle_action(_lifecycle_signal(), "NONE")
+    assert res_none["action"] == "NONE"
+    assert res_none["ok"] is True
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — `AttributeError: 'MT5Executor' object has no attribute 'apply_lifecycle_derisk'`.
+
+- [ ] **Step 3: Implement the four methods**
+
+Add the following to `mt5_executor.py`, immediately after `close_signal_exposure` (which ends at line 5490):
+
+```python
+    def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel unfilled pending limits and move every open layer to breakeven.
+
+        Never loosens an existing stop: a layer whose broker SL is already
+        tighter than the breakeven price is left untouched.
+        """
+        result: Dict[str, Any] = {
+            "action": "DERISK",
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+
+        try:
+            cancelled = self.cancel_signal_pending_orders(signal_data) or []
+            result["cancelled"] = [int(t) for t in cancelled if int(t) > 0]
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE DERISK] cancel pending failed: {exc}")
+            result["failed"].append(f"cancel:{exc}")
+
+        symbol = signal_data.get("symbol") or _cfg("DEFAULT_SYMBOL", DEFAULT_SYMBOL)
+        direction = (signal_data.get("direction") or "BUY").strip().upper()
+        is_buy = direction == "BUY"
+        sym_info = self.get_symbol_info(symbol)
+        digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
+        offset = max(0.0, _cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS))
+        layers = signal_data.get("layers") or {}
+
+        # Publish the signal's initial risk (per ounce) so the ledger can record
+        # `initial_r_per_oz` and `r_at_exit` at close time.
+        _risks = []
+        for _lk, _lv in layers.items():
+            if not isinstance(_lv, dict):
+                continue
+            _e = _num(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
+            _s = _num(_lv.get("initial_sl"), 0.0)
+            if _e > 0.0 and _s > 0.0:
+                _risks.append(abs(_e - _s))
+        if _risks:
+            signal_data["initial_r_per_oz"] = round(sum(_risks) / len(_risks), 4)
+
+        for lk, lv in list(layers.items()):
+            if not isinstance(lv, dict):
+                continue
+            ticket = _int_num(lv.get("ticket"), 0)
+            if ticket <= 0:
+                continue
+            entry = _num(lv.get("entry_price") or lv.get("entry") or lv.get("target_price"), 0.0)
+            if entry <= 0.0:
+                result["failed"].append(f"{lk}:no_entry")
+                continue
+            be_sl = round(entry + offset if is_buy else entry - offset, digits)
+            cur_sl = _num(lv.get("broker_sl") or lv.get("sl"), 0.0)
+            if cur_sl > 0.0:
+                already_tighter = (cur_sl >= be_sl - 1e-6) if is_buy else (cur_sl <= be_sl + 1e-6)
+                if already_tighter:
+                    continue
+            try:
+                if self.modify_position_sltp(ticket, sl=be_sl, tp=None):
+                    lv["sl"] = be_sl
+                    lv["broker_sl"] = be_sl
+                    result["moved"].append({"layer": lk, "ticket": ticket, "sl": be_sl})
+                else:
+                    result["failed"].append(f"{lk}:modify_failed")
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE DERISK] layer {lk} ticket {ticket} failed: {exc}")
+                result["failed"].append(f"{lk}:{exc}")
+
+        result["ok"] = not result["failed"]
+        logger.info(
+            f"[LIFECYCLE DERISK] moved={len(result['moved'])} cancelled={len(result['cancelled'])} "
+            f"failed={len(result['failed'])}"
+        )
+        return result
+
+    def apply_lifecycle_flatten(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Close every open position at market and cancel every pending limit."""
+        result: Dict[str, Any] = {
+            "action": "FLATTEN",
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+        try:
+            exposure = self.close_signal_exposure(signal_data) or {}
+            result["closed"] = [int(t) for t in (exposure.get("closed_tickets") or []) if int(t) > 0]
+            result["cancelled"] = [int(t) for t in (exposure.get("cancelled_orders") or []) if int(t) > 0]
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE FLATTEN] close failed: {exc}")
+            result["failed"].append(f"close:{exc}")
+            result["ok"] = False
+
+        # Retry accounting: the guard gives up (and leaves the position to its
+        # broker SL, the safe fallback) after `max_close_retries` failures.
+        if not result["ok"]:
+            retries = _int_num(signal_data.get("lifecycle_retry_count"), 0)
+            retries += 1
+            signal_data["lifecycle_retry_count"] = retries
+            max_retries = self._get_lifecycle_policy().max_close_retries
+            if retries > max_retries:
+                logger.error(
+                    f"[LIFECYCLE FLATTEN] giving up after {retries} failed attempts "
+                    f"(max {max_retries}); the position stays on its broker SL."
+                )
+                result["ok"] = False
+                result["gave_up"] = True
+        else:
+            signal_data["lifecycle_retry_count"] = 0
+
+        logger.info(
+            f"[LIFECYCLE FLATTEN] closed={len(result['closed'])} cancelled={len(result['cancelled'])} "
+            f"failed={len(result['failed'])}"
+        )
+        return result
+
+    def apply_lifecycle_pending_expire(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel the unfilled pending limits of a signal that never filled."""
+        result: Dict[str, Any] = {
+            "action": "EXPIRE_PENDING",
+            "ok": True,
+            "moved": [],
+            "closed": [],
+            "cancelled": [],
+            "failed": [],
+        }
+        if not isinstance(signal_data, dict):
+            result["ok"] = False
+            return result
+        try:
+            cancelled = self.cancel_signal_pending_orders(signal_data) or []
+            result["cancelled"] = [int(t) for t in cancelled if int(t) > 0]
+        except Exception as exc:
+            logger.warning(f"[LIFECYCLE EXPIRE_PENDING] cancel failed: {exc}")
+            result["failed"].append(f"cancel:{exc}")
+            result["ok"] = False
+        logger.info(f"[LIFECYCLE EXPIRE_PENDING] cancelled={len(result['cancelled'])}")
+        return result
+
+    def apply_lifecycle_action(self, signal_data: Dict[str, Any], action: str) -> Dict[str, Any]:
+        """Dispatch a lifecycle action. Unknown actions are a no-op."""
+        token = str(action or "").strip().upper()
+        if token == "DERISK":
+            return self.apply_lifecycle_derisk(signal_data)
+        if token in ("FLATTEN", "SESSION_FLATTEN"):
+            return self.apply_lifecycle_flatten(signal_data)
+        if token == "EXPIRE_PENDING":
+            return self.apply_lifecycle_pending_expire(signal_data)
+        return {"action": "NONE", "ok": True, "moved": [], "closed": [], "cancelled": [], "failed": []}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add mt5_executor.py tests/test_trade_lifecycle.py
+git commit -m "feat(mt5_executor): add derisk / flatten / pending-expire lifecycle actions
+
+apply_lifecycle_derisk cancels unfilled pending limits and moves open layers to
+breakeven without ever loosening an existing stop. apply_lifecycle_flatten
+reuses close_signal_exposure so the validated market-close path is shared with
+/closeall. Every action returns a structured result for logging and alerting."
+```
+
+---
+
+## Task 6: `main.py` — run the age guard every second
+
+**Files:**
+- Modify: `main.py:4111-4120` (`_process_pre_tp1_or_backstop_tick`)
+- Modify: `tests/test_trade_lifecycle.py` (append the watcher tests)
+
+**Interfaces:**
+- Consumes: `risk_lifecycle.evaluate_trade_age`, `risk_lifecycle.read_lifecycle_policy` (Task 1); `MT5Executor.apply_lifecycle_action` (Task 5).
+- Produces: the age guard runs inside `_process_pre_tp1_or_backstop_tick`, stamping `sig["lifecycle_derisk_at"]`, `sig["lifecycle_flatten_at"]`, `sig["lifecycle_pending_expired_at"]`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- main.py age guard ---------------------------------------------------
+
+def _install_signal(monkeypatch, tmp_path, sig):
+    import main
+    from state_manager import StateManager
+    from trade_ledger import TradeLedger
+
+    main.state_mgr = StateManager(tmp_path / "lifecycle_state.json")
+    main.trade_ledger = TradeLedger(tmp_path / "lifecycle_ledger.jsonl")
+    main.state_mgr.create_signal(
+        message_id="9001",
+        symbol="XAUUSD.s",
+        direction="BUY",
+        timestamp=sig.get("timestamp"),
+    )
+    main.state_mgr.update_signal("9001", sig)
+    return main
+
+
+@pytest.mark.asyncio
+async def test_age_guard_derisks_an_old_signal(monkeypatch, tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", True)
+    monkeypatch.setattr(config, "LIFECYCLE_DERISK_SECONDS", 7200)
+    monkeypatch.setattr(config, "LIFECYCLE_FLATTEN_SECONDS", 21600)
+
+    sig = _lifecycle_signal()
+    sig["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    sig["first_fill_at"] = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+
+    main_mod = _install_signal(monkeypatch, tmp_path, sig)
+
+    applied = []
+
+    class _FakeExecutor:
+        def get_tick(self, symbol):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0)
+
+        def get_pip_size(self, symbol):
+            return 0.1
+
+        def apply_lifecycle_action(self, signal_data, action):
+            applied.append(action)
+            return {"action": action, "ok": True, "moved": [], "closed": [], "cancelled": [], "failed": []}
+
+    monkeypatch.setattr(main_mod, "executor", _FakeExecutor())
+
+    await main_mod._process_pre_tp1_or_backstop_tick("9001", dict(sig))
+
+    assert applied == ["DERISK"]
+```
+
+> If the project does not already use `pytest-asyncio`, use `asyncio.run(...)` inside a plain `def` test instead of `@pytest.mark.asyncio`. Check `python -m pytest tests/test_v3_concurrency_and_ops.py -q` — that file already contains async tests, so follow whatever pattern it uses.
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — the watcher does not call `apply_lifecycle_action`.
+
+- [ ] **Step 3: Implement the age guard**
+
+In `main.py`, at the top of `_process_pre_tp1_or_backstop_tick` (after the `direction` assignment at line 4116 and **before** the `tick = await _mt5_call(executor.get_tick, symbol)` call at line 4118), insert:
+
+```python
+    # Trade Lifecycle Guard: age-based de-risk / flatten, evaluated every second.
+    # Runs before the TP1 branches so an aged trade is de-risked first.
+    lifecycle_pol = read_lifecycle_policy(config)
+    if lifecycle_pol.lifecycle_enabled:
+        now_utc = datetime.now(timezone.utc)
+        server_offset = 0
+        try:
+            server_offset = int(await _mt5_call(executor.get_server_time_offset_seconds) or 0)
+        except Exception:
+            server_offset = 0
+        age_res = evaluate_trade_age(sig, now_utc, lifecycle_pol, server_offset)
+        action = str(age_res.get("action") or "NONE")
+        stamp_key = {
+            "DERISK": "lifecycle_derisk_at",
+            "FLATTEN": "lifecycle_flatten_at",
+            "SESSION_FLATTEN": "lifecycle_flatten_at",
+            "EXPIRE_PENDING": "lifecycle_pending_expired_at",
+        }.get(action)
+        already_done = bool(sig.get(stamp_key)) if stamp_key else False
+        if action != "NONE" and not already_done:
+            res: Optional[Dict[str, Any]] = None
+            try:
+                res = await _mt5_call(executor.apply_lifecycle_action, sig, action)
+                sig[stamp_key] = now_utc.isoformat()
+                sig["lifecycle_action"] = action
+                sig["lifecycle_reason"] = age_res.get("reason")
+                state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+                logger.info(
+                    f"[LIFECYCLE {action}] msg={msg_id} reason={age_res.get('reason')} "
+                    f"result={res}"
+                )
+                if action in ("FLATTEN", "SESSION_FLATTEN", "EXPIRE_PENDING"):
+                    sig["status"] = "CLOSED"
+                    sig["closed_at"] = now_utc.isoformat()
+                    state_mgr.update_signal(msg_id, sig, chat_id=sig_chat)
+                    await notify_saved_messages(
+                        f"⏱ **Trade Lifecycle Guard — `{action}`**\n"
+                        f"• Signal: `{msg_id}` ({direction} {symbol})\n"
+                        f"• Reason: {age_res.get('reason')}\n"
+                        f"• Closed: `{res.get('closed')}` | Cancelled: `{res.get('cancelled')}`"
+                    )
+                    return
+            except Exception as exc:
+                logger.warning(f"[LIFECYCLE {action}] msg={msg_id} failed: {exc}")
+
+            if isinstance(res, dict) and res.get("gave_up"):
+                await notify_saved_messages(
+                    f"⚠️ **Trade Lifecycle Guard gave up** on signal `{msg_id}` ({direction} {symbol})\n"
+                    f"• Reason: {age_res.get('reason')}\n"
+                    f"• The position keeps its broker SL and the bot stops retrying "
+                    f"({lifecycle_pol.max_close_retries} attempts)."
+                )
+                return
+```
+
+Add the required imports to `main.py`:
+
+```python
+from risk_lifecycle import evaluate_trade_age, read_lifecycle_policy
+```
+
+If `datetime` / `timezone` are not already imported in `main.py`, add `from datetime import datetime, timezone`.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add main.py tests/test_trade_lifecycle.py
+git commit -m "feat(main): run the trade-age guard every second
+
+_process_pre_tp1_or_backstop_tick now evaluates the age guard before the TP1
+branches, so an aged trade is de-risked or flattened first. Each action is
+stamped on the signal, which makes it idempotent across repeated ticks."
+```
+
+---
+
+## Task 7: `main.py` — the `/rlock` and `/lifecycle` commands
+
+**Files:**
+- Modify: `main.py:7045-7049` (`_is_known_saved_command` list)
+- Modify: `main.py:7350` (insert the new command handlers before the `# LIVE CONTROL: /floatcap` block at line 7350)
+- Modify: `main.py:8433` (the command list in the `/status` reply)
+- Modify: `tests/test_trade_lifecycle.py` (append the command tests)
+
+**Interfaces:**
+- Consumes: `risk_lifecycle.apply_rlock_command`, `risk_lifecycle.apply_lifecycle_command` (Task 1).
+- Produces: the Saved Messages commands `/rlock` and `/lifecycle`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- Saved Messages commands ---------------------------------------------
+
+class _MockEvent:
+    def __init__(self, text: str):
+        self.message = type("M", (), {"message": text, "out": True})()
+        self.replies = []
+
+    async def reply(self, text, **kwargs):
+        self.replies.append(text)
+
+
+@pytest.mark.asyncio
+async def test_rlock_command_toggles_at_runtime(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "R_LOCK_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/rlock on")
+    await main.handle_saved_messages_command(ev)
+    assert config.R_LOCK_ENABLED is True
+    assert any("R-Relative Profit Floor" in r for r in ev.replies)
+
+    ev2 = _MockEvent("/rlock off")
+    await main.handle_saved_messages_command(ev2)
+    assert config.R_LOCK_ENABLED is False
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_command_toggles_at_runtime(monkeypatch, tmp_path):
+    import config
+    import main
+
+    monkeypatch.setattr(config, "LIFECYCLE_ENABLED", False)
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/lifecycle on")
+    await main.handle_saved_messages_command(ev)
+    assert config.LIFECYCLE_ENABLED is True
+    assert any("Trade Lifecycle Guard" in r for r in ev.replies)
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — the commands are not recognised.
+
+- [ ] **Step 3: Implement the commands**
+
+In `main.py`, insert the following block immediately **before** the `# LIVE CONTROL: /floatcap` comment (line 7350):
+
+```python
+    # LIVE CONTROL: /rlock [on|off] — toggle the R-relative profit floor
+    if text in ("/rlock", "rlock") or any(
+        text.startswith(p) for p in ("/rlock ", "rlock ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        changed, reply_msg = apply_rlock_command(_cfg_mod, [arg] if arg else [])
+        if changed:
+            logger.info(f"[/rlock] R_LOCK_ENABLED updated to {getattr(_cfg_mod, 'R_LOCK_ENABLED', False)}")
+        await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /lifecycle [on|off] — toggle the trade-age guard
+    if text in ("/lifecycle", "lifecycle") or any(
+        text.startswith(p) for p in ("/lifecycle ", "lifecycle ")
+    ):
+        _cfg_mod = sys.modules.get("config") or config
+        parts = text.split(maxsplit=1)
+        arg = parts[1].strip().lower() if len(parts) > 1 else ""
+        changed, reply_msg = apply_lifecycle_command(_cfg_mod, [arg] if arg else [])
+        if changed:
+            logger.info(f"[/lifecycle] LIFECYCLE_ENABLED updated to {getattr(_cfg_mod, 'LIFECYCLE_ENABLED', False)}")
+        await event.reply(reply_msg)
+        return
+```
+
+Add the import at the top of `main.py`:
+
+```python
+from risk_lifecycle import apply_lifecycle_command, apply_rlock_command, evaluate_trade_age, read_lifecycle_policy
+```
+
+- [ ] **Step 4: Register the commands as known**
+
+In `main.py`, in the `_is_known_saved_command` list (lines 7045-7049), add the new commands:
+
+```python
+    "/rlock", "rlock",
+    "/lifecycle", "lifecycle",
+```
+
+- [ ] **Step 5: Add the commands to the `/status` help line**
+
+In `main.py` line 8433, extend the command list with `/rlock` and `/lifecycle`:
+
+```python
+f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+```
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 8: Commit**
+
+```powershell
+git add main.py tests/test_trade_lifecycle.py
+git commit -m "feat(main): add /rlock and /lifecycle Saved Messages commands
+
+Both toggle their feature at runtime with no restart, and double as the live
+kill switches for the rollout."
+```
+
+---
+
+## Task 8: `trade_ledger.py` — schema 4 with cash MFE, giveback, R and age
+
+**Files:**
+- Modify: `trade_ledger.py:456-488` (`build_trade_record`)
+- Modify: `trade_ledger.py:502` (`append_trade` — the `schema_version` default)
+- Modify: `tests/test_trade_lifecycle.py` (append the ledger tests)
+
+**Interfaces:**
+- Consumes: nothing from earlier tasks (independent).
+- Produces: every closed-signal record gains `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action`; `schema_version` becomes `4`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- trade ledger schema 4 -----------------------------------------------
+
+def test_build_trade_record_adds_cash_mfe_and_giveback():
+    from trade_ledger import build_trade_record
+
+    sig = {
+        "timestamp": "2026-11-19T06:19:09+00:00",
+        "chat_id": -100,
+        "message_id": 42,
+        "symbol": "XAUUSD.s",
+        "direction": "SELL",
+        "total_lots": 0.05,
+        "filled_lots": 0.05,
+        "layers": {
+            "L1": {"ticket": 1, "status": "CLOSED", "lot": 0.01, "entry_price": 3740.0},
+        },
+        "max_favorable_excursion": {"peak_price": 3728.55, "peak_profit_per_oz": 11.12},
+        "realized_pnl": 0.56,
+        "initial_r_per_oz": 20.0,
+        "first_fill_at": "2026-11-19T06:19:09+00:00",
+        "closed_at": "2026-11-19T09:18:51+00:00",
+    }
+
+    rec = build_trade_record(sig, signal_key="-100:42", realized_pnl=0.56)
+
+    assert rec["schema_version"] == 4
+    # 11.12 $/oz * 0.05 lots * 100 oz/lot = 55.60
+    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["giveback_cash"] == pytest.approx(55.04)
+    assert rec["initial_r_per_oz"] == pytest.approx(20.0)
+    assert rec["r_at_exit"] == pytest.approx(0.278)
+    assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2)
+    assert rec["lifecycle_action"] is None
+
+
+def test_build_trade_record_tolerates_missing_new_fields():
+    from trade_ledger import build_trade_record
+
+    rec = build_trade_record(
+        {"chat_id": -100, "message_id": 7, "direction": "BUY"},
+        signal_key="-100:7",
+        realized_pnl=1.0,
+    )
+    assert rec["schema_version"] == 4
+    assert rec["mfe_cash"] is None
+    assert rec["giveback_cash"] is None
+    assert rec["exit_age_seconds"] is None
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — `schema_version` is `3` and the new keys are missing.
+
+- [ ] **Step 3: Implement the schema-4 fields**
+
+In `trade_ledger.py`, in `build_trade_record`, insert the computation block **before** the `record: Dict[str, Any] = {` assignment at line 456:
+
+```python
+    # --- Schema 4 telemetry: cash excursion, giveback, R and exit age -------
+    # `max_favorable_excursion.peak_profit_per_oz` is a PER-OUNCE figure; it is
+    # converted to cash here (contract = 100 oz per lot) so giveback is finally
+    # measurable.
+    CONTRACT_OZ_PER_LOT = 100.0
+    mfe_per_oz = _safe_float((mfe_dict or {}).get("peak_profit_per_oz"), 0.0) if mfe_dict else 0.0
+    lots_for_mfe = _safe_float(total_lots, 0.0)
+    mfe_cash: Optional[float] = None
+    if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
+        mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)
+
+    realized_for_giveback = _safe_float(realized_pnl, 0.0)
+    giveback_cash: Optional[float] = None
+    if mfe_cash is not None:
+        giveback_cash = round(mfe_cash - realized_for_giveback, 2)
+
+    initial_r = _safe_float(signal_data.get("initial_r_per_oz"), 0.0)
+    if initial_r <= 0.0:
+        # Fallback: derive the signal's initial risk per ounce from its layers.
+        _layer_risks = []
+        for _lv in (signal_data.get("layers") or {}).values():
+            if not isinstance(_lv, dict):
+                continue
+            _e = _safe_float(_lv.get("entry_price") or _lv.get("entry") or _lv.get("target_price"), 0.0)
+            _s = _safe_float(_lv.get("initial_sl"), 0.0)
+            if _e > 0.0 and _s > 0.0:
+                _layer_risks.append(abs(_e - _s))
+        if _layer_risks:
+            initial_r = sum(_layer_risks) / len(_layer_risks)
+    initial_r_per_oz: Optional[float] = round(initial_r, 4) if initial_r > 0.0 else None
+    r_at_exit: Optional[float] = None
+    if initial_r_per_oz and mfe_cash is not None and initial_r_per_oz > 0.0:
+        risk_cash = initial_r_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT
+        if risk_cash > 0.0:
+            r_at_exit = round(mfe_cash / risk_cash, 4)
+
+    exit_age_seconds: Optional[int] = None
+    _filled_at = signal_data.get("first_fill_at")
+    _closed_at = signal_data.get("closed_at") or datetime.now(timezone.utc).isoformat()
+    if _filled_at and _closed_at:
+        try:
+            from datetime import datetime as _dt
+
+            _f = _dt.fromisoformat(str(_filled_at).replace("Z", "+00:00"))
+            _c = _dt.fromisoformat(str(_closed_at).replace("Z", "+00:00"))
+            exit_age_seconds = int((_c - _f).total_seconds())
+        except (TypeError, ValueError):
+            exit_age_seconds = None
+
+    lifecycle_action = signal_data.get("lifecycle_action")
+```
+
+Then add the new keys to the `record` dict (after `"giveback_from_peak": giveback_from_peak,` at line 479):
+
+```python
+        "mfe_cash": mfe_cash,
+        "giveback_cash": giveback_cash,
+        "initial_r_per_oz": initial_r_per_oz,
+        "r_at_exit": r_at_exit,
+        "exit_age_seconds": exit_age_seconds,
+        "lifecycle_action": (str(lifecycle_action) if lifecycle_action else None),
+```
+
+And change `"schema_version": 3,` to `"schema_version": 4,` at line 457.
+
+Also change the default in `append_trade` at line 502:
+
+```python
+        entry.setdefault("schema_version", 4)
+```
+
+> If `Optional` is not imported in `trade_ledger.py`, add it to the `typing` import.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add trade_ledger.py tests/test_trade_lifecycle.py
+git commit -m "feat(trade_ledger): schema 4 - cash MFE, cash giveback, R at exit, exit age
+
+max_favorable_excursion.peak_profit_per_oz is a per-ounce figure and was never
+converted to cash, so no tool could see the giveback. Schema 4 records mfe_cash,
+giveback_cash, initial_r_per_oz, r_at_exit, exit_age_seconds and
+lifecycle_action. Older records are read unchanged."
+```
+
+---
+
+## Task 9: `main.py` — the `/stats` command
+
+**Files:**
+- Modify: `main.py` (new module-level helper `_build_ledger_stats()` plus the `/stats` handler)
+- Modify: `main.py:7045-7049` (register `/stats` as a known command)
+- Modify: `main.py:8433` (add `/stats` to the help line)
+- Modify: `tests/test_trade_lifecycle.py` (append the stats tests)
+
+**Interfaces:**
+- Consumes: `trade_ledger.jsonl` on disk (Task 8's records).
+- Produces: `main._build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] = None) -> Dict[str, Any]` and the `/stats` Saved Messages command.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_trade_lifecycle.py`:
+
+```python
+# --- /stats ---------------------------------------------------------------
+
+def test_build_ledger_stats_summarises_pnl_and_giveback():
+    import main
+
+    records = [
+        {
+            "closed_at": "2026-11-19T09:00:00+00:00",
+            "realized_pnl": 10.0,
+            "exit_reason_code": "ATR_TRAIL",
+            "mfe_cash": 30.0,
+            "giveback_cash": 20.0,
+            "exit_age_seconds": 7200,
+            "lifecycle_action": None,
+        },
+        {
+            "closed_at": "2026-11-19T10:00:00+00:00",
+            "realized_pnl": -5.0,
+            "exit_reason_code": "BROKER_SL",
+            "mfe_cash": 12.0,
+            "giveback_cash": 17.0,
+            "exit_age_seconds": 90000,
+            "lifecycle_action": "FLATTEN",
+        },
+    ]
+
+    stats = main._build_ledger_stats(records)
+
+    assert stats["count"] == 2
+    assert stats["net_pnl"] == pytest.approx(5.0)
+    assert stats["wins"] == 1
+    assert stats["losses"] == 1
+    assert stats["win_rate"] == pytest.approx(0.5)
+    assert stats["total_giveback"] == pytest.approx(37.0)
+    assert stats["max_exit_age_seconds"] == 90000
+    assert stats["lifecycle_closes"] == 1
+    assert stats["exit_reasons"]["ATR_TRAIL"] == 1
+    assert stats["exit_reasons"]["BROKER_SL"] == 1
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: FAIL — `AttributeError: module 'main' has no attribute '_build_ledger_stats'`.
+
+- [ ] **Step 3: Implement the stats helper**
+
+Add this module-level function to `main.py` (place it next to `_close_all_bot_exposure_and_signals` around line 1208):
+
+```python
+def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Aggregate closed-trade records into the `/stats` summary."""
+    rows = [r for r in (records or []) if isinstance(r, dict)]
+    now = now or datetime.now(timezone.utc)
+
+    def _closed_dt(row: Dict[str, Any]) -> Optional[datetime]:
+        raw = str(row.get("closed_at") or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    cutoff_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_7d = now - timedelta(days=7)
+
+    def _in_window(row: Dict[str, Any], cutoff: datetime) -> bool:
+        dt = _closed_dt(row)
+        return bool(dt and dt >= cutoff)
+
+    def _slice(cutoff: Optional[datetime]) -> List[Dict[str, Any]]:
+        if cutoff is None:
+            return list(rows)
+        return [r for r in rows if _in_window(r, cutoff)]
+
+    def _aggregate(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
+        pnls = [float(r.get("realized_pnl") or 0.0) for r in subset]
+        wins = sum(1 for p in pnls if p > 0.0)
+        losses = sum(1 for p in pnls if p < 0.0)
+        givebacks = [float(r.get("giveback_cash")) for r in subset if r.get("giveback_cash") is not None]
+        ages = [int(r.get("exit_age_seconds")) for r in subset if r.get("exit_age_seconds") is not None]
+        reasons: Dict[str, int] = {}
+        for r in subset:
+            code = str(r.get("exit_reason_code") or "UNKNOWN")
+            reasons[code] = reasons.get(code, 0) + 1
+        return {
+            "count": len(subset),
+            "net_pnl": round(sum(pnls), 2),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(subset), 4) if subset else 0.0,
+            "total_giveback": round(sum(givebacks), 2),
+            "max_exit_age_seconds": max(ages) if ages else 0,
+            "lifecycle_closes": sum(1 for r in subset if r.get("lifecycle_action")),
+            "exit_reasons": reasons,
+        }
+
+    return {
+        "today": _aggregate(_slice(cutoff_today)),
+        "seven_day": _aggregate(_slice(cutoff_7d)),
+        "all_time": _aggregate(rows),
+    }
+```
+
+- [ ] **Step 4: Implement the `/stats` command**
+
+Add the command handler in `handle_saved_messages_command`, immediately before the `# LIVE CONTROL: /floatcap` block (line 7350), alongside the `/rlock` and `/lifecycle` handlers added in Task 7:
+
+```python
+    # LIVE CONTROL: /stats — closed-trade analytics from the trade ledger
+    if text in ("/stats", "stats"):
+        _cfg_mod = sys.modules.get("config") or config
+        ledger_path = Path(getattr(_cfg_mod, "TRADES_LEDGER_PATH", Path("trades_ledger.jsonl")))
+        records: List[Dict[str, Any]] = []
+        try:
+            if ledger_path.exists():
+                for line in ledger_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception as exc:
+            logger.warning(f"[/stats] could not read ledger {ledger_path}: {exc}")
+
+        if not records:
+            await event.reply(f"📊 **Trade Stats**\n• No ledger data found at `{ledger_path}`.")
+            return
+
+        stats = _build_ledger_stats(records)
+        today = stats["today"]
+        seven = stats["seven_day"]
+        allt = stats["all_time"]
+        fin = await _mt5_call(executor.get_account_financials)
+        curr = fin.get("currency", "GBP")
+
+        def _line(label: str, agg: Dict[str, Any]) -> str:
+            return (
+                f"• **{label}:** `{agg['net_pnl']:+.2f} {curr}` | "
+                f"`{agg['count']}` trades | win rate `{agg['win_rate'] * 100:.0f}%` | "
+                f"giveback `{agg['total_giveback']:.2f} {curr}` | "
+                f"max age `{agg['max_exit_age_seconds']}s`\n"
+            )
+
+        await event.reply(
+            "📊 **Trade Stats**\n"
+            + _line("Today", today)
+            + _line("7 days", seven)
+            + _line("All time", allt)
+            + f"• Lifecycle closes: `{allt['lifecycle_closes']}`\n"
+            + f"• Exit reasons: `{allt['exit_reasons']}`\n\n"
+            f"{fin['formatted']}"
+        )
+        return
+```
+
+Ensure `json`, `Path`, `List`, `Dict`, `Any`, `Optional`, `timedelta` are imported in `main.py` (add any that are missing).
+
+- [ ] **Step 5: Register `/stats` and add it to the help line**
+
+In `main.py`, add `"/stats", "stats",` to the `_is_known_saved_command` list (lines 7045-7049), and add `/stats` to the help line at line 8433.
+
+- [ ] **Step 6: Run the tests to verify they pass**
+
+```powershell
+python -m pytest tests/test_trade_lifecycle.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Run the full suite**
+
+```powershell
+python -m pytest -q
+```
+
+Expected: **0 failed**.
+
+- [ ] **Step 8: Commit**
+
+```powershell
+git add main.py tests/test_trade_lifecycle.py
+git commit -m "feat(main): add /stats - closed-trade analytics from the ledger
+
+Reports net P&L, win rate, total cash giveback, longest trade age and the exit
+reason mix for today, 7 days and all time. This is the instrument that makes
+the giveback measurable rather than anecdotal."
+```
+
+---
+
+## Task 10: `scripts/ab_replay_proof.py` — Arm C
+
+**Files:**
+- Modify: `scripts/ab_replay_proof.py:52` (`ARM_B_CALIBRATED_PARAMS` — add the Arm C params)
+- Modify: `scripts/ab_replay_proof.py:792-814` (`_pin_arm_b_params` — add `_pin_arm_c_params`)
+- Modify: `scripts/ab_replay_proof.py:993-1022` (`_run_worker_main` — handle `arm_mode == "c"`)
+- Modify: `scripts/ab_replay_proof.py:1105-1126` (`_run_arm_subprocess` — accept `"c"`)
+- Modify: `scripts/ab_replay_proof.py:1154-1190` (`_evaluate_gates` — add the C-vs-B gate)
+- Modify: `scripts/ab_replay_proof.py:1275-1326` (`main` — add the `--arm c` branch)
+- Modify: `scripts/ab_replay_proof.py:1192-1273` (`_render_markdown` — render Arm C)
+
+**Interfaces:**
+- Consumes: every feature from Tasks 1-9.
+- Produces: `--arm c` runs the same 12 recorded trades with the R lock and the age guard enabled, and the gate `g5` asserts Arm C ≥ Arm B on net P&L and ≤ Arm B on tail loss.
+
+- [ ] **Step 1: Add the Arm C parameter block**
+
+In `scripts/ab_replay_proof.py`, immediately after the `ARM_B_CALIBRATED_PARAMS` dict (which starts at line 52), add:
+
+```python
+# Arm C params: Arm B plus the R-relative profit floor and the trade-age guard.
+ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
+    "R_LOCK_ENABLED": True,
+    "LIFECYCLE_ENABLED": True,
+    "LIFECYCLE_DERISK_SECONDS": 7200,
+    "LIFECYCLE_FLATTEN_SECONDS": 21600,
+    "LIFECYCLE_PENDING_EXPIRE_SECONDS": 43200,
+    "LIFECYCLE_SESSION_FLATTEN_ENABLED": False,
+}
+```
+
+- [ ] **Step 2: Add the Arm C pinning function**
+
+In `scripts/ab_replay_proof.py`, immediately after `_pin_arm_b_params` (which ends at line 814), add:
+
+```python
+def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None:
+    """Explicitly pin and verify the Arm C lifecycle parameters across config, executor, and main."""
+    targets = (config_mod, executor_mod, main_mod)
+    for key, expected in ARM_C_CALIBRATED_PARAMS.items():
+        for mod in targets:
+            if hasattr(mod, key):
+                setattr(mod, key, expected)
+        actual = getattr(config_mod, key, None)
+        if isinstance(expected, float):
+            if abs(float(actual or 0.0) - expected) > 1e-9:
+                raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual} != {expected}")
+        elif actual != expected:
+            raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual!r} != {expected!r}")
+```
+
+- [ ] **Step 3: Handle `arm_mode == "c"` in the worker**
+
+In `scripts/ab_replay_proof.py`, inside `_run_worker_main` (line 993), change the branch at line 1019-1022:
+
+```python
+        if arm_mode == "a":
+            if hasattr(config, "PROFIT_RATCHET_ENABLED"):
+                raise RuntimeError("Arm A contamination: PROFIT_RATCHET_ENABLED found in 4544f7f worktree!")
+        elif arm_mode == "b":
+            _pin_arm_b_params(config, mt5_executor, main)
+        else:
+            _pin_arm_b_params(config, mt5_executor, main)
+            _pin_arm_c_params(config, mt5_executor, main)
+```
+
+- [ ] **Step 4: Extend the gate evaluation**
+
+In `scripts/ab_replay_proof.py`, in `_evaluate_gates` (line 1154), add the Arm C gate. Change the function signature to accept `arm_c` and add the gate:
+
+```python
+def _evaluate_gates(
+    arm_a: Optional[Dict[str, Any]],
+    arm_b: Optional[Dict[str, Any]],
+    arm_c: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+```
+
+and, after the existing `g4_single` computation, add:
+
+```python
+    if arm_c and arm_b:
+        sc = arm_c["summary"]
+        sb2 = arm_b["summary"]
+        g5 = (
+            sc["net_gbp"] >= sb2["net_gbp"]
+            and sc["tail_loss_gbp"] <= sb2["tail_loss_gbp"]
+            and sc["error_count"] == 0
+        )
+    else:
+        g5 = None
+```
+
+Add `"g5": g5` to the returned gates dict.
+
+> If `tail_loss_gbp` is not a key of the arm summary, use the summary's actual worst-trade key. Inspect `sc` keys with `print(sorted(arm_b["summary"].keys()))` in a scratch run first and use the real key name.
+
+- [ ] **Step 5: Extend `main()` and the markdown renderer**
+
+In `scripts/ab_replay_proof.py` `main()` (line 1275):
+
+```python
+        if args.arm in ("a", "both"):
+            arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
+        if args.arm in ("b", "both"):
+            arm_b_res = _run_arm_subprocess("b", REPO_ROOT, bars_file, io_dir / "arm_b.json")
+        if args.arm in ("c", "both"):
+            arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
+```
+
+declare `arm_c_res: Optional[Dict[str, Any]] = None` next to `arm_a_res` / `arm_b_res`, pass it into `_evaluate_gates(arm_a_res, arm_b_res, arm_c_res)`, and add `"arm_c": arm_c_res` to the report dict.
+
+In `_render_markdown`, add an Arm C section after the existing Arm A/B table:
+
+```python
+    if arm_c:
+        sc = arm_c["summary"]
+        lines += [
+            "",
+            "### Arm C (v3.8.0 Trade Lifecycle Guard)",
+            "",
+            f"- **Net PnL:** `£{sc['net_gbp']}` (Arm B: `£{sb['net_gbp']}`)",
+            f"- **Tail Loss:** `£{sc.get('tail_loss_gbp')}` (Arm B: `£{sb.get('tail_loss_gbp')}`)",
+        ]
+```
+
+- [ ] **Step 6: Run the replay proof**
+
+```powershell
+cd C:\Users\kambo\Code\telegram-mt5-copier
+python scripts/ab_replay_proof.py --arm c
+```
+
+Expected: the script writes the Arm C report and prints the gate table. If the bars must be fetched from MT5, run it with the MT5 terminal open; if a saved bars JSON exists, pass it with the script's existing `--bars` option.
+
+**If gate `g5` fails** (Arm C net P&L below Arm B, or a worse tail loss), do **not** enable the feature. Adjust `ARM_C_CALIBRATED_PARAMS` / `R_LOCK_TIERS` and re-run. Record the outcome in the commit message.
+
+- [ ] **Step 7: Commit**
+
+```powershell
+git add scripts/ab_replay_proof.py
+git commit -m "feat(replay): add Arm C (R lock + trade-age guard) to the A/B replay proof
+
+Arm C replays the same 12 recorded trades with R_LOCK_ENABLED and
+LIFECYCLE_ENABLED on, and gate g5 requires Arm C >= Arm B on net P&L and
+<= Arm B on tail loss. This is the pre-live acceptance evidence."
+```
+
+---
+
+## Task 11: Changelog, environment verification and final push
+
+**Files:**
+- Modify: `AUTOMATION_CHANGELOG.md` (prepend the v3.8.0 section)
+- Modify: `.env.example` (verify the knob block is present — done in Task 1)
+
+**Interfaces:**
+- Consumes: everything.
+- Produces: a verified, pushed release.
+
+- [ ] **Step 1: Run the full verification suite**
+
+```powershell
+cd C:\Users\kambo\Code\telegram-mt5-copier
+python -m pytest -q
+python -c "import parser, mt5_executor, main, risk_lifecycle, config; print('IMPORT OK')"
+python check_algo.py
+python -c "import startup_checks, config; r = startup_checks.validate_environment(); print(r)"
+python -c "import config; print('R_LOCK_ENABLED', config.R_LOCK_ENABLED); print('LIFECYCLE_ENABLED', config.LIFECYCLE_ENABLED); print('R_LOCK_TIERS', config.R_LOCK_TIERS)"
+```
+
+Expected:
+
+- pytest: **0 failed**.
+- `IMPORT OK`.
+- `check_algo.py`: `ALL CHECKS PASSED`.
+- `startup_checks.validate_environment()`: `{'ok': True, 'errors': [], 'warnings': []}`.
+- `R_LOCK_ENABLED False` and `LIFECYCLE_ENABLED False` (both ship disabled).
+
+- [ ] **Step 2: Confirm the working tree is clean of runtime artifacts**
+
+```powershell
+git status --porcelain
+```
+
+Expected: no `.env`, no `*.log`, no `signals_state*.json`, no `trades_ledger*.jsonl`, no `*.session`.
+
+- [ ] **Step 3: Write the changelog entry**
+
+Prepend to `AUTOMATION_CHANGELOG.md`:
+
+```markdown
+## [2026-11-20] — v3.8.0 Trade Lifecycle Guard (R-Relative Profit Floor + Trade-Age Guard)
+
+- **Spec:** `docs/superpowers/specs/2026-11-20-trade-lifecycle-guard-design.md`
+- **Plan:** `docs/superpowers/plans/2026-11-20-trade-lifecycle-guard.md`
+- **Motivation:** the live ledger (19 closed signals, `dry_run=false`) showed `£154.93` of
+  favourable excursion turning into `-£33.15` realized — `£188.08` given back, 121% of
+  everything the market gave. Two trades held 21.0 h and 20.3 h (`-£105.43`, 61% of the
+  total loss).
+
+### 1. R-Relative Profit Floor (`risk_lifecycle.py`, `dynamic_risk.py`, `mt5_executor.py`)
+
+- The ATR engine armed its breakeven lock at `max(0.75 x ATR, $3.50)` regardless of stop
+  distance, so a `$22/oz` stop and a `$2.00` scalp both became risk-free after the same
+  `$3.50`. The new floor scales to each trade's own risk `R = |entry - initial SL|`
+  (tiers `0.5R -> entry`, `1.0R -> +0.25R`, `1.5R -> +0.50R`, `2.0R -> +0.75R`).
+- `compute_dynamic_atr_trail_stop` gained an additive `r_lock_floor` keyword; the floor
+  joins the existing candidate list, so the ATR trail still owns the tight stop and the
+  forward-only (never-loosens) invariant is preserved.
+- `initial_sl` is captured per layer at placement (the trail overwrites `sl`/`broker_sl`,
+  so the original risk would otherwise be lost).
+
+### 2. Trade-Age Guard (`risk_lifecycle.py`, `mt5_executor.py`, `main.py`)
+
+- No trade-age, pending-expiry or session guard existed in the live code.
+- Two-step de-risk: at `2 h` the unfilled pending limits are cancelled and every open layer
+  moves to breakeven (never loosening an existing stop); at `6 h` everything is closed at
+  market. Unfilled signals are cancelled at `12 h`.
+- The session/rollover cut ships **disabled** (`LIFECYCLE_SESSION_FLATTEN_ENABLED=false`).
+
+### 3. Instrumentation (`trade_ledger.py`)
+
+- Ledger schema `3 -> 4`: `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`,
+  `exit_age_seconds`, `lifecycle_action`. `peak_profit_per_oz` is per-ounce and was never
+  converted to cash, so giveback was not measurable.
+- New `/stats` command: today / 7-day / all-time P&L, win rate, total cash giveback,
+  longest trade age, exit-reason mix.
+
+### 4. Live Control
+
+- `/rlock on|off` and `/lifecycle on|off` toggle both features at runtime with no restart
+  and double as the kill switches.
+
+### 5. Deploy Readiness
+
+- **Both features ship DISABLED** (`R_LOCK_ENABLED=false`, `LIFECYCLE_ENABLED=false`).
+  A fresh clone behaves identically to v3.7.0.
+- **No VPS deployment was performed.**
+- **VPS `.env` drift is UNRESOLVED and must be corrected by hand at deploy time.** `.env` is
+  gitignored, so the push cannot fix it. The knobs to add are: `R_LOCK_ENABLED`,
+  `R_LOCK_TIERS`, `R_LOCK_MIN_R_DOLLARS`, `LIFECYCLE_ENABLED`, `LIFECYCLE_DERISK_SECONDS`,
+  `LIFECYCLE_FLATTEN_SECONDS`, `LIFECYCLE_PENDING_EXPIRE_SECONDS`,
+  `LIFECYCLE_SESSION_FLATTEN_ENABLED`, `LIFECYCLE_SESSION_FLATTEN_AT`,
+  `LIFECYCLE_MAX_CLOSE_RETRIES`.
+- The server still pins `DYNAMIC_ATR_TRAIL_MULT=1.50` while the repo says `1.40` — fix that
+  at the same time.
+
+```
+
+- [ ] **Step 4: Commit and push**
+
+```powershell
+git add AUTOMATION_CHANGELOG.md
+git commit -m "docs(changelog): v3.8.0 - Trade Lifecycle Guard (R floor + trade-age guard)"
+git push origin main
+git ls-remote origin main
+```
+
+Expected: `origin/main` points at the new commit and `git status -sb` shows `## main...origin/main` with nothing ahead or behind.
+
+---
+
+## Self-Review
+
+**1. Spec coverage**
+
+| Spec requirement | Task |
+|---|---|
+| §4.2 `risk_lifecycle.py` policy + 7 functions | Task 1 |
+| §4.3 10 config knobs + startup validation | Task 1 |
+| §4.4 `r_lock_floor` candidate + tie-break | Task 2 |
+| §4.4 `initial_sl` capture | Task 3 |
+| §4.4 R floor wired into `evaluate_dynamic_atr_engine` | Task 4 |
+| §4.5 age guard actions | Task 5 |
+| §4.5 watcher integration | Task 6 |
+| §4.5/§4.10 `/rlock` + `/lifecycle` | Task 7 |
+| §4.8 ledger schema 4 | Task 8 |
+| §4.9 `/stats` | Task 9 |
+| §8.4 Arm C replay proof | Task 10 |
+| §9 rollout + VPS `.env` drift note | Task 11 |
+| §6 invariants 1-7 | Enforced in Tasks 2, 4, 5, 6; asserted in Tasks 2, 4, 5, 6 tests |
+| §7 error handling (exception containment, retry counter, missing `initial_sl`, missing ledger) | Tasks 4, 5, 6, 9 |
+| §9.6 doc refresh | **Out of scope by design** (spec §9.6) |
+
+Gap check: the spec's `lifecycle_retry_count` state key (Error handling table) is **not** implemented by any task. Either add it to Task 5's `apply_lifecycle_flatten` (increment `signal_data["lifecycle_retry_count"]` on a failed close and refuse to retry past `policy.max_close_retries`) or remove the row from the spec. **Implement it in Task 5** — it is the difference between "retry forever" and "give up and alert".
+
+**2. Placeholder scan** — no `TBD`, no `TODO`, no "similar to Task N", no "add appropriate error handling". Every code step carries real code. Two deliberate conditional instructions are marked as such: the `_env_choice` correction in Task 1 Step 4 (the helper cannot accept free-form strings) and the `tail_loss_gbp` key name in Task 10 Step 4 (the summary key must be confirmed against the real output).
+
+**3. Type consistency**
+
+- `LifecyclePolicy` field names are identical in Task 1 (definition), Task 4 (`_get_lifecycle_policy`), Task 5 (no field access), Task 6 (`read_lifecycle_policy`).
+- `compute_r_lock_floor(direction, entry_price, initial_sl, mfe_dollars, policy, digits)` — Task 1 defines it, Task 4 calls it with exactly those keyword names.
+- `compute_dynamic_atr_trail_stop(..., r_lock_floor=None)` — Task 2 defines it, Task 4 passes `r_lock_floor=r_lock_floor`.
+- `apply_lifecycle_action(signal_data, action)` — Task 5 defines it, Task 6 calls it with two positional args.
+- `evaluate_trade_age(signal_data, now_utc, policy, server_offset_seconds)` — Task 1 defines it, Task 6 calls it with four positional args.
+- Action strings `DERISK` / `FLATTEN` / `SESSION_FLATTEN` / `EXPIRE_PENDING` — identical in Tasks 1, 5, 6.
+- `_build_ledger_stats(records)` — Task 9 defines it, its own test calls it with one arg.
+- The ledger field names `mfe_cash`, `giveback_cash`, `initial_r_per_oz`, `r_at_exit`, `exit_age_seconds`, `lifecycle_action` — Task 8 writes them, Task 9 reads `giveback_cash`, `exit_age_seconds`, `lifecycle_action`, `exit_reason_code`, `realized_pnl`. Consistent.
+
+**Gaps found in self-review and closed inline**
+
+1. `lifecycle_retry_count` was specified but not implemented — **now implemented in Task 5** (`apply_lifecycle_flatten` increments it on a failed close and sets `gave_up` once it exceeds `policy.max_close_retries`).
+2. `initial_r_per_oz` was read by the ledger but never written — **now written in Task 5** (`apply_lifecycle_derisk` averages the layers' `|entry - initial_sl|` onto the signal) **and** derived independently by the ledger in Task 8 from the layers, so the field is populated even when the guard never fires.
+3. `closed_at` was read by the ledger but never stamped — **now stamped in Task 6** when the guard marks a signal `CLOSED`, **and** the ledger falls back to `datetime.now(timezone.utc)` when it is absent.
+
+**Open items carried into execution**
+
+1. `LIFECYCLE_MAX_CLOSE_RETRIES` is honoured by `apply_lifecycle_flatten` but the "gave up and alert the operator" notification is raised by the caller in `main.py` (Task 6) when `res.get("gave_up")` is true. Confirm the alert path is wired when Task 6 is implemented.
+2. The `tail_loss_gbp` summary key in Task 10 Step 4 must be confirmed against the real `arm_b["summary"]` output before use.
