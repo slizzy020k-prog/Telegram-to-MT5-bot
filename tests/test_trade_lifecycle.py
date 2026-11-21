@@ -567,3 +567,269 @@ def test_the_reported_r_lock_floor_is_pre_clamp_and_the_candidate_is_post_clamp(
     assert res["r_lock_floor"] == pytest.approx(3904.0)
     # ...but the broker minimum-distance clamp moved the effective stop.
     assert res["candidate_sl"] == pytest.approx(3903.0)
+
+
+# --- executor state capture ---------------------------------------------
+
+def test_execute_4layer_specs_records_initial_sl(monkeypatch):
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    captured = {}
+
+    def _fake_layer(symbol, direction, target_price, lot, sl, tp, tick, **kwargs):
+        captured["sl"] = sl
+        return 9001, "MARKET"
+
+    monkeypatch.setattr(ex, "_execute_layer_price", _fake_layer)
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L1", 3895.0, 0.01, 3905.0)],
+        sl=3880.0,
+        tick=SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0),
+    )
+    assert captured["sl"] == 3880.0
+    assert layers["L1"]["initial_sl"] == pytest.approx(3880.0)
+    # A MARKET layer fills at placement, so the fill time is stamped right here.
+    assert layers["L1"].get("filled_at"), "a MARKET layer must record its fill time"
+
+
+def test_execute_4layer_specs_does_not_stamp_a_pending_limit_layer(monkeypatch):
+    """A LIMIT layer has not filled yet, so it must not carry a fill timestamp."""
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    def _fake_layer(symbol, direction, target_price, lot, sl, tp, tick, **kwargs):
+        return 9002, "LIMIT"
+
+    monkeypatch.setattr(ex, "_execute_layer_price", _fake_layer)
+    market, pending, layers = ex._execute_4layer_specs(
+        symbol="XAUUSD.s",
+        direction="BUY",
+        layer_specs=[("L2", 3890.0, 0.01, 3905.0)],
+        sl=3880.0,
+        tick=SimpleNamespace(bid=3895.0, ask=3895.2, time=1700000000.0),
+    )
+    assert layers["L2"]["status"] == "PENDING"
+    assert layers["L2"].get("filled_at") is None
+    assert layers["L2"]["initial_sl"] == pytest.approx(3880.0)
+
+
+def test_hydrate_signal_layers_stamps_first_fill_at(monkeypatch):
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    sig = {
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "layers": {
+            "L1": {"ticket": 101, "status": "PENDING", "lot": 0.01, "remaining_lot": 0.01},
+        },
+        "market_tickets": [],
+        "pending_tickets": [101],
+    }
+    positions = {
+        101: SimpleNamespace(
+            ticket=101,
+            type=0,
+            price_open=3895.0,
+            volume=0.01,
+            sl=3880.0,
+            tp=3905.0,
+            profit=0.0,
+        )
+    }
+    ex.hydrate_signal_layers_from_mt5(sig, live_positions_by_ticket=positions)
+    assert sig["layers"]["L1"]["status"] == "FILLED"
+    assert sig.get("first_fill_at"), "first_fill_at must be stamped on the first fill"
+    assert sig["layers"]["L1"].get("filled_at"), "the layer must record its fill time"
+
+
+def test_stamp_fill_times_never_overwrites_the_first_fill():
+    sig = {"first_fill_at": "2026-11-19T06:00:00+00:00"}
+    layer = {"filled_at": "2026-11-19T05:00:00+00:00"}
+    changed = rl.stamp_fill_times(sig, layer, now=datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc))
+    assert changed is False
+    assert sig["first_fill_at"] == "2026-11-19T06:00:00+00:00"
+    assert layer["filled_at"] == "2026-11-19T05:00:00+00:00"
+
+
+def test_stamp_fill_times_sets_both_when_missing():
+    sig = {}
+    layer = {}
+    now = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    assert rl.stamp_fill_times(sig, layer, now=now) is True
+    assert sig["first_fill_at"] == now.isoformat()
+    assert layer["filled_at"] == now.isoformat()
+
+
+def test_stamp_fill_times_reports_no_change_without_a_target():
+    sig = {"first_fill_at": "2026-11-19T06:00:00+00:00"}
+    now = datetime(2026, 11, 19, 7, 0, tzinfo=timezone.utc)
+    assert rl.stamp_fill_times(sig, None, now=now) is False
+    assert rl.stamp_fill_times(None, None, now=now) is False
+    assert sig["first_fill_at"] == "2026-11-19T06:00:00+00:00"
+
+
+def test_resolve_fill_time_prefers_the_earliest_known_fill():
+    sig = {
+        # The signal stamp records the FIRST LIMIT fill, hours after L1 filled
+        # at market. The trade age must run from the market fill.
+        "first_fill_at": "2026-11-19T09:00:00+00:00",
+        "layers": {
+            "L1": {"filled_at": "2026-11-19T06:00:00+00:00"},
+            "L2": {"filled_at": "2026-11-19T09:00:00+00:00"},
+        },
+    }
+    assert rl.resolve_fill_time(sig) == datetime(2026, 11, 19, 6, 0, tzinfo=timezone.utc)
+
+
+def test_resolve_fill_time_ignores_layers_without_a_fill():
+    sig = {"layers": {"L1": {"status": "PENDING"}, "L2": {"filled_at": "2026-11-19T09:00:00+00:00"}}}
+    assert rl.resolve_fill_time(sig) == datetime(2026, 11, 19, 9, 0, tzinfo=timezone.utc)
+
+
+def test_resolve_fill_time_is_none_without_any_fill_stamp():
+    assert rl.resolve_fill_time({}) is None
+    assert rl.resolve_fill_time({"layers": {"L1": {"status": "PENDING"}}}) is None
+    assert rl.resolve_fill_time({"first_fill_at": "not-a-timestamp"}) is None
+
+
+def test_evaluate_trade_age_uses_the_fill_clock_not_the_signal_stamp():
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        # The position filled 10 minutes ago; the signal is 9 hours old.
+        "first_fill_at": (now - timedelta(minutes=10)).isoformat(),
+        "layers": {"L1": {"filled_at": (now - timedelta(minutes=10)).isoformat()}},
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_NONE
+    # The fill clock is exactly 10 minutes old, NOT the 9-hour-old signal stamp.
+    assert res["fill_age_seconds"] == 600
+
+
+def test_evaluate_trade_age_still_flattens_an_old_fill():
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "first_fill_at": (now - timedelta(hours=7)).isoformat(),
+        "layers": {"L1": {"filled_at": (now - timedelta(hours=7)).isoformat()}},
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+
+
+def test_evaluate_trade_age_falls_back_to_the_signal_timestamp_without_fill_stamps():
+    """Regression guard: a signal with no fill stamp keeps the signal-timestamp age."""
+    now = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+    sig = {
+        "timestamp": (now - timedelta(hours=9)).isoformat(),
+        "market_tickets": [101],
+        "pending_tickets": [],
+    }
+    res = rl.evaluate_trade_age(sig, now, _policy())
+    assert res["action"] == rl.ACTION_FLATTEN
+    assert res["fill_age_seconds"] == 9 * 3600
+
+
+@pytest.mark.asyncio
+async def test_live_reconcile_stamps_the_fill_time_on_the_filled_layer(monkeypatch):
+    """The LIVE PENDING -> FILLED path (main._reconcile_live_mt5_signals) must stamp."""
+    import copy
+    from types import SimpleNamespace
+
+    import main
+
+    sig = {
+        "message_id": 4242,
+        "chat_id": -1001234567,
+        "symbol": "XAUUSD.s",
+        "direction": "BUY",
+        "status": "ACTIVE",
+        "market_tickets": [],
+        "pending_tickets": [7002],
+        "layers": {
+            "L2": {
+                "lot": 0.01,
+                "target_price": 3890.0,
+                "tp": 3905.0,
+                "ticket": 7002,
+                "order_type": "BUY_LIMIT",
+                "status": "PENDING",
+            },
+        },
+        "timestamp": (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat(),
+    }
+
+    class _FakeExecutor:
+        dry_run = True
+
+        def get_live_positions(self, symbol=None):
+            return [
+                SimpleNamespace(
+                    ticket=7002,
+                    symbol="XAUUSD.s",
+                    type=0,
+                    volume=0.01,
+                    price_open=3890.0,
+                    sl=3880.0,
+                    tp=3905.0,
+                    profit=0.0,
+                )
+            ]
+
+        def get_live_orders(self, symbol=None):
+            return []
+
+        def get_symbol_info(self, symbol):
+            return SimpleNamespace(digits=2)
+
+        def is_ticket_in_reconcile_grace(self, ticket, grace_seconds=3.0):
+            return False
+
+        def assign_or_preserve_layer_roles(self, signal_data):
+            return {}
+
+    class _FakeState:
+        def __init__(self, record):
+            self.record = record
+
+        def get_signal(self, message_id, chat_id=None):
+            return copy.deepcopy(self.record)
+
+        def update_signal(self, message_id, updates, chat_id=None):
+            self.record.update(copy.deepcopy(updates))
+            return copy.deepcopy(self.record)
+
+    fake_state = _FakeState(sig)
+    monkeypatch.setattr(main, "executor", _FakeExecutor())
+    monkeypatch.setattr(main, "state_mgr", fake_state)
+
+    await main._reconcile_live_mt5_signals([("4242", copy.deepcopy(sig))])
+
+    stored = fake_state.record
+    assert stored["layers"]["L2"]["status"] == "FILLED"
+    assert stored["layers"]["L2"].get("filled_at"), "the live path must record the fill time"
+    assert stored.get("first_fill_at"), "the live path must stamp the signal-level first fill"
+    # The guard must read the fill clock, not the 9-hour-old signal timestamp.
+    res = rl.evaluate_trade_age(stored, datetime.now(timezone.utc), _policy())
+    assert res["fill_age_seconds"] < 600
+    assert res["action"] == rl.ACTION_NONE

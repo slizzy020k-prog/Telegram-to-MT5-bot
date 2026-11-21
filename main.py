@@ -140,6 +140,7 @@ from dynamic_risk import (
     format_dynamic_risk_status_line,
     read_dynamic_risk_policy,
 )
+from risk_lifecycle import stamp_fill_times
 
 
 # ---------------------------------------------------------------------------
@@ -3552,6 +3553,13 @@ async def _reconcile_live_mt5_signals(
                     for l_data in layers.values():
                         if isinstance(l_data, dict) and _safe_ticket_int(l_data.get("ticket")) == ti:
                             l_data["status"] = "FILLED"
+                            # First fill of this signal: start the position-age clock
+                            # used by the trade-age guard. Without this stamp a limit
+                            # order that filled hours after the signal was created
+                            # falls back to the signal timestamp, which makes a
+                            # brand-new position look hours old.
+                            if stamp_fill_times(sig, l_data):
+                                updated = True
                             if p_open > 0.0:
                                 l_data["entry_price"] = p_open
                                 l_data["entry"] = p_open
@@ -3756,6 +3764,8 @@ async def _reconcile_live_mt5_signals(
                 "banked_profit": sig.get("banked_profit", 0.0),
                 "roles_locked": bool(sig.get("roles_locked")),
             }
+            if sig.get("first_fill_at"):
+                updates["first_fill_at"] = sig["first_fill_at"]
             if _is_num(sig.get("recorded_entry_price")):
                 updates["recorded_entry_price"] = sig.get("recorded_entry_price")
             if closed_runner_tkts and rem_runner_tkts:

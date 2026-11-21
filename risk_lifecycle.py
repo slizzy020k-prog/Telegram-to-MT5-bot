@@ -37,6 +37,8 @@ __all__ = [
     "evaluate_trade_age",
     "parse_r_lock_tiers",
     "read_lifecycle_policy",
+    "resolve_fill_time",
+    "stamp_fill_times",
 ]
 
 ACTION_NONE = "NONE"
@@ -297,6 +299,47 @@ def _parse_iso_utc(value: Any) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def stamp_fill_times(
+    signal_data: Optional[Dict[str, Any]],
+    layer_data: Optional[Dict[str, Any]] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Record a fill timestamp on a layer and on its signal.
+
+    The layer always gets ``filled_at``. The signal gets ``first_fill_at`` only when it is
+    unset, so the first fill of the trade wins. Returns True when something changed.
+    """
+    changed = False
+    ts = (now or datetime.now(timezone.utc)).isoformat()
+    if isinstance(layer_data, dict) and not layer_data.get("filled_at"):
+        layer_data["filled_at"] = ts
+        changed = True
+    if isinstance(signal_data, dict) and not signal_data.get("first_fill_at"):
+        signal_data["first_fill_at"] = ts
+        changed = True
+    return changed
+
+
+def resolve_fill_time(signal_data: Dict[str, Any]) -> Optional[datetime]:
+    """Return the EARLIEST known fill time for a signal, or None.
+
+    A zone signal normally fills L1 at market and L2-L4 later as limits, so the
+    trade age must be measured from the FIRST fill -- never from the signal
+    timestamp, and never from the latest fill.
+    """
+    sig = signal_data if isinstance(signal_data, dict) else {}
+    best = _parse_iso_utc(sig.get("first_fill_at"))
+    layers = sig.get("layers")
+    if isinstance(layers, dict):
+        for lv in layers.values():
+            if not isinstance(lv, dict):
+                continue
+            ldt = _parse_iso_utc(lv.get("filled_at"))
+            if ldt is not None and (best is None or ldt < best):
+                best = ldt
+    return best
+
+
 def _parse_session_at(session_at: str) -> Tuple[int, int]:
     """Parse ``"23:30"`` into ``(hour, minute)``."""
     parts = str(session_at or "23:30").split(":")
@@ -329,9 +372,10 @@ def evaluate_trade_age(
 
     now = _parse_iso_utc(now_utc) or datetime.now(timezone.utc)
     signal_dt = _parse_iso_utc(sig.get("timestamp"))
-    # Fall back to the signal timestamp when the fill time is unknown: the position
-    # is at least as old as the signal, so the age guard must not stand down.
-    fill_dt = _parse_iso_utc(sig.get("first_fill_at")) or signal_dt
+    # The fill clock is the EARLIEST known fill (the signal stamp or any layer
+    # stamp). Fall back to the signal timestamp when no fill time is known: the
+    # position is at least as old as the signal, so the age guard must not stand down.
+    fill_dt = resolve_fill_time(sig) or signal_dt
     signal_age = int((now - signal_dt).total_seconds()) if signal_dt else 0
     fill_age = int((now - fill_dt).total_seconds()) if fill_dt else None
 

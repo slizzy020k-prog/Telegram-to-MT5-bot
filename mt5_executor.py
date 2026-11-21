@@ -109,6 +109,7 @@ from dynamic_risk import (
     read_dynamic_risk_policy,
     scale_sl_tp_by_atr,
 )
+from risk_lifecycle import stamp_fill_times
 
 logger = logging.getLogger("copier.mt5")
 
@@ -2357,7 +2358,19 @@ class MT5Executor:
                     "ticket": t,
                     "order_type": o_type,
                     "status": status,
+                    # The stop the order was actually placed with. The trailing
+                    # engine overwrites `sl`/`broker_sl`, so the initial risk R
+                    # must be captured here to stay available for the R-relative
+                    # profit floor.
+                    "initial_sl": (round(float(sl), 2) if sl is not None else None),
                 }
+                if o_type == "MARKET":
+                    # A MARKET layer fills immediately at placement, so this is the
+                    # fill time. MARKET layers never go through the PENDING ->
+                    # FILLED transition, so without this stamp the first fill of a
+                    # normal zone signal (L1 at market, L2-L4 as limits) would
+                    # never be recorded.
+                    layer_dict["filled_at"] = datetime.now(timezone.utc).isoformat()
                 if layer_entry_px is not None:
                     layer_dict["entry_price"] = layer_entry_px
                     layer_dict["entry"] = layer_entry_px
@@ -6073,6 +6086,10 @@ class MT5Executor:
                 if st_u == "PENDING":
                     lv["status"] = "FILLED"
                     changed = True
+                    # First fill of this signal: start the position-age clock used
+                    # by the trade-age guard (`risk_lifecycle.evaluate_trade_age`).
+                    if stamp_fill_times(signal_data, lv):
+                        changed = True
                 if p_open > 0.0 and (_num(lv.get("entry_price"), 0.0) <= 0.0 or _num(lv.get("entry"), 0.0) <= 0.0):
                     ep = round(p_open, digits)
                     lv["entry_price"] = ep
