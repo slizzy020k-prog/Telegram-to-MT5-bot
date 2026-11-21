@@ -61,7 +61,7 @@
   - `parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]`
   - `read_lifecycle_policy(cfg_mod: Any) -> LifecyclePolicy`
   - `compute_initial_r(entry_price: float, initial_sl: float) -> Optional[float]`
-  - `compute_r_lock_floor(direction: str, entry_price: float, initial_sl: float, mfe_dollars: float, policy: LifecyclePolicy, digits: int = 2) -> Optional[float]`
+  - `compute_r_lock_floor(direction: str, entry_price: float, initial_sl: float, mfe_dollars: float, live_price: float, policy: LifecyclePolicy, digits: int = 2) -> Optional[float]` — returns the greatest reached lock fraction, and `None` when the floor would sit on the wrong side of `live_price`.
   - `evaluate_trade_age(signal_data: Dict[str, Any], now_utc: datetime, policy: LifecyclePolicy, server_offset_seconds: int = 0) -> Dict[str, Any]`
   - `apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]`
   - `apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]`
@@ -131,40 +131,40 @@ def test_compute_initial_r_returns_none_for_invalid_inputs():
 
 def test_r_lock_floor_none_below_first_tier():
     # R = 20.0, first tier 0.5R -> needs MFE 10.0
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 9.99, _policy()) is None
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 9.99, 3920.0, _policy()) is None
 
 
 def test_r_lock_floor_locks_entry_at_half_r():
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, _policy()) == pytest.approx(3900.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 10.0, 3920.0, _policy()) == pytest.approx(3900.0)
 
 
 def test_r_lock_floor_ladder_boundaries():
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 20.0, _policy()) == pytest.approx(3905.0)
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 30.0, _policy()) == pytest.approx(3910.0)
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy()) == pytest.approx(3915.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 20.0, 3920.0, _policy()) == pytest.approx(3905.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 30.0, 3920.0, _policy()) == pytest.approx(3910.0)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, _policy()) == pytest.approx(3915.0)
 
 
 def test_r_lock_floor_scales_with_stop_distance():
-    wide = rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 11.0, _policy())   # R = 22.0
-    tight = rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 1.0, _policy())    # R = 2.00
+    wide = rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 11.0, 3920.0, _policy())   # R = 22.0
+    tight = rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 1.0, 3920.0, _policy())    # R = 2.00
     assert wide == pytest.approx(3900.0)
     assert tight == pytest.approx(3900.0)
     # 1R on the wide stop locks a much larger absolute distance than on the tight stop
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 22.0, _policy()) == pytest.approx(3905.5)
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 2.0, _policy()) == pytest.approx(3900.5)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3878.0, 22.0, 3920.0, _policy()) == pytest.approx(3905.5)
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3898.0, 2.0, 3920.0, _policy()) == pytest.approx(3900.5)
 
 
 def test_r_lock_floor_sell_is_mirrored():
-    assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, _policy()) == pytest.approx(3895.0)
+    assert rl.compute_r_lock_floor("SELL", 3900.0, 3920.0, 20.0, 3880.0, _policy()) == pytest.approx(3895.0)
 
 
 def test_r_lock_floor_disabled_returns_none():
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, _policy(r_lock_enabled=False)) is None
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.0, 3920.0, _policy(r_lock_enabled=False)) is None
 
 
 def test_r_lock_floor_below_min_r_returns_none():
     # R = 0.20 which is under r_lock_min_r_dollars = 0.50
-    assert rl.compute_r_lock_floor("BUY", 3900.0, 3899.8, 1.0, _policy()) is None
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3899.8, 1.0, 3920.0, _policy()) is None
 
 
 # --- evaluate_trade_age --------------------------------------------------
@@ -305,6 +305,11 @@ def test_r_lock_floor_never_loosens_as_mfe_grows():
     assert values == sorted(values)
 
 
+def test_r_lock_floor_is_unchanged_just_past_the_top_tier():
+    # 2.01R is past the last tier (2.0R) -> the floor stays at +0.75R
+    assert rl.compute_r_lock_floor("BUY", 3900.0, 3880.0, 40.2, 3920.0, _policy()) == pytest.approx(3915.0)
+
+
 def test_read_lifecycle_policy_repairs_an_inverted_threshold_pair():
     import config
 
@@ -388,9 +393,10 @@ multiple before it is protected.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Any, Dict, Optional, Sequence, Tuple
+
 
 __all__ = [
     "ACTION_NONE",
@@ -489,7 +495,7 @@ class LifecyclePolicy:
 def parse_r_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
     """Parse ``"0.5:0.00,1.0:0.25"`` into ascending ``((r_threshold, lock_fraction), ...)``.
 
-    Malformed entries are skipped rather than raising, so a typo in ``.env`` can
+    Malformed entries are skipped rather than raising, so a typo in `.env` can
     never stop the bot from booting. The result is always sorted ascending by
     ``r_threshold`` so "the highest reached tier" is well defined.
     """
@@ -696,7 +702,9 @@ def evaluate_trade_age(
 
     now = _parse_iso_utc(now_utc) or datetime.now(timezone.utc)
     signal_dt = _parse_iso_utc(sig.get("timestamp"))
-    fill_dt = _parse_iso_utc(sig.get("first_fill_at"))
+    # Fall back to the signal timestamp when the fill time is unknown: the position
+    # is at least as old as the signal, so the age guard must not stand down.
+    fill_dt = _parse_iso_utc(sig.get("first_fill_at")) or signal_dt
     signal_age = int((now - signal_dt).total_seconds()) if signal_dt else 0
     fill_age = int((now - fill_dt).total_seconds()) if fill_dt else None
 
@@ -768,7 +776,8 @@ def apply_rlock_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, str]:
             f"📐 **R-Relative Profit Floor (`/rlock`): {badge}**\n"
             f"• Tiers: `{_format_tiers(policy)}`\n"
             f"• Minimum R: `${policy.r_lock_min_r_dollars:.2f}` per ounce\n"
-            "• Change: `/rlock on` | `/rlock off`"
+            "• Toggles `R_LOCK_ENABLED`\n"
+            "• Change: `/rlock on` | `/rlock off`\n"
             "• The floor is a peak-derived level: it disappears if price retraces past it,"
             " so it can never place a stop on the wrong side of the market."
         )
@@ -804,6 +813,7 @@ def apply_lifecycle_command(cfg_mod: Any, args: Sequence[str]) -> Tuple[bool, st
             f"• Pending expiry: `{policy.pending_expire_seconds}s`\n"
             f"• Session cut: {session}\n"
             f"• Max close retries: `{policy.max_close_retries}`\n"
+            "• Toggles `LIFECYCLE_ENABLED`\n"
             "• Change: `/lifecycle on` | `/lifecycle off`"
         )
     token = cleaned[0].lower()
@@ -3004,7 +3014,7 @@ Gap check: the spec's `lifecycle_retry_count` state key (Error handling table) i
 **3. Type consistency**
 
 - `LifecyclePolicy` field names are identical in Task 1 (definition), Task 4 (`_get_lifecycle_policy`), Task 5 (no field access), Task 6 (`read_lifecycle_policy`).
-- `compute_r_lock_floor(direction, entry_price, initial_sl, mfe_dollars, policy, digits)` — Task 1 defines it, Task 4 calls it with exactly those keyword names.
+- `compute_r_lock_floor(direction, entry_price, initial_sl, mfe_dollars, live_price, policy, digits)` — Task 1 defines it, Task 4 calls it with exactly those keyword names (including `live_price=live_price`).
 - `compute_dynamic_atr_trail_stop(..., r_lock_floor=None)` — Task 2 defines it, Task 4 passes `r_lock_floor=r_lock_floor`.
 - `apply_lifecycle_action(signal_data, action)` — Task 5 defines it, Task 6 calls it with two positional args.
 - `evaluate_trade_age(signal_data, now_utc, policy, server_offset_seconds)` — Task 1 defines it, Task 6 calls it with four positional args.

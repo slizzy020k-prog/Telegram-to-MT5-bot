@@ -194,7 +194,7 @@ current SL.
 
 ```
 mfe        = sign × (peak_price − entry_price)
-r_lock_floor = compute_r_lock_floor(direction, entry_price, initial_sl, mfe, policy)
+r_lock_floor = compute_r_lock_floor(direction, entry_price, initial_sl, mfe, live_price, policy)
 ```
 
 `initial_sl` comes from the new per-layer state key `lv["initial_sl"]`, captured once at order
