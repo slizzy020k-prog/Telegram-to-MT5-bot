@@ -48,6 +48,51 @@ WARMUP_START_MT5 = datetime(2026, 11, 17, 0, 0)
 WARMUP_END_MT5 = datetime(2026, 11, 19, 13, 0)
 CHAT_ID = -1001234567890
 
+# Production-engine replay. Arms B and C drive the real ATR trail engine; Arm A
+# stays the frozen 4544f7f reference and is deliberately NOT fed the engine ATR.
+_PRODUCTION_ENGINE_ARM = False
+R_LOCK_WIDE_R_THRESHOLD = 5.0  # R >= $5/oz counts as a "wide stop" for precedence
+_PICKER_TRACE: Dict[str, Any] = {}
+
+
+def _reset_picker_trace(msg_id: str) -> None:
+    global _PICKER_TRACE
+    _PICKER_TRACE = {
+        "msg_id": msg_id,
+        "calls": 0,
+        "sources": {},
+        "r_lock_wins": 0,
+        "r_lock_wide_wins": 0,
+        "r_lock_max_r": 0.0,
+        "r_lock_first_mfe": None,
+    }
+
+
+def _install_picker_trace(mt5_executor_mod: Any) -> None:
+    """Record every production picker decision so R-lock precedence is evidenced."""
+    orig = mt5_executor_mod.compute_dynamic_atr_trail_stop
+
+    def _traced(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        res = orig(*args, **kwargs)
+        st = _PICKER_TRACE
+        if st:
+            st["calls"] += 1
+            src = str(res.get("stop_source") or "")
+            st["sources"][src] = st["sources"].get(src, 0) + 1
+            if src == "R_LOCK":
+                st["r_lock_wins"] += 1
+                ir = kwargs.get("initial_r")
+                if isinstance(ir, (int, float)) and not isinstance(ir, bool):
+                    if float(ir) > st["r_lock_max_r"]:
+                        st["r_lock_max_r"] = float(ir)
+                    if float(ir) >= R_LOCK_WIDE_R_THRESHOLD:
+                        st["r_lock_wide_wins"] += 1
+                if st["r_lock_first_mfe"] is None:
+                    st["r_lock_first_mfe"] = float(res.get("mfe_dollars") or 0.0)
+        return res
+
+    mt5_executor_mod.compute_dynamic_atr_trail_stop = _traced
+
 # Calibrated v3.6.0 parameters (M1 Swarm Consensus + 9 canonical Rev 2 defaults)
 ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "PROFIT_RATCHET_ENABLED": True,
@@ -269,6 +314,43 @@ def _compute_rolling_atr(bars: List[Dict[str, Any]], period: int = ATR_PERIOD) -
                 trs.append(tr)
             prev_close = c
         bars[i]["atr14"] = round(sum(trs) / len(trs), 4) if trs else 0.0
+
+
+def _compute_m5_atr_by_m1(bars: List[Dict[str, Any]], period: int = ATR_PERIOD) -> List[float]:
+    """Closed-bar M5 ATR aligned to each M1 bar, for the production ATR engine.
+
+    The production trail engine reads get_atr(symbol, trail_timeframe=M5, ...),
+    which in dry-run returns _dry_run_atr. The replay tape is M1, so aggregate the
+    M1 bars into M5 buckets, run the same closed-bar SMA-TR formula on the M5 series,
+    and give each M1 bar the ATR of the last COMPLETED M5 bar (closed-bar semantics).
+    Without this the engine sees ATR=0 and returns before ever calling the picker.
+    """
+    buckets: Dict[int, Dict[str, Any]] = {}
+    order: List[int] = []
+    for b in bars:
+        key = (int(b["time_utc"]) // 300) * 300
+        agg = buckets.get(key)
+        if agg is None:
+            buckets[key] = {
+                "time_utc": key,
+                "open": float(b["open"]),
+                "high": float(b["high"]),
+                "low": float(b["low"]),
+                "close": float(b["close"]),
+            }
+            order.append(key)
+        else:
+            agg["high"] = max(agg["high"], float(b["high"]))
+            agg["low"] = min(agg["low"], float(b["low"]))
+            agg["close"] = float(b["close"])
+    m5_bars = [buckets[k] for k in order]
+    _compute_rolling_atr(m5_bars, period)
+    atr_by_bucket = {int(mb["time_utc"]): float(mb.get("atr14") or 0.0) for mb in m5_bars}
+    out: List[float] = []
+    for b in bars:
+        key = (int(b["time_utc"]) // 300) * 300
+        out.append(atr_by_bucket.get(key - 300, 0.0))
+    return out
 
 
 def fetch_m1_bars(
@@ -900,6 +982,8 @@ async def _run_single_trade_worker(
     is_buy = trade["dir"] == "BUY"
     total_lot = round(sum(l[1] for l in trade["layers"]), 4)
     avg_entry = round(sum(l[1] * l[2] for l in trade["layers"]) / total_lot, 4)
+    _reset_picker_trace(msg_id)
+    m5_atr_series = _compute_m5_atr_by_m1(bars) if _PRODUCTION_ENGINE_ARM else None
 
     # Fresh isolated runtime state per trade
     state_path = runtime_dir / f"state_{msg_id}.json"
@@ -942,6 +1026,8 @@ async def _run_single_trade_worker(
             bar_utc = _utc_iso(bar["time_utc"])
             _REPLAY_CLOCK.set_epoch(int(bar["time_utc"]))
             main_mod.executor._dry_run_m1_atr = float(bar.get("atr14") or 0.0)
+            if m5_atr_series is not None:
+                main_mod.executor._dry_run_atr = m5_atr_series[b_idx]
             main_mod.executor._dry_run_last_m1_candle = {
                 "open": float(prev_bar["open"]),
                 "high": float(prev_bar["high"]),
@@ -1037,6 +1123,7 @@ async def _run_single_trade_worker(
         "actual_close_utc": trade["close_utc"],
         "total_lot": total_lot,
         "avg_entry": avg_entry,
+        "initial_r_per_oz": round(abs(avg_entry - float(trade["sl"])), 4),
         "sl": trade["sl"],
         "tp1": trade["tp_levels"]["TP1"],
         "actual_mt5_gbp": trade["actual_mt5_gbp"],
@@ -1065,6 +1152,12 @@ async def _run_single_trade_worker(
             )
         ),
         "error": error_msg,
+        "engine_picker_calls": int(_PICKER_TRACE.get("calls", 0)),
+        "stop_source_counts": dict(_PICKER_TRACE.get("sources", {})),
+        "r_lock_wins": int(_PICKER_TRACE.get("r_lock_wins", 0)),
+        "r_lock_wide_wins": int(_PICKER_TRACE.get("r_lock_wide_wins", 0)),
+        "r_lock_max_r": round(float(_PICKER_TRACE.get("r_lock_max_r", 0.0)), 4),
+        "r_lock_first_mfe": _PICKER_TRACE.get("r_lock_first_mfe"),
     }
 
 
@@ -1109,6 +1202,13 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         # reads the wall clock, and the replay simulates the RECORDED week.
         if arm_mode in ("b", "c"):
             _install_replay_clock(main)
+
+        # Arms B and C drive the production ATR trail engine: feed it the M5 ATR it
+        # actually reads and trace every picker decision. Arm A is the frozen 4544f7f
+        # reference and is deliberately left untouched.
+        globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in ("b", "c")
+        if _PRODUCTION_ENGINE_ARM:
+            _install_picker_trace(mt5_executor)
 
         async def _no_notify(*_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1188,6 +1288,11 @@ def _summarize_arm(results: List[Dict[str, Any]], arm_mode: str) -> Dict[str, An
         "unflagged_rollover_exits": unflagged_rollover,
         "error_count": len(errors),
         "errors": errors,
+        "engine_picker_calls": sum(int(r.get("engine_picker_calls", 0)) for r in results),
+        "r_lock_wins": sum(int(r.get("r_lock_wins", 0)) for r in results),
+        "r_lock_wide_wins": sum(int(r.get("r_lock_wide_wins", 0)) for r in results),
+        "r_lock_max_r": round(max([float(r.get("r_lock_max_r", 0.0)) for r in results] or [0.0]), 4),
+        "r_lock_trades": [r["msg_id"] for r in results if int(r.get("r_lock_wins", 0)) > 0],
     }
 
 
@@ -1205,7 +1310,10 @@ def _run_arm_subprocess(arm_mode: str, code_root: Path, bars_path: Path, out_pat
         "--worker-out",
         str(out_path),
     ]
-    proc = subprocess.run(cmd, cwd=str(code_root), env=env, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd, cwd=str(code_root), env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"Arm {arm_mode.upper()} worker failed (rc={proc.returncode}):\n"
@@ -1251,9 +1359,12 @@ def _evaluate_gates(
     if arm_c and arm_b:
         sc = arm_c["summary"]
         sb2 = arm_b["summary"]
+        # tail_loss_gbp_13078_9953 is a SIGNED PnL sum (negative = a loss). Better
+        # tail protection means a LESS negative value, exactly as gate_2 compares it
+        # (sb.tail > sa.tail). So "C's tail loss no worse than B's" is sc.tail >= sb.tail.
         g5 = (
             sc["net_gbp"] >= sb2["net_gbp"]
-            and sc["tail_loss_gbp_13078_9953"] <= sb2["tail_loss_gbp_13078_9953"]
+            and sc["tail_loss_gbp_13078_9953"] >= sb2["tail_loss_gbp_13078_9953"]
             and sc["error_count"] == 0
         )
     else:
@@ -1392,7 +1503,24 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             f"- **Tail Loss (13078 + 9953):** `£{sc['tail_loss_gbp_13078_9953']}` "
             f"(Arm B: {tail_b})",
             f"- **Trade Count:** `{sc['trade_count']}` | Errors: `{sc['error_count']}`",
+            f"- **Production ATR engine picker calls:** `{sc.get('engine_picker_calls', 0)}`",
+            f"- **R-lock precedence:** `{sc.get('r_lock_wins', 0)}` picker wins "
+            f"(`{sc.get('r_lock_wide_wins', 0)}` on wide stops R>=$5), "
+            f"max R=`{sc.get('r_lock_max_r', 0.0)}`, "
+            f"trades: `{', '.join(sc.get('r_lock_trades', [])) or 'none'}`",
         ]
+        rlock_rows = [r for r in arm_c["results"] if int(r.get("r_lock_wins", 0)) > 0]
+        if rlock_rows:
+            lines += [
+                "",
+                "| Msg ID | Initial R ($/oz) | R-lock wins | Wide (R>=$5) wins |",
+                "|---|---:|---:|---:|",
+            ]
+            for r in rlock_rows:
+                lines.append(
+                    f"| `{r['msg_id']}` | `{r.get('initial_r_per_oz', 0.0)}` | "
+                    f"`{r.get('r_lock_wins', 0)}` | `{r.get('r_lock_wide_wins', 0)}` |"
+                )
 
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():

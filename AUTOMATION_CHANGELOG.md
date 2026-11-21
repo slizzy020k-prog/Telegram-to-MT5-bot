@@ -4,6 +4,72 @@ All autonomous parameter calibrations, FSM/Profit Ratchet upgrades, bug fixes, a
 
 ---
 
+## [2026-11-21] — v3.8.2 Replay-Proof Fidelity: the harness now drives the production ATR engine
+
+- **Baseline Commit:** `4a6073f` (v3.8.1)
+- **Scope:** `scripts/ab_replay_proof.py` only. **No trading-behavior change.**
+  `R_LOCK_ENABLED=false`, `LIFECYCLE_ENABLED=false` still ship disabled; `check_algo.py` ALL
+  CHECKS PASSED; `startup_checks` ok; `458/458` pytest PASS.
+
+### 1. Why this was needed
+
+- The v3.8.1 audit found the replay **never called the production ATR engine**: the trail engine
+  reads `get_atr(symbol, trail_timeframe=M5, ...)`, which in dry-run returns `_dry_run_atr`, but
+  the harness only fed `_dry_run_m1_atr`. So the engine saw ATR=0 and returned before ever calling
+  the picker — Arm C could not evidence the R-gated BE lock at all.
+
+### 2. The fix
+
+- Added `_compute_m5_atr_by_m1`: aggregates the M1 tape into M5 buckets, runs the same closed-bar
+  SMA-TR ATR(14) on the M5 series, and feeds each M1 bar the ATR of the last COMPLETED M5 bar into
+  `_dry_run_atr`. The production engine now runs on every tick.
+- **Gated to arms B and C.** Arm A stays the frozen `4544f7f` reference and is deliberately not fed
+  the engine ATR, so the historical baseline is untouched.
+- Added a picker trace (`_install_picker_trace`) that records every `compute_dynamic_atr_trail_stop`
+  decision, so R-lock precedence is evidenced per trade (wins, wide-stop wins, max R).
+
+### 3. R-lock precedence — VERIFIED
+
+- **6405 production picker calls** (was 0). **R_LOCK won 36 times, 16 of them on wide stops (R >= $5).**
+
+| Msg ID | Initial R ($/oz) | R-lock wins | Wide (R>=$5) wins |
+|---|---:|---:|---:|
+| `9937` | `11.155` | `6` | `6` |
+| `9953` | `6.028` | `30` | `10` |
+
+- Trade `9937` is a genuinely wide stop ($11.155/oz): the R ladder wins the picker there, which is
+  exactly the breathing-room behavior the R-gate was built to deliver.
+
+### 4. Two harness bugs fixed
+
+- **cp1252 capture crash:** `_run_arm_subprocess` captured worker output with the locale codec and
+  crashed on the worker's UTF-8 logs. Now `encoding=utf-8, errors=replace`.
+- **g5 tail sign-direction:** the gate compared the SIGNED tail PnL with `<=`, the opposite of
+  gate_2's convention (`sb.tail > sa.tail` = less negative = better protection) and of the stated
+  intent (C's tail loss no worse than B's). Corrected to `>=`. This was inherited from the Task 10
+  brief's formula; it is a one-line direction fix, not a threshold change.
+
+### 5. Replay numbers (engine now live for B and C)
+
+| Arm | Net P&L | Tail loss (13078+9953) | Errors |
+|---|---:|---:|---:|
+| A (`4544f7f`, frozen) | `£+15.62` | `£-61.99` | 0 |
+| B (calibrated, engine ON) | `£+49.61` | `£-26.08` | 0 |
+| **C (R lock + age guard)** | **`£+53.60`** | **`£-21.74`** | 0 |
+
+- **g5 = True** (C >= B on net P&L AND C tail no worse than B). gate_1/2/4 True.
+- **gate_3 still False** (the pre-existing choke-trio MFE-capture gate, unrelated to this change),
+  so `all_gates_passed` is False and the script exits 1. That is expected, not a regression.
+- **Arm B's baseline moved** (from `£+0.13` to `£+49.61`) because B now actually runs its own ATR
+  engine; before, ATR=0 silently disabled it. This is a more faithful replay, not a calibration change.
+
+### 6. Still open before enabling
+
+- The de-risk's flat BE (no R input) still overrides the R-gate on aged trades (v3.8.1 §3).
+- The M1 tape is fetched live from the broker, so Arm A/B baselines drift between runs; the replay
+  is a directional instrument, not a byte-reproducible regression gate.
+- Both features remain **disabled** pending those decisions.
+
 ## [2026-11-21] — v3.8.1 Trade Lifecycle Guard Calibration (R-gated BE lock + wider age timers)
 
 - **Baseline Commit:** `6526e39` (v3.8.0)
