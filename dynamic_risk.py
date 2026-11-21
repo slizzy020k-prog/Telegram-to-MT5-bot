@@ -509,10 +509,14 @@ def compute_dynamic_atr_trail_stop(
     When it is a positive number the BE lock becomes **R-gated**: it then waits
     for `max(0.5 * R, 0.75 * ATR, $2.50)` of favourable excursion instead of the
     flat `max(0.75 * ATR, $3.50)`, so a wide-stop trade is not locked at
-    breakeven long before the R ladder could matter. While the gate is active
-    the R ladder REPLACES the flat BE lock: the BE candidate then carries the
-    same price as the R floor, and `R_LOCK` (picker priority 0) wins the tie.
-    When `initial_r` is `None` or non-positive the behaviour is unchanged.
+    breakeven long before the R ladder could matter. The gate changes only
+    WHEN the BE lock arms, never WHERE it locks: the stop stays at the classic
+    breakeven offset (`entry +/- $0.50`), so the R-gated path can never be less
+    protective than the flat BE lock it replaced. The picker keeps the tightest
+    candidate, so `BE_LOCK` wins at the 0.5R tier (the R floor is only `entry`)
+    and `R_LOCK` wins from the 1.0R tier upward (the R floor is
+    `entry + 0.25 * R`). When `initial_r` is `None` or non-positive the
+    behaviour is unchanged.
     """
     atr_f = _safe_float(atr, 0.0)
     if not policy.trail_enabled or atr_f <= 0.0 or entry_price <= 0.0 or live_price <= 0.0:
@@ -566,11 +570,10 @@ def compute_dynamic_atr_trail_stop(
     be_armed = mfe + 1e-9 >= be_threshold
     if not be_armed:
         be_sl = None
-    elif r_gated and r_lock_candidate is not None:
-        # The R ladder REPLACES the flat BE lock while R is valid: both candidates
-        # then carry the same price, and R_LOCK (picker priority 0) wins the tie.
-        be_sl = r_lock_candidate
     else:
+        # The R gate only changes WHEN the BE lock arms, never WHERE it locks.
+        # The stop stays at the classic breakeven offset, so the R-gated path can
+        # never be less protective than the flat BE lock it replaced.
         be_sl = round(entry_price + sign * max(0.0, policy.be_lock_offset_dollars), digits)
     should_sweep_pending = be_armed
 
