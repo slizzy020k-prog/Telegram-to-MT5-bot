@@ -3586,8 +3586,8 @@ restart; recomputing it would drop the monotonic guarantee.
             elif lifecycle_pol.r_lock_enabled and not lv.get("_r_lock_skipped_logged"):
                 lv["_r_lock_skipped_logged"] = True
                 logger.info(
-                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (signal opened before the upgrade); "
-                    "ATR trail only."
+                    f"[R-LOCK SKIPPED] {lk} has no initial_sl (the layer was placed without a stop, "
+                    "or the signal predates the upgrade); ATR trail only."
                 )
 ```
 
@@ -3690,7 +3690,7 @@ with the default the trail engine behaves exactly as before."
 ## Task 5: `mt5_executor.py` — the lifecycle actions
 
 **Files:**
-- Modify: `mt5_executor.py` (add four methods after `close_signal_exposure`, which ends at line 5490)
+- Modify: `mt5_executor.py` (add four methods after `close_signal_exposure`, which starts at line 5507)
 - Modify: `tests/test_trade_lifecycle.py` (append the action tests)
 
 **Interfaces:**
@@ -3754,10 +3754,34 @@ def test_apply_lifecycle_derisk_moves_open_layers_to_be(monkeypatch):
 
     assert res["ok"] is True
     assert res["action"] == "DERISK"
-    assert calls and calls[0][0] == 101
+    # ONLY the open layer is moved. L2 is a PENDING limit that was just cancelled;
+    # modifying it would fail at the broker and report a failed de-risk.
+    assert [t for t, _ in calls] == [101]
     assert calls[0][1] == pytest.approx(3895.50)   # entry + the $0.50 BE offset
     assert res["cancelled"] == [102]
+    assert res["failed"] == []
     assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.50)
+
+
+def test_apply_lifecycle_derisk_leaves_pending_layers_untouched(monkeypatch):
+    """A pending limit has no position to move; touching it would report a false failure."""
+    from mt5_executor import MT5Executor
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+
+    calls = []
+    monkeypatch.setattr(ex, "modify_position_sltp", lambda t, sl=None, tp=None: calls.append((t, sl)) or True)
+    monkeypatch.setattr(ex, "cancel_signal_pending_orders", lambda sig: [102])
+
+    sig = _lifecycle_signal()
+    res = ex.apply_lifecycle_derisk(sig)
+
+    assert [t for t, _ in calls] == [101]
+    assert res["ok"] is True
+    assert res["failed"] == []
+    assert res["moved"] and res["moved"][0]["layer"] == "L1"
 
 
 def test_apply_lifecycle_derisk_never_loosens_an_existing_stop(monkeypatch):
@@ -3852,7 +3876,7 @@ Expected: FAIL — `AttributeError: 'MT5Executor' object has no attribute 'apply
 
 - [ ] **Step 3: Implement the four methods**
 
-Add the following to `mt5_executor.py`, immediately after `close_signal_exposure` (which ends at line 5490):
+Add the following to `mt5_executor.py`, immediately after `close_signal_exposure` (which starts at line 5507):
 
 ```python
     def apply_lifecycle_derisk(self, signal_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -3903,6 +3927,12 @@ Add the following to `mt5_executor.py`, immediately after `close_signal_exposure
 
         for lk, lv in list(layers.items()):
             if not isinstance(lv, dict):
+                continue
+            # Only a layer that HOLDS a position can be moved to breakeven. A
+            # PENDING layer is an unfilled limit that `cancel_signal_pending_orders`
+            # has just cancelled — modifying it would fail at the broker and would
+            # mark an otherwise successful de-risk as failed.
+            if str(lv.get("status") or "").strip().upper() in ("PENDING", "CANCELLED", "CLOSED"):
                 continue
             ticket = _int_num(lv.get("ticket"), 0)
             if ticket <= 0:
