@@ -3620,3 +3620,163 @@ def test_append_trade_defaults_to_schema_4(tmp_path):
 
     assert entry["schema_version"] == 4
 
+
+# --- /stats ---------------------------------------------------------------
+
+def test_build_ledger_stats_summarises_pnl_and_giveback():
+    import main
+
+    records = [
+        {
+            "closed_at": "2026-11-19T09:00:00+00:00",
+            "realized_pnl": 10.0,
+            "exit_reason_code": "ATR_TRAIL",
+            "mfe_cash": 30.0,
+            "giveback_cash": 20.0,
+            "exit_age_seconds": 7200,
+            "lifecycle_action": None,
+        },
+        {
+            "closed_at": "2026-11-19T10:00:00+00:00",
+            "realized_pnl": -5.0,
+            "exit_reason_code": "BROKER_SL",
+            "mfe_cash": 12.0,
+            "giveback_cash": 17.0,
+            "exit_age_seconds": 90000,
+            "lifecycle_action": "FLATTEN",
+        },
+    ]
+
+    stats = main._build_ledger_stats(records)
+
+    # The helper returns one aggregate per window; the plan's draft asserted
+    # these fields on the top level, so they are asserted on the all-time
+    # aggregate that carries them.
+    allt = stats["all_time"]
+    assert allt["count"] == 2
+    assert allt["net_pnl"] == pytest.approx(5.0)
+    assert allt["wins"] == 1
+    assert allt["losses"] == 1
+    assert allt["win_rate"] == pytest.approx(0.5)
+    assert allt["total_giveback"] == pytest.approx(37.0)
+    assert allt["max_exit_age_seconds"] == 90000
+    assert allt["lifecycle_closes"] == 1
+    assert allt["exit_reasons"]["ATR_TRAIL"] == 1
+    assert allt["exit_reasons"]["BROKER_SL"] == 1
+    assert set(stats) == {"today", "seven_day", "all_time"}
+
+
+def test_build_ledger_stats_windows_are_time_scoped():
+    import main
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 11, 19, 12, 0, 0, tzinfo=timezone.utc)
+    records = [
+        {"closed_at": "2026-11-19T09:00:00+00:00", "realized_pnl": 10.0},
+        {"closed_at": "2026-11-17T09:00:00+00:00", "realized_pnl": 20.0},
+        {"closed_at": "2026-01-01T09:00:00+00:00", "realized_pnl": 30.0},
+    ]
+
+    stats = main._build_ledger_stats(records, now=now)
+
+    assert stats["today"]["count"] == 1
+    assert stats["today"]["net_pnl"] == pytest.approx(10.0)
+    assert stats["seven_day"]["count"] == 2
+    assert stats["seven_day"]["net_pnl"] == pytest.approx(30.0)
+    assert stats["all_time"]["count"] == 3
+    assert stats["all_time"]["net_pnl"] == pytest.approx(60.0)
+
+
+def test_build_ledger_stats_tolerates_garbage_records():
+    import main
+
+    stats = main._build_ledger_stats([None, "nonsense", {"realized_pnl": None}])
+
+    assert stats["all_time"]["count"] == 1
+    assert stats["all_time"]["net_pnl"] == pytest.approx(0.0)
+    assert stats["all_time"]["total_giveback"] == pytest.approx(0.0)
+
+
+class _StubFinancialsExecutor:
+    """An executor stub that answers the account financials call."""
+
+    def get_account_financials(self):
+        return {"currency": "GBP", "balance": 1000.0, "formatted": "• Balance: 1000.00 GBP"}
+
+
+@pytest.mark.asyncio
+async def test_stats_command_reports_no_ledger_data(monkeypatch, tmp_path):
+    """A missing ledger must degrade gracefully, never raise."""
+    import config
+    import main
+
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", tmp_path / "missing_ledger.jsonl")
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    assert "no ledger data" in ev.replies[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_tolerates_a_corrupt_ledger(monkeypatch, tmp_path):
+    """A corrupt ledger must degrade gracefully, never raise."""
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    ledger.write_text("this is not json\n{broken\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    assert "no ledger data" in ev.replies[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_stats_command_reports_the_ledger_summary(monkeypatch, tmp_path):
+    import json
+
+    import config
+    import main
+
+    ledger = tmp_path / "trades_ledger.jsonl"
+    rec = {
+        "schema_version": 4,
+        "closed_at": "2026-11-19T09:00:00+00:00",
+        "realized_pnl": 10.0,
+        "exit_reason_code": "ATR_TRAIL",
+        "mfe_cash": 30.0,
+        "giveback_cash": 20.0,
+        "exit_age_seconds": 7200,
+        "lifecycle_action": None,
+    }
+    ledger.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    monkeypatch.setattr(config, "TRADES_LEDGER_PATH", ledger)
+    monkeypatch.setattr(main, "executor", _StubFinancialsExecutor())
+    _install_signal(monkeypatch, tmp_path, {})
+
+    ev = _MockEvent("/stats")
+    await main.handle_saved_messages_command(ev)
+
+    assert ev.replies
+    body = ev.replies[0]
+    assert "Trade Stats" in body
+    assert "+10.00 GBP" in body
+    assert "giveback" in body
+
+
+def test_stats_is_a_known_saved_command():
+    import main
+
+    assert main._is_known_saved_command("/stats")
+    assert main._is_known_saved_command("stats")
+
+

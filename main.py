@@ -5,9 +5,10 @@ import copy
 import time
 import inspect
 import asyncio
+import json
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable
 
@@ -1206,6 +1207,64 @@ async def _execute_tp1_scaling_handoff(
 
 def _safe_float_or_none(val: Any) -> Optional[float]:
     return float(val) if _is_num(val) else None
+
+
+def _build_ledger_stats(records: List[Dict[str, Any]], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Aggregate closed-trade records into the `/stats` summary."""
+    rows = [r for r in (records or []) if isinstance(r, dict)]
+    now = now or datetime.now(timezone.utc)
+
+    def _closed_dt(row: Dict[str, Any]) -> Optional[datetime]:
+        raw = str(row.get("closed_at") or "").strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+    cutoff_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_7d = now - timedelta(days=7)
+
+    def _in_window(row: Dict[str, Any], cutoff: datetime) -> bool:
+        dt = _closed_dt(row)
+        return bool(dt and dt >= cutoff)
+
+    def _slice(cutoff: Optional[datetime]) -> List[Dict[str, Any]]:
+        if cutoff is None:
+            return list(rows)
+        return [r for r in rows if _in_window(r, cutoff)]
+
+    def _aggregate(subset: List[Dict[str, Any]]) -> Dict[str, Any]:
+        pnls = [float(r.get("realized_pnl") or 0.0) for r in subset]
+        wins = sum(1 for p in pnls if p > 0.0)
+        losses = sum(1 for p in pnls if p < 0.0)
+        givebacks = [float(r.get("giveback_cash")) for r in subset if r.get("giveback_cash") is not None]
+        ages = [int(r.get("exit_age_seconds")) for r in subset if r.get("exit_age_seconds") is not None]
+        reasons: Dict[str, int] = {}
+        for r in subset:
+            code = str(r.get("exit_reason_code") or "UNKNOWN")
+            reasons[code] = reasons.get(code, 0) + 1
+        return {
+            "count": len(subset),
+            "net_pnl": round(sum(pnls), 2),
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(wins / len(subset), 4) if subset else 0.0,
+            "total_giveback": round(sum(givebacks), 2),
+            "max_exit_age_seconds": max(ages) if ages else 0,
+            "lifecycle_closes": sum(1 for r in subset if r.get("lifecycle_action")),
+            "exit_reasons": reasons,
+        }
+
+    return {
+        "today": _aggregate(_slice(cutoff_today)),
+        "seven_day": _aggregate(_slice(cutoff_7d)),
+        "all_time": _aggregate(rows),
+    }
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -7312,6 +7371,7 @@ _KNOWN_SAVED_COMMANDS = {
     "/sim_shortfall", "sim_shortfall", "/testrunner", "testrunner",
     "/testorder", "testorder", "/testlimit", "testlimit", "/test", "test",
     "/health", "health", "/status", "status", "/ping", "ping",
+    "/stats", "stats",
     "/trades", "trades", "/algo", "algo", "/check", "check", "/help", "help",
     "/sl", "/tp", "/tp1", "/tp2", "/tp3", "/tp4", "/tp5",
     "/trail", "trail", "/be", "be", "breakeven", "/partial", "partial",
@@ -7630,6 +7690,63 @@ async def handle_saved_messages_command(event: Any) -> None:
         if changed:
             logger.info(f"[/lifecycle] LIFECYCLE_ENABLED updated to {getattr(_cfg_mod, 'LIFECYCLE_ENABLED', False)}")
         await event.reply(reply_msg)
+        return
+
+    # LIVE CONTROL: /stats — closed-trade analytics from the trade ledger
+    if text in ("/stats", "stats"):
+        _cfg_mod = sys.modules.get("config") or config
+        ledger_path = Path(getattr(_cfg_mod, "TRADES_LEDGER_PATH", Path("trades_ledger.jsonl")))
+        records: List[Dict[str, Any]] = []
+        try:
+            if ledger_path.exists():
+                # Streamed line by line: the ledger is JSONL, so no whole-file
+                # text blob is ever held in memory.
+                with ledger_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, dict):
+                            records.append(obj)
+        except Exception as exc:
+            logger.warning(f"[/stats] could not read ledger {ledger_path}: {exc}")
+
+        if not records:
+            await event.reply(f"📊 **Trade Stats**\n• No ledger data found at `{ledger_path}`.")
+            return
+
+        stats = _build_ledger_stats(records)
+        today = stats["today"]
+        seven = stats["seven_day"]
+        allt = stats["all_time"]
+        try:
+            fin = await _mt5_call(executor.get_account_financials)
+        except Exception as exc:
+            logger.warning(f"[/stats] account financials unavailable: {exc}")
+            fin = {"currency": "GBP", "formatted": ""}
+        curr = fin.get("currency", "GBP")
+
+        def _line(label: str, agg: Dict[str, Any]) -> str:
+            return (
+                f"• **{label}:** `{agg['net_pnl']:+.2f} {curr}` | "
+                f"`{agg['count']}` trades | win rate `{agg['win_rate'] * 100:.0f}%` | "
+                f"giveback `{agg['total_giveback']:.2f} {curr}` | "
+                f"max age `{agg['max_exit_age_seconds']}s`\n"
+            )
+
+        await event.reply(
+            "📊 **Trade Stats**\n"
+            + _line("Today", today)
+            + _line("7 days", seven)
+            + _line("All time", allt)
+            + f"• Lifecycle closes: `{allt['lifecycle_closes']}`\n"
+            + f"• Exit reasons: `{allt['exit_reasons']}`\n\n"
+            f"{fin.get('formatted', '')}"
+        )
         return
 
     # LIVE CONTROL: /floatcap [pct|off] — toggle/configure floating-loss force-close hard cap
@@ -8715,7 +8832,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Execution Mode: `{'DRY-RUN' if executor.dry_run else 'LIVE BROKER'}` | Magic: `{MAGIC_NUMBER}`"
             f"\n• Runner Exit Architecture: `{staged_badge}`"
             f"{trades_str}\n\n"
-            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
+            f"📱 **Commands:** `/health`, `/status`, `/resume`, `/bank_tp1`, `/bank`, `/lotcap`, `/losslimit`, `/floatcap`, `/dynamicrisk`, `/atrtrail`, `/rlock`, `/lifecycle`, `/stats`, `/trade`, `/sl`, `/tp`, `/trail`, `/be`, `/partial`, `dailywin`, `dailyloss`, `/set_daily_loss`, `/status_daily_loss`, `/closeall`, `/sim_tp1 1|2|3|4`, `/sim_shortfall`, `/sim_trail 2|3|4`, `/test`, `/testrunner`, `/testorder`"
         )
         await event.reply(reply_text)
         return
