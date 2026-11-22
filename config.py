@@ -541,6 +541,37 @@ DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS: float = _env_float(
 DYNAMIC_ATR_TRAIL_STEP_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25, min_val=0.05, max_val=20.0, positive_only=True
 )
+
+# Selectable trailing profile (validated A/B research arms; baseline is the SHIPPED
+# production default). Applied AFTER the DYNAMIC_ATR_TRAIL_* knobs are parsed and
+# overriding ONLY ACTIVATION_MULT + MAX_DOLLARS; every other trail knob keeps its
+# parsed value:
+#   t2: ACTIVATION_MULT 1.00 + MAX_DOLLARS 5.50 (Pareto-safe fallback)
+#   t3: ACTIVATION_MULT 0.70 + MAX_DOLLARS 5.50 (leading config)
+# _env_choice upper-cases the raw value before matching, so the choices are
+# upper-case and the result is normalised back to lower-case; empty/invalid
+# values fall back to "baseline" (knobs left exactly as parsed).
+TRAILING_PROFILE: str = _env_choice(
+    "TRAILING_PROFILE", "baseline", ("BASELINE", "T2", "T3")
+).lower()
+
+_TRAILING_PROFILE_PRESETS: Dict[str, Tuple[float, float]] = {
+    "t2": (1.00, 5.50),
+    "t3": (0.70, 5.50),
+}
+if TRAILING_PROFILE in _TRAILING_PROFILE_PRESETS:
+    (
+        DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
+        DYNAMIC_ATR_TRAIL_MAX_DOLLARS,
+    ) = _TRAILING_PROFILE_PRESETS[TRAILING_PROFILE]
+_cfg_logger.info(
+    "TRAILING_PROFILE=%s applied (DYNAMIC_ATR_TRAIL_ACTIVATION_MULT=%.2f, "
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS=%.2f)",
+    TRAILING_PROFILE,
+    DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
+    DYNAMIC_ATR_TRAIL_MAX_DOLLARS,
+)
+
 DYNAMIC_ATR_BE_ACTIVATION_MULT: float = _env_float(
     "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75, min_val=0.0, max_val=20.0
 )
