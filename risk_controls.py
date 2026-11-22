@@ -185,3 +185,28 @@ def format_limits_status_lines(cfg_mod: Any, dd_status: Dict[str, Any], risk_sta
         f_state = "🔴 TRIGGERED" if dd.get("float_force_close_triggered") else "🟢 ACTIVE"
         fc_line = f"• Floating Loss Cap (`/floatcap`): `{f_state}` — `{_fmt_pct(snap.float_loss_cap_pct)}` (`-{_safe_float(dd.get('float_cap_limit')):.2f} {curr}` | Current: `-{float_loss:.2f} {curr}`)"
     return {"active_lots_label": lots_label, "drawdown_guard_line": dd_line, "float_cap_line": fc_line}
+
+
+def format_protection_profile_line(cfg_mod: Any) -> str:
+    """Display-only one-line summary of the active protection profile.
+
+    Reads the live config module without mutating it: TRAILING_PROFILE,
+    R-Lock (via risk_lifecycle), High-Risk Lot Cap and the daily-loss pause
+    guard. Used by the startup log, /status and the launcher banners.
+    """
+    prof = str(getattr(cfg_mod, "TRAILING_PROFILE", "baseline"))
+    snap = read_risk_limits(cfg_mod)
+    lot_txt = "ON" if snap.lot_cap_enabled else "OFF"
+    # _fmt_pct already carries the '%' suffix (80.0 -> '80%'), so no extra '%'.
+    pause_txt = _fmt_pct(snap.daily_loss_pause_pct) if snap.daily_loss_pause_pct > 0 else "OFF"
+    try:
+        from risk_lifecycle import read_lifecycle_policy  # lazy import: avoid circularity
+
+        r_lock_on = bool(read_lifecycle_policy(cfg_mod).r_lock_enabled)
+    except Exception:
+        r_lock_on = bool(getattr(cfg_mod, "R_LOCK_ENABLED", False))
+    r_txt = "ON" if r_lock_on else "OFF"
+    return (
+        f"• Protection Profile: TRAILING_PROFILE=`{prof}` | R-Lock: `{r_txt}` "
+        f"| Lot Cap: `{lot_txt}` | Daily Loss Pause: `{pause_txt}`"
+    )

@@ -132,6 +132,7 @@ from risk_controls import (
     apply_loss_limit_command,
     apply_lot_cap_command,
     format_limits_status_lines,
+    format_protection_profile_line,
     read_risk_limits,
 )
 from dynamic_risk import (
@@ -8675,6 +8676,7 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         _cfg_mod = sys.modules.get("config") or config
         limits_lines = format_limits_status_lines(_cfg_mod, dd_st, risk_st)
+        protection_line = format_protection_profile_line(_cfg_mod)
         dyn_line = await _fetch_dynamic_risk_status_line(_cfg_mod)
         srv_date = await _trading_day_str_async()
         ledger_stats = trade_ledger.get_stats(server_date=srv_date)
@@ -8687,6 +8689,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• Daily Loss Limit (`dailyloss`): {dl_state_str}"
             f"\n{limits_lines['drawdown_guard_line']}"
             f"\n{limits_lines['float_cap_line']}"
+            f"\n{protection_line}"
             f"\n{dyn_line}"
             f"\n• Trade Ledger (`{TRADES_LEDGER_PATH.name}`): `{ledger_stats['total_trades']}` closed | "
             f"Win Rate: `{ledger_stats['win_rate_pct']:.1f}%` | "
@@ -8695,7 +8698,7 @@ async def handle_saved_messages_command(event: Any) -> None:
         )
 
         reply_text = (
-            f"🤖 **Telegram Copier System Status (v3.0)**\n"
+            f"🤖 **Telegram Copier System Status (v3.9.0)**\n"
             f"• State: `{'🟢 ONLINE' if mt5_ok else '🔴 MT5 DISCONNECTED'}` (Ping: `{ping_ms:.2f} ms`)\n"
             f"• Algo Trading: `{algo_str}` | Telegram Reconnects: `{_telegram_reconnect_count}`"
             f"{acc_info}"
@@ -8875,7 +8878,7 @@ async def main() -> None:
     lots_str = " / ".join(f"{b:.2f}" for b in BASE_LAYER_LOTS)
     total_base = sum(BASE_LAYER_LOTS) * RISK_LOT_MULTIPLIER
     print("\033[93m\033[1m╔═════════════════════════════════════════════════════════════════════════╗")
-    print("║        ⚡ ULTIMATE TELEGRAM-TO-MT5 XAUUSD PRO COPIER v3.0 ⚡           ║")
+    print("║        ⚡ ULTIMATE TELEGRAM-TO-MT5 XAUUSD PRO COPIER v3.9.0 ⚡         ║")
     print("║  ─────────────────────────────────────────────────────────────────────  ║")
     print(f"║   • Broker Symbol: \033[97m{DEFAULT_SYMBOL:<12}\033[93m  • Magic Number: \033[97m{MAGIC_NUMBER:<12}\033[93m   ║")
     print(f"║   • Mode: \033[92m{'DRY-RUN (SIM)' if DRY_RUN else 'LIVE BROKER':<16}\033[93m   • 4-Layer: \033[97m{lots_str} ({total_base:.2f})\033[93m  ║")
@@ -8978,6 +8981,7 @@ async def main() -> None:
             f"🛡️ Risk Limits: Lot Cap={_lot_lbl} | Drawdown Guard={_dd_lbl} | Float Cap={_fc_lbl} "
             f"(Manual Saved Messages controls: /lotcap, /losslimit, /floatcap, dailyloss, dailywin)"
         )
+        logger.info("🎛️ " + format_protection_profile_line(sys.modules.get("config") or config))
 
         session_file = str(BASE_DIR / TELEGRAM_SESSION_NAME)
         logger.info(f"Initializing Telegram Client (Session: {session_file})...")
