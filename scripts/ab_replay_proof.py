@@ -76,6 +76,16 @@ def _reset_picker_trace(msg_id: str) -> None:
         "r_lock_wide_wins": 0,
         "r_lock_max_r": 0.0,
         "r_lock_first_mfe": None,
+        # Phase 2 lock_fraction instrumentation (REPORTING ONLY; never alters a
+        # picker decision). f_k == 0 wins are BE-equivalents (floor == entry).
+        "r_lock_fraction_zero_wins": 0,
+        "r_lock_fraction_pos_wins": 0,
+        "r_lock_winning_r_min": None,
+        "r_lock_winning_r_max": 0.0,
+        "r_lock_max_trail_dist_at_win": 0.0,
+        "r_lock_win_details": [],
+        "max_trail_dist": 0.0,
+        "r_values_seen": set(),
     }
 
 
@@ -90,19 +100,112 @@ def _install_picker_trace(mt5_executor_mod: Any) -> None:
             st["calls"] += 1
             src = str(res.get("stop_source") or "")
             st["sources"][src] = st["sources"].get(src, 0) + 1
+            # Per-call trail distance + per-layer R, for the structural wide-stop
+            # check (trail_dist vs (t_k - f_k) * R). Reporting only.
+            td = float(res.get("trail_dist") or 0.0)
+            if td > st["max_trail_dist"]:
+                st["max_trail_dist"] = td
+            ir = kwargs.get("initial_r")
+            ir_ok = isinstance(ir, (int, float)) and not isinstance(ir, bool) and float(ir) > 0.0
+            if ir_ok:
+                st["r_values_seen"].add(round(float(ir), 4))
             if src == "R_LOCK":
                 st["r_lock_wins"] += 1
-                ir = kwargs.get("initial_r")
-                if isinstance(ir, (int, float)) and not isinstance(ir, bool):
+                if ir_ok:
                     if float(ir) > st["r_lock_max_r"]:
                         st["r_lock_max_r"] = float(ir)
                     if float(ir) >= R_LOCK_WIDE_R_THRESHOLD:
                         st["r_lock_wide_wins"] += 1
                 if st["r_lock_first_mfe"] is None:
                     st["r_lock_first_mfe"] = float(res.get("mfe_dollars") or 0.0)
+                # Recover the winning tier's lock_fraction f_k from the winning
+                # floor: floor = entry + sign * f_k * R  =>  f_k = sign*(floor-entry)/R.
+                entry = kwargs.get("entry_price")
+                floor = res.get("r_lock_floor")
+                if (
+                    ir_ok
+                    and isinstance(entry, (int, float)) and not isinstance(entry, bool)
+                    and isinstance(floor, (int, float)) and not isinstance(floor, bool)
+                ):
+                    sign = 1.0 if str(kwargs.get("direction") or "BUY").strip().upper() == "BUY" else -1.0
+                    frac = round(sign * (float(floor) - float(entry)) / float(ir), 4)
+                    mfe = float(res.get("mfe_dollars") or 0.0)
+                    st["r_lock_win_details"].append({
+                        "fraction": frac,
+                        "r": round(float(ir), 4),
+                        "trail_dist": round(td, 4),
+                        "mfe": round(mfe, 4),
+                        "zone": str(res.get("trail_zone") or ""),
+                    })
+                    if frac <= 1e-9:
+                        st["r_lock_fraction_zero_wins"] += 1
+                    else:
+                        st["r_lock_fraction_pos_wins"] += 1
+                    if st["r_lock_winning_r_min"] is None or float(ir) < st["r_lock_winning_r_min"]:
+                        st["r_lock_winning_r_min"] = float(ir)
+                    if float(ir) > st["r_lock_winning_r_max"]:
+                        st["r_lock_winning_r_max"] = float(ir)
+                    if td > st["r_lock_max_trail_dist_at_win"]:
+                        st["r_lock_max_trail_dist_at_win"] = td
         return res
 
     mt5_executor_mod.compute_dynamic_atr_trail_stop = _traced
+
+
+def _rlock_snap_tier(fraction: float, tiers: Any, r: float, mfe: float) -> Tuple[Optional[float], float]:
+    """Snap a recovered lock_fraction to its configured tier (t_k, f_k).
+
+    The winning floor is rounded to broker digits, so recovering f_k from
+    (floor - entry) / R carries up to half-a-cent/R of discretisation error
+    (e.g. 0.2495 instead of 0.25, or -0.0 instead of 0.0). Snap to the nearest
+    configured tier fraction within that tolerance so the histogram groups by
+    true tier. Returns (threshold, snapped_fraction); threshold is None when no
+    tier matches (e.g. tiers unavailable on the frozen Arm A engine).
+    """
+    frac = 0.0 if abs(fraction) <= 1e-9 else float(fraction)
+    tol = (0.005 / r + 1e-6) if r > 0.0 else 1e-6
+    best: Optional[Tuple[float, float]] = None
+    best_dist = tol
+    for (t, f) in (tiers or []):
+        dist = abs(float(f) - frac)
+        if dist <= best_dist:
+            best_dist = dist
+            best = (float(t), float(f))
+    if best is None:
+        return (None, frac)
+    return (best[0], best[1])
+
+
+def _enrich_rlock_trace(st: Dict[str, Any], tiers: Any) -> None:
+    """Add t_k / margin to each win and compute the structural wide-stop view.
+
+    Mutates the trace dict in place; deterministic and reporting-only. The
+    structural test: R_LOCK can only win a profit tier (f_k > 0) while
+    trail_dist > (t_k - f_k) * R. If even the LARGEST trail distance ever
+    observed is below the EASIEST profit-tier margin on the widest layer, the
+    wide stop is structurally unreachable by the R lock (not a fraction problem).
+    """
+    if not st:
+        return
+    for d in st.get("r_lock_win_details") or []:
+        t, f_snap = _rlock_snap_tier(d["fraction"], tiers, d["r"], d["mfe"])
+        d["fraction"] = f_snap
+        d["threshold"] = t
+        if t is not None:
+            margin = round((t - f_snap) * d["r"], 4)
+            d["margin_needed"] = margin
+            d["trail_gt_margin"] = bool(d["trail_dist"] > margin + 1e-9)
+        else:
+            d["margin_needed"] = None
+            d["trail_gt_margin"] = None
+    r_vals = sorted(st.get("r_values_seen") or [])
+    widest_r = r_vals[-1] if r_vals else 0.0
+    profit_margins = [(float(t) - float(f)) * widest_r for (t, f) in (tiers or []) if float(f) > 0.0]
+    min_margin = round(min(profit_margins), 4) if profit_margins else None
+    max_td = round(float(st.get("max_trail_dist") or 0.0), 4)
+    st["r_lock_widest_r"] = round(widest_r, 4)
+    st["r_lock_min_profit_margin"] = min_margin
+    st["r_lock_structural_blocked"] = bool(min_margin is not None and max_td < min_margin - 1e-9)
 
 # Canonical DYNAMIC_ATR_* trail + BE knobs pinned for BOTH arms so the replay
 # is independent of the ambient .env (Phase 1.1, Hole 2). Values equal the
@@ -163,6 +266,19 @@ ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
 ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
     **_DYNAMIC_ATR_PINNED_PARAMS,
     "R_LOCK_ENABLED": True,
+}
+
+# EXPERIMENTAL - Phase 2 decision evidence ONLY. NOT production, NOT shipped,
+# never a default arm, and never written to config.py / .env. A deliberately
+# re-tiered (lower-threshold) R-lock ladder used to TEST the audit hypothesis
+# that re-tiering cannot engage wide stops. Run explicitly via "--arm cx"
+# (which also runs Arm C for a before/after on the pinned tape). The easiest
+# profit-tier margin here is (0.75 - 0.25) * R = 0.5R, vs 0.75R for the shipped
+# ladder; any layer with 0.5R above the $8 trail clamp ceiling (R > $16) stays
+# structurally unreachable regardless of tiering.
+ARM_CX_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_C_CALIBRATED_PARAMS,
+    "R_LOCK_TIERS": "0.5:0.00,0.75:0.25,1.0:0.50,1.25:0.75",
 }
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
@@ -1125,6 +1241,26 @@ def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None
                 main_mod._MAIN_CFG_SNAPSHOT[k] = ARM_C_CALIBRATED_PARAMS[k]
 
 
+def _pin_arm_cx_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None:
+    """EXPERIMENTAL ONLY: pin the re-tiered R-lock ladder override (arm cx).
+
+    Applied AFTER the Arm B + Arm C pins so the only delta vs Arm C is
+    R_LOCK_TIERS. Never touches production defaults; replay arm-param override.
+    """
+    targets = (config_mod, executor_mod, main_mod)
+    for key, expected in ARM_CX_EXPERIMENTAL_PARAMS.items():
+        for mod in targets:
+            if hasattr(mod, key):
+                setattr(mod, key, expected)
+        actual = getattr(config_mod, key, None)
+        if actual != expected:
+            raise RuntimeError(f"Arm CX experimental calibration mismatch for {key}: {actual!r} != {expected!r}")
+    if hasattr(main_mod, "_MAIN_CFG_SNAPSHOT") and isinstance(main_mod._MAIN_CFG_SNAPSHOT, dict):
+        for k in list(main_mod._MAIN_CFG_SNAPSHOT.keys()):
+            if k in ARM_CX_EXPERIMENTAL_PARAMS:
+                main_mod._MAIN_CFG_SNAPSHOT[k] = ARM_CX_EXPERIMENTAL_PARAMS[k]
+
+
 class _ReplayClock:
     """The simulated UTC clock of a replay worker.
 
@@ -1308,6 +1444,15 @@ async def _run_single_trade_worker(
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
 
+    # Phase 2: label each R_LOCK win with its tier threshold/margin and compute
+    # the structural wide-stop view using the EFFECTIVE lifecycle tiers. Pure
+    # reporting; the frozen Arm A executor has no lifecycle policy (guarded).
+    try:
+        _eff_tiers = tuple(main_mod.executor._get_lifecycle_policy().r_lock_tiers)
+    except Exception:
+        _eff_tiers = ()
+    _enrich_rlock_trace(_PICKER_TRACE, _eff_tiers)
+
     net_gbp = spy.total_gbp()
     pts_lot = spy.total_pts_lot()
     realized_pts_per_oz = round(pts_lot / total_lot, 2) if total_lot > 0.0 else 0.0
@@ -1358,6 +1503,22 @@ async def _run_single_trade_worker(
         "r_lock_wide_wins": int(_PICKER_TRACE.get("r_lock_wide_wins", 0)),
         "r_lock_max_r": round(float(_PICKER_TRACE.get("r_lock_max_r", 0.0)), 4),
         "r_lock_first_mfe": _PICKER_TRACE.get("r_lock_first_mfe"),
+        "peak_mfe_r_multiple": (
+            round(peak_mfe / abs(avg_entry - float(trade["sl"])), 4)
+            if abs(avg_entry - float(trade["sl"])) > 1e-9 else None
+        ),
+        "r_lock_fraction_zero_wins": int(_PICKER_TRACE.get("r_lock_fraction_zero_wins", 0)),
+        "r_lock_fraction_pos_wins": int(_PICKER_TRACE.get("r_lock_fraction_pos_wins", 0)),
+        "r_lock_be_equivalent_wins": int(_PICKER_TRACE.get("r_lock_fraction_zero_wins", 0)),
+        "r_lock_winning_r_min": _PICKER_TRACE.get("r_lock_winning_r_min"),
+        "r_lock_winning_r_max": round(float(_PICKER_TRACE.get("r_lock_winning_r_max", 0.0)), 4),
+        "r_lock_max_trail_dist_at_win": round(float(_PICKER_TRACE.get("r_lock_max_trail_dist_at_win", 0.0)), 4),
+        "max_trail_dist_observed": round(float(_PICKER_TRACE.get("max_trail_dist", 0.0)), 4),
+        "r_values_seen": sorted(_PICKER_TRACE.get("r_values_seen") or []),
+        "r_lock_widest_r": float(_PICKER_TRACE.get("r_lock_widest_r", 0.0)),
+        "r_lock_min_profit_margin": _PICKER_TRACE.get("r_lock_min_profit_margin"),
+        "r_lock_structural_blocked": bool(_PICKER_TRACE.get("r_lock_structural_blocked", False)),
+        "r_lock_win_details": list(_PICKER_TRACE.get("r_lock_win_details") or []),
     }
 
 
@@ -1373,11 +1534,15 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         os.environ["TRADES_LEDGER_PATH"] = str(rdir / "trades_ledger.jsonl")
         os.environ["LOCK_FILE_PATH"] = str(rdir / "copier.lock")
 
-        if arm_mode in ("b", "c"):
+        if arm_mode in ("b", "c", "cx"):
             for k, v in ARM_B_CALIBRATED_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
-        if arm_mode == "c":
+        if arm_mode in ("c", "cx"):
             for k, v in ARM_C_CALIBRATED_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        if arm_mode == "cx":
+            # EXPERIMENTAL replay-only override; never a production default.
+            for k, v in ARM_CX_EXPERIMENTAL_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
@@ -1394,19 +1559,23 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
                 raise RuntimeError("Arm A contamination: PROFIT_RATCHET_ENABLED found in 4544f7f worktree!")
         elif arm_mode == "b":
             _pin_arm_b_params(config, mt5_executor, main)
-        else:
+        elif arm_mode == "c":
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
+        else:  # cx: EXPERIMENTAL re-tier override layered on top of Arm C
+            _pin_arm_b_params(config, mt5_executor, main)
+            _pin_arm_c_params(config, mt5_executor, main)
+            _pin_arm_cx_params(config, mt5_executor, main)
 
         # Arms B and C run on the simulated replay clock: the trade-age guard
         # reads the wall clock, and the replay simulates the RECORDED week.
-        if arm_mode in ("b", "c"):
+        if arm_mode in ("b", "c", "cx"):
             _install_replay_clock(main)
 
         # Arms B and C drive the production ATR trail engine: feed it the M5 ATR it
         # actually reads and trace every picker decision. Arm A is the frozen 4544f7f
         # reference and is deliberately left untouched.
-        globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in ("b", "c")
+        globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in ("b", "c", "cx")
         if _PRODUCTION_ENGINE_ARM:
             _install_picker_trace(mt5_executor)
 
@@ -1432,13 +1601,21 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
             }
         else:
             effective = dict(ARM_B_CALIBRATED_PARAMS)
-            if arm_mode == "c":
+            if arm_mode in ("c", "cx"):
                 effective.update(ARM_C_CALIBRATED_PARAMS)
+            if arm_mode == "cx":
+                effective.update(ARM_CX_EXPERIMENTAL_PARAMS)
             arm_params_snapshot = {
                 "arm": arm_mode,
                 "pinned_params": effective,
                 "config_verified": {k: getattr(config, k) for k in effective},
             }
+            if arm_mode == "cx":
+                arm_params_snapshot["experimental"] = True
+                arm_params_snapshot["experimental_note"] = (
+                    "EXPERIMENTAL re-tiered R_LOCK_TIERS override (replay arm-param only; "
+                    "not production, not shipped). Compared against Arm C on the pinned tape."
+                )
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
 
@@ -1498,6 +1675,28 @@ def _summarize_arm(results: List[Dict[str, Any]], arm_mode: str) -> Dict[str, An
     avg_mfe_cap_vals = [float(r["mfe_capture_pct"]) for r in results if r.get("mfe_capture_pct") is not None and float(r["sim_gbp"]) > 0]
     avg_win_mfe_cap = round(sum(avg_mfe_cap_vals) / len(avg_mfe_cap_vals), 1) if avg_mfe_cap_vals else 0.0
 
+    # Phase 2 lock_fraction aggregates (reporting only).
+    frac_zero = sum(int(r.get("r_lock_fraction_zero_wins", 0)) for r in results)
+    frac_pos = sum(int(r.get("r_lock_fraction_pos_wins", 0)) for r in results)
+    win_details = [d for r in results for d in (r.get("r_lock_win_details") or [])]
+    win_r_vals = sorted({round(float(d["r"]), 4) for d in win_details})
+    frac_dist: Dict[str, int] = {}
+    for d in win_details:
+        key = str(d["fraction"])
+        frac_dist[key] = frac_dist.get(key, 0) + 1
+    max_td_win = max([float(r.get("r_lock_max_trail_dist_at_win", 0.0)) for r in results] or [0.0])
+    max_td_obs = max([float(r.get("max_trail_dist_observed", 0.0)) for r in results] or [0.0])
+    trio_ids = {"13153", "9934", "13167"}
+    trio_peak_r = {
+        r["msg_id"]: float(r.get("peak_mfe_r_multiple") or 0.0)
+        for r in results if r["msg_id"] in trio_ids
+    }
+    trio_reach_half = any(v >= 0.5 for v in trio_peak_r.values())
+    struct_blocked_wide = [
+        r["msg_id"] for r in results
+        if r.get("r_lock_structural_blocked") and float(r.get("r_lock_widest_r", 0.0)) >= R_LOCK_WIDE_R_THRESHOLD
+    ]
+
     return {
         "arm": arm_mode,
         "trade_count": len(results),
@@ -1519,6 +1718,18 @@ def _summarize_arm(results: List[Dict[str, Any]], arm_mode: str) -> Dict[str, An
         "r_lock_wide_wins": sum(int(r.get("r_lock_wide_wins", 0)) for r in results),
         "r_lock_max_r": round(max([float(r.get("r_lock_max_r", 0.0)) for r in results] or [0.0]), 4),
         "r_lock_trades": [r["msg_id"] for r in results if int(r.get("r_lock_wins", 0)) > 0],
+        "r_lock_fraction_zero_wins": frac_zero,
+        "r_lock_fraction_pos_wins": frac_pos,
+        "r_lock_be_equivalent_wins": frac_zero,
+        "r_lock_winning_r_min": min(win_r_vals) if win_r_vals else None,
+        "r_lock_winning_r_max": max(win_r_vals) if win_r_vals else 0.0,
+        "r_lock_winning_r_values": win_r_vals,
+        "r_lock_fraction_distribution": frac_dist,
+        "r_lock_max_trail_dist_at_win": round(max_td_win, 4),
+        "max_trail_dist_observed": round(max_td_obs, 4),
+        "trio_peak_r_multiples": trio_peak_r,
+        "trio_peaks_reach_half_r": bool(trio_reach_half),
+        "r_lock_structural_blocked_wide_trades": struct_blocked_wide,
     }
 
 
@@ -1738,14 +1949,76 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         if rlock_rows:
             lines += [
                 "",
-                "| Msg ID | Initial R ($/oz) | R-lock wins | Wide (R>=$5) wins |",
-                "|---|---:|---:|---:|",
+                "| Msg ID | Initial R ($/oz) | R-lock wins | Wide (R>=$5) wins | f=0 (BE-equiv) | f>0 | Winning R range |",
+                "|---|---:|---:|---:|---:|---:|---|",
             ]
             for r in rlock_rows:
+                rmin = r.get("r_lock_winning_r_min")
+                rmax = r.get("r_lock_winning_r_max", 0.0)
+                rrange = f"${rmin:.2f} - ${rmax:.2f}" if rmin is not None else "n/a"
                 lines.append(
                     f"| `{r['msg_id']}` | `{r.get('initial_r_per_oz', 0.0)}` | "
-                    f"`{r.get('r_lock_wins', 0)}` | `{r.get('r_lock_wide_wins', 0)}` |"
+                    f"`{r.get('r_lock_wins', 0)}` | `{r.get('r_lock_wide_wins', 0)}` | "
+                    f"`{r.get('r_lock_fraction_zero_wins', 0)}` | `{r.get('r_lock_fraction_pos_wins', 0)}` | "
+                    f"`{rrange}` |"
                 )
+        # Phase 2 lock_fraction distribution + structural wide-stop evidence.
+        lines += [
+            "",
+            "#### R-lock lock_fraction distribution (Arm C)",
+            "",
+            f"- **Wins at fraction 0 (BE-equivalents):** `{sc.get('r_lock_fraction_zero_wins', 0)}`",
+            f"- **Wins at fraction > 0:** `{sc.get('r_lock_fraction_pos_wins', 0)}`",
+            f"- **Winning R range ($/oz):** `{sc.get('r_lock_winning_r_min')}` .. `{sc.get('r_lock_winning_r_max', 0.0)}`",
+            f"- **Fraction histogram:** `{sc.get('r_lock_fraction_distribution', {})}`",
+            f"- **Max trail_dist at a win:** `${sc.get('r_lock_max_trail_dist_at_win', 0.0)}` | "
+            f"max trail_dist observed (any call): `${sc.get('max_trail_dist_observed', 0.0)}`",
+            "",
+            "#### Structural wide-stop check (trail_dist vs (t_k - f_k)*R)",
+            "",
+            "| Msg ID | Widest layer R | Easiest profit margin (t-f)*R | Max trail_dist | Structurally blocked |",
+            "|---|---:|---:|---:|---|",
+        ]
+        for r in arm_c["results"]:
+            if float(r.get("r_lock_widest_r", 0.0)) <= 0.0:
+                continue
+            margin = r.get("r_lock_min_profit_margin")
+            mtxt = f"${margin:.2f}" if margin is not None else "n/a"
+            blocked = "YES" if r.get("r_lock_structural_blocked") else "no"
+            lines.append(
+                f"| `{r['msg_id']}` | `${r.get('r_lock_widest_r', 0.0):.2f}` | `{mtxt}` | "
+                f"`${r.get('max_trail_dist_observed', 0.0):.2f}` | `{blocked}` |"
+            )
+        lines += [
+            "",
+            f"- **Trio peaks reach 0.5R?** `{sc.get('trio_peaks_reach_half_r', False)}` "
+            f"(peak/R multiples: `{sc.get('trio_peak_r_multiples', {})}`)",
+            f"- **Wide trades structurally blocked:** `{', '.join(sc.get('r_lock_structural_blocked_wide_trades', [])) or 'none'}`",
+        ]
+
+    arm_cx = report.get("arm_cx")
+    if arm_cx and arm_c:
+        scx = arm_cx["summary"]
+        sc_c = arm_c["summary"]
+        lines += [
+            "",
+            "### EXPERIMENTAL Arm CX (re-tiered R-lock) vs Arm C - NOT shipped",
+            "",
+            f"- **Override (replay arm-param only):** `R_LOCK_TIERS = {ARM_CX_EXPERIMENTAL_PARAMS['R_LOCK_TIERS']}`",
+            "",
+            "| Metric | Arm C (shipped tiers) | Arm CX (experimental) | Delta (CX - C) |",
+            "|---|---:|---:|---:|",
+            f"| Net PnL (GBP) | `£{sc_c['net_gbp']:+.2f}` | `£{scx['net_gbp']:+.2f}` | `£{scx['net_gbp'] - sc_c['net_gbp']:+.2f}` |",
+            f"| Tail (13078+9953) | `£{sc_c['tail_loss_gbp_13078_9953']:+.2f}` | `£{scx['tail_loss_gbp_13078_9953']:+.2f}` | `£{scx['tail_loss_gbp_13078_9953'] - sc_c['tail_loss_gbp_13078_9953']:+.2f}` |",
+            f"| R-lock wins | `{sc_c.get('r_lock_wins', 0)}` | `{scx.get('r_lock_wins', 0)}` | `{scx.get('r_lock_wins', 0) - sc_c.get('r_lock_wins', 0):+d}` |",
+            f"| Wide (R>=$5) wins | `{sc_c.get('r_lock_wide_wins', 0)}` | `{scx.get('r_lock_wide_wins', 0)}` | `{scx.get('r_lock_wide_wins', 0) - sc_c.get('r_lock_wide_wins', 0):+d}` |",
+            f"| Fraction>0 wins | `{sc_c.get('r_lock_fraction_pos_wins', 0)}` | `{scx.get('r_lock_fraction_pos_wins', 0)}` | `{scx.get('r_lock_fraction_pos_wins', 0) - sc_c.get('r_lock_fraction_pos_wins', 0):+d}` |",
+            f"| Structurally blocked wide trades | `{len(sc_c.get('r_lock_structural_blocked_wide_trades', []))}` | `{len(scx.get('r_lock_structural_blocked_wide_trades', []))}` | - |",
+            "",
+            "Re-tiering lowers the easiest profit margin from 0.75R to 0.5R, but any layer with "
+            "0.5R above the $8 trail clamp ceiling (R > $16) remains structurally unreachable. "
+            "This arm is experimental evidence only; production R_LOCK_TIERS is unchanged.",
+        ]
 
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():
@@ -1756,7 +2029,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
-    parser.add_argument("--arm", choices=("a", "b", "c", "both"), default="both")
+    parser.add_argument("--arm", choices=("a", "b", "c", "cx", "both"), default="both")
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
     parser.add_argument("--save-bars", type=Path, default=None)
@@ -1775,7 +2048,7 @@ def main() -> int:
     parser.add_argument("--spread-override", type=float, default=None)
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1810,13 +2083,17 @@ def main() -> int:
         arm_a_res: Optional[Dict[str, Any]] = None
         arm_b_res: Optional[Dict[str, Any]] = None
         arm_c_res: Optional[Dict[str, Any]] = None
+        arm_cx_res: Optional[Dict[str, Any]] = None
 
         if args.arm in ("a", "both"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
         if args.arm in ("b", "both"):
             arm_b_res = _run_arm_subprocess("b", REPO_ROOT, bars_file, io_dir / "arm_b.json")
-        if args.arm in ("c", "both"):
+        if args.arm in ("c", "both", "cx"):
             arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
+        if args.arm == "cx":
+            # EXPERIMENTAL re-tier comparison; runs Arm C too for before/after.
+            arm_cx_res = _run_arm_subprocess("cx", REPO_ROOT, bars_file, io_dir / "arm_cx.json")
 
     gates = _evaluate_gates(arm_a_res, arm_b_res, arm_c_res)
     fixture_meta = None
@@ -1840,6 +2117,7 @@ def main() -> int:
         "arm_a": arm_a_res,
         "arm_b": arm_b_res,
         "arm_c": arm_c_res,
+        "arm_cx": arm_cx_res,
         "gates": gates,
     }
     md_text = _render_markdown(report)
