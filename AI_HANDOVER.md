@@ -146,7 +146,7 @@ Read-only IPC (`terminal_info` / `account_info` / `symbol_info`) under `_mt5_loc
 
 `DRY_RUN` (cfg or executor) bypasses everything. Returns `(ok, problems)`; hard failures only.
 **Wiring:** `main._run_mt5_session_preflight` (main.py:2818) called after `executor.connect` at boot (main.py:8935, before hydration/handlers armed) and on connection recovery (main.py:2883, only when the executor holds a live session). Failure ⇒ `TRADING_HALTED=True` (main.py:295), per-problem logs + Saved Messages alert, Telegram monitoring stays online, no orders. Per-order `check_preflight` remains defense-in-depth.
-**Caveat:** `MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN` is read via `getattr(cfg, ...)` but **`config.py` does not parse it from `.env`** — the `.env` opt-out is currently ineffective; tests inject it via a config namespace. The supported live path is configuring `MT5_LOGIN`. (Audit risk R9 partially fixed — see §12.)
+**Opt-in:** `MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN` is parsed from `.env` by `config.py` (default `False` = hard-halt on unverified identity) and documented in `.env.example`. The recommended live path is configuring `MT5_LOGIN` (and `MT5_SERVER`); the opt-in exists only for deliberate unverified-identity operation. (Audit risk R9 fixed — see §12.)
 
 ---
 

@@ -228,7 +228,7 @@ All values below are the **shipped defaults** (verified against `config.py` at v
 **`.env` hygiene for v3.9.0:**
 - **Remove any `LIFECYCLE_*` keys** from old `.env` files — they no longer exist and do nothing.
 - Runtime toggles (`/rlock`, `/atrtrail`, `/dynamicrisk`, `/lotcap`, …) are **in-memory only** and reset on restart; `.env` is the persistent switch.
-- In **live mode set `MT5_LOGIN`** (and optionally `MT5_SERVER`) or the session preflight halts trading. The code-level opt-out `MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN` is read from the config module but is **not currently parsed from `.env` by `config.py`** — configuring `MT5_LOGIN` is the supported path.
+- In **live mode set `MT5_LOGIN`** (and optionally `MT5_SERVER`) or the session preflight halts trading. The opt-in `MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN` (default `false`) is parsed from `.env` for deliberate unverified-identity operation; configuring `MT5_LOGIN` is the recommended path.
 - Config-default tests are **.env-independent**: your local activations cannot break the shipped-default suite.
 
 ---
