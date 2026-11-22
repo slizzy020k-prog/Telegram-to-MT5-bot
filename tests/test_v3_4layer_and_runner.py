@@ -864,6 +864,11 @@ async def test_v31_strict_activation_zone_and_near_miss_tp1_reversal_banks_profi
     # Pin the STANDARD-zone ATR trail multiplier to the specified 1.40 (not the .env
     # override) so the trailed-SL expectation below is anchored to the spec.
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.40, raising=False)
+    # Also pin the baseline STANDARD-zone clamp (max $8.00) and activation (1.00x) so the spec
+    # trail_dist 4.00 x 1.40 = 5.60 is not truncated by the ambient TRAILING_PROFILE=t3 $5.50
+    # clamp. The assertion below (3894.15) is unchanged; only the baseline precondition is pinned.
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, raising=False)
 
     alerts = []
     orig_notify = main.notify_saved_messages

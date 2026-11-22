@@ -2367,6 +2367,13 @@ def _gated_executor(monkeypatch, atr, r_lock_enabled):
     monkeypatch.setattr(config, "R_LOCK_ENABLED", r_lock_enabled)
     monkeypatch.setattr(mt5_executor, "R_LOCK_ENABLED", r_lock_enabled)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+    # Pin the baseline STANDARD-zone trail regime (activation 1.00x ATR, max $8.00) so these
+    # R-gated BE-lock tests stay hermetic against the ambient TRAILING_PROFILE (live t3 =
+    # 0.70x / $5.50). Assertions are unchanged; only the assumed baseline precondition is pinned.
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, raising=False)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00, raising=False)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00, raising=False)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00, raising=False)
 
     ex = MT5Executor(dry_run=True)
     ex.connect()
