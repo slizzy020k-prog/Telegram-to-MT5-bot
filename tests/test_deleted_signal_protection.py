@@ -541,7 +541,7 @@ async def test_8_protective_exit_when_trading_halted_and_noise_ignored(tmp_path)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_9_close_on_signal_deleted_config_toggle_and_startup_validation(tmp_path, monkeypatch):
+async def test_9_close_on_signal_deleted_config_toggle_and_startup_validation(tmp_path, monkeypatch, shipped_config):
     _reset_runtime(tmp_path, "scen9")
     main.executor = MT5Executor(dry_run=True)
     main.executor.connect()
@@ -575,7 +575,8 @@ async def test_9_close_on_signal_deleted_config_toggle_and_startup_validation(tm
     assert res_bad["ok"] is False
     assert any("CLOSE_ON_SIGNAL_DELETED" in e for e in res_bad["errors"])
     assert any("DELETED_SIGNAL_POLL_INTERVAL_SECONDS" in e for e in res_bad["errors"])
-    assert config.DELETED_SIGNAL_POLL_INTERVAL_SECONDS == pytest.approx(1.5)
+    assert shipped_config.DELETED_SIGNAL_POLL_INTERVAL_SECONDS == pytest.approx(1.5)
+    assert shipped_config.CLOSE_ON_SIGNAL_DELETED is True
 
 
 def test_10_real_channel_chatter_false_positives_blocked():

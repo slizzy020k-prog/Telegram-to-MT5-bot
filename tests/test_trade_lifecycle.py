@@ -181,7 +181,7 @@ def _atr_policy():
         trail_homerun_atr_mult=0.80,
         trail_activation_atr_mult=1.00,
         trail_min_dollars=2.50,
-        trail_max_dollars=12.00,
+        trail_max_dollars=8.00,
         trail_step_dollars=0.25,
         be_activation_atr_mult=0.75,
         be_min_mfe_dollars=3.50,
@@ -276,7 +276,7 @@ def test_trail_stop_uses_r_lock_floor_when_tighter():
         live_price=3905.0,
         prev_peak=3905.0,
         current_sl=3880.0,
-        atr=20.0,              # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+        atr=20.0,              # wide ATR -> the ATR trail is not armed (MFE < activation), so the R floor wins
         policy=pol,
         digits=2,
         r_lock_floor=3898.0,
@@ -1264,7 +1264,7 @@ def test_executor_applies_r_lock_floor(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0     # wide ATR -> the ATR trail distance clamps to the $12 ceiling
+    ex._dry_run_atr = 20.0     # wide ATR -> the ATR trail is not armed (MFE < activation), so the R floor wins
 
     sig = _atr_signal(3895.0, 3880.0)   # R = 15.0
     # Live price is $11.00 in favour -> 0.73R -> tier 0.5R reached -> floor = entry

@@ -28,7 +28,6 @@ Covers every v3.5.2 fix across Tracks A, B, and C:
      `validate_staged_trail_tiers()`).
 """
 
-import importlib
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,7 +442,7 @@ async def test_11_tp1_telegram_alert_format_and_hud_open_lots_accuracy(tmp_path,
     assert "Open Signals" in out or "Runner Active" in out or "0.01" in out or out != ""
 
 
-def test_12_v352_config_defaults_and_safety_invariants():
+def test_12_v352_config_defaults_and_safety_invariants(shipped_config):
     """Config defaults and invariants for Pure Dynamic ATR Engine."""
     assert config.DYNAMIC_ATR_SLTP_ENABLED is True
     assert config.DYNAMIC_SLTP_MODE == "ADAPTIVE"
@@ -463,5 +462,6 @@ def test_12_v352_config_defaults_and_safety_invariants():
     assert config.DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT == 0.75
     assert hasattr(config, "validate_dynamic_risk_pairs")
     config.validate_dynamic_risk_pairs()
-    reloaded = importlib.reload(config)
-    assert hasattr(reloaded, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS")
+    # The shipped_config fixture already did a neutralized reload; assert the attribute
+    # survives it without re-reading the ambient .env here.
+    assert hasattr(config, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS")

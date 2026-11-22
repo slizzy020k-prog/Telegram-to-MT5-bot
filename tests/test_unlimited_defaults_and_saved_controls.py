@@ -56,7 +56,7 @@ def _pin_unlimited_defaults(monkeypatch) -> None:
 # 1. Default Config Values (All Caps OFF / Unlimited)
 # ---------------------------------------------------------------------------
 
-def test_default_config_values_are_all_unlimited_off():
+def test_default_config_values_are_all_unlimited_off(shipped_config):
     assert config.ENFORCE_HIGH_RISK_LOT_CAP is False
     assert config.DAILY_LOSS_PAUSE_PCT == 0.0
     assert config.EMERGENCY_CUTOFF_LOSS_PCT == 0.0
@@ -172,9 +172,9 @@ def test_heavy_open_lots_uncapped_with_default_config(monkeypatch):
 # 4. Startup Validation Passes With Default 0.0 Limits & Rejects Invalid Cases
 # ---------------------------------------------------------------------------
 
-def test_startup_checks_allows_zero_limits_and_validates_ordering(tmp_path):
+def test_startup_checks_allows_zero_limits_and_validates_ordering(tmp_path, shipped_config):
     # Default config with 0.0 limits passes cleanly
-    res_default = startup_checks.validate_environment(check_packages=False)
+    res_default = startup_checks.validate_environment(check_packages=False, cfg=shipped_config)
     assert res_default["ok"] is True
     assert res_default["errors"] == []
 

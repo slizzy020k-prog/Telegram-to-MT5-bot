@@ -51,9 +51,9 @@ class DummyChannelEvent:
         self.message = DummyChannelMsg(msg_id, text, reply_to_msg_id=reply_to_msg_id)
 
 
-def test_default_be_layers_includes_all_four_layers():
+def test_default_be_layers_includes_all_four_layers(shipped_config):
     """Verify default BE_LAYERS covers all 4 layers including L4 (0.02 lot)."""
-    assert config.BE_LAYERS == ["L1", "L2", "L3", "L4"]
+    assert shipped_config.BE_LAYERS == ["L1", "L2", "L3", "L4"]
 
 
 def test_standalone_channel_breakeven_phrases_and_false_positive_guards():

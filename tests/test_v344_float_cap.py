@@ -96,7 +96,9 @@ def test_atr_trail_dist_clamps_to_range(monkeypatch):
     import dynamic_risk
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00)
     policy = dynamic_risk.read_dynamic_risk_policy(config)
 
     # Msg 10196 progressive-trail change: the scenario is kept inside the STANDARD zone
@@ -104,7 +106,7 @@ def test_atr_trail_dist_clamps_to_range(monkeypatch):
     # multiplier. It used to run at live=3860.00, i.e. MFE = $10.00, which lands exactly
     # on the EXTENDED boundary ($10.00) where the multiplier tightens to 1.00x and the
     # clamp assertion no longer tested the 1.5x ladder. live=3859.00 -> MFE = $9.00.
-    # ATR=10.0 -> 1.5 * 10 = 15.0 clamped to max=12.00
+    # ATR=10.0 -> 1.5 * 10 = 15.0 clamped to max=8.00
     res_high = dynamic_risk.compute_dynamic_atr_trail_stop(
         direction="BUY",
         entry_price=3850.0,
@@ -118,7 +120,7 @@ def test_atr_trail_dist_clamps_to_range(monkeypatch):
     assert res_high["mfe_dollars"] == 9.0
     assert res_high["trail_zone"] == "STANDARD", f"Expected STANDARD zone, got {res_high['trail_zone']}"
     assert res_high["trail_mult"] == 1.5
-    assert res_high["trail_dist"] == 12.00, f"Expected clamped to max=12.00, got {res_high['trail_dist']}"
+    assert res_high["trail_dist"] == 8.00, f"Expected clamped to max=8.00, got {res_high['trail_dist']}"
 
     # ATR=0.5 -> 1.5 * 0.5 = 0.75 clamped to min=$2.50 floor (same STANDARD zone)
     res_low = dynamic_risk.compute_dynamic_atr_trail_stop(
@@ -142,7 +144,9 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
     import dynamic_risk
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25)
     policy = dynamic_risk.read_dynamic_risk_policy(config)
 
@@ -152,7 +156,7 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
     # lands exactly on the EXTENDED boundary ($10.00) where the multiplier tightens to
     # 1.00x and trail_dist drops to the $2.50 floor.
     # First tick at 3845 (entry=3840, peak=3845, MFE=$5.00 -> STANDARD 1.5x,
-    # atr=2.0 -> trail_dist = clamp(1.5*2.0=3.0, 2.50, 12.00) = 3.0)
+    # atr=2.0 -> trail_dist = clamp(1.5*2.0=3.0, 2.50, 8.00) = 3.0)
     # raw cand = 3845 - 3.0 = 3842.0
     r1 = dynamic_risk.compute_dynamic_atr_trail_stop(
         direction="BUY",
@@ -211,7 +215,9 @@ def test_atr_trail_respects_breakeven_floor(monkeypatch):
     import dynamic_risk
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.5)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00)
     monkeypatch.setattr(config, "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75)
     monkeypatch.setattr(config, "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50)
     monkeypatch.setattr(config, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50)

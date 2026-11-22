@@ -84,3 +84,59 @@ def isolate_runtime_paths(tmp_path_factory):
             main_mod.trade_ledger = main_mod.TradeLedger(session_dir / "trades_ledger.jsonl")
 
     yield session_dir
+
+
+# Runtime-isolation knobs managed by _apply_isolated_env(). The shipped_config fixture
+# keeps these set so a neutralized reload still runs DRY_RUN=True against isolated temp
+# paths and never touches live runtime artifacts.
+_ISOLATION_ENV_KNOBS = frozenset({
+    "DRY_RUN",
+    "LOG_FILE_PATH",
+    "STATE_FILE_PATH",
+    "TRADES_LEDGER_PATH",
+    "LOCK_FILE_PATH",
+    "PREVENT_SYSTEM_SLEEP",
+    "CONSOLE_TITLE_UPDATES",
+})
+
+
+@pytest.fixture
+def shipped_config():
+    """Reload ``config`` with .env loading neutralized and every strategy knob delenv'd.
+
+    Yields the reloaded config module holding the SHIPPED literal defaults, independent of
+    the ambient (live-activated) .env. On teardown the original environment and dotenv
+    loader are restored and config is reloaded again, so subsequent tests see the ambient
+    values back. Phase 1.2 shipped-defaults pattern (see the phase1-2-3 brief).
+
+    Caveats:
+      * We patch ``dotenv.load_dotenv`` (not ``config.load_dotenv``) because reload re-runs
+        ``from dotenv import load_dotenv``, which would otherwise re-bind the real loader.
+      * Raw ``os.getenv`` knobs (e.g. R_LOCK_TIERS) are asserted via their reader fallback,
+        not by raw string equality.
+      * reload re-runs ``validate_dynamic_risk_pairs()``; from-config bindings in main /
+        mt5_executor do NOT follow the reload, so only assert on the yielded module.
+    """
+    import importlib
+
+    import dotenv
+
+    import config as cfg
+
+    knob_names = sorted({k for k in vars(cfg) if k.isupper()} - _ISOLATION_ENV_KNOBS)
+    saved_env = {k: os.environ.get(k) for k in knob_names}
+    saved_loader = dotenv.load_dotenv
+    dotenv.load_dotenv = lambda *a, **k: None
+    for k in knob_names:
+        os.environ.pop(k, None)
+    try:
+        importlib.reload(cfg)
+        yield cfg
+    finally:
+        dotenv.load_dotenv = saved_loader
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        importlib.reload(cfg)

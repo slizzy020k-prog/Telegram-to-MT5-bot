@@ -38,10 +38,18 @@ def _pin_dynamic_defaults(monkeypatch) -> None:
     monkeypatch.setattr(config, "DYNAMIC_SLTP_SCALE_MAX", 1.75)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_TIMEFRAME", "M5")
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MULT", 1.40)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS", 10.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MULT", 1.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", 18.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MULT", 0.80)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", 1.00)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MIN_DOLLARS", 2.50)
-    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 12.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_MAX_DOLLARS", 8.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", 2.20)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS", 5.50)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", 2.00)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS", 4.00)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25)
     monkeypatch.setattr(config, "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75)
     monkeypatch.setattr(config, "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50)
@@ -49,6 +57,7 @@ def _pin_dynamic_defaults(monkeypatch) -> None:
     monkeypatch.setattr(config, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50)
     monkeypatch.setattr(config, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT", 0.50)
     monkeypatch.setattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
     monkeypatch.setattr(mt5_executor, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
     monkeypatch.setattr(main, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
@@ -363,7 +372,7 @@ def test_quiet_session_sl_floor_clamped_to_450_adaptive_and_pure_atr(monkeypatch
 # 4. Decommission & Production Defaults Verification
 # ---------------------------------------------------------------------------
 
-def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch):
+def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch, shipped_config):
     """Verify that all legacy virtual exit mechanisms have been decommissioned and pure defaults are active."""
     deleted_symbols = [
         "GOLD_REVERSAL_GUARD_ENABLED",
@@ -517,25 +526,25 @@ def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
 
     # 4) Advance to bid=3898.8 (MFE = $3.80 >= $3.50 BE threshold; ATR trail activation = $2.00 also armed)
     # BE lock sets SL = 3895.0 + 0.50 = 3895.50.
-    # ATR trail dist = clamp(2.0 * 1.5, 2.50, 12.00) = $3.00 -> candidate ATR SL = 3898.8 - 3.00 = 3895.80.
-    # Max(BE lock 3895.50, ATR SL 3895.80) = 3895.80. Pending limit 102 is swept!
+    # ATR trail dist = clamp(2.0 * 1.40, 2.50, 8.00) = $2.80 -> candidate ATR SL = 3898.8 - 2.80 = 3896.00.
+    # Max(BE lock 3895.50, ATR SL 3896.00) = 3896.00. Pending limit 102 is swept!
     res_be = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3898.8, 3899.0))
     assert any(item[0] == 101 for item in res_be["newly_be_locked"])
     assert 102 in res_be["pending_swept"]
     assert sig["layers"]["L1"]["be_locked"] is True
-    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.80)
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3896.00)
     assert sig["pending_tickets"] == []
 
-    # 5) Advance to peak 3902.0 with higher volatility ATR=10.00 (trail_dist clamps to $12.00)
-    # Candidate SL = 3902.0 - 12.00 = 3890.00 < existing SL 3895.80 => forward-only NEVER loosens SL!
+    # 5) Advance to peak 3902.0 with higher volatility ATR=10.00 (trail_dist clamps to $8.00)
+    # Candidate SL = 3902.0 - 8.00 = 3894.00 < existing SL 3896.00 => forward-only NEVER loosens SL!
     ex._dry_run_atr = 10.00
     res_widen = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3902.0, 3902.3))
     assert res_widen["updated_tickets"] == []
-    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3895.80)
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3896.00)
     assert sig["layers"]["L1"]["dynamic_atr_trail_peak"] == pytest.approx(3902.0)
 
     # 6) Volatility contracts ATR=1.00 -> trail_dist clamped to min $2.50
-    # Candidate SL = 3902.0 - 2.50 = 3899.50 > 3895.80 -> SL ratchets forward!
+    # Candidate SL = 3902.0 - 2.50 = 3899.50 > 3896.00 -> SL ratchets forward!
     ex._dry_run_atr = 1.00
     res_tighten = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3902.0, 3902.3))
     assert len(res_tighten["updated_tickets"]) == 1
