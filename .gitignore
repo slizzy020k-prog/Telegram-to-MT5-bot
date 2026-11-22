@@ -1,5 +1,6 @@
 # Secrets & Telegram Session
 .env
+.env.*
 *.session
 *.session*
 *.session-journal
