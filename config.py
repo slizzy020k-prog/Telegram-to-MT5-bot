@@ -405,6 +405,9 @@ except ValueError:
 MT5_PASSWORD: Optional[str] = os.getenv("MT5_PASSWORD") or None
 MT5_SERVER: Optional[str] = os.getenv("MT5_SERVER") or None
 MT5_PATH: Optional[str] = os.getenv("MT5_PATH") or None
+# Explicit opt-in to allow boot when MT5_LOGIN is unset in live mode (identity
+# unverified). Default False = the startup preflight hard-halts. See startup_checks.
+MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN: bool = _env_bool("MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN", False)
 
 # ===========================================================================
 # FILE PATHS
