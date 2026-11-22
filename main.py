@@ -125,6 +125,7 @@ from startup_checks import (
     acquire_single_instance_lock,
     release_single_instance_lock,
     validate_environment,
+    validate_mt5_session,
 )
 from risk_controls import (
     apply_float_cap_command,
@@ -2814,6 +2815,32 @@ async def _probe_mt5_health() -> Tuple[bool, bool, Optional[float]]:
     return connected, allowed, latency_ms
 
 
+async def _run_mt5_session_preflight() -> bool:
+    """Phase 1.4 (R9): read-only MT5 session preflight; halt trading on hard failure.
+
+    Returns True when the session is verified (or DRY_RUN bypass). On hard failure it
+    sets TRADING_HALTED so no orders can be placed, logs each problem and alerts Saved
+    Messages, while Telegram monitoring stays online. Never attempts login / account
+    switching; per-order check_preflight remains as defense-in-depth.
+    """
+    global TRADING_HALTED
+    ok, problems = await _mt5_call(
+        validate_mt5_session, executor, sys.modules.get("config") or config
+    )
+    if ok:
+        return True
+    TRADING_HALTED = True
+    for prob in problems:
+        logger.error(f"[MT5 PREFLIGHT] {prob}")
+    logger.error("MT5 session preflight FAILED - trading HALTED; Telegram monitoring stays online.")
+    await notify_saved_messages(
+        "🛑 **MT5 Session Preflight Failed — Trading HALTED**\n"
+        + "\n".join(f"• {p}" for p in problems)
+        + "\n• No new orders will be placed. Verify the MT5 terminal account/server, then restart the copier."
+    )
+    return False
+
+
 async def _handle_mt5_connection_transition(connected: bool) -> None:
     """
     Emit a single Saved Messages alert on connected -> disconnected and a single
@@ -2850,6 +2877,10 @@ async def _handle_mt5_connection_transition(connected: bool) -> None:
             f"🟢 **MT5 Connection Recovered**\n"
             f"• MetaTrader 5 terminal is back online and connected to the trade server.{downtime_note}"
         )
+        # Phase 1.4: re-verify account identity/permissions on reconnect, but only once
+        # the executor actually holds a live initialized terminal session.
+        if await _mt5_call(executor.is_connected):
+            await _run_mt5_session_preflight()
 
 
 # ---------------------------------------------------------------------------
@@ -8898,34 +8929,38 @@ async def main() -> None:
             )
         else:
             logger.info("MetaTrader 5 connection established successfully.")
-            dl_prog = await _mt5_call(get_daily_loss_progress)
-            if dl_prog.get("triggered_date") == (await _trading_day_str_async()) and dl_prog.get("limit_reached"):
-                _daily_loss_locked = True
-                logger.warning(
-                    f"🔒 Daily loss limit already triggered today ({dl_prog['date']}); "
-                    f"starting in LOCKED mode (new signals blocked until next broker day or `dailyloss off`)."
+            # Phase 1.4 (R9): read-only MT5 session preflight (connectivity / server /
+            # account / permissions) BEFORE hydration and handlers are armed. On hard
+            # failure trading is HALTED but Telegram monitoring stays online.
+            if await _run_mt5_session_preflight():
+                dl_prog = await _mt5_call(get_daily_loss_progress)
+                if dl_prog.get("triggered_date") == (await _trading_day_str_async()) and dl_prog.get("limit_reached"):
+                    _daily_loss_locked = True
+                    logger.warning(
+                        f"🔒 Daily loss limit already triggered today ({dl_prog['date']}); "
+                        f"starting in LOCKED mode (new signals blocked until next broker day or `dailyloss off`)."
+                    )
+                # If all open positions are closed and there are no active signals,
+                # but previous realized loss would pause new signals, acknowledge
+                # that the previous loss has passed and update the baseline so new trades can be actioned.
+                open_pos = await _mt5_call(executor.get_open_market_tickets)
+                active_s = state_mgr.get_active_signals()
+                has_open_mkt_boot = bool(open_pos) or any(
+                    isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_s or [])
                 )
-            # If all open positions are closed and there are no active signals,
-            # but previous realized loss would pause new signals, acknowledge
-            # that the previous loss has passed and update the baseline so new trades can be actioned.
-            open_pos = await _mt5_call(executor.get_open_market_tickets)
-            active_s = state_mgr.get_active_signals()
-            has_open_mkt_boot = bool(open_pos) or any(
-                isinstance(s, dict) and bool(s.get("market_tickets")) for _, s in (active_s or [])
-            )
-            # Always baseline realized daily loss on startup against current account balance so
-            # previously realized losses from earlier runs never re-trigger configured drawdown guards on restart.
-            dd_init = await _mt5_call(executor.get_daily_drawdown_status)
-            if dd_init.get("realized_today", 0.0) < 0.0 or dd_init.get("pause_new_signals"):
-                upd = await _mt5_call(executor.update_daily_loss_baseline)
-                _daily_50pct_alert_date = None
-                logger.info(
-                    f"Startup daily loss baseline synced to current balance "
-                    f"{upd['current_balance']:.2f} {dd_init['currency']} "
-                    f"(archived prior realized={upd['baseline_realized']:.2f} {dd_init['currency']})."
-                )
-            await _startup_hydrate_and_backfill_ledger()
-            await _update_live_terminal_status_async(force_print=True)
+                # Always baseline realized daily loss on startup against current account balance so
+                # previously realized losses from earlier runs never re-trigger configured drawdown guards on restart.
+                dd_init = await _mt5_call(executor.get_daily_drawdown_status)
+                if dd_init.get("realized_today", 0.0) < 0.0 or dd_init.get("pause_new_signals"):
+                    upd = await _mt5_call(executor.update_daily_loss_baseline)
+                    _daily_50pct_alert_date = None
+                    logger.info(
+                        f"Startup daily loss baseline synced to current balance "
+                        f"{upd['current_balance']:.2f} {dd_init['currency']} "
+                        f"(archived prior realized={upd['baseline_realized']:.2f} {dd_init['currency']})."
+                    )
+                await _startup_hydrate_and_backfill_ledger()
+                await _update_live_terminal_status_async(force_print=True)
 
         _boot_limits = read_risk_limits(sys.modules.get("config") or config)
         _lot_lbl = "ON" if _boot_limits.lot_cap_enabled else "Unlimited (OFF)"

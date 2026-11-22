@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import ctypes
 import hashlib
 import importlib
@@ -586,3 +587,118 @@ def validate_environment(check_packages: bool = True, cfg: Any = None) -> Dict[s
         "errors": errors,
         "warnings": warnings,
     }
+
+
+def validate_mt5_session(executor: Any, cfg: Any) -> Tuple[bool, List[str]]:
+    """Read-only MT5 session preflight (Phase 1.4 / audit risk R9).
+
+    Verifies, using ONLY read-only IPC (terminal_info / account_info / symbol_info):
+      a. terminal_info() is available, .connected and .trade_allowed (algo trading on);
+      b. account_info() is available and, when configured, account.login == int(cfg.MT5_LOGIN)
+         and account.server == cfg.MT5_SERVER (HARD FAIL on mismatch). When MT5_LOGIN is
+         unset in live mode the identity is unverified -> HARD FAIL unless the explicit
+         opt-in cfg.MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN is True;
+      c. symbol_info(cfg.DEFAULT_SYMBOL) exists with sane volume_min / volume_step. A
+         non-FULL trade_mode is logged as a WARNING and does not block boot.
+
+    DRY_RUN bypasses all live checks. This NEVER calls mt5.login, never switches accounts
+    and never sends orders; it is an additional verification layer on top of connect().
+    Returns (ok, problems) where problems lists HARD failures only.
+    """
+    if getattr(cfg, "DRY_RUN", False) or getattr(executor, "dry_run", False):
+        return True, []
+
+    problems: List[str] = []
+
+    try:
+        import mt5_executor as _exe_mod
+
+        mt5 = _exe_mod.mt5
+    except Exception as exc:  # pragma: no cover - defensive
+        return False, [f"MT5 module unavailable for session preflight: {exc}"]
+
+    # (a)+(b) Single read-only IPC window under the executor's serialization lock.
+    lock = getattr(executor, "_mt5_lock", None)
+    cm = lock if lock is not None else contextlib.nullcontext()
+    term = None
+    acc = None
+    try:
+        with cm:
+            term = mt5.terminal_info()
+            acc = mt5.account_info()
+    except Exception as exc:
+        problems.append(f"MT5 session preflight IPC failed: {exc}")
+
+    # (a) terminal connectivity + algo-trading permission
+    if term is None:
+        problems.append("MT5 terminal_info() unavailable - terminal not initialized/connected.")
+    else:
+        if not getattr(term, "connected", False):
+            problems.append("MT5 terminal is not connected to the trade server (terminal_info.connected=False).")
+        if not getattr(term, "trade_allowed", False):
+            problems.append("MT5 Algorithmic Trading is disabled (terminal_info.trade_allowed=False).")
+
+    # (b) account identity - HARD FAIL on mismatch / unverified identity
+    login_cfg = getattr(cfg, "MT5_LOGIN", None)
+    server_cfg = getattr(cfg, "MT5_SERVER", None)
+    allow_unverified = bool(getattr(cfg, "MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN", False))
+    if acc is None:
+        problems.append("MT5 account_info() returned no account - trading identity cannot be verified.")
+    else:
+        acc_login = getattr(acc, "login", None)
+        acc_server = str(getattr(acc, "server", "") or "").strip()
+        login_set = login_cfg is not None and str(login_cfg).strip() != ""
+        if login_set:
+            try:
+                expected_login = int(login_cfg)
+            except (TypeError, ValueError):
+                expected_login = None
+                problems.append(f"Configured MT5_LOGIN={login_cfg!r} is not a valid integer.")
+            if expected_login is not None and acc_login != expected_login:
+                problems.append(
+                    f"MT5 account login mismatch: terminal is logged into {acc_login!r}, "
+                    f"but MT5_LOGIN={expected_login} is configured."
+                )
+        elif not allow_unverified:
+            problems.append(
+                "MT5_LOGIN is not configured - account identity unverified. Set MT5_LOGIN, "
+                "or explicitly opt in with MT5_PREFLIGHT_ALLOW_UNVERIFIED_LOGIN=True."
+            )
+        server_set = server_cfg is not None and str(server_cfg).strip() != ""
+        if server_set and acc_server != str(server_cfg).strip():
+            problems.append(
+                f"MT5 server mismatch: terminal server={acc_server!r}, "
+                f"configured MT5_SERVER={str(server_cfg).strip()!r}."
+            )
+
+    # (c) default symbol sanity (read-only symbol_info via the executor's locked helper)
+    symbol = str(getattr(cfg, "DEFAULT_SYMBOL", "") or "").strip()
+    if not symbol:
+        problems.append("DEFAULT_SYMBOL is not configured - cannot verify the trading symbol.")
+    else:
+        try:
+            info = executor.get_symbol_info(symbol)
+        except Exception as exc:
+            info = None
+            problems.append(f"MT5 symbol_info({symbol}) query failed: {exc}")
+        if info is None:
+            problems.append(f"Symbol {symbol} not found on broker (symbol_info returned None).")
+        else:
+            vol_min = getattr(info, "volume_min", None)
+            vol_step = getattr(info, "volume_step", None)
+            if not _is_finite_number(vol_min) or float(vol_min) <= 0:
+                problems.append(f"Symbol {symbol} has invalid volume_min={vol_min!r}.")
+            if not _is_finite_number(vol_step) or float(vol_step) <= 0:
+                problems.append(f"Symbol {symbol} has invalid volume_step={vol_step!r}.")
+            full_mode = getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4)
+            if not isinstance(full_mode, int) or isinstance(full_mode, bool):
+                full_mode = 4
+            mode = getattr(info, "trade_mode", None)
+            if not (isinstance(mode, int) and not isinstance(mode, bool) and mode == full_mode):
+                logger.warning(
+                    "[MT5 PREFLIGHT] Symbol %s trade_mode=%r is not FULL (%s) - market may be "
+                    "closed; warning only, not blocking boot.",
+                    symbol, mode, full_mode,
+                )
+
+    return (len(problems) == 0), problems
