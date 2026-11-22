@@ -14,6 +14,10 @@ Both arms run strictly in `DRY_RUN=true` with isolated temporary runtime paths
 set in `os.environ` prior to importing `config` or `main`.
 
 MT5 usage is strictly read-only (`mt5.copy_rates_range` only; zero orders).
+The historical M1 tape defaults to the canonical pinned fixture
+(`tests/fixtures/tape_2026-11-17_19.json`, validated on load); live fetch
+requires the explicit `--live-bars` flag, and `--refresh-tape <new-file>`
+re-fetches to a NEW file for human-reviewed promotion.
 Multi-layer trades initialize all filled MT5 layers (`L1..Lk`) at `open_utc`
 using exact MT5 fill prices, with legacy `TOP -> L1` normalized so all 12 trades
 exercise the 4-layer / Profit Ratchet FSM uniformly.
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -47,6 +52,12 @@ ATR_PERIOD = 14
 WARMUP_START_MT5 = datetime(2026, 11, 17, 0, 0)
 WARMUP_END_MT5 = datetime(2026, 11, 19, 13, 0)
 CHAT_ID = -1001234567890
+
+# Canonical pinned historical tape (Phase 1.1). Default replay input; live
+# MT5 fetch requires the explicit --live-bars flag, refresh requires
+# --refresh-tape <new-file>.
+PINNED_TAPE_PATH = REPO_ROOT / "tests" / "fixtures" / "tape_2026-11-17_19.json"
+TAPE_SCHEMA = "mt5-copier-replay-tape/1"
 
 # Production-engine replay. Arms B and C drive the real ATR trail engine; Arm A
 # stays the frozen 4544f7f reference and is deliberately NOT fed the engine ATR.
@@ -93,6 +104,32 @@ def _install_picker_trace(mt5_executor_mod: Any) -> None:
 
     mt5_executor_mod.compute_dynamic_atr_trail_stop = _traced
 
+# Canonical DYNAMIC_ATR_* trail + BE knobs pinned for BOTH arms so the replay
+# is independent of the ambient .env (Phase 1.1, Hole 2). Values equal the
+# shipped v3.9.0 production defaults; pinning makes them immune to .env drift.
+_DYNAMIC_ATR_PINNED_PARAMS: Dict[str, Any] = {
+    "DYNAMIC_ATR_SLTP_ENABLED": True,
+    "DYNAMIC_SLTP_MODE": "ADAPTIVE",
+    "DYNAMIC_ATR_TRAIL_ENABLED": True,
+    "DYNAMIC_ATR_TRAIL_TIMEFRAME": "M5",
+    "DYNAMIC_ATR_TRAIL_MULT": 1.40,
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS": 10.00,
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MULT": 1.00,
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS": 18.00,
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MULT": 0.80,
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT": 1.00,
+    "DYNAMIC_ATR_TRAIL_MIN_DOLLARS": 2.50,
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 8.00,
+    "DYNAMIC_ATR_TRAIL_STEP_DOLLARS": 0.25,
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS": 2.20,
+    "DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS": 5.50,
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS": 2.00,
+    "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS": 4.00,
+    "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.75,
+    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 3.50,
+    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
+}
+
 # Calibrated v3.6.0 parameters (M1 Swarm Consensus + 9 canonical Rev 2 defaults)
 ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "PROFIT_RATCHET_ENABLED": True,
@@ -118,10 +155,13 @@ ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     # Arm B is the no-R-lock baseline: pin it explicitly so an R_LOCK_ENABLED=true
     # in the ambient .env cannot contaminate the A/B/C comparison.
     "R_LOCK_ENABLED": False,
+    **_DYNAMIC_ATR_PINNED_PARAMS,
 }
 
-# Arm C params: Arm B plus the R-relative profit floor (R lock only).
+# Arm C params: Arm B plus the R-relative profit floor (R lock only). The same
+# DYNAMIC_ATR_* trail + BE pins apply so Arm C is equally .env-independent.
 ARM_C_CALIBRATED_PARAMS: Dict[str, Any] = {
+    **_DYNAMIC_ATR_PINNED_PARAMS,
     "R_LOCK_ENABLED": True,
 }
 
@@ -351,6 +391,79 @@ def _compute_m5_atr_by_m1(bars: List[Dict[str, Any]], period: int = ATR_PERIOD) 
     return out
 
 
+def _bars_sha256(bars: List[Dict[str, Any]]) -> str:
+    """Canonical hash of a bars array (order-sensitive, key-sorted compact JSON)."""
+    canonical = json.dumps(bars, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_pinned_tape(payload: Dict[str, Any], path: Path) -> None:
+    """Strict load-time validation of a canonical tape fixture.
+
+    Checks bar count, UTC range, symbol, sha256 of the bars array, and the
+    exact gap structure. Fails loudly on ANY mismatch; never substitutes.
+    """
+    bars = payload.get("bars")
+    if not isinstance(bars, list) or not bars:
+        raise RuntimeError(f"Pinned tape validation failed ({path}): bars array missing or empty")
+    if payload.get("bar_count") != len(bars):
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): bar_count {payload.get('bar_count')} != actual {len(bars)}"
+        )
+    first_iso = _utc_iso(bars[0]["time_utc"])
+    last_iso = _utc_iso(bars[-1]["time_utc"])
+    if first_iso != payload.get("first_utc") or last_iso != payload.get("last_utc"):
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): range {first_iso} -> {last_iso} "
+            f"!= pinned {payload.get('first_utc')} -> {payload.get('last_utc')}"
+        )
+    if payload.get("symbol") != SYMBOL:
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): symbol {payload.get('symbol')!r} != {SYMBOL!r}"
+        )
+    actual_sha = _bars_sha256(bars)
+    if actual_sha != payload.get("bars_sha256"):
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): bars sha256 {actual_sha} "
+            f"!= pinned {payload.get('bars_sha256')}"
+        )
+    ts = [int(b["time_utc"]) for b in bars]
+    diffs = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+    if any(d <= 0 or d % 60 != 0 for d in diffs):
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): timestamps not strictly increasing minute-aligned M1 bars"
+        )
+    gaps_meta = payload.get("gaps") or {}
+    actual_gaps = [{"after_index": i, "gap_sec": d} for i, d in enumerate(diffs) if d != 60]
+    if actual_gaps != list(gaps_meta.get("positions") or []):
+        raise RuntimeError(
+            f"Pinned tape validation failed ({path}): gap structure {actual_gaps} "
+            f"!= pinned {gaps_meta.get('positions')}"
+        )
+    if len(actual_gaps) != gaps_meta.get("count") or (max(diffs) if diffs else 0) != gaps_meta.get("max_gap_sec"):
+        raise RuntimeError(f"Pinned tape validation failed ({path}): gap count/max mismatch")
+
+
+def load_tape(bars_json_path: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any], bool]:
+    """Load a tape file; return (raw_bars, metadata, pinned).
+
+    Schema-tagged canonical fixtures are validated strictly and fail loudly.
+    Legacy tapes (no schema) load unvalidated but are marked unpinned so the
+    report never claims reproducibility for them.
+    """
+    payload = json.loads(bars_json_path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and payload.get("schema") == TAPE_SCHEMA:
+        _validate_pinned_tape(payload, bars_json_path)
+        return payload["bars"], payload, True
+    raw_bars = payload["bars"] if isinstance(payload, dict) else payload
+    meta = {
+        "count": len(raw_bars),
+        "first_utc": _utc_iso(raw_bars[0]["time_utc"]) if raw_bars else None,
+        "last_utc": _utc_iso(raw_bars[-1]["time_utc"]) if raw_bars else None,
+    }
+    return raw_bars, meta, False
+
+
 def fetch_m1_bars(
     bars_json_path: Optional[Path] = None,
     save_bars_path: Optional[Path] = None,
@@ -362,8 +475,7 @@ def fetch_m1_bars(
     """
     bars: List[Dict[str, Any]] = []
     if bars_json_path is not None:
-        payload = json.loads(bars_json_path.read_text(encoding="utf-8"))
-        raw_bars = payload["bars"] if isinstance(payload, dict) else payload
+        raw_bars, _tape_meta, _tape_pinned = load_tape(bars_json_path)
         for b in raw_bars:
             bars.append(
                 {
@@ -435,6 +547,92 @@ def fetch_m1_bars(
         save_bars_path.write_text(json.dumps(out_payload, indent=2), encoding="utf-8")
 
     return bars
+
+
+def _write_tape_fixture(
+    path: Path,
+    bars: List[Dict[str, Any]],
+    fetched_utc: str,
+    source: str,
+    canonical: bool = False,
+) -> Dict[str, Any]:
+    """Write a schema-tagged tape fixture (metadata + bars) for review/promotion."""
+    ts = [int(b["time_utc"]) for b in bars]
+    diffs = [ts[i + 1] - ts[i] for i in range(len(ts) - 1)]
+    gaps = [{"after_index": i, "gap_sec": d} for i, d in enumerate(diffs) if d != 60]
+    meta: Dict[str, Any] = {
+        "schema": TAPE_SCHEMA,
+        "canonical": canonical,
+        "symbol": SYMBOL,
+        "timeframe": "M1",
+        "atr_period": ATR_PERIOD,
+        "server_offset_sec": MT5_SERVER_OFFSET_SEC,
+        "gbp_rate_per_pt_001_lot": GBP_PER_PT_001_LOT,
+        "bar_count": len(bars),
+        "first_utc": _utc_iso(ts[0]) if ts else None,
+        "last_utc": _utc_iso(ts[-1]) if ts else None,
+        "bars_sha256": _bars_sha256(bars),
+        "bars_sha256_algorithm": "sha256(utf8(json.dumps(bars, sort_keys=True, separators=(',',':'))))",
+        "fetched_utc": fetched_utc,
+        "source": source,
+        "spread_policy": "per-bar broker spread_pts; spread_dollars = max(0.05, spread_pts * 0.01) unless --spread-override",
+        "gaps": {"count": len(gaps), "max_gap_sec": max(diffs) if diffs else 0, "positions": gaps},
+    }
+    payload = dict(meta)
+    payload["bars"] = bars
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return meta
+
+
+def _refresh_tape(target: Path, spread_override: Optional[float]) -> int:
+    """Explicit live re-fetch to a NEW tape file + diff summary for human review.
+
+    Never overwrites the canonical fixture in place; promotion is a separate,
+    deliberate human-reviewed step.
+    """
+    resolved = target.resolve()
+    if resolved == PINNED_TAPE_PATH.resolve():
+        raise RuntimeError("--refresh-tape must never overwrite the canonical fixture in place; choose a NEW file")
+    if resolved.exists():
+        raise RuntimeError(f"--refresh-tape target already exists: {resolved}; choose a NEW file")
+    new_bars = fetch_m1_bars(bars_json_path=None, spread_override=spread_override)
+    fetched_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    meta = _write_tape_fixture(
+        resolved,
+        new_bars,
+        fetched_utc=fetched_utc,
+        source=(
+            f"live MT5 copy_rates_range refresh {WARMUP_START_MT5.isoformat()} -> "
+            f"{WARMUP_END_MT5.isoformat()} (server time)"
+        ),
+        canonical=False,
+    )
+    print(f"Refreshed tape written to NEW file: {resolved}")
+    print(f"  bars={meta['bar_count']} range={meta['first_utc']} -> {meta['last_utc']}")
+    print(f"  sha256={meta['bars_sha256']}")
+    try:
+        old_bars, old_meta, _pinned = load_tape(PINNED_TAPE_PATH)
+    except Exception as exc:
+        print(f"  canonical fixture unavailable for diff ({exc}); review the new file manually")
+        return 0
+    print("Diff summary vs canonical fixture (human review required before promotion):")
+    print(f"  bar_count: canonical={len(old_bars)} new={len(new_bars)}")
+    print(
+        f"  range: canonical={old_meta.get('first_utc')} -> {old_meta.get('last_utc')} "
+        f"| new={meta['first_utc']} -> {meta['last_utc']}"
+    )
+    print(f"  sha256 identical: {old_meta.get('bars_sha256') == meta['bars_sha256']}")
+    print(
+        f"  gaps: canonical={len((old_meta.get('gaps') or {}).get('positions') or [])} "
+        f"new={meta['gaps']['count']}"
+    )
+    n = min(len(old_bars), len(new_bars))
+    first_diff = next((i for i in range(n) if old_bars[i] != new_bars[i]), None)
+    diff_count = sum(1 for i in range(n) if old_bars[i] != new_bars[i]) + abs(len(old_bars) - len(new_bars))
+    print(f"  differing bars: {diff_count} (first divergent index: {first_diff})")
+    print("Promotion is manual: review the diff, then replace the canonical fixture deliberately.")
+    return 0
 
 
 def _find_entry_bar_index(bars: List[Dict[str, Any]], open_utc: str) -> int:
@@ -921,6 +1119,10 @@ def _pin_arm_c_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> None
                 raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual} != {expected}")
         elif actual != expected:
             raise RuntimeError(f"Arm C calibration mismatch for {key}: {actual!r} != {expected!r}")
+    if hasattr(main_mod, "_MAIN_CFG_SNAPSHOT") and isinstance(main_mod._MAIN_CFG_SNAPSHOT, dict):
+        for k in list(main_mod._MAIN_CFG_SNAPSHOT.keys()):
+            if k in ARM_C_CALIBRATED_PARAMS:
+                main_mod._MAIN_CFG_SNAPSHOT[k] = ARM_C_CALIBRATED_PARAMS[k]
 
 
 class _ReplayClock:
@@ -1216,6 +1418,30 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         bars_payload = json.loads(bars_path.read_text(encoding="utf-8"))
         bars = bars_payload["bars"] if isinstance(bars_payload, dict) else bars_payload
 
+        # Arm params snapshot: record the exact strategy parameters + config
+        # used for this run so every output JSON is self-describing.
+        if arm_mode == "a":
+            arm_params_snapshot: Dict[str, Any] = {
+                "arm": "a",
+                "baseline_commit": BASELINE_COMMIT,
+                "pinned_params": {},
+                "config_effective": {
+                    k: getattr(config, k, None)
+                    for k in sorted(set(ARM_B_CALIBRATED_PARAMS) | set(ARM_C_CALIBRATED_PARAMS))
+                },
+            }
+        else:
+            effective = dict(ARM_B_CALIBRATED_PARAMS)
+            if arm_mode == "c":
+                effective.update(ARM_C_CALIBRATED_PARAMS)
+            arm_params_snapshot = {
+                "arm": arm_mode,
+                "pinned_params": effective,
+                "config_verified": {k: getattr(config, k) for k in effective},
+            }
+        arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
+        arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
+
         async def _run_all() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
             for idx, trade in enumerate(TRADE_CATALOG):
@@ -1238,6 +1464,8 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
             "arm": arm_mode,
             "code_root": str(Path(main.__file__).resolve().parent),
             "dry_run": bool(config.DRY_RUN),
+            "arm_params": arm_params_snapshot,
+            "bars_sha256": _bars_sha256(bars),
             "results": results,
             "summary": agg,
         }
@@ -1532,7 +1760,18 @@ def main() -> int:
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
     parser.add_argument("--save-bars", type=Path, default=None)
-    parser.add_argument("--bars-json", type=Path, default=None)
+    parser.add_argument(
+        "--bars-json", type=Path, default=PINNED_TAPE_PATH,
+        help="Tape JSON to replay (default: canonical pinned fixture). Schema-tagged fixtures are validated on load.",
+    )
+    parser.add_argument(
+        "--live-bars", action="store_true",
+        help="Opt INTO live MT5 copy_rates_range fetch (non-reproducible). Cannot combine with an explicit --bars-json.",
+    )
+    parser.add_argument(
+        "--refresh-tape", type=Path, default=None,
+        help="Re-fetch live bars to a NEW tape file (never the canonical fixture) and print a diff summary for human review.",
+    )
     parser.add_argument("--spread-override", type=float, default=None)
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -1545,8 +1784,20 @@ def main() -> int:
         assert args.worker_bars is not None and args.worker_out is not None
         return _run_worker_main(args.arm_mode, args.worker_bars, args.worker_out)
 
+    if args.refresh_tape is not None:
+        return _refresh_tape(args.refresh_tape, args.spread_override)
+
+    bars_json_resolved = args.bars_json.resolve() if args.bars_json is not None else None
+    if args.live_bars and bars_json_resolved != PINNED_TAPE_PATH.resolve():
+        parser.error("--live-bars cannot be combined with an explicit --bars-json")
+    use_live = args.live_bars
+    bars_source = (
+        "live" if use_live
+        else ("pinned_fixture" if bars_json_resolved == PINNED_TAPE_PATH.resolve() else "custom_json")
+    )
+
     bars = fetch_m1_bars(
-        bars_json_path=args.bars_json,
+        bars_json_path=None if use_live else args.bars_json,
         save_bars_path=args.save_bars,
         spread_override=args.spread_override,
     )
@@ -1568,6 +1819,10 @@ def main() -> int:
             arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
 
     gates = _evaluate_gates(arm_a_res, arm_b_res, arm_c_res)
+    fixture_meta = None
+    if bars_source == "pinned_fixture":
+        _fb, fixture_payload, _fp = load_tape(args.bars_json)
+        fixture_meta = {k: v for k, v in fixture_payload.items() if k != "bars"}
     report: Dict[str, Any] = {
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "symbol": SYMBOL,
@@ -1577,7 +1832,11 @@ def main() -> int:
             "first_utc": _utc_iso(bars[0]["time_utc"]) if bars else None,
             "last_utc": _utc_iso(bars[-1]["time_utc"]) if bars else None,
             "spread_override": args.spread_override,
+            "source": bars_source,
+            "path": None if use_live else str(args.bars_json),
+            "replay_bars_sha256": _bars_sha256(bars),
         },
+        "fixture_meta": fixture_meta,
         "arm_a": arm_a_res,
         "arm_b": arm_b_res,
         "arm_c": arm_c_res,
