@@ -281,6 +281,62 @@ ARM_CX_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
     "R_LOCK_TIERS": "0.5:0.00,0.75:0.25,1.0:0.50,1.25:0.75",
 }
 
+# EXPERIMENTAL - Phase 3+4 trailing A/B decision evidence ONLY. NOT production,
+# NOT shipped, never a default arm, and never written to config.py / .env.
+# All four arms are Arm B (R-lock OFF; Phase 2 proved R-lock irrelevant to
+# gate_3) plus ONE deliberate trail-knob delta, so every difference vs the
+# pinned baseline B is attributable to the named knob. Run explicitly via
+# "--arm trailing" (runs A + B + T1..T4 on the identical pinned tape) or a
+# single "--arm t1|t2|t3|t4".
+#   H1 (t1): arm the ATR trail earlier on high-ATR trades (9934 never armed
+#            at 1.00x because M5 ATR > MFE 6.34).
+#   H2 (t2): tighten the STANDARD-zone trail distance clamp $8.00 -> $5.50
+#            (reduce stop-distance surrender on 13153/13167/9934).
+#   H1+H2 (t3): both together (audit hypothesis: H1 alone is insufficient
+#            because an $8 trail is looser than BE at MFE 6.34).
+#   t4: intermediate STANDARD clamp $6.50 to map the trade-off.
+ARM_T1_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_B_CALIBRATED_PARAMS,
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT": 0.70,
+}
+ARM_T2_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_B_CALIBRATED_PARAMS,
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 5.50,
+}
+ARM_T3_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_B_CALIBRATED_PARAMS,
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT": 0.70,
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 5.50,
+}
+ARM_T4_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_B_CALIBRATED_PARAMS,
+    "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 6.50,
+}
+
+# Registry of the experimental trailing arms (order = report order).
+TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
+    "t1": {
+        "params": ARM_T1_EXPERIMENTAL_PARAMS,
+        "label": "H1: activation 1.00x -> 0.70x ATR",
+    },
+    "t2": {
+        "params": ARM_T2_EXPERIMENTAL_PARAMS,
+        "label": "H2: STANDARD trail clamp $8.00 -> $5.50",
+    },
+    "t3": {
+        "params": ARM_T3_EXPERIMENTAL_PARAMS,
+        "label": "H1+H2: activation 0.70x + clamp $5.50",
+    },
+    "t4": {
+        "params": ARM_T4_EXPERIMENTAL_PARAMS,
+        "label": "Intermediate: STANDARD trail clamp $8.00 -> $6.50",
+    },
+}
+
+# Arm modes that drive the production ATR engine on the simulated replay
+# clock (Arm A stays the frozen 4544f7f reference with the wall clock).
+_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS)
+
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
     {
@@ -1261,6 +1317,36 @@ def _pin_arm_cx_params(config_mod: Any, executor_mod: Any, main_mod: Any) -> Non
                 main_mod._MAIN_CFG_SNAPSHOT[k] = ARM_CX_EXPERIMENTAL_PARAMS[k]
 
 
+def _pin_arm_experimental_params(
+    params: Dict[str, Any],
+    config_mod: Any,
+    executor_mod: Any,
+    main_mod: Any,
+    label: str,
+) -> None:
+    """EXPERIMENTAL ONLY: pin a replay arm-param override set (arms t1..t4).
+
+    Applied AFTER the Arm B pins so the only delta vs the pinned baseline B
+    is the named experimental knob(s). Never touches production defaults;
+    this is a replay-only override mechanism, clearly labelled experimental.
+    """
+    targets = (config_mod, executor_mod, main_mod)
+    for key, expected in params.items():
+        for mod in targets:
+            if hasattr(mod, key):
+                setattr(mod, key, expected)
+        actual = getattr(config_mod, key, None)
+        if isinstance(expected, float):
+            if abs(float(actual or 0.0) - expected) > 1e-9:
+                raise RuntimeError(f"{label} experimental calibration mismatch for {key}: {actual} != {expected}")
+        elif actual != expected:
+            raise RuntimeError(f"{label} experimental calibration mismatch for {key}: {actual!r} != {expected!r}")
+    if hasattr(main_mod, "_MAIN_CFG_SNAPSHOT") and isinstance(main_mod._MAIN_CFG_SNAPSHOT, dict):
+        for k in list(main_mod._MAIN_CFG_SNAPSHOT.keys()):
+            if k in params:
+                main_mod._MAIN_CFG_SNAPSHOT[k] = params[k]
+
+
 class _ReplayClock:
     """The simulated UTC clock of a replay worker.
 
@@ -1534,7 +1620,7 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         os.environ["TRADES_LEDGER_PATH"] = str(rdir / "trades_ledger.jsonl")
         os.environ["LOCK_FILE_PATH"] = str(rdir / "copier.lock")
 
-        if arm_mode in ("b", "c", "cx"):
+        if arm_mode in _ENGINE_ARM_MODES:
             for k, v in ARM_B_CALIBRATED_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
         if arm_mode in ("c", "cx"):
@@ -1543,6 +1629,10 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         if arm_mode == "cx":
             # EXPERIMENTAL replay-only override; never a production default.
             for k, v in ARM_CX_EXPERIMENTAL_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        if arm_mode in TRAILING_EXPERIMENT_ARMS:
+            # EXPERIMENTAL replay-only trailing override; never a production default.
+            for k, v in TRAILING_EXPERIMENT_ARMS[arm_mode]["params"].items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
@@ -1562,20 +1652,26 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         elif arm_mode == "c":
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
-        else:  # cx: EXPERIMENTAL re-tier override layered on top of Arm C
+        elif arm_mode == "cx":  # EXPERIMENTAL re-tier override layered on top of Arm C
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
             _pin_arm_cx_params(config, mt5_executor, main)
+        else:  # t1..t4: EXPERIMENTAL trailing override layered on top of Arm B
+            _pin_arm_b_params(config, mt5_executor, main)
+            _pin_arm_experimental_params(
+                TRAILING_EXPERIMENT_ARMS[arm_mode]["params"],
+                config, mt5_executor, main, f"Arm {arm_mode.upper()}",
+            )
 
         # Arms B and C run on the simulated replay clock: the trade-age guard
         # reads the wall clock, and the replay simulates the RECORDED week.
-        if arm_mode in ("b", "c", "cx"):
+        if arm_mode in _ENGINE_ARM_MODES:
             _install_replay_clock(main)
 
         # Arms B and C drive the production ATR trail engine: feed it the M5 ATR it
         # actually reads and trace every picker decision. Arm A is the frozen 4544f7f
         # reference and is deliberately left untouched.
-        globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in ("b", "c", "cx")
+        globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in _ENGINE_ARM_MODES
         if _PRODUCTION_ENGINE_ARM:
             _install_picker_trace(mt5_executor)
 
@@ -1605,6 +1701,8 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
                 effective.update(ARM_C_CALIBRATED_PARAMS)
             if arm_mode == "cx":
                 effective.update(ARM_CX_EXPERIMENTAL_PARAMS)
+            if arm_mode in TRAILING_EXPERIMENT_ARMS:
+                effective.update(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
             arm_params_snapshot = {
                 "arm": arm_mode,
                 "pinned_params": effective,
@@ -1615,6 +1713,18 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
                 arm_params_snapshot["experimental_note"] = (
                     "EXPERIMENTAL re-tiered R_LOCK_TIERS override (replay arm-param only; "
                     "not production, not shipped). Compared against Arm C on the pinned tape."
+                )
+            if arm_mode in TRAILING_EXPERIMENT_ARMS:
+                arm_params_snapshot["experimental"] = True
+                arm_params_snapshot["experimental_note"] = (
+                    "EXPERIMENTAL trailing A/B arm-param override (replay arm-param only; "
+                    "not production, not shipped). Compared against pinned baseline Arm B "
+                    "on the identical pinned tape. Delta vs B: "
+                    + ", ".join(
+                        f"{k}={v}"
+                        for k, v in TRAILING_EXPERIMENT_ARMS[arm_mode]["params"].items()
+                        if ARM_B_CALIBRATED_PARAMS.get(k) != v
+                    )
                 )
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
@@ -1731,6 +1841,246 @@ def _summarize_arm(results: List[Dict[str, Any]], arm_mode: str) -> Dict[str, An
         "trio_peaks_reach_half_r": bool(trio_reach_half),
         "r_lock_structural_blocked_wide_trades": struct_blocked_wide,
     }
+
+
+def _classify_exit_reason(reason: Optional[str]) -> str:
+    """Bucket a replay exit reason for the trailing-experiment metric set."""
+    txt = str(reason or "").strip().upper()
+    if txt == "BROKER_SL":
+        return "initial_stop_loss"
+    if txt.endswith("_SL"):
+        return "protected_stop"  # ATR_TRAIL_SL / BE_LOCK_SL / MILESTONE_FLOOR_SL / R_LOCK_SL / ratchet / profit locks
+    if "BROKER_TP" in txt or txt.startswith("TP"):
+        return "tp_family"
+    return "other"
+
+
+def _trailing_experiment_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Phase 3+4 full metric set for one arm on the pinned tape.
+
+    Pure reporting over the existing per-trade result rows (no worker change,
+    so default replay behaviour is untouched). Definitions:
+      * win/loss: sign of simulated net GBP per trade (0 = flat/BE).
+      * max drawdown: peak-to-trough of the cumulative realized-GBP equity
+        curve in trade-close (catalog) order; NOT intra-trade tick drawdown.
+      * avg R/trade: realized $/oz divided by the trade's initial risk $/oz.
+      * profit surrendered after peak: max(0, peak MFE $/oz - max(realized
+        $/oz, 0)), lot-weighted to GBP (same avg-entry convention as
+        mfe_capture_pct; multi-layer partial fills make this an approximation,
+        per the audit). Flooring realized at 0 keeps the initial risk of a
+        stop-loss trade out of 'surrendered profit'.
+      * premature trailing-stop exit: a protected-stop exit (any *_SL except
+        the initial BROKER_SL) that realized < 50% of the trade's peak MFE.
+      * MAE: NOT measured - the replay worker does not track adverse excursion.
+    """
+    n = len(results)
+    wins = [r for r in results if float(r["sim_gbp"]) > 0.0]
+    losses = [r for r in results if float(r["sim_gbp"]) < 0.0]
+    flats = n - len(wins) - len(losses)
+    gross_profit = round(sum(float(r["sim_gbp"]) for r in wins), 2)
+    gross_loss = round(sum(float(r["sim_gbp"]) for r in losses), 2)
+    net = round(sum(float(r["sim_gbp"]) for r in results), 2)
+    profit_factor = round(gross_profit / abs(gross_loss), 3) if gross_loss < 0.0 else None
+
+    equity = 0.0
+    eq_peak = 0.0
+    max_dd = 0.0
+    for r in results:
+        equity += float(r["sim_gbp"])
+        eq_peak = max(eq_peak, equity)
+        max_dd = max(max_dd, eq_peak - equity)
+
+    r_mults = [
+        float(r["realized_pts_per_oz"]) / float(r["initial_r_per_oz"])
+        for r in results if float(r.get("initial_r_per_oz") or 0.0) > 0.0
+    ]
+    caps_all = [float(r["mfe_capture_pct"]) for r in results if r.get("mfe_capture_pct") is not None]
+    caps_win = [float(r["mfe_capture_pct"]) for r in wins if r.get("mfe_capture_pct") is not None]
+
+    surrender_gbp = 0.0
+    per_trade_surrender: Dict[str, Any] = {}
+    for r in results:
+        giveback_usd = max(0.0, float(r["peak_mfe_dollars"]) - max(float(r["realized_pts_per_oz"]), 0.0))
+        giveback_gbp = giveback_usd * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT
+        surrender_gbp += giveback_gbp
+        per_trade_surrender[r["msg_id"]] = {
+            "peak_mfe_usd_per_oz": round(float(r["peak_mfe_dollars"]), 2),
+            "realized_usd_per_oz": round(float(r["realized_pts_per_oz"]), 2),
+            "giveback_usd_per_oz": round(giveback_usd, 2),
+            "giveback_gbp": round(giveback_gbp, 2),
+        }
+
+    exit_buckets: Dict[str, int] = {}
+    exit_reason_dist: Dict[str, int] = {}
+    be_closures: List[str] = []
+    atr_trail_exits: List[str] = []
+    premature: List[str] = []
+    holding_minutes: List[float] = []
+    stage_dist: Dict[str, int] = {}
+    for r in results:
+        reason = str(r.get("exit_reason") or "UNKNOWN")
+        bucket = _classify_exit_reason(reason)
+        exit_buckets[bucket] = exit_buckets.get(bucket, 0) + 1
+        exit_reason_dist[reason] = exit_reason_dist.get(reason, 0) + 1
+        if "BE_LOCK" in reason.upper():
+            be_closures.append(r["msg_id"])
+        if "ATR_TRAIL" in reason.upper():
+            atr_trail_exits.append(r["msg_id"])
+        if (
+            bucket == "protected_stop"
+            and float(r["peak_mfe_dollars"]) > 0.0
+            and float(r["realized_pts_per_oz"]) < 0.5 * float(r["peak_mfe_dollars"])
+        ):
+            premature.append(r["msg_id"])
+        stage_key = f"TP{int(r.get('max_stage') or 0)}" if int(r.get("max_stage") or 0) > 0 else "none"
+        stage_dist[stage_key] = stage_dist.get(stage_key, 0) + 1
+        try:
+            t_open = _parse_utc(str(r["open_utc"]))
+            t_exit = _parse_utc(str(r.get("exit_utc") or r["open_utc"]))
+            holding_minutes.append((t_exit - t_open).total_seconds() / 60.0)
+        except Exception:
+            pass
+
+    atr_trail_engaged = [r["msg_id"] for r in results if int((r.get("stop_source_counts") or {}).get("ATR_TRAIL", 0)) > 0]
+    be_lock_engaged = [r["msg_id"] for r in results if int((r.get("stop_source_counts") or {}).get("BE_LOCK", 0)) > 0]
+    r_lock_trades = [r["msg_id"] for r in results if int(r.get("r_lock_wins", 0)) > 0]
+
+    def _trade_row(mid: str) -> Dict[str, Any]:
+        r = next((x for x in results if x["msg_id"] == mid), None)
+        if r is None:
+            return {}
+        return {
+            "sim_gbp": float(r["sim_gbp"]),
+            "sim_pts_lot": float(r["sim_pts_lot"]),
+            "mfe_capture_pct": r.get("mfe_capture_pct"),
+            "peak_mfe_usd_per_oz": round(float(r["peak_mfe_dollars"]), 2),
+            "realized_usd_per_oz": round(float(r["realized_pts_per_oz"]), 2),
+            "giveback_usd_per_oz": per_trade_surrender.get(mid, {}).get("giveback_usd_per_oz"),
+            "max_stage": int(r.get("max_stage") or 0),
+            "exit_reason": r.get("exit_reason"),
+            "exit_price": r.get("exit_price"),
+            "exit_utc": r.get("exit_utc"),
+            "atr_trail_picker_wins": int((r.get("stop_source_counts") or {}).get("ATR_TRAIL", 0)),
+            "stop_source_counts": dict(r.get("stop_source_counts") or {}),
+        }
+
+    return {
+        "total_trades": n,
+        "wins": len(wins),
+        "losses": len(losses),
+        "flats_be": flats,
+        "win_rate_pct": round(100.0 * len(wins) / n, 1) if n else 0.0,
+        "gross_profit_gbp": gross_profit,
+        "gross_loss_gbp": gross_loss,
+        "net_profit_gbp": net,
+        "profit_factor": profit_factor,
+        "max_drawdown_gbp": round(max_dd, 2),
+        "max_drawdown_basis": "cumulative realized-GBP equity curve, trade-close order (not intra-trade)",
+        "avg_r_per_trade": round(sum(r_mults) / len(r_mults), 4) if r_mults else None,
+        "avg_mfe_capture_pct_all": round(sum(caps_all) / len(caps_all), 1) if caps_all else None,
+        "avg_mfe_capture_pct_winners": round(sum(caps_win) / len(caps_win), 1) if caps_win else None,
+        "mae": "not measured (replay worker does not track adverse excursion)",
+        "avg_realized_profit_gbp": round(net / n, 4) if n else 0.0,
+        "avg_winner_gbp": round(gross_profit / len(wins), 4) if wins else 0.0,
+        "profit_surrendered_after_peak_gbp": round(surrender_gbp, 2),
+        "per_trade_surrender": per_trade_surrender,
+        "stop_loss_frequency": exit_buckets.get("initial_stop_loss", 0),
+        "protected_stop_exits": exit_buckets.get("protected_stop", 0),
+        "exit_bucket_distribution": exit_buckets,
+        "exit_reason_distribution": exit_reason_dist,
+        "tp_stage_distribution": stage_dist,
+        "r_lock_engagement": {"picker_wins": sum(int(r.get("r_lock_wins", 0)) for r in results), "trades": r_lock_trades},
+        "atr_trail_engagement": {"trades": atr_trail_engaged, "picker_wins": sum(int((r.get("stop_source_counts") or {}).get("ATR_TRAIL", 0)) for r in results)},
+        "be_lock_engagement_trades": be_lock_engaged,
+        "be_closure_frequency": len(be_closures),
+        "be_closure_trades": be_closures,
+        "atr_trail_exit_trades": atr_trail_exits,
+        "premature_trailing_exit_frequency": len(premature),
+        "premature_trailing_exit_trades": premature,
+        "premature_definition": "protected-stop exit (*_SL except initial BROKER_SL) realizing < 50% of peak MFE",
+        "avg_holding_time_min": round(sum(holding_minutes) / len(holding_minutes), 2) if holding_minutes else None,
+        "choke_trio_detail": {mid: _trade_row(mid) for mid in ("13153", "9934", "13167")},
+        "trade_9934_exit": _trade_row("9934"),
+        "winners_non_regression": {mid: _trade_row(mid) for mid in ("9905", "9705")},
+    }
+
+
+def _evaluate_trailing_gates(
+    arm_a: Dict[str, Any],
+    arm_b: Dict[str, Any],
+    variants: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """g1-g5 per experimental variant, same formulas as the shipped gates.
+
+    g1-g4 substitute the variant for Arm B against the frozen Arm A reference;
+    g5 compares the variant against the pinned baseline B (net + tail no worse,
+    zero errors). Winner non-regression (9905/9705) is reported vs baseline B;
+    'material' degradation = capture drop > 5.0 percentage points or GBP drop
+    > 0.10 on either winner. The gate_3 thresholds are used AS-IS (the
+    0.090 pts*lot == GBP 6.83 vs GBP 6.125 inconsistency is a finding, not
+    something to 'fix' here).
+    """
+    sa = arm_a["summary"]
+    sb = arm_b["summary"]
+    by_id_b = {r["msg_id"]: r for r in arm_b["results"]}
+    out: Dict[str, Any] = {}
+    for name, payload in variants.items():
+        sv = payload["summary"]
+        g1 = sv["net_gbp"] > sa["net_gbp"]
+        g2 = sv["tail_loss_gbp_13078_9953"] > sa["tail_loss_gbp_13078_9953"]
+        g3 = (
+            sv["choke_trio_gbp_13153_9934_13167"] > 2.45 * 2.5
+            and sv["choke_trio_pts_lot"] >= 0.090
+            and sv["trade_13153_max_stage"] >= 2
+        )
+        g4 = (
+            sa["error_count"] == 0
+            and sv["error_count"] == 0
+            and sv["trade_9934_banked_tracked"] > 0.0
+            and len(sa["unflagged_rollover_exits"]) == 0
+            and len(sv["unflagged_rollover_exits"]) == 0
+        )
+        g5 = (
+            sv["net_gbp"] >= sb["net_gbp"]
+            and sv["tail_loss_gbp_13078_9953"] >= sb["tail_loss_gbp_13078_9953"]
+            and sv["error_count"] == 0
+        )
+        winners: Dict[str, Any] = {}
+        for mid in ("9905", "9705"):
+            rv = next((r for r in payload["results"] if r["msg_id"] == mid), {})
+            rb = by_id_b.get(mid, {})
+            cap_b = rb.get("mfe_capture_pct")
+            cap_v = rv.get("mfe_capture_pct")
+            gbp_b = float(rb.get("sim_gbp") or 0.0)
+            gbp_v = float(rv.get("sim_gbp") or 0.0)
+            cap_drop = (float(cap_b) - float(cap_v)) if (cap_b is not None and cap_v is not None) else None
+            material = bool((cap_drop is not None and cap_drop > 5.0) or (gbp_b - gbp_v) > 0.10)
+            winners[mid] = {
+                "capture_baseline_pct": cap_b,
+                "capture_variant_pct": cap_v,
+                "capture_drop_pp": round(cap_drop, 1) if cap_drop is not None else None,
+                "gbp_baseline": gbp_b,
+                "gbp_variant": gbp_v,
+                "material_degradation": material,
+            }
+        out[name] = {
+            "gate_1_net_profit": g1,
+            "gate_2_tail_protection": g2,
+            "gate_3_mfe_capture_and_13153_stage2": g3,
+            "gate_3_legs": {
+                "trio_gbp": sv["choke_trio_gbp_13153_9934_13167"],
+                "trio_gbp_threshold": 2.45 * 2.5,
+                "trio_pts_lot": sv["choke_trio_pts_lot"],
+                "trio_pts_lot_threshold": 0.090,
+                "trade_13153_max_stage": sv["trade_13153_max_stage"],
+            },
+            "gate_4_zero_regression": g4,
+            "g5_vs_baseline_b": g5,
+            "all_gates_passed": bool(g1 and g2 and g3 and g4 and g5),
+            "winner_non_regression": winners,
+            "winner_non_regression_ok": all(not w["material_degradation"] for w in winners.values()),
+        }
+    return out
 
 
 def _run_arm_subprocess(arm_mode: str, code_root: Path, bars_path: Path, out_path: Path) -> Dict[str, Any]:
@@ -1895,13 +2245,16 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 f"`£{rb['sim_gbp']:+.2f}` | `{rb['exit_reason']}` (S{rb['max_stage']}) | `{cap_b}` | `{ro}` |"
             )
     else:
-        single = arm_a or arm_b or arm_c
+        single = arm_a or arm_b or arm_c or next(
+            (report.get(f"arm_{m}") for m in TRAILING_EXPERIMENT_ARMS if report.get(f"arm_{m}")), None
+        )
         assert single is not None
         ss = single["summary"]
         label = {
             "a": "Arm A (`4544f7f`)",
             "b": "Arm B (`v3.6.0` Calibrated)",
             "c": "Arm C (R Lock Only)",
+            **{m: f"EXPERIMENTAL Arm {m.upper()} ({TRAILING_EXPERIMENT_ARMS[m]['label']})" for m in TRAILING_EXPERIMENT_ARMS},
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -2020,6 +2373,134 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "This arm is experimental evidence only; production R_LOCK_TIERS is unchanged.",
         ]
 
+    trailing_experiments = report.get("trailing_experiments")
+    trailing_gates = report.get("trailing_gates")
+    if trailing_experiments and arm_b:
+        bm = trailing_experiments["baseline_metrics"]
+        arm_keys = list(trailing_experiments["arms"].keys())
+        cols = ["B (baseline)"] + [m.upper() for m in arm_keys]
+        lines += [
+            "",
+            "## EXPERIMENTAL Phase 3+4 Trailing A/B (pinned tape) - NOT shipped",
+            "",
+            f"- {trailing_experiments['note']}",
+            "",
+            "| Arm | Override vs baseline B |",
+            "|---|---|",
+            "| B | none (pinned baseline; R-lock OFF) |",
+        ]
+        for m in arm_keys:
+            ov = trailing_experiments["arms"][m]["overrides_vs_baseline_b"]
+            lines.append(f"| {m.upper()} | `{ov}` ({trailing_experiments['arms'][m]['label']}) |")
+
+        def _mrow(label: str, key: str, fmt: str = "{}") -> str:
+            cells = [fmt.format(bm.get(key))]
+            for m in arm_keys:
+                cells.append(fmt.format(trailing_experiments["arms"][m]["metrics"].get(key)))
+            return f"| {label} | " + " | ".join(f"`{c}`" for c in cells) + " |"
+
+        lines += [
+            "",
+            "| Metric | " + " | ".join(cols) + " |",
+            "|---|" + "---:|" * len(cols),
+            _mrow("Total trades", "total_trades"),
+            "| Wins / Losses / Flats | " + " | ".join(
+                f"`{x['wins']}/{x['losses']}/{x['flats_be']}`"
+                for x in [bm] + [trailing_experiments["arms"][m]["metrics"] for m in arm_keys]
+            ) + " |",
+            _mrow("Win rate %", "win_rate_pct"),
+            _mrow("Gross profit (GBP)", "gross_profit_gbp", "{:+.2f}"),
+            _mrow("Gross loss (GBP)", "gross_loss_gbp", "{:+.2f}"),
+            _mrow("Net profit (GBP)", "net_profit_gbp", "{:+.2f}"),
+            _mrow("Profit factor", "profit_factor"),
+            _mrow("Max drawdown (GBP, equity curve)", "max_drawdown_gbp", "{:.2f}"),
+            _mrow("Avg R/trade", "avg_r_per_trade"),
+            _mrow("Avg MFE capture % (all)", "avg_mfe_capture_pct_all"),
+            _mrow("Avg MFE capture % (winners)", "avg_mfe_capture_pct_winners"),
+            _mrow("Avg realised profit (GBP)", "avg_realized_profit_gbp", "{:+.4f}"),
+            _mrow("Surrendered after peak (GBP)", "profit_surrendered_after_peak_gbp", "{:.2f}"),
+            _mrow("Initial stop-loss exits", "stop_loss_frequency"),
+            _mrow("BE-closure frequency", "be_closure_frequency"),
+            _mrow("Premature trailing exits (<50% peak)", "premature_trailing_exit_frequency"),
+            _mrow("Avg holding time (min)", "avg_holding_time_min"),
+            "",
+            f"- MAE: {bm['mae']}",
+            f"- Premature definition: {bm['premature_definition']}",
+            f"- TP stage distribution B: `{bm['tp_stage_distribution']}`",
+        ]
+        for m in arm_keys:
+            mm = trailing_experiments["arms"][m]["metrics"]
+            lines.append(f"- TP stage distribution {m.upper()}: `{mm['tp_stage_distribution']}` | "
+                         f"ATR-trail engaged trades: `{mm['atr_trail_engagement']['trades']}` | "
+                         f"R-lock wins: `{mm['r_lock_engagement']['picker_wins']}` | "
+                         f"exit reasons: `{mm['exit_reason_distribution']}`")
+
+        lines += [
+            "",
+            "### gate_3 legs + choke-trio giveback per arm",
+            "",
+            "| Arm | Trio GBP (>6.125) | Trio pts*lot (>=0.090) | 13153 stage (>=2) | 13153 giveback $/oz | 9934 giveback $/oz | 13167 giveback $/oz | 9934 exit |",
+            "|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        sb = arm_b["summary"]
+        trio_b = bm["choke_trio_detail"]
+        lines.append(
+            f"| B | `{sb['choke_trio_gbp_13153_9934_13167']:+.2f}` | `{sb['choke_trio_pts_lot']:.4f}` | "
+            f"`{sb['trade_13153_max_stage']}` | `{trio_b['13153'].get('giveback_usd_per_oz')}` | "
+            f"`{trio_b['9934'].get('giveback_usd_per_oz')}` | `{trio_b['13167'].get('giveback_usd_per_oz')}` | "
+            f"`{trio_b['9934'].get('exit_reason')} @ {trio_b['9934'].get('exit_price')}` |"
+        )
+        for m in arm_keys:
+            payload = report.get(f"arm_{m}")
+            sv = payload["summary"]
+            mm = trailing_experiments["arms"][m]["metrics"]
+            trio = mm["choke_trio_detail"]
+            lines.append(
+                f"| {m.upper()} | `{sv['choke_trio_gbp_13153_9934_13167']:+.2f}` | `{sv['choke_trio_pts_lot']:.4f}` | "
+                f"`{sv['trade_13153_max_stage']}` | `{trio['13153'].get('giveback_usd_per_oz')}` | "
+                f"`{trio['9934'].get('giveback_usd_per_oz')}` | `{trio['13167'].get('giveback_usd_per_oz')}` | "
+                f"`{trio['9934'].get('exit_reason')} @ {trio['9934'].get('exit_price')}` |"
+            )
+
+        lines += [
+            "",
+            "### Winner non-regression (capture % / GBP, vs baseline B)",
+            "",
+            "| Arm | 9905 capture | 9905 GBP | 9705 capture | 9705 GBP |",
+            "|---|---:|---:|---:|---:|",
+            f"| B | `{bm['winners_non_regression']['9905'].get('mfe_capture_pct')}` | `{bm['winners_non_regression']['9905'].get('sim_gbp'):+.2f}` | "
+            f"`{bm['winners_non_regression']['9705'].get('mfe_capture_pct')}` | `{bm['winners_non_regression']['9705'].get('sim_gbp'):+.2f}` |",
+        ]
+        for m in arm_keys:
+            mm = trailing_experiments["arms"][m]["metrics"]
+            w = mm["winners_non_regression"]
+            lines.append(
+                f"| {m.upper()} | `{w['9905'].get('mfe_capture_pct')}` | `{w['9905'].get('sim_gbp'):+.2f}` | "
+                f"`{w['9705'].get('mfe_capture_pct')}` | `{w['9705'].get('sim_gbp'):+.2f}` |"
+            )
+
+        if trailing_gates:
+            lines += [
+                "",
+                "### Gates g1-g5 per experimental variant (g1-g4 vs Arm A; g5 vs baseline B)",
+                "",
+                "| Arm | g1 net | g2 tail | g3 trio | g4 zero-regression | g5 vs B | All | Winners OK |",
+                "|---|---|---|---|---|---|---|---|",
+            ]
+            for m in arm_keys:
+                tg = trailing_gates.get(m, {})
+                lines.append(
+                    f"| {m.upper()} | `{tg.get('gate_1_net_profit')}` | `{tg.get('gate_2_tail_protection')}` | "
+                    f"`{tg.get('gate_3_mfe_capture_and_13153_stage2')}` | `{tg.get('gate_4_zero_regression')}` | "
+                    f"`{tg.get('g5_vs_baseline_b')}` | `{tg.get('all_gates_passed')}` | `{tg.get('winner_non_regression_ok')}` |"
+                )
+            lines += [
+                "",
+                "Finding (not 'fixed'): gate_3's 0.090 pts*lot leg == GBP 6.83 at the pinned rate, "
+                "stricter than its GBP 6.125 leg; thresholds are inconsistent by design or by accident "
+                "and need an explicit owner decision.",
+            ]
+
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():
         lines.append(f"- **{k}:** `{v}`")
@@ -2029,7 +2510,12 @@ def _render_markdown(report: Dict[str, Any]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
-    parser.add_argument("--arm", choices=("a", "b", "c", "cx", "both"), default="both")
+    parser.add_argument(
+        "--arm",
+        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "both", "trailing"),
+        default="both",
+        help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape.",
+    )
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
     parser.add_argument("--save-bars", type=Path, default=None)
@@ -2048,7 +2534,7 @@ def main() -> int:
     parser.add_argument("--spread-override", type=float, default=None)
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -2084,18 +2570,54 @@ def main() -> int:
         arm_b_res: Optional[Dict[str, Any]] = None
         arm_c_res: Optional[Dict[str, Any]] = None
         arm_cx_res: Optional[Dict[str, Any]] = None
+        arm_t_res: Dict[str, Optional[Dict[str, Any]]] = {m: None for m in TRAILING_EXPERIMENT_ARMS}
 
-        if args.arm in ("a", "both"):
+        if args.arm in ("a", "both", "trailing"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
-        if args.arm in ("b", "both"):
+        if args.arm in ("b", "both", "trailing"):
             arm_b_res = _run_arm_subprocess("b", REPO_ROOT, bars_file, io_dir / "arm_b.json")
         if args.arm in ("c", "both", "cx"):
             arm_c_res = _run_arm_subprocess("c", REPO_ROOT, bars_file, io_dir / "arm_c.json")
         if args.arm == "cx":
             # EXPERIMENTAL re-tier comparison; runs Arm C too for before/after.
             arm_cx_res = _run_arm_subprocess("cx", REPO_ROOT, bars_file, io_dir / "arm_cx.json")
+        if args.arm == "trailing":
+            # EXPERIMENTAL Phase 3+4 trailing A/B; runs A + B too for gates.
+            for mode in TRAILING_EXPERIMENT_ARMS:
+                arm_t_res[mode] = _run_arm_subprocess(mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json")
+        elif args.arm in TRAILING_EXPERIMENT_ARMS:
+            arm_t_res[args.arm] = _run_arm_subprocess(args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json")
 
     gates = _evaluate_gates(arm_a_res, arm_b_res, arm_c_res)
+
+    # EXPERIMENTAL Phase 3+4 trailing A/B evidence (replay arm-param overrides
+    # only; production defaults untouched). Present only in --arm trailing mode.
+    trailing_experiments: Optional[Dict[str, Any]] = None
+    trailing_gates: Optional[Dict[str, Any]] = None
+    if args.arm == "trailing" and arm_a_res and arm_b_res:
+        variants = {m: arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]}
+        trailing_experiments = {
+            "experimental": True,
+            "note": (
+                "EXPERIMENTAL trailing A/B arm-param overrides on the identical pinned tape "
+                "(same bars, spread, GBP rate 0.7589, offset 7200, execution rules). "
+                "NOT production, NOT shipped; promotion requires explicit approval."
+            ),
+            "baseline_arm": "b",
+            "baseline_metrics": _trailing_experiment_metrics(arm_b_res["results"]),
+            "arms": {
+                m: {
+                    "label": TRAILING_EXPERIMENT_ARMS[m]["label"],
+                    "overrides_vs_baseline_b": {
+                        k: v for k, v in TRAILING_EXPERIMENT_ARMS[m]["params"].items()
+                        if ARM_B_CALIBRATED_PARAMS.get(k) != v
+                    },
+                    "metrics": _trailing_experiment_metrics(payload["results"]),
+                }
+                for m, payload in variants.items()
+            },
+        }
+        trailing_gates = _evaluate_trailing_gates(arm_a_res, arm_b_res, variants)
     fixture_meta = None
     if bars_source == "pinned_fixture":
         _fb, fixture_payload, _fp = load_tape(args.bars_json)
@@ -2118,6 +2640,12 @@ def main() -> int:
         "arm_b": arm_b_res,
         "arm_c": arm_c_res,
         "arm_cx": arm_cx_res,
+        "arm_t1": arm_t_res["t1"],
+        "arm_t2": arm_t_res["t2"],
+        "arm_t3": arm_t_res["t3"],
+        "arm_t4": arm_t_res["t4"],
+        "trailing_experiments": trailing_experiments,
+        "trailing_gates": trailing_gates,
         "gates": gates,
     }
     md_text = _render_markdown(report)
