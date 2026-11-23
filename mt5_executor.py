@@ -39,6 +39,8 @@ from config import (
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    DYNAMIC_ATR_INTERIM_FLOOR_ENABLED,
+    DYNAMIC_ATR_INTERIM_FLOOR_K,
     DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS,
     DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS,
     DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS,
@@ -228,6 +230,8 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_BE_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS",
         "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS",
+        "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED",
+        "DYNAMIC_ATR_INTERIM_FLOOR_K",
         "DYNAMIC_ATR_MFE_LOCK_ENABLED",
         "DYNAMIC_ATR_MFE_LOCK_TIERS",
         "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS",
@@ -1460,6 +1464,8 @@ class MT5Executor:
             DYNAMIC_ATR_BE_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_ACTIVATION_MULT", DYNAMIC_ATR_BE_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_MIN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", DYNAMIC_ATR_BE_MIN_MFE_DOLLARS),
             DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS=_cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
+            DYNAMIC_ATR_INTERIM_FLOOR_ENABLED=_cfg("DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", DYNAMIC_ATR_INTERIM_FLOOR_ENABLED),
+            DYNAMIC_ATR_INTERIM_FLOOR_K=_cfg("DYNAMIC_ATR_INTERIM_FLOOR_K", DYNAMIC_ATR_INTERIM_FLOOR_K),
             DYNAMIC_ATR_MFE_LOCK_ENABLED=_cfg("DYNAMIC_ATR_MFE_LOCK_ENABLED", DYNAMIC_ATR_MFE_LOCK_ENABLED),
             DYNAMIC_ATR_MFE_LOCK_TIERS=_cfg("DYNAMIC_ATR_MFE_LOCK_TIERS", DYNAMIC_ATR_MFE_LOCK_TIERS),
             DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS=_cfg("DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS),
@@ -8022,6 +8028,7 @@ class MT5Executor:
             f"BE_LOCK={fmt(trail_step.get('be_sl'))} | "
             f"AUTO_BE={fmt(trail_step.get('auto_be_sl'))} | "
             f"MILESTONE={fmt(trail_step.get('milestone_floor'))} | "
+            f"INTERIM_FLOOR={fmt(trail_step.get('interim_floor_sl'))} | "
             f"WINNER={trail_step.get('stop_source') or '-'} -> broker_sl={fmt(trail_step.get('candidate_sl'))}"
         )
 
@@ -8083,6 +8090,13 @@ class MT5Executor:
                 f"[T3 AUTO-BE] {lk} #{t_int}: mfe=${mfe:.2f} >= {policy.auto_be_pips:.0f} pips "
                 f"-> SL=entry {trail_step.get('auto_be_sl')}"
             )
+        if policy.interim_floor_enabled and trail_step.get("interim_floor_armed") and not lv.get("_t3_if_logged"):
+            lv["_t3_if_logged"] = True
+            binds = trail_step.get("stop_source") == "INTERIM_FLOOR"
+            logger.info(
+                f"[T3 INTERIM-FLOOR] {lk} #{t_int}: proposed_sl={trail_step.get('interim_floor_sl')} "
+                f"k={policy.interim_floor_k:.2f} binds={binds}"
+            )
 
     def evaluate_dynamic_atr_engine(
         self,
@@ -8108,6 +8122,7 @@ class MT5Executor:
             or bool(policy.mfe_lock_enabled)
             or bool(policy.auto_be_enabled)
             or policy.trail_distance_scale_mult != 1.0
+            or bool(policy.interim_floor_enabled)
         )
         empty_disabled = {
             "enabled": False,
@@ -8545,7 +8560,7 @@ class MT5Executor:
                     "pending_swept": [],
                 })
             if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK") or (
-                t3_active and stop_source in ("MFE_LOCK", "BE_LOCK", "AUTO_BE")
+                t3_active and stop_source in ("MFE_LOCK", "BE_LOCK", "AUTO_BE", "INTERIM_FLOOR")
             ):
                 lv["dynamic_atr_trail_sl"] = cand_sl
                 lv["dynamic_atr_trail_dist"] = trail_step["trail_dist"]

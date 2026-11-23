@@ -37,6 +37,7 @@ def _apply_isolated_env() -> None:
     os.environ["DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS"] = "0.0"
     os.environ["DYNAMIC_ATR_TRAIL_DISTANCE_TIERS"] = ""
     os.environ["DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"] = "1.0"
+    os.environ["DYNAMIC_ATR_INTERIM_FLOOR_ENABLED"] = "false"
 
 
 _apply_isolated_env()

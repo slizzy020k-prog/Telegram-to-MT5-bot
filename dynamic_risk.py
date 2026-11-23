@@ -82,6 +82,8 @@ class DynamicRiskPolicy:
     auto_be_pips: float = 30.0
     auto_be_pip_size_dollars: float = 0.0
     trail_distance_scale_mult: float = 1.0
+    interim_floor_enabled: bool = False
+    interim_floor_k: float = 0.50
     tp_trail_enabled: bool = True
     tp_lift_atr_mult: float = 0.50
     tp_lift_progress_pct: float = 0.75
@@ -182,6 +184,8 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         auto_be_pips=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIPS", 30.0), 30.0)),
         auto_be_pip_size_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", 0.0), 0.0)),
         trail_distance_scale_mult=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT", 1.0), 1.0), 0.50, 2.00),
+        interim_floor_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", False)),
+        interim_floor_k=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_INTERIM_FLOOR_K", 0.50), 0.50), 0.10, 2.00),
         tp_trail_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)),
         tp_lift_atr_mult=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50), 0.50)),
         tp_lift_progress_pct=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75), 0.75), 0.10, 0.99),
@@ -664,6 +668,8 @@ def compute_dynamic_atr_trail_stop(
             "mfe_lock_tier": 0.0,
             "auto_be_sl": None,
             "auto_be_armed": False,
+            "interim_floor_sl": None,
+            "interim_floor_armed": False,
             "trail_activation_threshold": None,
             "be_threshold": None,
             "distance_cap_applied": False,
@@ -787,6 +793,22 @@ def compute_dynamic_atr_trail_stop(
     if auto_be_thr > 0.0 and mfe + 1e-9 >= auto_be_thr:
         auto_be_sl = round(entry_price, digits)
 
+    # T3 opt-in: ATR-scaled interim fallback floor (research ifk50, k-mode). floor =
+    # entry + sign*k*ATR, armed once MFE >= k*ATR (peak reached the floor level). Uses the
+    # SAME trail ATR as the research (rounded to 4dp; NO min/max bound in k-mode). ONE EXTRA
+    # tightest-stop candidate (priority 6) that binds only when tighter; the immediate MFE
+    # ladder / T3 / BE / R-lock are UNCHANGED and the forward-only guard never loosens.
+    interim_floor_sl: Optional[float] = None
+    interim_floor_armed = False
+    if policy.interim_floor_enabled:
+        if_k = _clamp(_safe_float(policy.interim_floor_k, 0.50), 0.10, 2.00)
+        if_atr = round(atr_f, 4)
+        if_mfe = round(max(0.0, mfe), 4)
+        if_lvl = if_k * if_atr
+        if if_mfe > 0.0 and if_lvl > 0.0 and if_mfe + 1e-9 >= if_lvl:
+            interim_floor_armed = True
+            interim_floor_sl = round(entry_price + sign * if_lvl, digits)
+
     milestone_floor = (
         _compute_milestone_floor(sign, entry_price, cleared_milestones, tp_levels, policy.be_lock_offset_dollars, digits)
         if apply_milestone_floor
@@ -806,6 +828,8 @@ def compute_dynamic_atr_trail_stop(
         candidates.append((4, "BE_LOCK", be_sl))
     if auto_be_sl is not None:
         candidates.append((5, "AUTO_BE", auto_be_sl))
+    if interim_floor_sl is not None:
+        candidates.append((6, "INTERIM_FLOOR", interim_floor_sl))
 
     armed = bool(candidates)
     if not armed:
@@ -835,12 +859,14 @@ def compute_dynamic_atr_trail_stop(
             "mfe_lock_tier": round(mfe_lock_tier, 4),
             "auto_be_sl": auto_be_sl,
             "auto_be_armed": auto_be_sl is not None,
+            "interim_floor_sl": interim_floor_sl,
+            "interim_floor_armed": interim_floor_armed,
             "trail_activation_threshold": round(trail_activation_threshold, 4),
             "be_threshold": round(be_threshold, 4),
             "distance_cap_applied": distance_cap_applied,
         }
 
-    # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > MFE_LOCK > BE_LOCK > AUTO_BE.
+    # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > MFE_LOCK > BE_LOCK > AUTO_BE > INTERIM_FLOOR.
     # (With the opt-in candidates disabled the relative order of the remaining candidates
     # is unchanged, so default tie-breaks are identical.)
     # The picker always keeps the tightest stop, so a floor can only tighten it.
@@ -883,6 +909,8 @@ def compute_dynamic_atr_trail_stop(
         "mfe_lock_tier": round(mfe_lock_tier, 4),
         "auto_be_sl": auto_be_sl,
         "auto_be_armed": auto_be_sl is not None,
+        "interim_floor_sl": interim_floor_sl,
+        "interim_floor_armed": interim_floor_armed,
         "trail_activation_threshold": round(trail_activation_threshold, 4),
         "be_threshold": round(be_threshold, 4),
         "distance_cap_applied": distance_cap_applied,

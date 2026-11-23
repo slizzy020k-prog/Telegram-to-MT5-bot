@@ -653,6 +653,13 @@ DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS: float = _env_float(
 DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT: float = _env_float(
     "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT", 1.0, min_val=0.50, max_val=2.00, positive_only=True
 )
+# T3 opt-in: ATR-scaled interim fallback floor (research ifk50). floor = entry + sign*k*ATR,
+# armed once MFE >= k*ATR; an EXTRA tightest-stop candidate that binds only when tighter and
+# never loosens. Does NOT delay the immediate MFE ladder. k=0.50 reproduces backtested ifk50.
+DYNAMIC_ATR_INTERIM_FLOOR_ENABLED: bool = _env_bool("DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", False)
+DYNAMIC_ATR_INTERIM_FLOOR_K: float = _env_float(
+    "DYNAMIC_ATR_INTERIM_FLOOR_K", 0.50, min_val=0.10, max_val=2.00, positive_only=True
+)
 
 DYNAMIC_ATR_TP_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
 DYNAMIC_ATR_TP_LIFT_ATR_MULT: float = _env_float(

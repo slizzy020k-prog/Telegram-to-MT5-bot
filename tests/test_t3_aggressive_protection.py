@@ -49,6 +49,8 @@ NEW_KNOBS = {
     "DYNAMIC_ATR_AUTO_BE_PIPS": "auto_be_pips",
     "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": "auto_be_pip_size_dollars",
     "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": "trail_distance_scale_mult",
+    "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED": "interim_floor_enabled",
+    "DYNAMIC_ATR_INTERIM_FLOOR_K": "interim_floor_k",
 }
 
 
@@ -492,7 +494,7 @@ def test_each_knob_mutates_wide_stop_case(direction):
 # ---------------------------------------------------------------------------
 
 def _sentinel(knob, current):
-    if knob in ("DYNAMIC_ATR_MFE_LOCK_ENABLED", "DYNAMIC_ATR_AUTO_BE_ENABLED"):
+    if knob in ("DYNAMIC_ATR_MFE_LOCK_ENABLED", "DYNAMIC_ATR_AUTO_BE_ENABLED", "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED"):
         return not bool(current)
     if knob == "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS":
         return "6:3.50,10:3.00" if current != "6:3.50,10:3.00" else "5:2.00"
@@ -516,6 +518,8 @@ def _sentinel(knob, current):
         return 0.20 if current != 0.20 else 0.10
     if knob == "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT":
         return 1.05 if current != 1.05 else 1.10
+    if knob == "DYNAMIC_ATR_INTERIM_FLOOR_K":
+        return 0.75 if current != 0.75 else 0.60
     raise AssertionError(knob)
 
 
@@ -564,6 +568,8 @@ def test_shipped_defaults_match():
     assert pol.auto_be_pips == pytest.approx(30.0)
     assert pol.auto_be_pip_size_dollars == pytest.approx(0.0)
     assert pol.trail_distance_scale_mult == pytest.approx(1.0)
+    assert pol.interim_floor_enabled is False
+    assert pol.interim_floor_k == pytest.approx(0.50)
     assert dr.read_dynamic_risk_policy(SimpleNamespace()) == pol
 
 
@@ -715,3 +721,133 @@ def test_binding_sl_helper_formats_absent_as_dash(caplog):
     assert "BE_LOCK=3700.5" in line and "AUTO_BE=3700.0" in line
     assert "tier=1.50, pct=0.80" in line
     assert "WINNER=MFE_LOCK -> broker_sl=3704.8" in line
+
+
+# ---------------------------------------------------------------------------
+# 12. ATR-scaled interim fallback floor (research ifk50, opt-in)
+# ---------------------------------------------------------------------------
+
+def _ifpol(k=0.50, **kw):
+    base = dict(interim_floor_enabled=True, interim_floor_k=k)
+    base.update(kw)
+    return DynamicRiskPolicy(**base)
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_interim_floor_arms_at_mfe_ge_k_atr(direction):
+    entry = 3700.0
+    sign = 1.0 if direction == "BUY" else -1.0
+    atr = 4.0  # k=0.5 -> lvl 2.0
+    armed = _eng(direction, entry, _live(entry, 2.0, direction), _ifpol(), atr=atr, r=32.0)
+    below = _eng(direction, entry, _live(entry, 1.99, direction), _ifpol(), atr=atr, r=32.0)
+    assert armed["interim_floor_armed"] is True
+    assert armed["interim_floor_sl"] == pytest.approx(round(entry + sign * 2.0, 2))
+    assert below["interim_floor_armed"] is False
+    assert below["interim_floor_sl"] is None
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_interim_floor_matches_research_ifk50(direction):
+    # Research k-mode: lvl = k * trail_ATR (no bound), floor = round(entry + sign*lvl, 2).
+    entry = 3600.0
+    atr = 12.0
+    k = 0.50
+    sign = 1.0 if direction == "BUY" else -1.0
+    mfe = k * atr  # 6.0 -> peak reached the floor
+    res = _eng(direction, entry, _live(entry, mfe, direction), _ifpol(k), atr=atr, r=32.0)
+    expected = round(entry + sign * (k * round(atr, 4)), 2)
+    assert res["interim_floor_sl"] == pytest.approx(expected)
+    assert res["interim_floor_armed"] is True
+    assert res["stop_source"] == "INTERIM_FLOOR"
+    assert res["candidate_sl"] == pytest.approx(expected)
+
+
+def test_interim_floor_binds_only_when_tighter_than_ladder():
+    entry = 3700.0
+    # MFE 2 / ATR 4: ladder 45% -> 0.90; floor k0.5 -> 2.00 (tighter for BUY).
+    res = _eng("BUY", entry, 3702.0, _ifpol(0.50, mfe_lock_enabled=True), atr=4.0)
+    assert res["mfe_lock_sl"] == pytest.approx(3700.9)
+    assert res["interim_floor_sl"] == pytest.approx(3702.0)
+    assert res["stop_source"] == "INTERIM_FLOOR"
+    assert res["candidate_sl"] == pytest.approx(3702.0)
+
+
+def test_interim_floor_never_loosens_tighter_mfe_lock():
+    entry = 3700.0
+    # MFE 8 / ATR 4: ladder 85% -> 6.80 (tighter); floor 2.00 must NOT win.
+    res = _eng("BUY", entry, 3708.0, _ifpol(0.50, mfe_lock_enabled=True), atr=4.0)
+    assert res["mfe_lock_sl"] == pytest.approx(3706.8)
+    assert res["interim_floor_sl"] == pytest.approx(3702.0)
+    assert res["stop_source"] == "MFE_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3706.8)
+
+
+def test_interim_floor_step_guard_blocks_loosening():
+    res = _eng("BUY", 3700.0, 3702.0, _ifpol(), atr=4.0, r=32.0, sl=3703.0)
+    assert res["interim_floor_armed"] is True
+    assert res["should_update"] is False  # existing 3703 tighter than floor 3702
+
+
+def test_interim_floor_leaves_ladder_and_activation_unchanged():
+    entry = 3700.0
+    live = 3706.0
+    a = _eng("BUY", entry, live, _ladder(), atr=4.0, auto_be=3.0)
+    b = _eng("BUY", entry, live, _ladder(interim_floor_enabled=True), atr=4.0, auto_be=3.0)
+    for key in ("mfe_lock_fraction", "mfe_lock_profit", "mfe_lock_sl", "mfe_lock_ratio", "mfe_lock_tier",
+                "trail_activation_threshold", "be_threshold", "be_sl", "auto_be_sl", "auto_be_armed",
+                "trail_dist", "atr_sl"):
+        assert a[key] == b[key], "interim floor changed " + key
+
+
+def test_interim_floor_default_off_byte_identical():
+    entry = 3700.0
+    for direction in ("BUY", "SELL"):
+        for atr, mfe in [(4.0, 2.0), (9.78, 6.0), (12.0, 8.0)]:
+            a = _eng(direction, entry, _live(entry, mfe, direction), _pol(), atr=atr, r=8.0)
+            b = _eng(direction, entry, _live(entry, mfe, direction), _pol(interim_floor_enabled=False), atr=atr, r=8.0)
+            assert a == b
+            assert a["interim_floor_sl"] is None and a["interim_floor_armed"] is False
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_interim_floor_k_configurable(direction):
+    entry = 3700.0
+    sign = 1.0 if direction == "BUY" else -1.0
+    for k in (0.25, 0.50, 1.00):
+        res = _eng(direction, entry, _live(entry, 4.0, direction), _ifpol(k), atr=4.0, r=32.0)
+        assert res["interim_floor_sl"] == pytest.approx(round(entry + sign * (k * 4.0), 2))
+    low = _eng(direction, entry, _live(entry, 4.0, direction), _ifpol(0.25), atr=4.0, r=32.0)
+    high = _eng(direction, entry, _live(entry, 4.0, direction), _ifpol(1.00), atr=4.0, r=32.0)
+    assert low["interim_floor_sl"] != high["interim_floor_sl"]
+
+
+def test_interim_floor_respects_stops_buffer():
+    # Floor winner is clamped against live price by the existing stops-buffer clamp.
+    res = _eng("BUY", 3700.0, 3702.0, _ifpol(), atr=4.0, r=32.0, buf=0.5)
+    assert res["stop_source"] == "INTERIM_FLOOR"
+    assert res["candidate_sl"] == pytest.approx(3701.5)  # min(3702, live 3702 - 0.5)
+
+
+def test_interim_floor_non_vacuous_mutation():
+    entry = 3700.0
+    default = _eng("BUY", entry, 3702.0, _pol(), atr=4.0, r=32.0)
+    enabled = _eng("BUY", entry, 3702.0, _ifpol(), atr=4.0, r=32.0)
+    assert default["armed"] is False
+    assert enabled["armed"] is True
+    assert enabled != default
+
+
+def test_executor_interim_floor_applies_logs_and_marks(monkeypatch, caplog):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", True)
+    ex = _ex(4.0)
+    sig = _sig(3700.0, 3690.0)
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 2.0, "BUY"))
+    lv = sig["layers"]["L1"]
+    assert 3690.0 < lv["broker_sl"] <= 3702.0  # protective; clamped by the existing stops-buffer
+    assert lv.get("dynamic_atr_trail_sl") == lv["broker_sl"]  # protection marker stamped
+    assert sig.get("active_stop_source") == "INTERIM_FLOOR"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("[T3 INTERIM-FLOOR]" in m and "proposed_sl=3702.0" in m for m in msgs)
+    assert any("[T3 BINDING-SL]" in m and "INTERIM_FLOOR=" in m and "WINNER=INTERIM_FLOOR" in m for m in msgs)
