@@ -472,6 +472,102 @@ def _install_wick_gate(mt5_executor_mod: Any, mode: str, tiers_str: str, cfg_mod
     mt5_executor_mod.compute_dynamic_atr_trail_stop = _gated
 
 
+# ---------------------------------------------------------------------------
+# RESEARCH ONLY - ATR-scaled interim protection floor (interim-floor brief).
+# AUGMENTS (never suppresses) the production picker: the immediate MFE ladder,
+# T3 trail, R-lock, BE/auto-BE and milestone floors are all UNCHANGED and still
+# proposed every tick. The floor is ONE EXTRA tightest-stop candidate that binds
+# ONLY when tighter than every production candidate, and the forward-only
+# should_update guard guarantees an applied SL never loosens. MFE activation is
+# NOT delayed; MFE/peak keep tracking wicks independent of TP moves.
+#   atr mode: floor = entry + sign*k*ATR, armed once MFE >= k*ATR (peak reached
+#             the floor level, so the floor is never above the reached peak).
+#   mfe mode: floor = entry + sign*f*MFE, armed once MFE/bounded_ATR >= 0.20
+#             (early fraction-of-MFE floor, ahead of the ladder's 0.40 ratio).
+# ---------------------------------------------------------------------------
+_INTERIM_FLOOR_SPEC: Optional[str] = None
+_INTERIM_FLOOR_STATS: Dict[str, Any] = {}
+_INTERIM_FLOOR_EARLY_RATIO = 0.20
+
+
+def _reset_interim_floor_stats() -> None:
+    global _INTERIM_FLOOR_STATS
+    _INTERIM_FLOOR_STATS = {"armed_calls": 0, "binds": 0, "max_floor_profit": 0.0}
+
+
+def _apply_interim_floor(res: Dict[str, Any], kwargs: Dict[str, Any], spec: str,
+                         stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Add the interim floor as an extra candidate; re-pick the tightest stop."""
+    entry = kwargs.get("entry_price")
+    atr = float(res.get("atr") or 0.0)
+    mfe = float(res.get("mfe_dollars") or 0.0)
+    if not isinstance(entry, (int, float)) or atr <= 0.0 or mfe <= 0.0:
+        return res
+    sign = 1.0 if str(kwargs.get("direction") or "BUY").strip().upper() == "BUY" else -1.0
+    mode, strength = spec[0], float(spec[1:]) / 100.0
+    if mode == "k":
+        lvl = strength * atr
+        armed = mfe + 1e-9 >= lvl
+    else:  # "f": early fraction-of-MFE floor
+        atr_bound = max(1.0, min(12.0, atr))
+        armed = (mfe / atr_bound) + 1e-9 >= _INTERIM_FLOOR_EARLY_RATIO
+        lvl = strength * mfe
+    if not armed or lvl <= 0.0:
+        return res
+    floor_sl = round(float(entry) + sign * lvl, 2)
+    stats["armed_calls"] = int(stats.get("armed_calls", 0)) + 1
+    if lvl > float(stats.get("max_floor_profit", 0.0)):
+        stats["max_floor_profit"] = lvl
+    cands: List[Tuple[int, str, float]] = []
+    for idx, name, field in (
+        (0, "R_LOCK", "r_lock_floor"),
+        (1, "MILESTONE_FLOOR", "milestone_floor"),
+        (2, "ATR_TRAIL", "atr_sl"),
+        (3, "MFE_LOCK", "mfe_lock_sl"),
+        (4, "BE_LOCK", "be_sl"),
+        (5, "AUTO_BE", "auto_be_sl"),
+    ):
+        val = res.get(field)
+        if isinstance(val, (int, float)) and float(val) > 0.0:
+            cands.append((idx, name, float(val)))
+    cands.append((6, "INTERIM_FLOOR", floor_sl))
+    _, src, raw_sl = min(cands, key=lambda it: (-it[2] if sign > 0 else it[2], it[0]))
+    live = float(kwargs.get("live_price") or 0.0)
+    buf = max(0.0, float(kwargs.get("stops_buffer") or 0.0))
+    if buf > 0.0 and live > 0.0:
+        raw_sl = min(raw_sl, live - buf) if sign > 0 else max(raw_sl, live + buf)
+    cand_sl = round(raw_sl, 2)
+    policy = kwargs.get("policy")
+    step = float(getattr(policy, "trail_step_dollars", 0.25) or 0.25)
+    cur = float(kwargs.get("current_sl") or 0.0)
+    should_upd = True if cur <= 0.0 else ((sign * (cand_sl - cur)) >= max(1e-6, step - 1e-9))
+    if src == "INTERIM_FLOOR" and should_upd:
+        stats["binds"] = int(stats.get("binds", 0)) + 1
+    out = dict(res)
+    out.update({
+        "armed": True,
+        "candidate_sl": cand_sl,
+        "stop_source": src,
+        "should_update": should_upd,
+        "interim_floor_sl": floor_sl,
+        "interim_floor_armed": True,
+    })
+    return out
+
+
+def _install_interim_floor(mt5_executor_mod: Any, spec: str) -> None:
+    """Install INNERMOST so picker/protection telemetry sees the floor-augmented result."""
+    global _INTERIM_FLOOR_STATS
+    _reset_interim_floor_stats()
+    orig = mt5_executor_mod.compute_dynamic_atr_trail_stop
+
+    def _floored(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        res = orig(*args, **kwargs)
+        return _apply_interim_floor(res, kwargs, spec, _INTERIM_FLOOR_STATS)
+
+    mt5_executor_mod.compute_dynamic_atr_trail_stop = _floored
+
+
 # Canonical DYNAMIC_ATR_* trail + BE knobs pinned for BOTH arms so the replay
 # is independent of the ambient .env (Phase 1.1, Hole 2). Values equal the
 # shipped v3.9.0 production defaults; pinning makes them immune to .env drift.
@@ -723,6 +819,26 @@ WICK_RESEARCH_ARMS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# RESEARCH - ATR-scaled interim fallback floor arms (interim-floor brief).
+# Params IDENTICAL to the current upgraded + 1.05 config (s105); the immediate
+# MFE ladder is UNCHANGED (no suppression/delay). The ONLY addition is a
+# scripts-only extra tightest-stop candidate:
+#   ifkXX: floor = entry + sign*0.XX*ATR, armed once MFE >= 0.XX*ATR
+#   iffXX: floor = entry + sign*0.XX*MFE, armed once MFE/ATR >= 0.20
+# Baseline = s105. NOT adopted; research only.
+FLOOR_RESEARCH_ARMS: Dict[str, Dict[str, Any]] = {
+    "ifk25": {"params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "floor": "k25",
+              "label": "Interim floor k=0.25 x ATR (arms at MFE >= 0.25 ATR)"},
+    "ifk35": {"params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "floor": "k35",
+              "label": "Interim floor k=0.35 x ATR (arms at MFE >= 0.35 ATR)"},
+    "ifk50": {"params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "floor": "k50",
+              "label": "Interim floor k=0.50 x ATR (arms at MFE >= 0.50 ATR)"},
+    "iff30": {"params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "floor": "f30",
+              "label": "Early fraction floor f=0.30 x MFE (arms at ratio >= 0.20)"},
+    "iff40": {"params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "floor": "f40",
+              "label": "Early fraction floor f=0.40 x MFE (arms at ratio >= 0.20)"},
+}
+
 # Registry of the experimental trailing arms (order = report order).
 TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
     "t1": {
@@ -745,7 +861,7 @@ TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
 
 # Arm modes that drive the production ATR engine on the simulated replay
 # clock (Arm A stays the frozen 4544f7f reference with the wall clock).
-_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3")
+_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3", "ifk25", "ifk35", "ifk50", "iff30", "iff40")
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
@@ -1825,6 +1941,8 @@ async def _run_single_trade_worker(
         _reset_protection_trace(msg_id)
     if _WICK_TRACKER is not None:
         _WICK_TRACKER.reset()
+    if _INTERIM_FLOOR_SPEC:
+        _reset_interim_floor_stats()
     m5_atr_series = _compute_m5_atr_by_m1(bars) if _PRODUCTION_ENGINE_ARM else None
 
     # Fresh isolated runtime state per trade
@@ -2131,6 +2249,13 @@ async def _run_single_trade_worker(
         )
         if _EXIT_BINDING_TELEMETRY:
             res["exit_binding"] = exit_binding
+    if _INTERIM_FLOOR_SPEC:
+        res["interim_floor"] = {
+            "spec": _INTERIM_FLOOR_SPEC,
+            "armed_calls": int(_INTERIM_FLOOR_STATS.get("armed_calls", 0)),
+            "binds": int(_INTERIM_FLOOR_STATS.get("binds", 0)),
+            "max_floor_profit": round(float(_INTERIM_FLOOR_STATS.get("max_floor_profit", 0.0)), 4),
+        }
     if _WICK_GATE_MODE and _WICK_TRACKER is not None:
         res["wick_gate"] = {
             "mode": _WICK_GATE_MODE,
@@ -2148,6 +2273,7 @@ def _run_worker_main(
     protection_telemetry: bool = False,
     exit_binding: bool = False,
     wick_gate: Optional[str] = None,
+    interim_floor: Optional[str] = None,
 ) -> int:
     runtime_tmp = tempfile.TemporaryDirectory(prefix=f"ab_replay_{arm_mode}_")
     try:
@@ -2182,9 +2308,9 @@ def _run_worker_main(
             # EXPERIMENTAL replay-only T3-tight override; never a production default.
             for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
-        elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS:
+        elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS or arm_mode in FLOOR_RESEARCH_ARMS:
             # EXPERIMENTAL replay-only scale/ladder override; never a production default.
-            _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS[arm_mode]
+            _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS.get(arm_mode) or FLOOR_RESEARCH_ARMS[arm_mode]
             for k, v in _reg["params"].items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
@@ -2216,7 +2342,7 @@ def _run_worker_main(
             elif arm_mode in TIGHT_COMPARISON_ARMS:
                 _arm_params = TIGHT_COMPARISON_ARMS[arm_mode]["params"]
             else:
-                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS[arm_mode]
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS.get(arm_mode) or FLOOR_RESEARCH_ARMS[arm_mode]
                 _arm_params = _reg["params"]
             _pin_arm_experimental_params(
                 _arm_params, config, mt5_executor, main, f"Arm {arm_mode.upper()}",
@@ -2237,7 +2363,7 @@ def _run_worker_main(
             elif arm_mode in TIGHT_COMPARISON_ARMS:
                 _pinned_keys = set(TIGHT_COMPARISON_ARMS[arm_mode]["params"])
             else:
-                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS[arm_mode]
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS.get(arm_mode) or FLOOR_RESEARCH_ARMS[arm_mode]
                 _pinned_keys = set(_reg["params"])
             for _k, _v in _OPT_IN_PROTECTION_SHIPPED_DEFAULTS.items():
                 if _k in _pinned_keys:
@@ -2258,6 +2384,10 @@ def _run_worker_main(
         # actually reads and trace every picker decision. Arm A is the frozen 4544f7f
         # reference and is deliberately left untouched.
         globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in _ENGINE_ARM_MODES
+        globals()["_INTERIM_FLOOR_SPEC"] = interim_floor
+        if interim_floor:
+            # RESEARCH floor installed INNERMOST (augmentation, not suppression).
+            _install_interim_floor(mt5_executor, interim_floor)
         globals()["_WICK_GATE_MODE"] = wick_gate
         if wick_gate:
             # RESEARCH gate installed INNERMOST: picker/protection telemetry and
@@ -2320,8 +2450,8 @@ def _run_worker_main(
                 effective.update(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
             elif arm_mode == "t3tight":
                 effective.update(ARM_T3TIGHT_EXPERIMENTAL_PARAMS)
-            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS:
-                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS[arm_mode]
+            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS or arm_mode in FLOOR_RESEARCH_ARMS:
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS.get(arm_mode) or FLOOR_RESEARCH_ARMS[arm_mode]
                 effective.update(_reg["params"])
             arm_params_snapshot = {
                 "arm": arm_mode,
@@ -2358,9 +2488,15 @@ def _run_worker_main(
                         if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
                     )
                 )
-            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS:
+            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS or arm_mode in WICK_RESEARCH_ARMS or arm_mode in FLOOR_RESEARCH_ARMS:
                 arm_params_snapshot["experimental"] = True
-                if arm_mode in WICK_RESEARCH_ARMS:
+                if arm_mode in FLOOR_RESEARCH_ARMS:
+                    arm_params_snapshot["experimental_note"] = (
+                        "RESEARCH interim-floor arm (scripts-only extra candidate; NOT adopted, "
+                        "production engine + immediate MFE ladder unchanged). Params identical to "
+                        "upgraded + 1.05; floor=" + str(FLOOR_RESEARCH_ARMS[arm_mode]["floor"]) + "."
+                    )
+                elif arm_mode in WICK_RESEARCH_ARMS:
                     arm_params_snapshot["experimental_note"] = (
                         "RESEARCH wick-aware activation arm (scripts-only gate; NOT adopted, "
                         "production engine unchanged). Params identical to upgraded + 1.05; "
@@ -2374,7 +2510,7 @@ def _run_worker_main(
                         "pp on ratios 0.40/0.60/1.00; activation ratios and all other knobs unchanged."
                     )
                 else:
-                    _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS[arm_mode]
+                    _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS.get(arm_mode) or WICK_RESEARCH_ARMS.get(arm_mode) or FLOOR_RESEARCH_ARMS[arm_mode]
                     arm_params_snapshot["experimental_note"] = (
                         "EXPERIMENTAL distance-scale arm-param override (replay arm-param only; "
                         "not production, not shipped). Upgraded ATR-relative config (192d4f7) "
@@ -2384,6 +2520,8 @@ def _run_worker_main(
                     )
         if wick_gate:
             arm_params_snapshot["wick_gate"] = wick_gate
+        if interim_floor:
+            arm_params_snapshot["interim_floor"] = interim_floor
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
 
@@ -2914,6 +3052,7 @@ def _run_arm_subprocess(
     protection_telemetry: bool = False,
     exit_binding: bool = False,
     wick_gate: Optional[str] = None,
+    interim_floor: Optional[str] = None,
 ) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(code_root)
@@ -2936,6 +3075,8 @@ def _run_arm_subprocess(
         cmd += ["--worker-exit-binding"]
     if wick_gate:
         cmd += ["--worker-wick-gate", wick_gate]
+    if interim_floor:
+        cmd += ["--worker-interim-floor", interim_floor]
     proc = subprocess.run(
         cmd, cwd=str(code_root), env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
@@ -3086,7 +3227,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             )
     else:
         single = arm_a or arm_b or arm_c or next(
-            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3"] if report.get(f"arm_{m}")), None
+            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3"] + list(FLOOR_RESEARCH_ARMS) if report.get(f"arm_{m}")), None
         )
         assert single is not None
         ss = single["summary"]
@@ -3103,6 +3244,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "wc": f"RESEARCH Arm WC ({WICK_RESEARCH_ARMS['wc']['label']})",
             "wp2": f"RESEARCH Arm WP2 ({WICK_RESEARCH_ARMS['wp2']['label']})",
             "wp3": f"RESEARCH Arm WP3 ({WICK_RESEARCH_ARMS['wp3']['label']})",
+            **{m: f"RESEARCH Arm {m.upper()} ({FLOOR_RESEARCH_ARMS[m]['label']})" for m in FLOOR_RESEARCH_ARMS},
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -3451,6 +3593,53 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 )
             )
 
+    for _cand, _comp in (report.get("floor_comparisons") or {}).items():
+        _fl = FLOOR_RESEARCH_ARMS[_cand]["floor"]
+        _ll, _rl = "C baseline", "floor " + _fl
+        ma = _comp["arms"]["s105"]["metrics"]
+        mb = _comp["arms"][_cand]["metrics"]
+        d = _comp["delta_" + _cand + "_minus_current"]
+        lines += [
+            "",
+            "## RESEARCH interim floor " + _fl + " vs C baseline - NOT adopted",
+            "",
+            "- {}".format(_comp["note"]),
+            "",
+            "| Metric | {} | {} | Delta |".format(_ll, _rl),
+            "|---|---:|---:|---:|",
+        ]
+        def _ffmt(v: Any, fmt: str) -> str:
+            if v is None:
+                return "n/a"
+            try:
+                return fmt.format(v)
+            except (TypeError, ValueError):
+                return str(v)
+        def _frow(label: str, a: Any, b: Any, delta: Any = None, fmt: str = "{}") -> None:
+            dv = delta if delta is not None else (
+                round(b - a, 4) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else "-"
+            )
+            lines.append("| {} | `{}` | `{}` | `{}` |".format(
+                label, _ffmt(a, fmt), _ffmt(b, fmt), _ffmt(dv, fmt) if isinstance(dv, (int, float)) else dv))
+        _frow("Premature stop-outs", ma["premature_stop_outs"], mb["premature_stop_outs"], d["premature_stop_outs"])
+        _frow("Net profit (GBP)", ma["net_profit_gbp"], mb["net_profit_gbp"], d["net_profit_gbp"], "{:+.2f}")
+        _frow("Net expectancy (GBP/trade)", ma["net_expectancy_gbp"], mb["net_expectancy_gbp"], d["net_expectancy_gbp"], "{:+.4f}")
+        _frow("MFE given back (GBP)", ma["mfe_given_back_gbp"], mb["mfe_given_back_gbp"], d["mfe_given_back_gbp"], "{:+.2f}")
+        _frow("Profit factor", ma["profit_factor"], mb["profit_factor"])
+        _frow("Max drawdown (GBP)", ma["max_drawdown_gbp"], mb["max_drawdown_gbp"], fmt="{:.2f}")
+        _frow("Worst trade (GBP)", _comp["arms"]["s105"]["tail"]["worst_trade_gbp"], _comp["arms"][_cand]["tail"]["worst_trade_gbp"], fmt="{:+.2f}")
+        _frow("Avg winner (GBP)", ma["avg_winner_gbp"], mb["avg_winner_gbp"], fmt="{:+.4f}")
+        _frow("Avg loser (GBP)", ma["avg_loser_gbp"], mb["avg_loser_gbp"], fmt="{:+.4f}")
+        for k in range(1, 5):
+            _frow("TP{} completion".format(k), ma["tp_completion_rates"]["TP{}".format(k)], mb["tp_completion_rates"]["TP{}".format(k)], fmt="{:.2%}")
+        _frow("Cost-adj net (GBP)", ma["cost_adjusted"]["net_profit_gbp"], mb["cost_adjusted"]["net_profit_gbp"], d["cost_adjusted_net_profit_gbp"], "{:+.2f}")
+        _frow("Stop-mod failures", ma["stop_modify_failures"], mb["stop_modify_failures"])
+        _frow("Errors", ma["error_count"], mb["error_count"])
+        lines += [
+            "",
+            "- Premature trades C: `{}` | floor: `{}`".format(ma["premature_stop_out_trades"] or "none", mb["premature_stop_out_trades"] or "none"),
+        ]
+
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():
         lines.append(f"- **{k}:** `{v}`")
@@ -3525,7 +3714,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
     parser.add_argument(
         "--arm",
-        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3", "both", "trailing", "tight", "scale", "ladder", "wick"),
+        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3", "ifk25", "ifk35", "ifk50", "iff30", "iff40", "both", "trailing", "tight", "scale", "ladder", "wick", "floor"),
         default="both",
         help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape. "
         "'tight' runs the EXPERIMENTAL T3 vs T3-tight comparison (optionally on a custom tape "
@@ -3554,13 +3743,14 @@ def main() -> int:
     )
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp", "wc", "wp2", "wp3", "ifk25", "ifk35", "ifk50", "iff30", "iff40"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-catalog", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-protection-telemetry", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-exit-binding", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--worker-wick-gate", choices=("close", "persist2", "persist3"), default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-interim-floor", choices=("k25", "k35", "k50", "f30", "f40"), default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
@@ -3571,13 +3761,14 @@ def main() -> int:
             protection_telemetry=args.worker_protection_telemetry,
             exit_binding=args.worker_exit_binding,
             wick_gate=args.worker_wick_gate,
+            interim_floor=args.worker_interim_floor,
         )
 
     if args.refresh_tape is not None:
         return _refresh_tape(args.refresh_tape, args.spread_override)
 
-    if args.signals is not None and args.arm not in ("tight", "t3tight", "scale", "s100", "s105", "ladder", "l2pp", "l3pp", "wick", "wc", "wp2", "wp3"):
-        parser.error("--signals is only supported with --arm tight/t3tight/scale/s100/s105/ladder/l2pp/l3pp/wick/wc/wp2/wp3")
+    if args.signals is not None and args.arm not in ("tight", "t3tight", "scale", "s100", "s105", "ladder", "l2pp", "l3pp", "wick", "wc", "wp2", "wp3", "floor", "ifk25", "ifk35", "ifk50", "iff30", "iff40"):
+        parser.error("--signals is only supported with the research/comparison arm modes")
 
     bars_json_resolved = args.bars_json.resolve() if args.bars_json is not None else None
     if args.live_bars and bars_json_resolved != PINNED_TAPE_PATH.resolve():
@@ -3612,6 +3803,8 @@ def main() -> int:
         ladder_single_res: Dict[str, Dict[str, Any]] = {}
         wick_arms: Dict[str, Dict[str, Any]] = {}
         wick_single_res: Dict[str, Dict[str, Any]] = {}
+        floor_arms: Dict[str, Dict[str, Any]] = {}
+        floor_single_res: Dict[str, Dict[str, Any]] = {}
 
         if args.arm in ("a", "both", "trailing"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
@@ -3681,6 +3874,21 @@ def main() -> int:
                 catalog_path=args.signals, protection_telemetry=True,
                 wick_gate=WICK_RESEARCH_ARMS[args.arm]["gate"],
             )
+        if args.arm == "floor":
+            # RESEARCH: interim-floor strength sweep vs s105 baseline (immediate
+            # ladder unchanged; floor is an extra tightest-stop candidate).
+            for mode in ("s105",) + tuple(FLOOR_RESEARCH_ARMS):
+                floor_arms[mode] = _run_arm_subprocess(
+                    mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json",
+                    catalog_path=args.signals, protection_telemetry=True,
+                    interim_floor=FLOOR_RESEARCH_ARMS[mode]["floor"] if mode in FLOOR_RESEARCH_ARMS else None,
+                )
+        elif args.arm in FLOOR_RESEARCH_ARMS:
+            floor_single_res[args.arm] = _run_arm_subprocess(
+                args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json",
+                catalog_path=args.signals, protection_telemetry=True,
+                interim_floor=FLOOR_RESEARCH_ARMS[args.arm]["floor"],
+            )
 
     if args.arm == "tight":
         _err_t3 = int(tight_arms["t3"]["summary"]["error_count"])
@@ -3714,6 +3922,13 @@ def main() -> int:
             "error_counts": _errs,
             "all_gates_passed": all(v == 0 for v in _errs.values()),
         }
+    elif args.arm == "floor":
+        _errs = {m: int(floor_arms[m]["summary"]["error_count"]) for m in floor_arms}
+        gates = {
+            "mode": "floor_research",
+            "error_counts": _errs,
+            "all_gates_passed": all(v == 0 for v in _errs.values()),
+        }
     else:
         gates = _evaluate_gates(
             arm_a_res, arm_b_res, arm_c_res,
@@ -3721,6 +3936,7 @@ def main() -> int:
             or next((scale_single_res[m] for m in ("s100", "s105") if scale_single_res.get(m)), None)
             or next((ladder_single_res[m] for m in ("l2pp", "l3pp") if ladder_single_res.get(m)), None)
             or next((wick_single_res[m] for m in ("wc", "wp2", "wp3") if wick_single_res.get(m)), None)
+            or next((floor_single_res[m] for m in FLOOR_RESEARCH_ARMS if floor_single_res.get(m)), None)
             or next((arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]), None),
         )
 
@@ -3853,6 +4069,31 @@ def main() -> int:
                     "worst_3_trades_gbp": round(sum(float(r["sim_gbp"]) for r in _rows[:3]), 2),
                 }
                 _comp["arms"][_m]["wick_gate"] = WICK_RESEARCH_ARMS[_m]["gate"] if _m in WICK_RESEARCH_ARMS else None
+    floor_comparisons: Dict[str, Dict[str, Any]] = {}
+    if args.arm == "floor":
+        _floor_note = (
+            "RESEARCH interim-floor strength sweep driving the PRODUCTION engine (unchanged, immediate MFE "
+            "ladder) with a scripts-only EXTRA tightest-stop candidate: entry + sign*k*ATR (armed at "
+            "MFE >= k*ATR) or entry + sign*f*MFE (armed at MFE/ATR >= 0.20). The floor binds ONLY when "
+            "tighter than every production candidate; forward-only never-loosen preserved; 2% relative "
+            "ATR + 1.05 trail scale unchanged. NOT adopted; controller waits for user approval."
+        )
+        _floor_registry = {**LADDER_RESEARCH_ARMS, **FLOOR_RESEARCH_ARMS}
+        for _cand in FLOOR_RESEARCH_ARMS:
+            _comp = _build_side_by_side_comparison(
+                floor_arms, _floor_registry, "s105", _cand,
+                ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "overrides_vs_current",
+                "delta_" + _cand + "_minus_current", note=_floor_note,
+            )
+            for _m in _comp["arms"]:
+                _rows = sorted(floor_arms[_m]["results"], key=lambda r: float(r["sim_gbp"]))
+                _comp["arms"][_m]["tail"] = {
+                    "worst_trade_gbp": round(float(_rows[0]["sim_gbp"]), 2) if _rows else 0.0,
+                    "worst_trade_msg": _rows[0]["msg_id"] if _rows else None,
+                    "worst_3_trades_gbp": round(sum(float(r["sim_gbp"]) for r in _rows[:3]), 2),
+                }
+                _comp["arms"][_m]["interim_floor"] = FLOOR_RESEARCH_ARMS[_m]["floor"] if _m in FLOOR_RESEARCH_ARMS else None
+            floor_comparisons[_cand] = _comp
     signals_meta = None
     if args.signals is not None:
         _sp = json.loads(args.signals.read_text(encoding="utf-8"))
@@ -3891,7 +4132,7 @@ def main() -> int:
         "arm_t4": arm_t_res["t4"],
         "arm_t3tight": arm_t3tight_res or tight_arms.get("t3tight"),
         "arm_s100": scale_arms.get("s100") or scale_single_res.get("s100"),
-        "arm_s105": scale_arms.get("s105") or scale_single_res.get("s105") or ladder_arms.get("s105") or wick_arms.get("s105"),
+        "arm_s105": scale_arms.get("s105") or scale_single_res.get("s105") or ladder_arms.get("s105") or wick_arms.get("s105") or floor_arms.get("s105"),
         "arm_l2pp": ladder_arms.get("l2pp") or ladder_single_res.get("l2pp"),
         "arm_l3pp": ladder_arms.get("l3pp") or ladder_single_res.get("l3pp"),
         "ladder_minus2pp_comparison": ladder_minus2pp_comparison,
@@ -3903,6 +4144,12 @@ def main() -> int:
         "wick_close_comparison": wick_close_comparison,
         "wick_persist2_comparison": wick_persist2_comparison,
         "wick_persist3_comparison": wick_persist3_comparison,
+        "arm_ifk25": floor_arms.get("ifk25") or floor_single_res.get("ifk25"),
+        "arm_ifk35": floor_arms.get("ifk35") or floor_single_res.get("ifk35"),
+        "arm_ifk50": floor_arms.get("ifk50") or floor_single_res.get("ifk50"),
+        "arm_iff30": floor_arms.get("iff30") or floor_single_res.get("iff30"),
+        "arm_iff40": floor_arms.get("iff40") or floor_single_res.get("iff40"),
+        "floor_comparisons": floor_comparisons or None,
         "tight_comparison": tight_comparison,
         "scale_comparison": scale_comparison,
         "signals_meta": signals_meta,

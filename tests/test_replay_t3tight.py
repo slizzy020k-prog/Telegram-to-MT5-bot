@@ -861,3 +861,129 @@ def test_wick_variants_replay_invariants(tmp_path, kind):
         wg = r.get("wick_gate") or {}
         assert wg.get("mode") == harness.WICK_RESEARCH_ARMS[m]["gate"]
         assert int(wg.get("suppressed_calls", 0)) > 0 or float(wg.get("max_confirmed_tier", 0.0)) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# RESEARCH ATR-scaled interim floor (extra tightest-stop candidate; immediate
+# MFE ladder UNCHANGED; never-loosen; binds only when tighter).
+# ---------------------------------------------------------------------------
+
+def _floor_pick(pol, **kw):
+    import dynamic_risk
+    return dynamic_risk.compute_dynamic_atr_trail_stop(**kw)
+
+def test_interim_floor_arms_only_after_peak_reaches_level():
+    pol = _wick_pol()
+    stats = {}
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3602.4, prev_peak=3602.4,
+              current_sl=3562.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    res = _floor_pick(pol, **kw)
+    out = harness._apply_interim_floor(res, kw, "k25", stats)
+    assert out is res  # MFE 2.4 < k*ATR 2.5 -> untouched
+    kw2 = {**kw, "live_price": 3602.5, "prev_peak": 3602.5}
+    res2 = _floor_pick(pol, **kw2)
+    out2 = harness._apply_interim_floor(res2, kw2, "k25", stats)
+    assert out2["interim_floor_armed"] is True
+    assert out2["interim_floor_sl"] == pytest.approx(3602.5)
+    assert out2["stop_source"] == "INTERIM_FLOOR"
+    assert out2["candidate_sl"] == pytest.approx(3602.5)
+    assert out2["should_update"] is True
+
+def test_interim_floor_binds_only_when_tighter():
+    pol = _wick_pol()
+    stats = {}
+    # MFE 5: ladder lock 3602.25; k25 floor 3602.50 is TIGHTER -> floor binds.
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
+              current_sl=3562.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    out = harness._apply_interim_floor(_floor_pick(pol, **kw), kw, "k25", stats)
+    assert out["stop_source"] == "INTERIM_FLOOR"
+    assert out["candidate_sl"] == pytest.approx(3602.5)
+    # MFE 8: ladder lock 3605.20 is tighter than the 3602.50 floor -> ladder wins,
+    # exactly the production candidate (no conflict).
+    kw8 = {**kw, "live_price": 3608.0, "prev_peak": 3608.0}
+    res8 = _floor_pick(pol, **kw8)
+    out8 = harness._apply_interim_floor(res8, kw8, "k25", stats)
+    assert out8["stop_source"] == res8["stop_source"] == "MFE_LOCK"
+    assert out8["candidate_sl"] == res8["candidate_sl"]
+
+def test_interim_floor_never_loosens_and_preserves_mfe_activation():
+    pol = _wick_pol()
+    stats = {}
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
+              current_sl=3604.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    res = _floor_pick(pol, **kw)
+    out = harness._apply_interim_floor(res, kw, "k25", stats)
+    assert out["should_update"] is False  # established 3604 tighter than floor 3602.5
+    # MFE activation NOT delayed: ladder fields identical with/without the floor.
+    for key in ("mfe_lock_sl", "mfe_lock_fraction", "mfe_lock_profit", "mfe_lock_tier",
+                "mfe_dollars", "peak_price", "trail_activation_threshold"):
+        assert out[key] == res[key]
+
+def test_interim_floor_fraction_mode_and_sell_mirror():
+    pol = _wick_pol()
+    stats = {}
+    # f30 arms at ratio >= 0.20: MFE 2.0 / ATR 10 -> floor 3600 + 0.30*2 = 3600.6.
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3602.0, prev_peak=3602.0,
+              current_sl=3562.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    out = harness._apply_interim_floor(_floor_pick(pol, **kw), kw, "f30", stats)
+    assert out["interim_floor_sl"] == pytest.approx(3600.6)
+    kw_below = {**kw, "live_price": 3601.9, "prev_peak": 3601.9}
+    res_below = _floor_pick(pol, **kw_below)
+    assert harness._apply_interim_floor(res_below, kw_below, "f30", stats) is res_below
+    # SELL mirror: floor below entry; tightest = MIN.
+    kws = dict(direction="SELL", entry_price=3600.0, live_price=3597.5, prev_peak=3597.5,
+               current_sl=3638.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    outs = harness._apply_interim_floor(_floor_pick(pol, **kws), kws, "k25", stats)
+    assert outs["interim_floor_sl"] == pytest.approx(3597.5)
+    assert outs["stop_source"] == "INTERIM_FLOOR"
+    assert outs["candidate_sl"] == pytest.approx(3597.5)
+
+def test_floor_arms_params_identical_to_baseline():
+    for arm in harness.FLOOR_RESEARCH_ARMS:
+        assert harness.FLOOR_RESEARCH_ARMS[arm]["params"] == harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS
+    assert [harness.FLOOR_RESEARCH_ARMS[a]["floor"] for a in ("ifk25", "ifk35", "ifk50", "iff30", "iff40")] == ["k25", "k35", "k50", "f30", "f40"]
+
+def _run_floor_scenario(tmp_path, kind, arm):
+    tape = FIXTURE_DIR / f"tape_scenario_{kind}.json"
+    signals = FIXTURE_DIR / f"signals_scenario_{kind}.json"
+    bars = harness.fetch_m1_bars(bars_json_path=tape)
+    bars_file = tmp_path / f"bars_{kind}_{arm}.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    spec = harness.FLOOR_RESEARCH_ARMS[arm]["floor"] if arm in harness.FLOOR_RESEARCH_ARMS else None
+    return harness._run_arm_subprocess(
+        arm, REPO_ROOT, bars_file, tmp_path / f"{kind}_{arm}.json",
+        catalog_path=signals, protection_telemetry=True, interim_floor=spec,
+    )
+
+def test_two_run_determinism_ifk35_on_nov23(tmp_path):
+    bars = harness.fetch_m1_bars(bars_json_path=NOV23_TAPE)
+    bars_file = tmp_path / "bars.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    run1 = harness._run_arm_subprocess(
+        "ifk35", REPO_ROOT, bars_file, tmp_path / "ifk35_run1.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, interim_floor="k35",
+    )
+    run2 = harness._run_arm_subprocess(
+        "ifk35", REPO_ROOT, bars_file, tmp_path / "ifk35_run2.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, interim_floor="k35",
+    )
+    assert run1["bars_sha256"] == run2["bars_sha256"] == NOV23_BARS_SHA256
+    assert run1["arm_params"] == run2["arm_params"]
+    assert run1["arm_params"]["interim_floor"] == "k35"
+    assert run1["summary"]["error_count"] == 0
+    assert len(run1["results"]) == 9
+    assert json.dumps(run1["results"], sort_keys=True) == json.dumps(run2["results"], sort_keys=True)
+    assert json.dumps(run1["summary"], sort_keys=True) == json.dumps(run2["summary"], sort_keys=True)
+    for r in run1["results"]:
+        assert r.get("interim_floor", {}).get("spec") == "k35"
+
+@pytest.mark.parametrize("kind", ["sharp_reversal", "normal_retracement"])
+def test_floor_replay_invariants(tmp_path, kind):
+    for arm in ("s105", "ifk25", "ifk35", "ifk50", "iff30", "iff40"):
+        payload = _run_floor_scenario(tmp_path, kind, arm)
+        assert payload["summary"]["error_count"] == 0
+        met = harness._tight_comparison_metrics(payload["results"])
+        assert met["stop_modify_failures"] == 0
+        if arm in harness.FLOOR_RESEARCH_ARMS:
+            r = payload["results"][0]
+            assert r.get("interim_floor", {}).get("spec") == harness.FLOOR_RESEARCH_ARMS[arm]["floor"]
