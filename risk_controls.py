@@ -206,7 +206,28 @@ def format_protection_profile_line(cfg_mod: Any) -> str:
     except Exception:
         r_lock_on = bool(getattr(cfg_mod, "R_LOCK_ENABLED", False))
     r_txt = "ON" if r_lock_on else "OFF"
-    return (
+    base = (
         f"• Protection Profile: TRAILING_PROFILE=`{prof}` | R-Lock: `{r_txt}` "
         f"| Lot Cap: `{lot_txt}` | Daily Loss Pause: `{pause_txt}`"
     )
+    # T3 ATR-relative upgrade announcement (opt-in). Absent when the features are
+    # disabled, so the shipped/baseline line stays byte-for-byte unchanged.
+    mfe_on = bool(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ENABLED", False))
+    auto_be_on = bool(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_ENABLED", False))
+    if mfe_on or auto_be_on:
+        rel_mult = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_RELATIVE_SCALE_MULT", 1.0), 1.0)
+        be_pips = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIPS", 0.0), 0.0)
+        trail_ceiling = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)
+        be_ceiling = _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)
+        parts = []
+        if mfe_on:
+            parts.append("MFE-lock ladder `ON` (ATR-relative)")
+        if auto_be_on:
+            parts.append(f"Auto-BE `{be_pips:.0f} pips`")
+        parts.append(f"Relative ATR `x{rel_mult:.2f}`")
+        if trail_ceiling > 0.0:
+            parts.append(f"Trail ceiling `${trail_ceiling:.2f}`")
+        if be_ceiling > 0.0:
+            parts.append(f"BE ceiling `${be_ceiling:.2f}`")
+        base += " | T3 upgrade: " + " | ".join(parts)
+    return base

@@ -26,6 +26,16 @@ def _apply_isolated_env() -> None:
     os.environ["PREVENT_SYSTEM_SLEEP"] = "false"
     os.environ["CONSOLE_TITLE_UPDATES"] = "false"
     os.environ.setdefault("LIMIT_ENTRY_FRONT_RUN_OFFSET", "0.0")
+    # Hermeticity: neutralize the live opt-in T3-upgrade protection knobs so the
+    # developer's live .env (which enables them) cannot leak into tests that assume
+    # shipped baseline protection. Tests exercising the upgrade enable these explicitly
+    # via monkeypatch/policy objects. RELATIVE_SCALE_MULT keeps its shipped default (1.02):
+    # it is gated on the ladder and a shipped-default test pins it.
+    os.environ["DYNAMIC_ATR_MFE_LOCK_ENABLED"] = "false"
+    os.environ["DYNAMIC_ATR_AUTO_BE_ENABLED"] = "false"
+    os.environ["DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS"] = "0.0"
+    os.environ["DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS"] = "0.0"
+    os.environ["DYNAMIC_ATR_TRAIL_DISTANCE_TIERS"] = ""
 
 
 _apply_isolated_env()

@@ -78,3 +78,24 @@ def test_mutation_guard_proves_line_assertions_non_vacuous(monkeypatch: pytest.M
     monkeypatch.setattr(risk_controls, "format_protection_profile_line", lambda cfg: "MUTATED WRONG LINE")
     with pytest.raises(AssertionError):
         test_live_t3_protection_line_exact()
+
+
+def test_t3_upgrade_announcement_when_enabled() -> None:
+    cfg = _make_cfg("t3", True, True, 80.0)
+    cfg.DYNAMIC_ATR_MFE_LOCK_ENABLED = True
+    cfg.DYNAMIC_ATR_AUTO_BE_ENABLED = True
+    cfg.DYNAMIC_ATR_AUTO_BE_PIPS = 30.0
+    cfg.DYNAMIC_ATR_RELATIVE_SCALE_MULT = 1.02
+    cfg.DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS = 4.0
+    cfg.DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS = 3.0
+    line = risk_controls.format_protection_profile_line(cfg)
+    assert "MFE-lock ladder `ON` (ATR-relative)" in line
+    assert "Auto-BE `30 pips`" in line
+    assert "Relative ATR `x1.02`" in line
+    assert "Trail ceiling `$4.00`" in line
+    assert "BE ceiling `$3.00`" in line
+    # Baseline exact line is unchanged when the upgrade features are disabled.
+    assert risk_controls.format_protection_profile_line(_make_cfg("t3", True, True, 80.0)) == (
+        "• Protection Profile: TRAILING_PROFILE=`t3` | R-Lock: `ON` "
+        "| Lot Cap: `ON` | Daily Loss Pause: `80%`"
+    )
