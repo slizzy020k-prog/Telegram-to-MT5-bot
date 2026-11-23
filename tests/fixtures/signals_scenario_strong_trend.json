@@ -1,0 +1,35 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_scenario_strong_trend.json",
+  "built_utc": "2026-11-23T03:41:36Z",
+  "source": "SYNTHETIC scenario 'strong_trend': Strong directional trend (+$19) with only $0.7 pullbacks; moving TP1-TP4 targets must not reset MFE or the ladder.",
+  "conventions": {
+    "layers": "single L1 0.01 lot at 3600.00 for clean per-scenario attribution"
+  },
+  "trades": [
+    {
+      "msg_id": "syn_strong_trend",
+      "dir": "BUY",
+      "open_utc": "2026-11-23T11:25:00Z",
+      "close_utc": "2026-11-23T11:49:00Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3600.0
+        ]
+      ],
+      "sl": 3588.0,
+      "tp_levels": {
+        "TP1": 3605.0,
+        "TP2": 3610.0,
+        "TP3": 3615.0,
+        "TP4": 3620.0,
+        "TP5": 3625.0
+      },
+      "actual_mt5_gbp": 0.0,
+      "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)"
+    }
+  ],
+  "provenance": {}
+}

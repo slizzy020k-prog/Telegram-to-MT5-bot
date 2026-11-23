@@ -1,0 +1,50 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_scenario_multi_entry.json",
+  "built_utc": "2026-11-23T03:41:36Z",
+  "source": "SYNTHETIC scenario 'multi_entry': Multiple entries (4 filled zone layers, 0.05 lot total) with $2.5 retracements; per-position MFE and partial-close paths.",
+  "conventions": {
+    "layers": "single L1 0.01 lot at 3600.00 for clean per-scenario attribution"
+  },
+  "trades": [
+    {
+      "msg_id": "syn_multi_entry",
+      "dir": "BUY",
+      "open_utc": "2026-11-23T12:25:00Z",
+      "close_utc": "2026-11-23T12:42:00Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3600.0
+        ],
+        [
+          "L2",
+          0.01,
+          3597.0
+        ],
+        [
+          "L3",
+          0.01,
+          3594.0
+        ],
+        [
+          "L4",
+          0.02,
+          3591.0
+        ]
+      ],
+      "sl": 3580.0,
+      "tp_levels": {
+        "TP1": 3606.0,
+        "TP2": 3612.0,
+        "TP3": 3618.0,
+        "TP4": 3625.0,
+        "TP5": 3635.0
+      },
+      "actual_mt5_gbp": 0.0,
+      "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)"
+    }
+  ],
+  "provenance": {}
+}

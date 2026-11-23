@@ -1,18 +1,19 @@
-"""T3-tight replay validation - reproducibility + pinning regression gate.
+"""T3-upgraded replay validation - reproducibility + behavior regression gate.
 
-Covers the replay-validation brief (2026-11-20 trade-lifecycle-guard):
-  * the NEW Nov-23 tape fixture is schema-tagged, pinned (sha256/range/gaps)
-    and validated on load; the canonical Nov 17-19 fixture stays untouched;
-  * the T3-tight arm is EXACTLY T3 plus the six opt-in 5ac5fe2 knobs, and the
-    existing experimental arms (t1..t4) are unchanged;
-  * T3-tight pinning overrides ambient .env drift end-to-end into the
-    production DynamicRiskPolicy;
-  * the six knobs behave as documented when driving the PRODUCTION
-    dynamic_risk.compute_dynamic_atr_trail_stop (early arm, distance cap,
-    fractional-MFE lock) - not a reimplementation;
-  * two dry-run T3-tight replays on the Nov-23 tape are byte-identical;
-  * the sharp-reversal scenario reproduces the protection delta: T3 never
-    arms and takes the full wide stop, T3-tight arms early and locks profit.
+Aligns the replay arm with the DEFINITIVE ATR-relative spec (engine commit
+5f47b48), superseding the earlier fractional/absolute-dollar MFE-lock arm:
+  * ATR-RELATIVE MFE protection ladder (ratio:pct, NO fixed-dollar MFE tiers),
+    bounded ATR, per-layer hysteresis (pct/profit ratchet, never regress);
+  * exactly 2% Relative ATR adjustment, applied ONCE at source, gated on the
+    opt-in ladder (shipped defaults unchanged);
+  * automatic 30-pip BE (verified gold pip $0.10 -> $3.00) through the same
+    tightest-stop picker; explicit Telegram BE command recognition;
+  * moving TP1-TP4 never resets MFE / peak / ladder;
+  * the NEW Nov-23 tape stays pinned; canonical Nov 17-19 tape + existing
+    arms (a/b/c/cx/t1..t4) stay untouched;
+  * two dry-run upgraded replays on the Nov-23 tape are byte-identical;
+  * scenario behavior: sharp reversal / auto-BE / explicit-BE protect where
+    T3 takes the full wide stop; strong trend keeps MFE accumulating.
 
 Development/validation only: every replay runs DRY_RUN=true with isolated
 temporary runtime paths (the harness worker enforces this). No live orders.
@@ -30,8 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures"
 NOV23_TAPE = FIXTURE_DIR / "tape_2026-11-23.json"
 NOV23_SIGNALS = FIXTURE_DIR / "signals_2026-11-23.json"
-SHARP_TAPE = FIXTURE_DIR / "tape_scenario_sharp_reversal.json"
-SHARP_SIGNALS = FIXTURE_DIR / "signals_scenario_sharp_reversal.json"
 CANONICAL_TAPE = FIXTURE_DIR / "tape_2026-11-17_19.json"
 
 # Literal pins (the tests must not trust the harness dicts).
@@ -43,14 +42,31 @@ T3_DELTA = {
     "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT": 0.70,
     "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 5.50,
 }
+# Definitive ATR-relative upgrade (5f47b48). SUPERSEDES the fractional pins.
 TIGHT_KNOBS = {
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 4.00,
     "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 3.00,
-    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "4:3.50,6:3.00,10:2.50,18:2.00",
+    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "6:3.50,10:3.00,15:2.75,20:2.50",
     "DYNAMIC_ATR_MFE_LOCK_ENABLED": True,
-    "DYNAMIC_ATR_MFE_LOCK_TIERS": "4:0.30,6:0.50,10:0.65,18:0.75",
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85",
     "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS": 1.00,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS": 12.00,
+    "DYNAMIC_ATR_RELATIVE_SCALE_MULT": 1.02,
+    "DYNAMIC_ATR_AUTO_BE_ENABLED": True,
+    "DYNAMIC_ATR_AUTO_BE_PIPS": 30.0,
+    "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": 0.0,
 }
+# Verified pip convention: gold $0.10/pip -> 30 provider pips = $3.00.
+AUTO_BE_THRESHOLD_DOLLARS = 3.00
+
+
+def _ladder():
+    pairs = []
+    for tok in TIGHT_KNOBS["DYNAMIC_ATR_MFE_LOCK_TIERS"].split(","):
+        thr, pct = tok.split(":")
+        pairs.append((float(thr), float(pct)))
+    return tuple(sorted(pairs))
 
 
 def _load_harness():
@@ -94,7 +110,6 @@ def test_existing_experimental_arms_unchanged():
     assert set(harness.TRAILING_EXPERIMENT_ARMS) == {"t1", "t2", "t3", "t4"}
     assert harness.ARM_T3_EXPERIMENTAL_PARAMS == {**harness.ARM_B_CALIBRATED_PARAMS, **T3_DELTA}
     assert harness.ARM_B_CALIBRATED_PARAMS["R_LOCK_ENABLED"] is False
-    # The tight registry is separate and never mutates the trailing registry.
     assert set(harness.TIGHT_COMPARISON_ARMS) == {"t3", "t3tight"}
     assert harness.TIGHT_COMPARISON_ARMS["t3"]["params"] == harness.ARM_T3_EXPERIMENTAL_PARAMS
 
@@ -113,7 +128,7 @@ def test_nov23_signal_set_shape():
         assert t["dir"] in ("BUY", "SELL")
 
 
-def test_t3tight_params_are_t3_plus_exactly_six_knobs():
+def test_t3tight_params_are_t3_plus_exactly_upgrade_knobs():
     expected = {**harness.ARM_T3_EXPERIMENTAL_PARAMS, **TIGHT_KNOBS}
     assert harness.ARM_T3TIGHT_EXPERIMENTAL_PARAMS == expected
     delta = {
@@ -162,14 +177,21 @@ def test_t3tight_pinning_overrides_ambient_env(monkeypatch):
     assert pol.trail_max_dollars == pytest.approx(5.50)
     assert pol.trail_activation_ceiling_dollars == pytest.approx(4.00)
     assert pol.be_activation_ceiling_dollars == pytest.approx(3.00)
-    assert pol.trail_distance_tiers == "4:3.50,6:3.00,10:2.50,18:2.00"
+    assert pol.trail_distance_tiers == "6:3.50,10:3.00,15:2.75,20:2.50"
     assert pol.mfe_lock_enabled is True
-    assert pol.mfe_lock_tiers == "4:0.30,6:0.50,10:0.65,18:0.75"
+    assert pol.mfe_lock_tiers == TIGHT_KNOBS["DYNAMIC_ATR_MFE_LOCK_TIERS"]
     assert pol.mfe_lock_cost_floor_dollars == pytest.approx(0.60)
+    assert pol.mfe_lock_atr_min_dollars == pytest.approx(1.00)
+    assert pol.mfe_lock_atr_max_dollars == pytest.approx(12.00)
+    assert pol.relative_scale_mult == pytest.approx(1.02)
+    assert pol.auto_be_enabled is True
+    assert pol.auto_be_pips == pytest.approx(30.0)
+    assert pol.auto_be_pip_size_dollars == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
-# Production-engine knob semantics (drives the real function, no reimplementation)
+# Production-engine behavior (drives the real functions; expectations are
+# DERIVED from the definitive spec ladder, not stale hardcoded numbers)
 # ---------------------------------------------------------------------------
 
 def _policy(**overrides):
@@ -183,47 +205,167 @@ def _policy(**overrides):
     return dynamic_risk.read_dynamic_risk_policy(SimpleNamespace(**base))
 
 
-def test_production_picker_t3tight_arms_early_and_caps_distance():
+def _pick(pol, *, direction="BUY", entry=3600.0, live, peak=None, atr, sl=3562.0, **kw):
+    import dynamic_risk
+
+    return dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction=direction, entry_price=entry, live_price=live,
+        prev_peak=peak if peak is not None else live, current_sl=sl,
+        atr=atr, policy=pol, auto_be_threshold=AUTO_BE_THRESHOLD_DOLLARS, **kw,
+    )
+
+
+def test_production_picker_atr_relative_ladder():
+    pol = _policy(**TIGHT_KNOBS)
+    entry, live, atr = 3600.0, 3605.0, 12.0
+    res = _pick(pol, live=live, atr=atr)
+    mfe = live - entry
+    atr_bound = min(max(atr, TIGHT_KNOBS["DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS"]),
+                    TIGHT_KNOBS["DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS"])
+    ratio = mfe / atr_bound
+    exp_pct, exp_tier = 0.0, 0.0
+    for thr, p in _ladder():
+        if ratio + 1e-9 >= thr:
+            exp_pct, exp_tier = p, thr
+    protected = exp_pct * mfe
+    assert exp_pct > 0.0  # non-vacuous: this MFE/ATR must reach a tier
+    assert res["mfe_lock_ratio"] == pytest.approx(ratio, abs=5e-5)  # engine rounds ratio to 4dp
+    assert res["mfe_lock_tier"] == pytest.approx(exp_tier)
+    assert res["mfe_lock_fraction"] == pytest.approx(exp_pct)
+    assert res["mfe_lock_profit"] == pytest.approx(protected)
+    assert res["mfe_lock_sl"] == pytest.approx(entry + protected, abs=0.011)  # broker 2dp rounding
+    # Activation ceilings retained (NOT fixed-dollar MFE tiers).
+    assert res["trail_armed"] is True
+    assert res["trail_activation_threshold"] == pytest.approx(4.00)
+    assert res["be_armed"] is True
+    assert res["be_threshold"] == pytest.approx(3.00)
+    assert res["auto_be_armed"] is True
+    assert res["auto_be_sl"] == pytest.approx(entry)
+    # Tightest-stop picker: the ladder lock beats BE/auto-BE/trail here.
+    assert res["stop_source"] == "MFE_LOCK"
+    assert res["candidate_sl"] == pytest.approx(entry + protected, abs=0.011)
+
+
+@pytest.mark.parametrize("thr,pct", _ladder())
+def test_production_picker_all_seven_atr_tiers(thr, pct):
+    pol = _policy(**TIGHT_KNOBS)
+    atr = 10.0  # inside the [1, 12] bounds -> ratio == MFE/10
+    mfe = thr * atr + 0.05  # just above this tier, below the next
+    res = _pick(pol, live=3600.0 + mfe, atr=atr)
+    assert res["mfe_lock_tier"] == pytest.approx(thr)
+    assert res["mfe_lock_fraction"] == pytest.approx(pct)
+    assert res["mfe_lock_profit"] == pytest.approx(pct * mfe, abs=5e-5)
+    assert res["mfe_lock_sl"] == pytest.approx(3600.0 + pct * mfe, abs=0.011)  # broker 2dp
+    # The picker can only be TIGHTER than the ladder lock, never looser
+    # (allowing the broker 2-digit rounding of the lock itself).
+    assert res["candidate_sl"] >= 3600.0 + pct * mfe - 0.011
+
+
+def test_production_picker_tier_hysteresis_no_regression():
+    pol = _policy(**TIGHT_KNOBS)
+    # Highest tier previously reached: 1.50 -> pct 0.80, locked profit $8.
+    # ATR now spikes (bounded to 12) so the CURRENT ratio would pick tier 0.40.
+    res = _pick(pol, live=3605.0, atr=20.0, mfe_lock_prev_pct=0.80, mfe_lock_prev_profit=8.0)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.80)  # never regress
+    assert res["mfe_lock_profit"] == pytest.approx(max(0.80 * 5.0, 8.0))  # profit ratchets
+    assert res["mfe_lock_sl"] == pytest.approx(3608.0)
+
+
+def test_production_picker_atr_bounds_and_cost_floor():
+    pol = _policy(**TIGHT_KNOBS)
+    hi = _pick(pol, live=3606.0, atr=25.0)  # ATR bounded to 12 -> ratio 6/12
+    assert hi["mfe_lock_ratio"] == pytest.approx(0.5)
+    lo = _pick(pol, live=3600.6, atr=0.5)  # ATR bounded to 1.0 -> ratio 0.6
+    assert lo["mfe_lock_ratio"] == pytest.approx(0.6)
+    assert lo["mfe_lock_fraction"] == pytest.approx(0.55)
+    # protected = 0.55 * 0.6 = 0.33 < cost floor 0.60 -> no nominal-loss lock
+    assert lo["mfe_lock_sl"] is None
+
+
+def test_relative_atr_two_percent_applied_once_and_gated():
+    import dynamic_risk
+
+    pol_on = _policy(**TIGHT_KNOBS)
+    assert dynamic_risk.compute_volatility_ratio(4.0, pol_on) == pytest.approx(1.02)
+    assert dynamic_risk.compute_volatility_ratio(6.0, pol_on) == pytest.approx(1.53)
+    # Idempotent across repeated calcs (recomputed from ATR/baseline each call).
+    assert dynamic_risk.compute_volatility_ratio(6.0, pol_on) == pytest.approx(1.53)
+    # Gated on the opt-in ladder: shipped defaults unchanged.
+    pol_off = _policy()
+    assert dynamic_risk.compute_volatility_ratio(4.0, pol_off) == pytest.approx(1.00)
+    pol_one = _policy(**{**TIGHT_KNOBS, "DYNAMIC_ATR_RELATIVE_SCALE_MULT": 1.0})
+    assert dynamic_risk.compute_volatility_ratio(4.0, pol_one) == pytest.approx(1.00)
+
+
+def test_production_picker_auto_be_30pip_never_loosens():
+    pol = _policy(**TIGHT_KNOBS)
+    below = _pick(pol, live=3602.9, atr=12.0)
+    assert below["auto_be_armed"] is False
+    at = _pick(pol, live=3603.0, atr=12.0)
+    assert at["auto_be_armed"] is True
+    assert at["auto_be_sl"] == pytest.approx(3600.0)  # SL -> entry, exactly 30 pips
+    # BE lock (entry + $0.50) is tighter than auto-BE; picker keeps the tighter.
+    assert at["candidate_sl"] >= at["auto_be_sl"]
+    assert at["stop_source"] in ("BE_LOCK", "MFE_LOCK", "ATR_TRAIL", "AUTO_BE")
+
+
+def test_moving_tp_does_not_reset_mfe_or_ladder():
     import dynamic_risk
 
     pol = _policy(**TIGHT_KNOBS)
-    res = dynamic_risk.compute_dynamic_atr_trail_stop(
-        direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
-        current_sl=3562.0, atr=12.0, policy=pol,
+    kw = dict(live=3606.0, peak=3608.0, atr=10.0, sl=3601.0)
+    r1 = _pick(pol, tp_levels={"TP1": 3605.0, "TP2": 3610.0}, cleared_milestones=["TP1"], **kw)
+    r2 = _pick(pol, tp_levels={"TP1": 3607.0, "TP2": 3612.0, "TP3": 3618.0},
+               cleared_milestones=["TP1", "TP2"], **kw)
+    # MFE comes from entry + monotonic peak, independent of TP management.
+    assert r1["mfe_dollars"] == r2["mfe_dollars"] == pytest.approx(8.0)
+    assert r1["peak_price"] == r2["peak_price"] == pytest.approx(3608.0)
+    assert r1["mfe_lock_profit"] == r2["mfe_lock_profit"]
+    assert r1["mfe_lock_fraction"] == r2["mfe_lock_fraction"]
+    # The bot's own TP lift still advances stages against the moved targets.
+    step = dynamic_risk.compute_dynamic_tp_step(
+        direction="BUY", entry_price=3600.0, live_price=3609.0, peak_price=3609.0,
+        atr=10.0, tp_levels={"TP1": 3605.0, "TP2": 3610.0, "TP3": 3615.0},
+        current_stage_idx=1, max_stage=5, cleared_milestones=["TP1"], policy=pol,
     )
-    # MFE $5 with ATR $12: T3 alone would need 0.70*12 = $8.40 to arm the trail.
-    assert res["trail_activation_threshold"] == pytest.approx(4.00)
-    assert res["trail_armed"] is True
-    assert res["be_armed"] is True  # BE ceiling $3 overrides the R-gate
-    assert res["be_threshold"] == pytest.approx(3.00)
-    # Distance: clamp(1.4*12, [2.5, 5.5]) = 5.5, capped to 3.5 by the MFE>=4 tier.
-    assert res["trail_dist"] == pytest.approx(3.50)
-    assert res["distance_cap_applied"] is True
-    # Fractional MFE lock: 0.30 * 5.00 = 1.50 >= cost floor 0.60.
-    assert res["mfe_lock_sl"] == pytest.approx(3601.50)
-    assert res["mfe_lock_fraction"] == pytest.approx(0.30)
-    # Tightest-stop picker: ATR_TRAIL and MFE_LOCK tie at 3601.50 > BE 3600.50.
-    assert res["candidate_sl"] == pytest.approx(3601.50)
-    assert res["stop_source"] == "ATR_TRAIL"
-    assert res["should_update"] is True
+    assert step["should_lift"] is True
+    assert step["target_stage_idx"] >= 2
 
 
-def test_production_picker_defaults_do_not_arm_at_mfe5_atr12():
-    import dynamic_risk
+def test_production_picker_sell_mirror():
+    pol = _policy(**TIGHT_KNOBS)
+    res = _pick(pol, direction="SELL", live=3595.0, atr=12.0, sl=3638.0)
+    mfe = 3600.0 - 3595.0
+    ratio = mfe / 12.0
+    exp_pct = max((p for thr, p in _ladder() if ratio + 1e-9 >= thr), default=0.0)
+    assert res["mfe_lock_fraction"] == pytest.approx(exp_pct)
+    assert res["mfe_lock_sl"] == pytest.approx(3600.0 - exp_pct * mfe, abs=0.011)
+    assert res["stop_source"] == "MFE_LOCK"
+    assert res["auto_be_sl"] == pytest.approx(3600.0)
 
-    pol = dynamic_risk.read_dynamic_risk_policy(SimpleNamespace())
-    res = dynamic_risk.compute_dynamic_atr_trail_stop(
-        direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
-        current_sl=3562.0, atr=12.0, policy=pol,
-    )
-    assert res["trail_armed"] is False
-    assert res["be_armed"] is False
-    assert res["armed"] is False
-    assert res["mfe_lock_sl"] is None
+
+@pytest.mark.parametrize("text", [
+    "Go breakeven", "Set breakeven", "Set break even", "Break even all entries",
+])
+def test_explicit_be_commands_parse_to_breakeven_action(text):
+    import parser
+
+    res = parser.parse_message(text)
+    assert res is not None
+    assert res.management_action == "ACTION_BREAKEVEN"
+
+
+def test_explicit_be_close_worst_command_recognized():
+    import parser
+
+    text = "Set break even on best entries close worst"
+    res = parser.parse_message(text)
+    assert res is not None
+    assert res.management_action in ("ACTION_BREAKEVEN", "ACTION_CLOSE_WORST_HOLD_LAYERS")
 
 
 # ---------------------------------------------------------------------------
-# Two-run determinism (dry-run replay, T3-tight on the NEW Nov-23 tape)
+# Two-run determinism (dry-run replay, upgraded arm on the NEW Nov-23 tape)
 # ---------------------------------------------------------------------------
 
 def test_two_run_determinism_t3tight_on_nov23(tmp_path):
@@ -252,40 +394,94 @@ def test_two_run_determinism_t3tight_on_nov23(tmp_path):
     for r in run1["results"]:
         assert "time_to_first_protection_min" in r
         assert "first_protect_utc" in r
+        assert "stop_modify_failures" in r
+
+
+# ---------------------------------------------------------------------------
+# Scenario behavior (production engine via the replay worker)
+# ---------------------------------------------------------------------------
+
+def _run_scenario(tmp_path, kind, arm):
+    tape = FIXTURE_DIR / f"tape_scenario_{kind}.json"
+    signals = FIXTURE_DIR / f"signals_scenario_{kind}.json"
+    bars = harness.fetch_m1_bars(bars_json_path=tape)
+    bars_file = tmp_path / f"bars_{kind}.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    return harness._run_arm_subprocess(
+        arm, REPO_ROOT, bars_file, tmp_path / f"{kind}_{arm}.json",
+        catalog_path=signals, protection_telemetry=True,
+    )
 
 
 def test_sharp_reversal_scenario_protection_delta(tmp_path):
-    bars = harness.fetch_m1_bars(bars_json_path=SHARP_TAPE)
-    bars_file = tmp_path / "bars.json"
-    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
-
-    t3 = harness._run_arm_subprocess(
-        "t3", REPO_ROOT, bars_file, tmp_path / "t3.json",
-        catalog_path=SHARP_SIGNALS, protection_telemetry=True,
-    )
-    tight = harness._run_arm_subprocess(
-        "t3tight", REPO_ROOT, bars_file, tmp_path / "tight.json",
-        catalog_path=SHARP_SIGNALS, protection_telemetry=True,
-    )
-    tight2 = harness._run_arm_subprocess(
-        "t3tight", REPO_ROOT, bars_file, tmp_path / "tight2.json",
-        catalog_path=SHARP_SIGNALS, protection_telemetry=True,
-    )
-    assert json.dumps(tight["results"], sort_keys=True) == json.dumps(tight2["results"], sort_keys=True)
-
-    r3 = t3["results"][0]
-    rt = tight["results"][0]
+    t3 = _run_scenario(tmp_path, "sharp_reversal", "t3")
+    tight = _run_scenario(tmp_path, "sharp_reversal", "t3tight")
     assert t3["summary"]["error_count"] == 0
     assert tight["summary"]["error_count"] == 0
-    # T3: ~$5 MFE never reaches the 0.70x ATR (~$7.5) arm threshold on a wide
-    # R=$38 stop -> no protection, full initial stop loss (the Nov-23 13305 shape).
+    r3, rt = t3["results"][0], tight["results"][0]
+    # T3: ~$5 MFE never reaches the 0.70x ATR arm threshold on a wide R=$38
+    # stop -> no protection, full initial stop loss (the Nov-23 13305 shape).
     assert r3["first_protect_utc"] is None
     assert r3["exit_reason"] == "BROKER_SL"
     assert float(r3["sim_gbp"]) < 0.0
-    # T3-tight: ceilings arm protection early; the reversal exits at a locked
-    # profit instead of the full wide stop.
+    # Upgraded: ATR-relative ladder + ceilings arm early; reversal exits at a
+    # locked profit instead of the full wide stop.
     assert rt["first_protect_utc"] is not None
     assert rt["time_to_first_protection_min"] is not None
     assert rt["exit_reason"] != "BROKER_SL"
     assert rt["exit_reason"].endswith("_SL")
+    assert float(rt["sim_gbp"]) > 0.0
+    assert int(rt["stop_modify_failures"]) == 0
+
+
+def test_auto_be_30pip_scenario(tmp_path):
+    t3 = _run_scenario(tmp_path, "auto_be_30pip", "t3")
+    tight = _run_scenario(tmp_path, "auto_be_30pip", "t3tight")
+    r3, rt = t3["results"][0], tight["results"][0]
+    assert t3["summary"]["error_count"] == 0
+    assert tight["summary"]["error_count"] == 0
+    # T3 never arms (MFE ~3.6 < 0.70x ATR ~7.5 and < 0.5R) -> full wide stop.
+    assert r3["exit_reason"] == "BROKER_SL"
+    assert float(r3["sim_gbp"]) < 0.0
+    # Upgraded: 30-pip auto-BE / BE ceiling fires at $3.00; exit ~breakeven.
+    assert rt["exit_reason"] != "BROKER_SL"
+    assert rt["first_auto_be_utc"] is not None or rt["first_be_arm_utc"] is not None
+    assert abs(float(rt["realized_pts_per_oz"])) <= 0.60
+
+
+def test_explicit_be_scenario(tmp_path):
+    t3 = _run_scenario(tmp_path, "explicit_be", "t3")
+    tight = _run_scenario(tmp_path, "explicit_be", "t3tight")
+    r3, rt = t3["results"][0], tight["results"][0]
+    assert t3["summary"]["error_count"] == 0
+    assert tight["summary"]["error_count"] == 0
+    assert r3["exit_reason"] == "BROKER_SL"
+    assert float(r3["sim_gbp"]) < 0.0
+    # The scripted "Set breakeven" command drove the production BE path.
+    assert rt["explicit_be"] is not None
+    assert "error" not in rt["explicit_be"]
+    assert rt["explicit_be"]["command"] == "Set breakeven"
+    assert rt["exit_reason"] != "BROKER_SL"
+    assert float(rt["sim_gbp"]) >= 0.0
+
+
+def test_strong_trend_mfe_accumulates_with_moving_tp(tmp_path):
+    tight = _run_scenario(tmp_path, "strong_trend", "t3tight")
+    assert tight["summary"]["error_count"] == 0
+    rt = tight["results"][0]
+    # Strong trend: MFE keeps accumulating while the bot lifts TP1->TP2+;
+    # the ladder ratchets to a high tier and never resets.
+    assert float(rt["peak_mfe_dollars"]) >= 15.0
+    assert int(rt["max_stage"]) >= 2
+    assert float(rt["max_mfe_lock_pct"]) >= 0.65
+    assert int(rt["stop_modify_failures"]) == 0
+
+
+def test_rapid_atr_change_tier_hysteresis_in_replay(tmp_path):
+    tight = _run_scenario(tmp_path, "rapid_atr_change", "t3tight")
+    assert tight["summary"]["error_count"] == 0
+    rt = tight["results"][0]
+    # Pre-expansion MFE/ATR (~5.8/3.4) reaches tier >= 1.25 (pct 0.75); the
+    # later ATR spike must not regress the persisted pct (hysteresis).
+    assert float(rt["max_mfe_lock_pct"]) >= 0.75
     assert float(rt["sim_gbp"]) > 0.0

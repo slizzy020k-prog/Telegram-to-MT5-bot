@@ -1,0 +1,37 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_scenario_explicit_be.json",
+  "built_utc": "2026-11-23T03:41:36Z",
+  "source": "SYNTHETIC scenario 'explicit_be': Explicit Telegram BE command ('Set breakeven') scripted at bar 30 while ~$5.5 in profit, then sharp reversal; drives mt5_executor.apply_signal_breakeven.",
+  "conventions": {
+    "layers": "single L1 0.01 lot at 3600.00 for clean per-scenario attribution"
+  },
+  "trades": [
+    {
+      "msg_id": "syn_explicit_be",
+      "dir": "BUY",
+      "open_utc": "2026-11-23T14:25:00Z",
+      "close_utc": "2026-11-23T14:34:00Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3600.0
+        ]
+      ],
+      "sl": 3585.0,
+      "tp_levels": {
+        "TP1": 3610.0,
+        "TP2": 3618.0,
+        "TP3": 3628.0,
+        "TP4": 3640.0,
+        "TP5": 3655.0
+      },
+      "actual_mt5_gbp": 0.0,
+      "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)",
+      "be_command_utc": "2026-11-23T14:30:00Z",
+      "be_command_text": "Set breakeven"
+    }
+  ],
+  "provenance": {}
+}

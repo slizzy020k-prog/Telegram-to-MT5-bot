@@ -259,6 +259,8 @@ def _osc_warmup(start: float, n: int, up: float, down: float, end: float) -> Lis
 
 
 def _scenario_bars(kind: str) -> List[Dict[str, Any]]:
+    if kind in _SEGMENT_SPECS:
+        return _spec_bars(kind)
     epoch = int(datetime(2026, 11, 23, {"high_atr": 3, "normal_retracement": 5, "sharp_reversal": 7}[kind], 0, tzinfo=timezone.utc).timestamp())
     if kind in ("high_atr", "sharp_reversal"):
         # ATR ~10 warmup: |delta| ~4.6-5 plus 2.5+2.5 wicks.
@@ -307,6 +309,103 @@ def _scenario_bars(kind: str) -> List[Dict[str, Any]]:
     return _mk_bars(epoch, closes, wicks)
 
 
+# Spec-driven scenarios for attachment section 9 (deterministic, no randomness).
+# Each spec: warmup oscillation + entry doji + scripted (delta-list, wick) segments.
+_SEGMENT_SPECS: Dict[str, Dict[str, Any]] = {
+    "low_vol": {
+        "warmup": (3598.8, 25, 0.8, 0.7, 3600.0, (0.4, 0.4)),
+        "doji_wick": (0.4, 0.4),
+        "segments": [
+            ([0.8, 0.8, 0.9, 0.9], (0.4, 0.4)),
+            ([-0.5, -0.4], (0.4, 0.4)),
+            ([0.9, 0.9, 0.8], (0.4, 0.4)),
+            ([-0.5, -0.4], (0.4, 0.4)),
+            ([0.8, 0.7], (0.4, 0.4)),
+            ([-0.3, -0.3, 0.2, -0.2], (0.3, 0.3)),
+            ([-0.1, 0.1, -0.1, 0.1, -0.1, 0.1], (0.2, 0.2)),
+        ],
+        "hour": 9,
+    },
+    "rapid_atr_change": {
+        "warmup": (3597.6, 25, 1.5, 1.3, 3600.0, (0.8, 0.8)),
+        "doji_wick": (0.8, 0.8),
+        "segments": [
+            # Straight grind to ~$5.3 MFE with tiny wicks so the pre-expansion
+            # ladder reaches tier >= 1.25 before the ATR spike (hysteresis probe).
+            ([1.2, 1.3, 1.2, 1.3], (0.3, 0.3)),
+            # Volatility expansion: ATR jumps ~3 -> ~10+ mid-trade (hysteresis probe).
+            # 15 big bars = 3 full M5 buckets so the closed-bar ATR window is dominated.
+            ([7.0, -8.0, 8.0, -7.0, 6.0, -9.0, 7.0, -8.0, 8.0, -7.0, 6.0, -8.0, 7.0, -9.0, 8.0], (4.0, 4.0)),
+            ([-2.0, 1.0, -1.0], (2.0, 2.0)),
+        ],
+        "hour": 10,
+    },
+    "strong_trend": {
+        "warmup": (3597.6, 25, 1.6, 1.4, 3600.0, (1.2, 1.2)),
+        "doji_wick": (1.2, 1.2),
+        "segments": [
+            # Strong trend: shallow $0.4 pullbacks + $0.3 wicks (adverse ~$1.0
+            # from peak) so the early ladder tiers' retained giveback absorbs it.
+            ([1.8, 1.6, -0.4] * 6, (0.3, 0.3)),
+            ([1.5, 1.5], (0.3, 0.3)),
+            ([-0.4, 0.3, -0.3, 0.2], (0.3, 0.3)),
+        ],
+        "hour": 11,
+    },
+    "multi_entry": {
+        "warmup": (3597.6, 25, 1.6, 1.4, 3600.0, (1.2, 1.2)),
+        "doji_wick": (1.2, 1.2),
+        "segments": [
+            ([2.0, 2.0], (1.5, 1.5)),
+            ([-1.2, -1.3], (1.5, 1.5)),
+            ([2.5, 2.5], (1.5, 1.5)),
+            ([-1.2, -1.3], (1.5, 1.5)),
+            ([2.0, 2.0], (1.5, 1.5)),
+            ([-1.5, -1.5, -1.5], (1.5, 1.5)),
+            ([-0.3, 0.2, -0.2, 0.1], (0.6, 0.6)),
+        ],
+        "hour": 12,
+    },
+    "auto_be_30pip": {
+        "warmup": (3595.0, 25, 5.0, 4.6, 3600.0, (2.5, 2.5)),
+        "doji_wick": (0.3, 0.3),
+        "segments": [
+            # MFE ~3.6: >= auto-BE $3.00 (30 pips x $0.10) but < ladder tier 1 (0.40 x ATR ~10).
+            ([1.2, 1.1, 1.0], (0.3, 0.3)),
+            ([-4.0, -5.0, -6.0, -4.0], (0.5, 3.5)),
+            ([-1.0, 0.5], (1.0, 1.0)),
+        ],
+        "hour": 13,
+    },
+    "explicit_be": {
+        "warmup": (3595.0, 25, 5.0, 4.6, 3600.0, (2.5, 2.5)),
+        "doji_wick": (0.5, 0.5),
+        "segments": [
+            ([2.0, 2.0, 1.0], (0.5, 0.5)),
+            ([0.0], (0.5, 0.5)),  # bar 30: scripted "Set breakeven" command fires here
+            ([-5.0, -6.0, -7.0], (0.5, 3.5)),
+            ([-1.0, 0.5], (1.0, 1.0)),
+        ],
+        "hour": 14,
+    },
+}
+
+
+def _spec_bars(kind: str) -> List[Dict[str, Any]]:
+    spec = _SEGMENT_SPECS[kind]
+    start, n, up, down, end, wick = spec["warmup"]
+    epoch = int(datetime(2026, 11, 23, spec["hour"], 0, tzinfo=timezone.utc).timestamp())
+    closes = _osc_warmup(start, n, up, down, end)
+    wicks = [wick] * n
+    closes.append(end)
+    wicks.append(spec["doji_wick"])
+    for deltas, seg_wick in spec["segments"]:
+        for d in deltas:
+            closes.append(round(closes[-1] + d, 2))
+            wicks.append(seg_wick)
+    return _mk_bars(epoch, closes, wicks)
+
+
 SCENARIO_DEFS: Dict[str, Dict[str, Any]] = {
     "high_atr": {
         "sl": 3562.0,
@@ -326,6 +425,45 @@ SCENARIO_DEFS: Dict[str, Dict[str, Any]] = {
         "atr_band": (8.5, 12.5),
         "description": "High ATR (~10), wide stop R=$38, ~$5 MFE spike then sharp reversal through entry to SL (Nov-23 msg 13305 shape).",
     },
+    "low_vol": {
+        "sl": 3590.0,
+        "tp_levels": {"TP1": 3604.0, "TP2": 3607.0, "TP3": 3610.0, "TP4": 3614.0, "TP5": 3618.0},
+        "atr_band": (1.0, 2.8),
+        "description": "Low volatility (ATR ~1.5), R=$10, gentle $0.8-1 retractions on a +$5.7 grind; ladder tiers arm on small MFE/ATR ratios.",
+    },
+    "rapid_atr_change": {
+        "sl": 3585.0,
+        "tp_levels": {"TP1": 3606.0, "TP2": 3612.0, "TP3": 3618.0, "TP4": 3625.0, "TP5": 3635.0},
+        "atr_band": (3.0, 12.0),
+        "description": "Rapid ATR expansion ~3 -> ~10-13 mid-trade after ~$5.8 MFE; tier hysteresis must not regress when ATR spikes.",
+    },
+    "strong_trend": {
+        "sl": 3588.0,
+        "tp_levels": {"TP1": 3605.0, "TP2": 3610.0, "TP3": 3615.0, "TP4": 3620.0, "TP5": 3625.0},
+        "atr_band": (3.0, 5.5),
+        "description": "Strong directional trend (+$19) with only $0.7 pullbacks; moving TP1-TP4 targets must not reset MFE or the ladder.",
+    },
+    "multi_entry": {
+        "sl": 3580.0,
+        "tp_levels": {"TP1": 3606.0, "TP2": 3612.0, "TP3": 3618.0, "TP4": 3625.0, "TP5": 3635.0},
+        "atr_band": (3.0, 5.5),
+        "layers": [["L1", 0.01, 3600.0], ["L2", 0.01, 3597.0], ["L3", 0.01, 3594.0], ["L4", 0.02, 3591.0]],
+        "description": "Multiple entries (4 filled zone layers, 0.05 lot total) with $2.5 retracements; per-position MFE and partial-close paths.",
+    },
+    "auto_be_30pip": {
+        "sl": 3585.0,
+        "tp_levels": {"TP1": 3610.0, "TP2": 3618.0, "TP3": 3628.0, "TP4": 3640.0, "TP5": 3655.0},
+        "atr_band": (8.5, 12.5),
+        "description": "Automatic 30-pip BE: MFE ~$3.6 reaches the $3.00 auto-BE threshold but stays below ladder tier 1 (0.40 x ATR ~10), then reverses to SL.",
+    },
+    "explicit_be": {
+        "sl": 3585.0,
+        "tp_levels": {"TP1": 3610.0, "TP2": 3618.0, "TP3": 3628.0, "TP4": 3640.0, "TP5": 3655.0},
+        "atr_band": (8.5, 12.5),
+        "be_command_bar": 30,
+        "be_command_text": "Set breakeven",
+        "description": "Explicit Telegram BE command ('Set breakeven') scripted at bar 30 while ~$5.5 in profit, then sharp reversal; drives mt5_executor.apply_signal_breakeven.",
+    },
 }
 
 
@@ -342,6 +480,8 @@ def build_scenarios() -> int:
         med = sorted(trade_atrs)[len(trade_atrs) // 2]
         lo, hi = defn["atr_band"]
         assert lo <= med <= hi, f"{kind}: median trade-window M5 ATR {med:.2f} outside band [{lo}, {hi}]"
+        if kind == "rapid_atr_change":
+            assert max(m5[40:]) > 2.0 * m5[28], f"rapid_atr_change: ATR did not expand (bar28={m5[28]:.2f}, post={max(m5[40:]):.2f})"
         tape_path = FIXTURE_DIR / f"tape_scenario_{kind}.json"
         meta = h._write_tape_fixture(
             tape_path, bars, fetched_utc=fetched_utc,
@@ -359,12 +499,15 @@ def build_scenarios() -> int:
             "dir": "BUY",
             "open_utc": open_utc,
             "close_utc": h._utc_iso(bars[-1]["time_utc"]),
-            "layers": [["L1", 0.01, 3600.0]],
+            "layers": defn.get("layers") or [["L1", 0.01, 3600.0]],
             "sl": defn["sl"],
             "tp_levels": defn["tp_levels"],
             "actual_mt5_gbp": 0.0,
             "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)",
         }
+        if defn.get("be_command_bar") is not None:
+            trade["be_command_utc"] = h._utc_iso(bars[defn["be_command_bar"]]["time_utc"])
+            trade["be_command_text"] = defn.get("be_command_text") or "Set breakeven"
         signals_path = FIXTURE_DIR / f"signals_scenario_{kind}.json"
         signals_path.write_text(json.dumps({
             "schema": SIGNALS_SCHEMA,

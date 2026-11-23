@@ -221,6 +221,10 @@ _PROTECTION_TRACE: Dict[str, Any] = {}
 # Spread is already modeled per-bar from the tape (bid/ask); this adds an explicit
 # slippage allowance on top. Reporting constant only - never fed to the engine.
 SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE = 0.10
+# Commission estimate for the cost-adjusted view ($/oz round turn). Documented
+# assumption: $7 per 1.00 lot round turn = $0.07/oz (1 lot = 100 oz). Reporting
+# constant only - never fed to the engine.
+COMMISSION_ESTIMATE_DOLLARS_PER_OZ_ROUND_TURN = 0.07
 
 
 def _reset_protection_trace(msg_id: str) -> None:
@@ -232,7 +236,11 @@ def _reset_protection_trace(msg_id: str) -> None:
         "first_be_arm_utc": None,
         "first_trail_arm_utc": None,
         "first_mfe_lock_utc": None,
+        "first_auto_be_utc": None,
         "in_profit_candidate_calls": 0,
+        "max_mfe_lock_tier": 0.0,
+        "max_mfe_lock_pct": 0.0,
+        "max_mfe_lock_profit": 0.0,
     }
 
 
@@ -248,17 +256,30 @@ def _install_protection_trace(mt5_executor_mod: Any) -> None:
             be_armed = bool(res.get("be_armed"))
             trail_armed = bool(res.get("trail_armed"))
             lock_armed = res.get("mfe_lock_sl") is not None
+            auto_be_armed = bool(res.get("auto_be_armed"))
             if be_armed and st["first_be_arm_utc"] is None:
                 st["first_be_arm_utc"] = now_iso
             if trail_armed and st["first_trail_arm_utc"] is None:
                 st["first_trail_arm_utc"] = now_iso
             if lock_armed and st["first_mfe_lock_utc"] is None:
                 st["first_mfe_lock_utc"] = now_iso
-            if (be_armed or trail_armed or lock_armed) and st["first_protect_utc"] is None:
+            if auto_be_armed and st["first_auto_be_utc"] is None:
+                st["first_auto_be_utc"] = now_iso
+            if (be_armed or trail_armed or lock_armed or auto_be_armed) and st["first_protect_utc"] is None:
                 st["first_protect_utc"] = now_iso
                 st["first_protect_source"] = (
-                    "BE_LOCK" if be_armed else ("ATR_TRAIL" if trail_armed else "MFE_LOCK")
+                    "BE_LOCK" if be_armed else (
+                        "ATR_TRAIL" if trail_armed else ("MFE_LOCK" if lock_armed else "AUTO_BE")
+                    )
                 )
+            for key, field in (
+                ("max_mfe_lock_tier", "mfe_lock_tier"),
+                ("max_mfe_lock_pct", "mfe_lock_fraction"),
+                ("max_mfe_lock_profit", "mfe_lock_profit"),
+            ):
+                v = float(res.get(field) or 0.0)
+                if v > st[key]:
+                    st[key] = v
             entry = kwargs.get("entry_price")
             cand = res.get("candidate_sl")
             if isinstance(entry, (int, float)) and isinstance(cand, (int, float)):
@@ -376,19 +397,28 @@ ARM_T4_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
     "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 6.50,
 }
 
-# EXPERIMENTAL - T3-tight validation arm (replay-validation brief 2026-11-20).
-# T3 (activation 0.70x + STANDARD clamp $5.50) PLUS the six opt-in protection
-# knobs shipped in engine commit 5ac5fe2. Replay arm-param override ONLY:
-# never written to config.py / .env, never a default arm. The canonical pinned
-# fixture and the existing arms (a/b/c/cx/t1..t4) are deliberately untouched.
+# EXPERIMENTAL - T3-upgraded validation arm (t3-atr-relative definitive spec).
+# T3 (TRAILING_PROFILE=t3 base: activation 0.70x + STANDARD clamp $5.50) PLUS the
+# opt-in ATR-relative upgrade shipped in engine commit 5f47b48: ATR-relative MFE
+# protection ladder (ratio:pct, hysteresis, bounded ATR), 2% Relative ATR, and
+# automatic 30-pip BE (verified gold pip $0.10 -> $3.00). SUPERSEDES the earlier
+# fractional/absolute-dollar MFE-lock arm (5ac5fe2). Replay arm-param override
+# ONLY: never written to config.py / .env, never a default arm. The canonical
+# pinned fixture and the existing arms (a/b/c/cx/t1..t4) are deliberately untouched.
 ARM_T3TIGHT_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
     **ARM_T3_EXPERIMENTAL_PARAMS,
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 4.00,
     "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 3.00,
-    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "4:3.50,6:3.00,10:2.50,18:2.00",
+    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "6:3.50,10:3.00,15:2.75,20:2.50",
     "DYNAMIC_ATR_MFE_LOCK_ENABLED": True,
-    "DYNAMIC_ATR_MFE_LOCK_TIERS": "4:0.30,6:0.50,10:0.65,18:0.75",
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85",
     "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS": 1.00,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS": 12.00,
+    "DYNAMIC_ATR_RELATIVE_SCALE_MULT": 1.02,
+    "DYNAMIC_ATR_AUTO_BE_ENABLED": True,
+    "DYNAMIC_ATR_AUTO_BE_PIPS": 30.0,
+    "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": 0.0,
 }
 
 # Side-by-side comparison registry for "--arm tight" (T3 vs T3-tight). Kept
@@ -400,7 +430,7 @@ TIGHT_COMPARISON_ARMS: Dict[str, Dict[str, Any]] = {
     },
     "t3tight": {
         "params": ARM_T3TIGHT_EXPERIMENTAL_PARAMS,
-        "label": "T3-tight: T3 + six opt-in protection knobs (5ac5fe2)",
+        "label": "T3-upgraded: ATR-relative MFE ladder + 2% Relative ATR + auto 30-pip BE (5f47b48)",
     },
 }
 
@@ -998,6 +1028,9 @@ class BrokerSpy:
         self.current_tick: Optional[SimpleNamespace] = None
         self.current_utc: str = ""
         self._deal_seq: int = 900000
+        # Stop-modification telemetry (reporting only; surfaced opt-in).
+        self.modify_attempts: int = 0
+        self.modify_failures: int = 0
 
     def register_position(
         self,
@@ -1106,7 +1139,10 @@ def _install_broker_spy(executor: Any, spy: BrokerSpy) -> None:
     def _spy_modify_position_sltp(
         ticket: int, sl: Optional[float] = None, tp: Optional[float] = None, **kwargs: Any
     ) -> bool:
+        spy.modify_attempts += 1
         ok = orig_modify(ticket, sl, tp, **kwargs)
+        if not ok:
+            spy.modify_failures += 1
         if ok:
             pos = spy.positions.get(int(ticket))
             if pos and pos["open"]:
@@ -1534,6 +1570,15 @@ async def _run_single_trade_worker(
     exit_utc: Optional[str] = None
     error_msg: Optional[str] = None
 
+    # Optional scripted explicit Telegram BE command (attachment section 9).
+    # Drives the SAME production path the Telegram handler uses
+    # (mt5_executor.apply_signal_breakeven) at the first bar >= be_command_utc.
+    be_cmd_ts: Optional[int] = None
+    if trade.get("be_command_utc"):
+        be_cmd_ts = int(_parse_utc(trade["be_command_utc"]).timestamp())
+    be_cmd_fired = False
+    explicit_be_info: Optional[Dict[str, Any]] = None
+
     try:
         for b_idx in range(idx0 + 1, len(bars)):
             bar = bars[b_idx]
@@ -1556,6 +1601,20 @@ async def _run_single_trade_worker(
                 spy.current_tick = tick
                 spy.current_utc = bar_utc
                 main_mod.executor.get_tick = lambda _sym, _t=tick: _t
+
+                if be_cmd_ts is not None and not be_cmd_fired and int(bar["time_utc"]) >= be_cmd_ts:
+                    be_cmd_fired = True
+                    _cmd_txt = trade.get("be_command_text") or "Set breakeven"
+                    try:
+                        _be_res = main_mod.executor.apply_signal_breakeven(sig)
+                        explicit_be_info = {
+                            "command": _cmd_txt,
+                            "utc": bar_utc,
+                            "modified_tickets": len(_be_res.get("modified_tickets") or []),
+                            "deferred_tickets": len(_be_res.get("deferred_tickets") or []),
+                        }
+                    except Exception as exc:
+                        explicit_be_info = {"command": _cmd_txt, "utc": bar_utc, "error": f"{type(exc).__name__}: {exc}"}
 
                 exec_px = bid if is_buy else ask
                 cur_fav = (exec_px - avg_entry) if is_buy else (avg_entry - exec_px)
@@ -1717,8 +1776,15 @@ async def _run_single_trade_worker(
                 "first_be_arm_utc": pt.get("first_be_arm_utc"),
                 "first_trail_arm_utc": pt.get("first_trail_arm_utc"),
                 "first_mfe_lock_utc": pt.get("first_mfe_lock_utc"),
+                "first_auto_be_utc": pt.get("first_auto_be_utc"),
                 "in_profit_candidate_calls": int(pt.get("in_profit_candidate_calls", 0)),
                 "time_to_first_protection_min": tt_min,
+                "max_mfe_lock_tier": round(float(pt.get("max_mfe_lock_tier", 0.0)), 4),
+                "max_mfe_lock_pct": round(float(pt.get("max_mfe_lock_pct", 0.0)), 4),
+                "max_mfe_lock_profit": round(float(pt.get("max_mfe_lock_profit", 0.0)), 4),
+                "stop_modify_attempts": int(spy.modify_attempts),
+                "stop_modify_failures": int(spy.modify_failures),
+                "explicit_be": explicit_be_info,
             }
         )
     return res
@@ -2199,6 +2265,16 @@ def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     net = round(sum(float(r["sim_gbp"]) for r in results), 2)
     profit_factor = round(gross_profit / abs(gross_loss), 3) if gross_loss < 0.0 else None
 
+    # Max drawdown: peak-to-trough of the cumulative realized-GBP equity curve
+    # in trade-close (catalog) order; NOT intra-trade tick drawdown.
+    equity = 0.0
+    eq_peak = 0.0
+    max_dd = 0.0
+    for r in results:
+        equity += float(r["sim_gbp"])
+        eq_peak = max(eq_peak, equity)
+        max_dd = max(max_dd, eq_peak - equity)
+
     def _lot_gbp(r: Dict[str, Any], usd_per_oz: float) -> float:
         return usd_per_oz * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT
 
@@ -2234,8 +2310,9 @@ def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     never_protected = [r["msg_id"] for r in results if r.get("first_protect_utc") is None]
 
     slip = SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE
+    comm = COMMISSION_ESTIMATE_DOLLARS_PER_OZ_ROUND_TURN
     adj_rows = [
-        round(float(r["sim_gbp"]) - 2.0 * slip * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT, 2)
+        round(float(r["sim_gbp"]) - (2.0 * slip + comm) * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT, 2)
         for r in results
     ]
     adj_net = round(sum(adj_rows), 2)
@@ -2244,6 +2321,21 @@ def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     adj_gp = round(sum(adj_wins), 2)
     adj_gl = round(sum(adj_losses), 2)
     adj_pf = round(adj_gp / abs(adj_gl), 3) if adj_gl < 0.0 else None
+
+    # Break-even frequency (attachment section 9): trades where the engine BE
+    # lock / auto-BE ever armed (telemetry), and trades whose EXIT was a
+    # BE-family stop (BE_LOCK_SL / AUTO_BE_SL exit reason).
+    be_armed_trades = [r["msg_id"] for r in results if r.get("first_be_arm_utc")]
+    auto_be_armed_trades = [r["msg_id"] for r in results if r.get("first_auto_be_utc")]
+    mfe_lock_armed_trades = [r["msg_id"] for r in results if r.get("first_mfe_lock_utc")]
+    be_family_exits = [
+        r["msg_id"] for r in results
+        if "BE_LOCK" in str(r.get("exit_reason") or "").upper()
+        or "AUTO_BE" in str(r.get("exit_reason") or "").upper()
+    ]
+    stop_mod_attempts = sum(int(r.get("stop_modify_attempts") or 0) for r in results)
+    stop_mod_failures = sum(int(r.get("stop_modify_failures") or 0) for r in results)
+    explicit_be_events = [r.get("explicit_be") for r in results if r.get("explicit_be")]
 
     tp_completion = {
         f"TP{k}": round(sum(1 for r in results if int(r.get("max_stage") or 0) >= k) / n, 4) if n else 0.0
@@ -2262,6 +2354,8 @@ def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "net_profit_gbp": net,
         "net_expectancy_gbp": round(net / n, 4) if n else 0.0,
         "profit_factor": profit_factor,
+        "max_drawdown_gbp": round(max_dd, 2),
+        "max_drawdown_basis": "cumulative realized-GBP equity curve, trade-close order (not intra-trade)",
         "avg_winner_gbp": round(gross_profit / len(wins), 4) if wins else 0.0,
         "avg_loser_gbp": round(gross_loss / len(losses), 4) if losses else 0.0,
         "peak_mfe_gbp": peak_mfe_gbp,
@@ -2272,12 +2366,23 @@ def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "premature_stop_outs": len(premature),
         "premature_stop_out_trades": premature,
         "premature_definition": "protected-stop exit (*_SL except initial BROKER_SL) realizing < 50% of peak MFE",
+        "be_armed_trades": be_armed_trades,
+        "be_armed_frequency": len(be_armed_trades),
+        "auto_be_armed_trades": auto_be_armed_trades,
+        "auto_be_armed_frequency": len(auto_be_armed_trades),
+        "mfe_lock_armed_trades": mfe_lock_armed_trades,
+        "be_family_exit_trades": be_family_exits,
+        "be_family_exits": len(be_family_exits),
+        "stop_modify_attempts": stop_mod_attempts,
+        "stop_modify_failures": stop_mod_failures,
+        "explicit_be_events": explicit_be_events,
         "avg_time_to_first_protection_min": round(sum(tt_vals) / len(tt_vals), 2) if tt_vals else None,
         "trades_protected": len(tt_vals),
         "never_protected_trades": never_protected,
         "slippage_estimate_dollars_per_side": slip,
+        "commission_estimate_dollars_per_oz_round_turn": comm,
         "cost_adjusted": {
-            "basis": "tape per-bar spread already in bid/ask + flat round-turn slippage allowance (2 x per-side estimate)",
+            "basis": "tape per-bar spread in bid/ask + round-turn slippage (2 x per-side) + commission estimate ($/oz round turn)",
             "net_profit_gbp": adj_net,
             "net_expectancy_gbp": round(adj_net / n, 4) if n else 0.0,
             "profit_factor": adj_pf,
@@ -2814,6 +2919,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "",
             "- {}".format(tight["note"]),
             "- Slippage allowance: `${:.2f}/oz per side` on top of the tape's per-bar spread.".format(tight["slippage_estimate_dollars_per_side"]),
+            "- Commission estimate: `${:.2f}/oz round turn` ($7 per 1.00 lot RT; documented assumption).".format(tight["commission_estimate_dollars_per_oz_round_turn"]),
             "",
             "| Metric | T3 | T3-tight | Delta (tight - T3) |",
             "|---|---:|---:|---:|",
@@ -2854,6 +2960,12 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             _row("TP{} completion rate".format(k), mt3["tp_completion_rates"]["TP{}".format(k)], mtt["tp_completion_rates"]["TP{}".format(k)], fmt="{:.2%}")
         _row("Initial stop-loss exits", mt3["initial_stop_loss_exits"], mtt["initial_stop_loss_exits"])
         _row("Protected-stop exits", mt3["protected_stop_exits"], mtt["protected_stop_exits"])
+        _row("Max drawdown (GBP, equity curve)", mt3["max_drawdown_gbp"], mtt["max_drawdown_gbp"], fmt="{:.2f}")
+        _row("BE armed trades", mt3["be_armed_frequency"], mtt["be_armed_frequency"])
+        _row("Auto-BE armed trades", mt3["auto_be_armed_frequency"], mtt["auto_be_armed_frequency"])
+        _row("BE-family exits", mt3["be_family_exits"], mtt["be_family_exits"])
+        _row("Stop-mod attempts", mt3["stop_modify_attempts"], mtt["stop_modify_attempts"])
+        _row("Stop-mod failures", mt3["stop_modify_failures"], mtt["stop_modify_failures"])
         _row("Errors", mt3["error_count"], mtt["error_count"])
         lines += [
             "",
@@ -3068,6 +3180,7 @@ def main() -> int:
                 "Replay arm-param overrides only; not production, not shipped."
             ),
             "slippage_estimate_dollars_per_side": SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE,
+            "commission_estimate_dollars_per_oz_round_turn": COMMISSION_ESTIMATE_DOLLARS_PER_OZ_ROUND_TURN,
             "arms": {
                 m: {
                     "label": TIGHT_COMPARISON_ARMS[m]["label"],

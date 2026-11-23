@@ -1,0 +1,35 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_scenario_low_vol.json",
+  "built_utc": "2026-11-23T03:41:36Z",
+  "source": "SYNTHETIC scenario 'low_vol': Low volatility (ATR ~1.5), R=$10, gentle $0.8-1 retractions on a +$5.7 grind; ladder tiers arm on small MFE/ATR ratios.",
+  "conventions": {
+    "layers": "single L1 0.01 lot at 3600.00 for clean per-scenario attribution"
+  },
+  "trades": [
+    {
+      "msg_id": "syn_low_vol",
+      "dir": "BUY",
+      "open_utc": "2026-11-23T09:25:00Z",
+      "close_utc": "2026-11-23T09:48:00Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3600.0
+        ]
+      ],
+      "sl": 3590.0,
+      "tp_levels": {
+        "TP1": 3604.0,
+        "TP2": 3607.0,
+        "TP3": 3610.0,
+        "TP4": 3614.0,
+        "TP5": 3618.0
+      },
+      "actual_mt5_gbp": 0.0,
+      "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)"
+    }
+  ],
+  "provenance": {}
+}
