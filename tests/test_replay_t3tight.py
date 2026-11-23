@@ -702,3 +702,162 @@ def test_ladder_candidates_premature_not_worse(tmp_path, kind):
     assert mets["l3pp"]["premature_stop_outs"] <= mets["s105"]["premature_stop_outs"]
     assert mets["l2pp"]["stop_modify_failures"] == 0
     assert mets["l3pp"]["stop_modify_failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# RESEARCH wick-aware activation (scripts-only gate; production unchanged).
+# A = candle-close confirmation; B = N-consecutive persistence; C = immediate.
+# ---------------------------------------------------------------------------
+
+WICK_TIERS = harness._parse_wick_tiers(harness.LADDER_CURRENT_TIERS)
+
+
+def _wick_pol():
+    return _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05})
+
+
+def _wick_pick(pol, **kw):
+    return _pick(pol, **kw)
+
+
+def test_wick_gate_close_confirmation_suppresses_until_close():
+    tr = harness._WickConfirmationTracker("close", WICK_TIERS)
+    pol = _wick_pol()
+    # Intra-bar wick pushes MFE to 5 (ratio 0.5 >= 0.40) but NO bar has closed.
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
+              current_sl=3562.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    import dynamic_risk
+    res = dynamic_risk.compute_dynamic_atr_trail_stop(**kw)
+    assert res["mfe_lock_sl"] is not None  # production arms immediately
+    gated = harness._apply_wick_gate(res, kw, tr)
+    assert gated["mfe_lock_sl"] is None
+    assert gated["wick_gate_suppressed"] is True
+    # Re-pick = tightest OTHER candidate: BE_LOCK 3600.50 (> auto-BE 3600, > trail).
+    assert gated["stop_source"] == "BE_LOCK"
+    assert gated["candidate_sl"] == pytest.approx(3600.50)
+    assert gated["should_update"] is True
+    # MFE/peak fields untouched (wick tracking preserved, independent of TP moves).
+    assert gated["mfe_dollars"] == res["mfe_dollars"]
+    assert gated["peak_price"] == res["peak_price"]
+    # A wick-only bar that CLOSES below the threshold does NOT confirm.
+    tr.register(3600.0, 1.0)
+    tr.finalize_bar(3603.0, 10.0)  # close ratio 0.30 < 0.40
+    gated2 = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr)
+    assert gated2["mfe_lock_sl"] is None
+    # A bar CLOSING with ratio >= 0.40 confirms the tier -> lock allowed.
+    tr.finalize_bar(3604.5, 10.0)  # close ratio 0.45 >= 0.40
+    allowed = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr)
+    assert allowed["mfe_lock_sl"] == res["mfe_lock_sl"]
+    assert allowed["stop_source"] == res["stop_source"]
+    assert "wick_gate_suppressed" not in allowed
+
+
+def test_wick_gate_persistence_requires_n_consecutive_closes():
+    pol = _wick_pol()
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
+              current_sl=3562.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    import dynamic_risk
+    for mode, n in (("persist2", 2), ("persist3", 3)):
+        tr = harness._WickConfirmationTracker(mode, WICK_TIERS)
+        tr.register(3600.0, 1.0)
+        for i in range(n - 1):
+            tr.finalize_bar(3604.5, 10.0)
+            gated = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr)
+            assert gated["mfe_lock_sl"] is None, f"{mode} confirmed early after {i+1} closes"
+        tr.finalize_bar(3604.5, 10.0)
+        allowed = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr)
+        assert allowed["mfe_lock_sl"] is not None, f"{mode} not confirmed after {n} closes"
+        # A close below threshold resets the streak for a FRESH tracker.
+        tr2 = harness._WickConfirmationTracker(mode, WICK_TIERS)
+        tr2.register(3600.0, 1.0)
+        tr2.finalize_bar(3604.5, 10.0)
+        tr2.finalize_bar(3603.0, 10.0)  # breaks the streak
+        tr2.finalize_bar(3604.5, 10.0)
+        if n == 3:
+            gated = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr2)
+            assert gated["mfe_lock_sl"] is None
+
+
+def test_wick_gate_never_loosens_and_sell_mirror():
+    tr = harness._WickConfirmationTracker("close", WICK_TIERS)
+    pol = _wick_pol()
+    import dynamic_risk
+    # Established tighter stop must not be loosened by the re-picked candidate.
+    kw = dict(direction="BUY", entry_price=3600.0, live_price=3605.0, prev_peak=3605.0,
+              current_sl=3603.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    gated = harness._apply_wick_gate(dynamic_risk.compute_dynamic_atr_trail_stop(**kw), kw, tr)
+    assert gated["mfe_lock_sl"] is None
+    assert gated["should_update"] is False
+    # SELL mirror: re-pick takes the MIN (tightest) other candidate.
+    trs = harness._WickConfirmationTracker("close", WICK_TIERS)
+    kws = dict(direction="SELL", entry_price=3600.0, live_price=3595.0, prev_peak=3595.0,
+               current_sl=3638.0, atr=10.0, policy=pol, auto_be_threshold=3.0)
+    ress = dynamic_risk.compute_dynamic_atr_trail_stop(**kws)
+    gsell = harness._apply_wick_gate(ress, kws, trs)
+    assert gsell["mfe_lock_sl"] is None
+    assert gsell["stop_source"] == "BE_LOCK"
+    assert gsell["candidate_sl"] == pytest.approx(3599.50)
+
+
+def test_wick_research_arms_params_identical_to_baseline():
+    for arm in ("wc", "wp2", "wp3"):
+        assert harness.WICK_RESEARCH_ARMS[arm]["params"] == harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS
+    assert harness.WICK_RESEARCH_ARMS["wc"]["gate"] == "close"
+    assert harness.WICK_RESEARCH_ARMS["wp2"]["gate"] == "persist2"
+    assert harness.WICK_RESEARCH_ARMS["wp3"]["gate"] == "persist3"
+
+
+def _run_wick_scenario(tmp_path, kind, arm):
+    tape = FIXTURE_DIR / f"tape_scenario_{kind}.json"
+    signals = FIXTURE_DIR / f"signals_scenario_{kind}.json"
+    bars = harness.fetch_m1_bars(bars_json_path=tape)
+    bars_file = tmp_path / f"bars_{kind}_{arm}.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    gate = harness.WICK_RESEARCH_ARMS[arm]["gate"] if arm in harness.WICK_RESEARCH_ARMS else None
+    return harness._run_arm_subprocess(
+        arm, REPO_ROOT, bars_file, tmp_path / f"{kind}_{arm}.json",
+        catalog_path=signals, protection_telemetry=True, wick_gate=gate,
+    )
+
+
+def test_two_run_determinism_wc_on_nov23(tmp_path):
+    bars = harness.fetch_m1_bars(bars_json_path=NOV23_TAPE)
+    bars_file = tmp_path / "bars.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    run1 = harness._run_arm_subprocess(
+        "wc", REPO_ROOT, bars_file, tmp_path / "wc_run1.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, wick_gate="close",
+    )
+    run2 = harness._run_arm_subprocess(
+        "wc", REPO_ROOT, bars_file, tmp_path / "wc_run2.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, wick_gate="close",
+    )
+    assert run1["bars_sha256"] == run2["bars_sha256"] == NOV23_BARS_SHA256
+    assert run1["arm_params"] == run2["arm_params"]
+    assert run1["arm_params"]["wick_gate"] == "close"
+    assert run1["summary"]["error_count"] == 0
+    assert len(run1["results"]) == 9
+    assert json.dumps(run1["results"], sort_keys=True) == json.dumps(run2["results"], sort_keys=True)
+    assert json.dumps(run1["summary"], sort_keys=True) == json.dumps(run2["summary"], sort_keys=True)
+    for r in run1["results"]:
+        assert r.get("wick_gate", {}).get("mode") == "close"
+
+
+@pytest.mark.parametrize("kind", ["high_atr", "sharp_reversal", "normal_retracement"])
+def test_wick_variants_replay_invariants(tmp_path, kind):
+    # NOTE: premature stop-outs are NOT guaranteed to decrease - on
+    # normal_retracement the gate lets the trade ride higher but the lagging
+    # confirmation exits at the looser BE fallback (a measured research finding,
+    # reported to the controller). The guaranteed invariants are: zero errors,
+    # zero stop-mod failures, gate telemetry present, and the gate actually
+    # engaging (suppression or confirmation) on these wicky tapes.
+    runs = {m: _run_wick_scenario(tmp_path, kind, m) for m in ("s105", "wc", "wp2", "wp3")}
+    for m, payload in runs.items():
+        assert payload["summary"]["error_count"] == 0
+        met = harness._tight_comparison_metrics(payload["results"])
+        assert met["stop_modify_failures"] == 0
+    for m in ("wc", "wp2", "wp3"):
+        r = runs[m]["results"][0]
+        wg = r.get("wick_gate") or {}
+        assert wg.get("mode") == harness.WICK_RESEARCH_ARMS[m]["gate"]
+        assert int(wg.get("suppressed_calls", 0)) > 0 or float(wg.get("max_confirmed_tier", 0.0)) > 0.0
