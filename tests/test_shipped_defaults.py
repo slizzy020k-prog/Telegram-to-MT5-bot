@@ -63,6 +63,12 @@ _SHIPPED_POLICY_DEFAULTS = {
     "be_activation_atr_mult": 0.75,
     "be_min_mfe_dollars": 3.50,
     "be_lock_offset_dollars": 0.50,
+    "trail_activation_ceiling_dollars": 0.0,
+    "be_activation_ceiling_dollars": 0.0,
+    "trail_distance_tiers": "",
+    "mfe_lock_enabled": False,
+    "mfe_lock_tiers": "4:0.30,6:0.50,10:0.65,18:0.75",
+    "mfe_lock_cost_floor_dollars": 0.60,
     "tp_trail_enabled": True,
     "tp_lift_atr_mult": 0.50,
     "tp_lift_progress_pct": 0.75,
@@ -140,6 +146,12 @@ _SHIPPED_CONFIG_LITERALS = {
     "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.75,
     "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 3.50,
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 0.0,
+    "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 0.0,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "",
+    "DYNAMIC_ATR_MFE_LOCK_ENABLED": False,
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": "4:0.30,6:0.50,10:0.65,18:0.75",
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
     "DYNAMIC_ATR_TP_TRAIL_ENABLED": True,
     "DYNAMIC_ATR_TP_LIFT_ATR_MULT": 0.50,
     "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT": 0.75,
@@ -167,7 +179,7 @@ def test_shipped_config_dynamic_knob_set_is_complete(shipped_config):
     dynamic_knobs = {k for k in vars(shipped_config) if k.startswith("DYNAMIC_")}
     pinned = {k for k in _SHIPPED_CONFIG_LITERALS if k.startswith("DYNAMIC_")}
     assert dynamic_knobs == pinned
-    assert len(dynamic_knobs) == 36
+    assert len(dynamic_knobs) == 42
 
 
 def test_shipped_r_lock_via_reader_fallback(shipped_config):

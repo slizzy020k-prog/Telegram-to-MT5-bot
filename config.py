@@ -581,6 +581,43 @@ DYNAMIC_ATR_BE_MIN_MFE_DOLLARS: float = _env_float(
 DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50, min_val=0.0, max_val=10.0
 )
+
+# ---------------------------------------------------------------------------
+# T3 AGGRESSIVE PROFIT PROTECTION (opt-in). Every knob below defaults to OFF /
+# current-behavior, so the shipped engine is byte-for-byte unchanged until the
+# controller enables it in .env. Tighter behavior NEVER loosens a protective stop:
+# it only arms earlier / caps the trail distance / adds a tighter lock candidate
+# to the existing tightest-stop picker.
+# ---------------------------------------------------------------------------
+# Cap the trail activation threshold in dollars. When > 0 the trail arms at
+# min(trail_activation_atr_mult * ATR, ceiling) instead of the pure ATR multiple,
+# so a high-ATR regime does not delay protection. 0.0 = disabled (current behavior).
+# T3-tight live value: 4.00.
+DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS", 0.0, min_val=0.0, max_val=500.0
+)
+# Cap the BE activation threshold in dollars. When > 0 the BE lock arms at
+# min(be_activation_atr_mult * ATR, ceiling). This INTENTIONALLY OVERRIDES the
+# R-gate: it arms BE before 0.5R on wide-stop trades (opt-in only). 0.0 = disabled
+# (current R-gated / flat logic). T3-tight live value: 3.00.
+DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", 0.0, min_val=0.0, max_val=500.0
+)
+# Progressive trail-distance tightening tiers "mfe:max_dist,..." e.g.
+# "4:3.50,6:3.00,10:2.50,18:2.00". When set, trail_dist is capped by the tightest
+# (smallest) cap whose mfe threshold <= current MFE. MFE comes from a monotonic
+# peak, so the cap only tightens and trail_dist never expands. "" = disabled.
+DYNAMIC_ATR_TRAIL_DISTANCE_TIERS: str = (os.getenv("DYNAMIC_ATR_TRAIL_DISTANCE_TIERS") or "").strip()
+# Fractional-MFE profit lock: locks fraction*MFE above entry once it covers the
+# spread+slippage cost floor. Disabled by default; tiers used only when enabled.
+DYNAMIC_ATR_MFE_LOCK_ENABLED: bool = _env_bool("DYNAMIC_ATR_MFE_LOCK_ENABLED", False)
+DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "4:0.30,6:0.50,10:0.65,18:0.75").strip()
+# Spread+slippage floor: the lock arms only when fraction*MFE >= this floor, so it
+# never locks a nominal profit that is a net loss after costs.
+DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 0.60, min_val=0.0, max_val=50.0
+)
+
 DYNAMIC_ATR_TP_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
 DYNAMIC_ATR_TP_LIFT_ATR_MULT: float = _env_float(
     "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50, min_val=0.05, max_val=5.0, positive_only=True

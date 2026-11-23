@@ -32,9 +32,13 @@ from config import (
     DEFAULT_SYMBOL,
     DEFAULT_TP_STEP_PIPS,
     DYNAMIC_ATR_BASELINE_DOLLARS,
+    DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS,
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS,
+    DYNAMIC_ATR_MFE_LOCK_ENABLED,
+    DYNAMIC_ATR_MFE_LOCK_TIERS,
     DYNAMIC_ATR_PERIOD,
     DYNAMIC_ATR_SLTP_ENABLED,
     DYNAMIC_ATR_TIMEFRAME,
@@ -42,7 +46,9 @@ from config import (
     DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT,
     DYNAMIC_ATR_TP1_LIFT_MIN_PROGRESS_PCT,
     DYNAMIC_ATR_TP_TRAIL_ENABLED,
+    DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS,
     DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
+    DYNAMIC_ATR_TRAIL_DISTANCE_TIERS,
     DYNAMIC_ATR_TRAIL_ENABLED,
     DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS,
     DYNAMIC_ATR_TRAIL_EXTENDED_MFE_DOLLARS,
@@ -200,7 +206,9 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TRAIL_EXTENDED_MULT",
         "DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS",
         "DYNAMIC_ATR_TRAIL_HOMERUN_MULT",
+        "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS",
         "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT",
+        "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS",
         "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
         "DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS",
@@ -208,9 +216,13 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS",
         "DYNAMIC_ATR_TRAIL_STEP_DOLLARS",
+        "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS",
         "DYNAMIC_ATR_BE_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS",
         "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS",
+        "DYNAMIC_ATR_MFE_LOCK_ENABLED",
+        "DYNAMIC_ATR_MFE_LOCK_TIERS",
+        "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS",
         "DYNAMIC_ATR_TP_TRAIL_ENABLED",
         "DYNAMIC_ATR_TP_LIFT_ATR_MULT",
         "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT",
@@ -1419,7 +1431,9 @@ class MT5Executor:
             DYNAMIC_ATR_TRAIL_EXTENDED_MULT=_cfg("DYNAMIC_ATR_TRAIL_EXTENDED_MULT", DYNAMIC_ATR_TRAIL_EXTENDED_MULT),
             DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS", DYNAMIC_ATR_TRAIL_HOMERUN_MFE_DOLLARS),
             DYNAMIC_ATR_TRAIL_HOMERUN_MULT=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MULT", DYNAMIC_ATR_TRAIL_HOMERUN_MULT),
+            DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS", DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS),
             DYNAMIC_ATR_TRAIL_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", DYNAMIC_ATR_TRAIL_ACTIVATION_MULT),
+            DYNAMIC_ATR_TRAIL_DISTANCE_TIERS=_cfg("DYNAMIC_ATR_TRAIL_DISTANCE_TIERS", DYNAMIC_ATR_TRAIL_DISTANCE_TIERS),
             DYNAMIC_ATR_TRAIL_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_MIN_DOLLARS),
             DYNAMIC_ATR_TRAIL_MAX_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MAX_DOLLARS", DYNAMIC_ATR_TRAIL_MAX_DOLLARS),
             DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_EXTENDED_MIN_DOLLARS),
@@ -1427,9 +1441,13 @@ class MT5Executor:
             DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS),
             DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS", DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS),
             DYNAMIC_ATR_TRAIL_STEP_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_STEP_DOLLARS", DYNAMIC_ATR_TRAIL_STEP_DOLLARS),
+            DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS=_cfg("DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS),
             DYNAMIC_ATR_BE_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_ACTIVATION_MULT", DYNAMIC_ATR_BE_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_MIN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", DYNAMIC_ATR_BE_MIN_MFE_DOLLARS),
             DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS=_cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
+            DYNAMIC_ATR_MFE_LOCK_ENABLED=_cfg("DYNAMIC_ATR_MFE_LOCK_ENABLED", DYNAMIC_ATR_MFE_LOCK_ENABLED),
+            DYNAMIC_ATR_MFE_LOCK_TIERS=_cfg("DYNAMIC_ATR_MFE_LOCK_TIERS", DYNAMIC_ATR_MFE_LOCK_TIERS),
+            DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS=_cfg("DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS),
             DYNAMIC_ATR_TP_TRAIL_ENABLED=_cfg("DYNAMIC_ATR_TP_TRAIL_ENABLED", DYNAMIC_ATR_TP_TRAIL_ENABLED),
             DYNAMIC_ATR_TP_LIFT_ATR_MULT=_cfg("DYNAMIC_ATR_TP_LIFT_ATR_MULT", DYNAMIC_ATR_TP_LIFT_ATR_MULT),
             DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT=_cfg("DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT),
@@ -7959,6 +7977,55 @@ class MT5Executor:
             return None
         return max(cands) if is_buy else min(cands)
 
+    def _log_t3_protection(
+        self,
+        lk: str,
+        t_int: int,
+        lv: Dict[str, Any],
+        trail_step: Dict[str, Any],
+        policy: DynamicRiskPolicy,
+        digits: int,
+    ) -> None:
+        """Concise opt-in T3 logging: BE/trail/MFE-lock activation, zone transitions, MFE-lock calc.
+
+        Reporting only -- never alters the stop decision. Called solely when a T3 knob is
+        enabled, so default behavior adds no log lines and no per-layer state.
+        """
+        mfe = float(trail_step.get("mfe_dollars") or 0.0)
+        if trail_step.get("be_armed") and not lv.get("_t3_be_logged"):
+            lv["_t3_be_logged"] = True
+            logger.info(
+                f"[T3 BE-ARM] {lk} #{t_int}: mfe=${mfe:.2f} >= be_threshold=${trail_step.get('be_threshold') or 0.0:.2f} "
+                f"-> be_sl={trail_step.get('be_sl')}"
+            )
+        if trail_step.get("trail_armed") and not lv.get("_t3_trail_logged"):
+            lv["_t3_trail_logged"] = True
+            logger.info(
+                f"[T3 TRAIL-ARM] {lk} #{t_int}: mfe=${mfe:.2f} >= "
+                f"trail_activation_threshold=${trail_step.get('trail_activation_threshold') or 0.0:.2f}"
+            )
+        zone = trail_step.get("trail_zone") or "STANDARD"
+        prev_zone = lv.get("_t3_zone")
+        if prev_zone != zone:
+            lv["_t3_zone"] = zone
+            if prev_zone is not None:
+                logger.info(
+                    f"[T3 ZONE] {lk} #{t_int}: {prev_zone} -> {zone} "
+                    f"(trail_dist=${trail_step.get('trail_dist', 0.0):.2f}, cap_applied={bool(trail_step.get('distance_cap_applied'))})"
+                )
+        if policy.mfe_lock_enabled:
+            frac = float(trail_step.get("mfe_lock_fraction") or 0.0)
+            lock_sl = trail_step.get("mfe_lock_sl")
+            if lv.get("_t3_mfe_frac") != frac or (lock_sl is not None and not lv.get("_t3_mfe_logged")):
+                lv["_t3_mfe_frac"] = frac
+                if lock_sl is not None:
+                    lv["_t3_mfe_logged"] = True
+                logger.info(
+                    f"[T3 MFE-LOCK] {lk} #{t_int}: mfe=${mfe:.2f} fraction={frac:.2f} "
+                    f"locked=${round(frac * mfe, digits):.2f} cost_floor=${policy.mfe_lock_cost_floor_dollars:.2f} "
+                    f"armed={lock_sl is not None} sl={lock_sl}"
+                )
+
     def evaluate_dynamic_atr_engine(
         self,
         signal_data: Dict[str, Any],
@@ -7973,6 +8040,15 @@ class MT5Executor:
         - Strictly broker-executed SL/TP via `modify_position_sltp`; NEVER calls `close_market_position`.
         """
         policy = self._get_dynamic_risk_policy()
+        # T3 aggressive protection is opt-in; only when a knob is enabled do we emit the
+        # extra activation / tier / MFE-lock / SL-mod logs below. At defaults this is
+        # False, so the executor logging and state are byte-for-byte unchanged.
+        t3_active = (
+            policy.trail_activation_ceiling_dollars > 0.0
+            or policy.be_activation_ceiling_dollars > 0.0
+            or bool(str(policy.trail_distance_tiers or "").strip())
+            or bool(policy.mfe_lock_enabled)
+        )
         empty_disabled = {
             "enabled": False,
             "paused_by_spread": False,
@@ -8342,6 +8418,8 @@ class MT5Executor:
                 _forward_update_sig("atr_stop", last_atr_sl_seen)
             if trail_step.get("milestone_floor"):
                 _forward_update_sig("fsm_floor", float(trail_step["milestone_floor"]))
+            if t3_active:
+                self._log_t3_protection(lk, t_int, lv, trail_step, policy, digits)
 
             if trail_step.get("should_sweep_pending") or ("TP1" in seen_cleared):
                 sweep_pendings = True
@@ -8407,6 +8485,11 @@ class MT5Executor:
             signal_data["active_stop_source"] = stop_source
             last_stop_source = stop_source
             last_sl_applied = cand_sl
+            if t3_active:
+                logger.info(
+                    f"[T3 SL-MOD] {lk} #{t_int} {stop_source}: {cur_sl if cur_sl is not None else 0.0} -> {cand_sl} "
+                    f"(mfe=${trail_step.get('mfe_dollars', 0.0):.2f}, trail_dist=${trail_step.get('trail_dist', 0.0):.2f})"
+                )
             if trail_step.get("trail_armed") and not was_trail_armed and trail_armed_sl is None:
                 trail_armed_sl = cand_sl
 
