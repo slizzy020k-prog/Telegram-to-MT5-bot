@@ -48,6 +48,7 @@ NEW_KNOBS = {
     "DYNAMIC_ATR_AUTO_BE_ENABLED": "auto_be_enabled",
     "DYNAMIC_ATR_AUTO_BE_PIPS": "auto_be_pips",
     "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": "auto_be_pip_size_dollars",
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": "trail_distance_scale_mult",
 }
 
 
@@ -513,6 +514,8 @@ def _sentinel(knob, current):
         return 25.0 if current != 25.0 else 35.0
     if knob == "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS":
         return 0.20 if current != 0.20 else 0.10
+    if knob == "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT":
+        return 1.05 if current != 1.05 else 1.10
     raise AssertionError(knob)
 
 
@@ -560,6 +563,7 @@ def test_shipped_defaults_match():
     assert pol.auto_be_enabled is False
     assert pol.auto_be_pips == pytest.approx(30.0)
     assert pol.auto_be_pip_size_dollars == pytest.approx(0.0)
+    assert pol.trail_distance_scale_mult == pytest.approx(1.0)
     assert dr.read_dynamic_risk_policy(SimpleNamespace()) == pol
 
 
@@ -577,3 +581,92 @@ def test_explicit_be_variations_recognized(text):
     lo = text.lower()
     assert any(re.search(p, lo) for p in parser.BREAKEVEN_PATTERNS)
     assert parser._is_unambiguous_breakeven_cmd(lo) is True
+
+
+# ---------------------------------------------------------------------------
+# 10. ATR trailing distance scale (5% wider, opt-in; ATR trail ONLY)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_scale_widen_five_percent(direction):
+    entry = 3700.0
+    sign = 1.0 if direction == "BUY" else -1.0
+    base = _eng(direction, entry, _live(entry, 5.0, direction), _pol(), atr=4.0, r=32.0)
+    scaled = _eng(direction, entry, _live(entry, 5.0, direction), _pol(trail_distance_scale_mult=1.05), atr=4.0, r=32.0)
+    assert base["trail_dist"] == pytest.approx(5.6)
+    assert base["trail_dist_original"] == pytest.approx(5.6)
+    assert scaled["trail_dist_original"] == pytest.approx(5.6)
+    assert scaled["trail_dist"] == pytest.approx(round(5.6 * 1.05, 2))  # 5.88
+    assert scaled["atr_sl"] == pytest.approx(round(entry + sign * 5.0 - sign * round(5.6 * 1.05, 2), 2))
+    assert sign * (scaled["atr_sl"] - base["atr_sl"]) < 0  # further from peak
+    assert scaled["stop_source"] == "ATR_TRAIL"
+    assert scaled != base  # non-vacuous
+
+
+def test_scale_widens_even_when_cap_binds():
+    pol = _pol(trail_distance_tiers=DIST_TIERS, trail_distance_scale_mult=1.05)
+    res = _eng("BUY", 3700.0, 3706.0, pol, atr=9.78)  # MFE 6 -> cap 3.50 binds
+    assert res["distance_cap_applied"] is True
+    assert res["trail_dist_original"] == pytest.approx(3.50)
+    assert res["trail_dist"] == pytest.approx(round(3.50 * 1.05, 2))
+    assert res["trail_dist"] > 3.50  # widened despite the cap
+
+
+def test_scale_default_byte_identical():
+    entry = 3700.0
+    for direction in ("BUY", "SELL"):
+        for atr, mfe in [(4.0, 5.0), (9.78, 12.0), (2.0, 3.0)]:
+            a = _eng(direction, entry, _live(entry, mfe, direction), _pol(), atr=atr, r=8.0)
+            b = _eng(direction, entry, _live(entry, mfe, direction), _pol(trail_distance_scale_mult=1.0), atr=atr, r=8.0)
+            assert a == b
+            assert a["trail_dist"] == a["trail_dist_original"]
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_scale_leaves_mfe_activation_autobe_unchanged(direction):
+    entry = 3700.0
+    live = _live(entry, 6.0, direction)
+    a = _eng(direction, entry, live, _ladder(), atr=4.0, auto_be=3.0)
+    b = _eng(direction, entry, live, _ladder(trail_distance_scale_mult=1.05), atr=4.0, auto_be=3.0)
+    for key in ("mfe_lock_fraction", "mfe_lock_profit", "mfe_lock_sl", "mfe_lock_ratio", "mfe_lock_tier",
+                "trail_activation_threshold", "be_threshold", "be_sl", "auto_be_sl", "auto_be_armed"):
+        assert a[key] == b[key], "scale changed " + key
+    assert a["trail_dist"] != b["trail_dist"]  # only the ATR trail distance differs
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_scale_monotonic_with_distance_tiers(direction):
+    pol = _pol(trail_distance_tiers=DIST_TIERS, trail_distance_scale_mult=1.05)
+    entry = 3700.0
+    prev = None
+    for mfe in (6.0, 10.0, 15.0, 20.0):
+        res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=9.78)
+        assert res["trail_dist"] == pytest.approx(round(res["trail_dist_original"] * 1.05, 2))
+        if prev is not None:
+            assert res["trail_dist"] <= prev + 1e-9
+        prev = res["trail_dist"]
+
+
+def test_scale_never_loosens_tighter_mfe_lock():
+    pol = _ladder(trail_distance_scale_mult=1.05)
+    res = _eng("BUY", 3700.0, 3706.0, pol, atr=4.0)
+    assert res["stop_source"] == "MFE_LOCK"
+    assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])  # 3704.8, not the wider trail
+    assert res["atr_sl"] < res["candidate_sl"]
+
+
+def test_scale_step_guard_blocks_loosening_existing_stop():
+    pol = _pol(trail_distance_scale_mult=1.05)
+    res = _eng("BUY", 3700.0, 3706.0, pol, atr=4.0, r=32.0, sl=3705.0)
+    assert res["should_update"] is False
+
+
+def test_scale_atr_rise_cannot_loosen_established_stop():
+    pol = _pol(trail_distance_scale_mult=1.05)
+    entry = 3700.0
+    first = _eng("BUY", entry, 3708.0, pol, atr=4.0, r=32.0)
+    established = first["candidate_sl"]
+    assert first["should_update"] is True
+    second = _eng("BUY", entry, 3708.0, pol, atr=8.0, r=32.0, peak=3708.0, sl=established)
+    assert second["atr_sl"] < established
+    assert second["should_update"] is False

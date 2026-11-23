@@ -54,6 +54,7 @@ from config import (
     DYNAMIC_ATR_TP_TRAIL_ENABLED,
     DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS,
     DYNAMIC_ATR_TRAIL_ACTIVATION_MULT,
+    DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT,
     DYNAMIC_ATR_TRAIL_DISTANCE_TIERS,
     DYNAMIC_ATR_TRAIL_ENABLED,
     DYNAMIC_ATR_TRAIL_EXTENDED_MAX_DOLLARS,
@@ -214,6 +215,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_TRAIL_HOMERUN_MULT",
         "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS",
         "DYNAMIC_ATR_TRAIL_ACTIVATION_MULT",
+        "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT",
         "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS",
         "DYNAMIC_ATR_TRAIL_MIN_DOLLARS",
         "DYNAMIC_ATR_TRAIL_MAX_DOLLARS",
@@ -1445,6 +1447,7 @@ class MT5Executor:
             DYNAMIC_ATR_TRAIL_HOMERUN_MULT=_cfg("DYNAMIC_ATR_TRAIL_HOMERUN_MULT", DYNAMIC_ATR_TRAIL_HOMERUN_MULT),
             DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS", DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS),
             DYNAMIC_ATR_TRAIL_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_TRAIL_ACTIVATION_MULT", DYNAMIC_ATR_TRAIL_ACTIVATION_MULT),
+            DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT=_cfg("DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT", DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT),
             DYNAMIC_ATR_TRAIL_DISTANCE_TIERS=_cfg("DYNAMIC_ATR_TRAIL_DISTANCE_TIERS", DYNAMIC_ATR_TRAIL_DISTANCE_TIERS),
             DYNAMIC_ATR_TRAIL_MIN_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MIN_DOLLARS", DYNAMIC_ATR_TRAIL_MIN_DOLLARS),
             DYNAMIC_ATR_TRAIL_MAX_DOLLARS=_cfg("DYNAMIC_ATR_TRAIL_MAX_DOLLARS", DYNAMIC_ATR_TRAIL_MAX_DOLLARS),
@@ -8026,7 +8029,8 @@ class MT5Executor:
             lv["_t3_trail_logged"] = True
             logger.info(
                 f"[T3 TRAIL-ARM] {lk} #{t_int}: mfe=${mfe:.2f} >= "
-                f"trail_activation_threshold=${trail_step.get('trail_activation_threshold') or 0.0:.2f}"
+                f"trail_activation_threshold=${trail_step.get('trail_activation_threshold') or 0.0:.2f} "
+                f"trail_dist=${trail_step.get('trail_dist', 0.0):.2f} (orig=${trail_step.get('trail_dist_original', 0.0):.2f}, scale={policy.trail_distance_scale_mult:.2f})"
             )
         zone = trail_step.get("trail_zone") or "STANDARD"
         prev_zone = lv.get("_t3_zone")
@@ -8082,6 +8086,7 @@ class MT5Executor:
             or bool(str(policy.trail_distance_tiers or "").strip())
             or bool(policy.mfe_lock_enabled)
             or bool(policy.auto_be_enabled)
+            or policy.trail_distance_scale_mult != 1.0
         )
         empty_disabled = {
             "enabled": False,
@@ -8540,7 +8545,8 @@ class MT5Executor:
             if t3_active:
                 logger.info(
                     f"[T3 SL-MOD] {lk} #{t_int} {stop_source}: {cur_sl if cur_sl is not None else 0.0} -> {cand_sl} "
-                    f"(mfe=${trail_step.get('mfe_dollars', 0.0):.2f}, trail_dist=${trail_step.get('trail_dist', 0.0):.2f})"
+                    f"(mfe=${trail_step.get('mfe_dollars', 0.0):.2f}, trail_dist=${trail_step.get('trail_dist', 0.0):.2f} "
+                    f"[orig=${trail_step.get('trail_dist_original', 0.0):.2f}, scale={policy.trail_distance_scale_mult:.2f}])"
                 )
             if trail_step.get("trail_armed") and not was_trail_armed and trail_armed_sl is None:
                 trail_armed_sl = cand_sl

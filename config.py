@@ -646,6 +646,13 @@ DYNAMIC_ATR_AUTO_BE_PIPS: float = _env_float(
 DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", 0.0, min_val=0.0, max_val=10.0
 )
+# T3 opt-in: widen the effective ATR trailing distance by this constant factor, applied
+# AFTER the zone clamp + distance-tier cap (so it widens even when a cap binds). 1.0 =
+# shipped behavior; live value 1.05 gives ~5% more retracement room to reduce premature
+# stop-outs. Applies ONLY to the ATR trailing distance (not MFE lock / BE / activation).
+DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT: float = _env_float(
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT", 1.0, min_val=0.50, max_val=2.00, positive_only=True
+)
 
 DYNAMIC_ATR_TP_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
 DYNAMIC_ATR_TP_LIFT_ATR_MULT: float = _env_float(

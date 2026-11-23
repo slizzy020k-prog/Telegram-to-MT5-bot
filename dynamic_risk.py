@@ -81,6 +81,7 @@ class DynamicRiskPolicy:
     auto_be_enabled: bool = False
     auto_be_pips: float = 30.0
     auto_be_pip_size_dollars: float = 0.0
+    trail_distance_scale_mult: float = 1.0
     tp_trail_enabled: bool = True
     tp_lift_atr_mult: float = 0.50
     tp_lift_progress_pct: float = 0.75
@@ -180,6 +181,7 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         auto_be_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_ENABLED", False)),
         auto_be_pips=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIPS", 30.0), 30.0)),
         auto_be_pip_size_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", 0.0), 0.0)),
+        trail_distance_scale_mult=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT", 1.0), 1.0), 0.50, 2.00),
         tp_trail_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)),
         tp_lift_atr_mult=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50), 0.50)),
         tp_lift_progress_pct=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75), 0.75), 0.10, 0.99),
@@ -643,6 +645,7 @@ def compute_dynamic_atr_trail_stop(
             "should_sweep_pending": False,
             "peak_price": prev_peak,
             "trail_dist": 0.0,
+            "trail_dist_original": 0.0,
             "candidate_sl": None,
             "be_sl": None,
             "atr_sl": None,
@@ -725,6 +728,15 @@ def compute_dynamic_atr_trail_stop(
             capped = round(min(trail_dist, min(caps)), digits)
             distance_cap_applied = capped < trail_dist
             trail_dist = capped
+    # T3 opt-in: widen the effective ATR trailing distance by a constant scale (e.g. 1.05
+    # for ~5% more retracement room). Applied AFTER zone clamp + distance-tier cap, so it
+    # widens even when a cap binds. A constant scale preserves monotonic non-increasing
+    # trail_dist; the tightest-stop picker + should_update guard remain the never-loosen
+    # backstop. Applies ONLY to the ATR trail (MFE lock / BE / activation untouched).
+    trail_dist_original = trail_dist
+    trail_scale = _clamp(_safe_float(policy.trail_distance_scale_mult, 1.0), 0.50, 2.00)
+    if trail_scale != 1.0:
+        trail_dist = round(trail_dist * trail_scale, digits)
     # T3 opt-in: a positive trail activation ceiling caps the arm threshold in dollars.
     trail_activation_threshold = max(0.0, policy.trail_activation_atr_mult * atr_f)
     trail_ceiling = max(0.0, _safe_float(policy.trail_activation_ceiling_dollars, 0.0))
@@ -805,6 +817,7 @@ def compute_dynamic_atr_trail_stop(
             "should_sweep_pending": False,
             "peak_price": round(peak_px, digits),
             "trail_dist": trail_dist,
+            "trail_dist_original": trail_dist_original,
             "candidate_sl": None,
             "be_sl": None,
             "atr_sl": None,
@@ -852,6 +865,7 @@ def compute_dynamic_atr_trail_stop(
         "should_sweep_pending": should_sweep_pending,
         "peak_price": round(peak_px, digits),
         "trail_dist": trail_dist,
+        "trail_dist_original": trail_dist_original,
         "candidate_sl": cand_sl,
         "be_sl": be_sl,
         "atr_sl": atr_sl,

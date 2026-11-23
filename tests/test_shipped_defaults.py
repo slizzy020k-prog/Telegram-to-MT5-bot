@@ -75,6 +75,7 @@ _SHIPPED_POLICY_DEFAULTS = {
     "auto_be_enabled": False,
     "auto_be_pips": 30.0,
     "auto_be_pip_size_dollars": 0.0,
+    "trail_distance_scale_mult": 1.0,
     "tp_trail_enabled": True,
     "tp_lift_atr_mult": 0.50,
     "tp_lift_progress_pct": 0.75,
@@ -164,6 +165,7 @@ _SHIPPED_CONFIG_LITERALS = {
     "DYNAMIC_ATR_AUTO_BE_ENABLED": False,
     "DYNAMIC_ATR_AUTO_BE_PIPS": 30.0,
     "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": 0.0,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": 1.0,
     "DYNAMIC_ATR_TP_TRAIL_ENABLED": True,
     "DYNAMIC_ATR_TP_LIFT_ATR_MULT": 0.50,
     "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT": 0.75,
@@ -191,7 +193,7 @@ def test_shipped_config_dynamic_knob_set_is_complete(shipped_config):
     dynamic_knobs = {k for k in vars(shipped_config) if k.startswith("DYNAMIC_")}
     pinned = {k for k in _SHIPPED_CONFIG_LITERALS if k.startswith("DYNAMIC_")}
     assert dynamic_knobs == pinned
-    assert len(dynamic_knobs) == 48
+    assert len(dynamic_knobs) == 49
 
 
 def test_shipped_r_lock_via_reader_fallback(shipped_config):

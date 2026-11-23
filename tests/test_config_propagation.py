@@ -237,7 +237,7 @@ def test_dynamic_knob_whitelist_drift_guard(monkeypatch):
         "config vs reader drift: only-config=" + str(sorted(config_set - reader_set))
         + " only-reader=" + str(sorted(reader_set - config_set))
     )
-    assert len(config_set) == 48, "expected 48 DYNAMIC_* knobs, got " + str(len(config_set))
+    assert len(config_set) == 49, "expected 49 DYNAMIC_* knobs, got " + str(len(config_set))
 
 
 def test_r_lock_knob_whitelist_drift_guard(monkeypatch):
