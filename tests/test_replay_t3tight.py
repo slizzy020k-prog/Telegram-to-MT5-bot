@@ -590,3 +590,115 @@ def test_scale_retracement_scenarios_premature_not_worse(tmp_path, kind):
     # More retracement room must not INCREASE premature stop-outs.
     assert m105["premature_stop_outs"] <= m100["premature_stop_outs"]
     assert m105["stop_modify_failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# RESEARCH binding-ladder candidates (-2pp / -3pp on clipping tiers only).
+# NOT adopted; these tests pin the research arms' semantics + reproducibility.
+# ---------------------------------------------------------------------------
+
+def _parse_tiers(raw):
+    out = {}
+    for tok in raw.split(","):
+        thr, pct = tok.split(":")
+        out[float(thr)] = float(pct)
+    return out
+
+
+def test_ladder_candidates_reduce_only_clipping_tiers():
+    cur = _parse_tiers(harness.LADDER_CURRENT_TIERS)
+    assert cur == _parse_tiers(harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS["DYNAMIC_ATR_MFE_LOCK_TIERS"])
+    clipping = {0.40, 0.60, 1.00}  # identified by exit binding telemetry
+    for arm, pp in (("l2pp", 0.02), ("l3pp", 0.03)):
+        params = harness.LADDER_RESEARCH_ARMS[arm]["params"]
+        cand = _parse_tiers(params["DYNAMIC_ATR_MFE_LOCK_TIERS"])
+        assert set(cand) == set(cur)  # activation ratios UNCHANGED
+        for thr in cur:
+            expected_drop = pp if thr in clipping else 0.0
+            assert cur[thr] - cand[thr] == pytest.approx(expected_drop), f"tier {thr}"
+        # Every non-tier knob identical to the upgraded + 1.05 base.
+        for k, v in harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS.items():
+            if k != "DYNAMIC_ATR_MFE_LOCK_TIERS":
+                assert params[k] == v, f"knob {k} changed"
+
+
+def test_production_picker_candidate_ladder_protects_less_at_clipping_tier():
+    pol_cur = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05})
+    pol2 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05,
+                      "DYNAMIC_ATR_MFE_LOCK_TIERS": harness.LADDER_MINUS2PP_TIERS})
+    pol3 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05,
+                      "DYNAMIC_ATR_MFE_LOCK_TIERS": harness.LADDER_MINUS3PP_TIERS})
+    # MFE 5.5 / ATR 10 -> ratio 0.55 -> clipping tier 0.40.
+    kw = dict(live=3605.5, peak=3605.5, atr=10.0, sl=3562.0)
+    rc, r2, r3 = _pick(pol_cur, **kw), _pick(pol2, **kw), _pick(pol3, **kw)
+    assert rc["mfe_lock_tier"] == r2["mfe_lock_tier"] == r3["mfe_lock_tier"] == pytest.approx(0.40)
+    assert rc["mfe_lock_fraction"] == pytest.approx(0.45)
+    assert r2["mfe_lock_fraction"] == pytest.approx(0.43)
+    assert r3["mfe_lock_fraction"] == pytest.approx(0.42)
+    mfe = 5.5
+    assert rc["mfe_lock_profit"] == pytest.approx(0.45 * mfe, abs=5e-5)
+    assert r2["mfe_lock_profit"] == pytest.approx(0.43 * mfe, abs=5e-5)
+    assert r3["mfe_lock_profit"] == pytest.approx(0.42 * mfe, abs=5e-5)
+    assert r2["mfe_lock_sl"] == pytest.approx(3600.0 + 0.43 * mfe, abs=0.011)
+    assert r3["mfe_lock_sl"] == pytest.approx(3600.0 + 0.42 * mfe, abs=0.011)
+    # Activation / BE / auto-BE untouched by the ladder reduction.
+    for key in ("trail_activation_threshold", "be_threshold", "auto_be_sl", "be_sl"):
+        assert rc[key] == r2[key] == r3[key]
+
+
+def test_production_picker_candidate_never_loosens_established_stop():
+    pol_cur = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05})
+    pol2 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05,
+                      "DYNAMIC_ATR_MFE_LOCK_TIERS": harness.LADDER_MINUS2PP_TIERS})
+    kw = dict(live=3605.5, peak=3605.5, atr=10.0, sl=3562.0)
+    established = _pick(pol_cur, **kw)
+    # Hysteresis carries the CURRENT ladder's established pct/profit into the
+    # candidate policy: the protected stop must not loosen.
+    carried = _pick(pol2, mfe_lock_prev_pct=established["mfe_lock_fraction"],
+                    mfe_lock_prev_profit=established["mfe_lock_profit"], **kw)
+    assert carried["mfe_lock_fraction"] == pytest.approx(established["mfe_lock_fraction"])
+    assert carried["mfe_lock_profit"] == pytest.approx(established["mfe_lock_profit"])
+    assert carried["mfe_lock_sl"] == pytest.approx(established["mfe_lock_sl"])
+
+
+def test_two_run_determinism_l2pp_on_nov23(tmp_path):
+    bars = harness.fetch_m1_bars(bars_json_path=NOV23_TAPE)
+    bars_file = tmp_path / "bars.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    run1 = harness._run_arm_subprocess(
+        "l2pp", REPO_ROOT, bars_file, tmp_path / "l2pp_run1.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, exit_binding=True,
+    )
+    run2 = harness._run_arm_subprocess(
+        "l2pp", REPO_ROOT, bars_file, tmp_path / "l2pp_run2.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True, exit_binding=True,
+    )
+    assert run1["bars_sha256"] == run2["bars_sha256"] == NOV23_BARS_SHA256
+    assert run1["arm_params"] == run2["arm_params"]
+    assert run1["summary"]["error_count"] == 0
+    assert len(run1["results"]) == 9
+    assert json.dumps(run1["results"], sort_keys=True) == json.dumps(run2["results"], sort_keys=True)
+    assert json.dumps(run1["summary"], sort_keys=True) == json.dumps(run2["summary"], sort_keys=True)
+    # Exit binding telemetry is present and well-formed.
+    for r in run1["results"]:
+        assert isinstance(r.get("exit_binding"), list) and r["exit_binding"]
+        for eb in r["exit_binding"]:
+            assert set(eb["component_sls"]) == {
+                "atr_sl", "mfe_lock_sl", "r_lock_floor", "be_sl", "auto_be_sl", "milestone_floor"
+            }
+            if eb["exit_reason_code"] == "SL":
+                assert eb["binding_component"]
+
+
+@pytest.mark.parametrize("kind", ["normal_retracement", "high_atr", "sharp_reversal"])
+def test_ladder_candidates_premature_not_worse(tmp_path, kind):
+    runs = {m: _run_scenario(tmp_path, kind, m) for m in ("s105", "l2pp", "l3pp")}
+    mets = {}
+    for m, payload in runs.items():
+        assert payload["summary"]["error_count"] == 0
+        mets[m] = harness._tight_comparison_metrics(payload["results"])
+    # Reducing clipping-tier protection must not INCREASE premature stop-outs.
+    assert mets["l2pp"]["premature_stop_outs"] <= mets["s105"]["premature_stop_outs"]
+    assert mets["l3pp"]["premature_stop_outs"] <= mets["s105"]["premature_stop_outs"]
+    assert mets["l2pp"]["stop_modify_failures"] == 0
+    assert mets["l3pp"]["stop_modify_failures"] == 0

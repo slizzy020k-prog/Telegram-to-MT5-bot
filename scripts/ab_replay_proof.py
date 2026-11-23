@@ -216,6 +216,7 @@ def _enrich_rlock_trace(st: Dict[str, Any], tiers: Any) -> None:
 # WHEN protection first armed on the simulated replay clock.
 # ---------------------------------------------------------------------------
 _PROTECTION_TELEMETRY = False
+_EXIT_BINDING_TELEMETRY = False
 _PROTECTION_TRACE: Dict[str, Any] = {}
 # Round-turn slippage estimate for the cost-adjusted metric view ($/oz per side).
 # Spread is already modeled per-bar from the tape (bid/ask); this adds an explicit
@@ -241,6 +242,10 @@ def _reset_protection_trace(msg_id: str) -> None:
         "max_mfe_lock_tier": 0.0,
         "max_mfe_lock_pct": 0.0,
         "max_mfe_lock_profit": 0.0,
+        # Per-layer last / last-applied production picker snapshots (exit binding
+        # evidence). Keyed by rounded layer entry price; layers sharing an entry
+        # share a slot (their picker math is identical).
+        "picker_by_layer": {},
     }
 
 
@@ -286,6 +291,17 @@ def _install_protection_trace(mt5_executor_mod: Any) -> None:
                 sign = 1.0 if str(kwargs.get("direction") or "BUY").strip().upper() == "BUY" else -1.0
                 if sign * (float(cand) - float(entry)) > 1e-9:
                     st["in_profit_candidate_calls"] += 1
+            if isinstance(entry, (int, float)):
+                slim = {k: res.get(k) for k in (
+                    "stop_source", "candidate_sl", "atr_sl", "mfe_lock_sl", "r_lock_floor",
+                    "be_sl", "auto_be_sl", "milestone_floor", "mfe_lock_tier",
+                    "mfe_lock_fraction", "mfe_lock_profit", "mfe_dollars", "trail_dist",
+                    "atr", "should_update",
+                )}
+                slot = st["picker_by_layer"].setdefault(str(round(float(entry), 4)), {"last": None, "last_applied": None})
+                slot["last"] = slim
+                if res.get("should_update"):
+                    slot["last_applied"] = slim
         return res
 
     mt5_executor_mod.compute_dynamic_atr_trail_stop = _traced
@@ -484,6 +500,39 @@ SCALE_COMPARISON_ARMS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# RESEARCH - binding-ladder backtest (binding-ladder-research-brief). Exit
+# binding telemetry on the upgraded+1.05 arm showed MFE_LOCK binds at 14/16
+# premature layer exits; the CLIPPING tiers are 0.40 (pct 0.45, 12 exits),
+# 0.60 (pct 0.55, 1 exit) and 1.00 (pct 0.70, 1 exit). Candidates reduce ONLY
+# those tiers' protected-% by 2 / 3 percentage points; activation ratios and
+# every other knob (auto 30-pip BE, ceilings, distance tiers, 2% relative ATR,
+# 1.05 trail scale, initial SL) stay UNCHANGED. Research only - NOT adopted.
+LADDER_CURRENT_TIERS = "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
+LADDER_MINUS2PP_TIERS = "0.40:0.43,0.60:0.53,0.80:0.65,1.00:0.68,1.25:0.75,1.50:0.80,2.00:0.85"
+LADDER_MINUS3PP_TIERS = "0.40:0.42,0.60:0.52,0.80:0.65,1.00:0.67,1.25:0.75,1.50:0.80,2.00:0.85"
+ARM_LADDER_MINUS2PP_PARAMS: Dict[str, Any] = {
+    **ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS,
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": LADDER_MINUS2PP_TIERS,
+}
+ARM_LADDER_MINUS3PP_PARAMS: Dict[str, Any] = {
+    **ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS,
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": LADDER_MINUS3PP_TIERS,
+}
+LADDER_RESEARCH_ARMS: Dict[str, Dict[str, Any]] = {
+    "s105": {
+        "params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS,
+        "label": "Current ladder (upgraded ATR-relative + 1.05 trail scale)",
+    },
+    "l2pp": {
+        "params": ARM_LADDER_MINUS2PP_PARAMS,
+        "label": "Candidate -2pp on clipping tiers 0.40/0.60/1.00 (ratios unchanged)",
+    },
+    "l3pp": {
+        "params": ARM_LADDER_MINUS3PP_PARAMS,
+        "label": "Candidate -3pp on clipping tiers 0.40/0.60/1.00 (ratios unchanged)",
+    },
+}
+
 # Registry of the experimental trailing arms (order = report order).
 TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
     "t1": {
@@ -506,7 +555,7 @@ TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
 
 # Arm modes that drive the production ATR engine on the simulated replay
 # clock (Arm A stays the frozen 4544f7f reference with the wall clock).
-_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight", "s100", "s105")
+_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight", "s100", "s105", "l2pp", "l3pp")
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
@@ -1741,6 +1790,48 @@ async def _run_single_trade_worker(
         _eff_tiers = ()
     _enrich_rlock_trace(_PICKER_TRACE, _eff_tiers)
 
+    # Exit binding evidence (research): for every closed layer, attribute the SL
+    # that was actually hit to the production picker component that proposed it
+    # (last APPLIED picker snapshot), and record the active MFE tier/pct plus
+    # every component's proposed SL at that point. FSM-other stops (legacy
+    # ratchet / stage-0 lock / manual BE paths that bypass the ATR picker) are
+    # labelled, never guessed.
+    exit_binding: List[Dict[str, Any]] = []
+    if _PROTECTION_TELEMETRY and _EXIT_BINDING_TELEMETRY:
+        _slots = _PROTECTION_TRACE.get("picker_by_layer") or {}
+        for ev in spy.closed_events:
+            _slot = _slots.get(str(round(float(ev["entry_price"]), 4))) or {}
+            _applied = _slot.get("last_applied") or _slot.get("last") or {}
+            _sl_hit = float(ev["exit_price"]) if str(ev.get("reason")) == "SL" else None
+            _comps = {k: _applied.get(k) for k in (
+                "atr_sl", "mfe_lock_sl", "r_lock_floor", "be_sl", "auto_be_sl", "milestone_floor"
+            )}
+            _binding = None
+            if _sl_hit is not None:
+                for _name, _val in _comps.items():
+                    if isinstance(_val, (int, float)) and abs(float(_val) - _sl_hit) < 0.011:
+                        _binding = _name
+                        break
+                if _binding is None and isinstance(_applied.get("candidate_sl"), (int, float)):
+                    if abs(float(_applied["candidate_sl"]) - _sl_hit) < 0.011:
+                        _binding = str(_applied.get("stop_source") or "UNKNOWN")
+                if _binding is None:
+                    _binding = "FSM_OTHER_OR_UNTRACKED"
+            exit_binding.append({
+                "layer": ev["layer"],
+                "entry_price": ev["entry_price"],
+                "exit_price": ev["exit_price"],
+                "exit_reason_code": ev["reason"],
+                "sl_hit": _sl_hit,
+                "binding_component": _binding,
+                "stop_source_last_applied": _applied.get("stop_source"),
+                "active_mfe_tier": _applied.get("mfe_lock_tier"),
+                "active_mfe_pct": _applied.get("mfe_lock_fraction"),
+                "mfe_at_exit": _applied.get("mfe_dollars"),
+                "component_sls": _comps,
+                "candidate_sl": _applied.get("candidate_sl"),
+            })
+
     net_gbp = spy.total_gbp()
     pts_lot = spy.total_pts_lot()
     realized_pts_per_oz = round(pts_lot / total_lot, 2) if total_lot > 0.0 else 0.0
@@ -1837,6 +1928,8 @@ async def _run_single_trade_worker(
                 "explicit_be": explicit_be_info,
             }
         )
+        if _EXIT_BINDING_TELEMETRY:
+            res["exit_binding"] = exit_binding
     return res
 
 
@@ -1846,6 +1939,7 @@ def _run_worker_main(
     out_path: Path,
     catalog_path: Optional[Path] = None,
     protection_telemetry: bool = False,
+    exit_binding: bool = False,
 ) -> int:
     runtime_tmp = tempfile.TemporaryDirectory(prefix=f"ab_replay_{arm_mode}_")
     try:
@@ -1880,9 +1974,10 @@ def _run_worker_main(
             # EXPERIMENTAL replay-only T3-tight override; never a production default.
             for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
-        elif arm_mode in SCALE_COMPARISON_ARMS:
-            # EXPERIMENTAL replay-only distance-scale override; never a production default.
-            for k, v in SCALE_COMPARISON_ARMS[arm_mode]["params"].items():
+        elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS:
+            # EXPERIMENTAL replay-only scale/ladder override; never a production default.
+            _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS[arm_mode]
+            for k, v in _reg["params"].items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
@@ -1913,7 +2008,8 @@ def _run_worker_main(
             elif arm_mode in TIGHT_COMPARISON_ARMS:
                 _arm_params = TIGHT_COMPARISON_ARMS[arm_mode]["params"]
             else:
-                _arm_params = SCALE_COMPARISON_ARMS[arm_mode]["params"]
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS[arm_mode]
+                _arm_params = _reg["params"]
             _pin_arm_experimental_params(
                 _arm_params, config, mt5_executor, main, f"Arm {arm_mode.upper()}",
             )
@@ -1933,7 +2029,8 @@ def _run_worker_main(
             elif arm_mode in TIGHT_COMPARISON_ARMS:
                 _pinned_keys = set(TIGHT_COMPARISON_ARMS[arm_mode]["params"])
             else:
-                _pinned_keys = set(SCALE_COMPARISON_ARMS[arm_mode]["params"])
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS[arm_mode]
+                _pinned_keys = set(_reg["params"])
             for _k, _v in _OPT_IN_PROTECTION_SHIPPED_DEFAULTS.items():
                 if _k in _pinned_keys:
                     continue
@@ -1956,6 +2053,7 @@ def _run_worker_main(
         if _PRODUCTION_ENGINE_ARM:
             _install_picker_trace(mt5_executor)
         globals()["_PROTECTION_TELEMETRY"] = bool(protection_telemetry)
+        globals()["_EXIT_BINDING_TELEMETRY"] = bool(exit_binding)
         if _PROTECTION_TELEMETRY:
             _install_protection_trace(mt5_executor)
 
@@ -2006,8 +2104,9 @@ def _run_worker_main(
                 effective.update(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
             elif arm_mode == "t3tight":
                 effective.update(ARM_T3TIGHT_EXPERIMENTAL_PARAMS)
-            elif arm_mode in SCALE_COMPARISON_ARMS:
-                effective.update(SCALE_COMPARISON_ARMS[arm_mode]["params"])
+            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS:
+                _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS[arm_mode]
+                effective.update(_reg["params"])
             arm_params_snapshot = {
                 "arm": arm_mode,
                 "pinned_params": effective,
@@ -2043,15 +2142,24 @@ def _run_worker_main(
                         if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
                     )
                 )
-            elif arm_mode in SCALE_COMPARISON_ARMS:
+            elif arm_mode in SCALE_COMPARISON_ARMS or arm_mode in LADDER_RESEARCH_ARMS:
                 arm_params_snapshot["experimental"] = True
-                arm_params_snapshot["experimental_note"] = (
-                    "EXPERIMENTAL distance-scale arm-param override (replay arm-param only; "
-                    "not production, not shipped). Upgraded ATR-relative config (192d4f7) "
-                    "with DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT="
-                    + str(SCALE_COMPARISON_ARMS[arm_mode]["params"]["DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"])
-                    + " (09aae20). Delta vs scale 1.00: DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT only."
-                )
+                if arm_mode in ("l2pp", "l3pp"):
+                    arm_params_snapshot["experimental_note"] = (
+                        "RESEARCH ladder candidate (replay arm-param only; NOT adopted). "
+                        "Upgraded ATR-relative config + 1.05 trail scale with clipping-tier "
+                        "protected-% reduced " + ("2" if arm_mode == "l2pp" else "3") +
+                        "pp on ratios 0.40/0.60/1.00; activation ratios and all other knobs unchanged."
+                    )
+                else:
+                    _reg = SCALE_COMPARISON_ARMS.get(arm_mode) or LADDER_RESEARCH_ARMS[arm_mode]
+                    arm_params_snapshot["experimental_note"] = (
+                        "EXPERIMENTAL distance-scale arm-param override (replay arm-param only; "
+                        "not production, not shipped). Upgraded ATR-relative config (192d4f7) "
+                        "with DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT="
+                        + str(_reg["params"]["DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"])
+                        + " (09aae20). Delta vs scale 1.00: DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT only."
+                    )
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
 
@@ -2580,6 +2688,7 @@ def _run_arm_subprocess(
     out_path: Path,
     catalog_path: Optional[Path] = None,
     protection_telemetry: bool = False,
+    exit_binding: bool = False,
 ) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(code_root)
@@ -2598,6 +2707,8 @@ def _run_arm_subprocess(
         cmd += ["--worker-catalog", str(catalog_path)]
     if protection_telemetry:
         cmd += ["--worker-protection-telemetry"]
+    if exit_binding:
+        cmd += ["--worker-exit-binding"]
     proc = subprocess.run(
         cmd, cwd=str(code_root), env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
@@ -2748,7 +2859,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             )
     else:
         single = arm_a or arm_b or arm_c or next(
-            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight", "s100", "s105"] if report.get(f"arm_{m}")), None
+            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight", "s100", "s105", "l2pp", "l3pp"] if report.get(f"arm_{m}")), None
         )
         assert single is not None
         ss = single["summary"]
@@ -2760,6 +2871,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "t3tight": f"EXPERIMENTAL Arm T3TIGHT ({TIGHT_COMPARISON_ARMS['t3tight']['label']})",
             "s100": f"EXPERIMENTAL Arm S100 ({SCALE_COMPARISON_ARMS['s100']['label']})",
             "s105": f"EXPERIMENTAL Arm S105 ({SCALE_COMPARISON_ARMS['s105']['label']})",
+            "l2pp": f"RESEARCH Arm L2PP ({LADDER_RESEARCH_ARMS['l2pp']['label']})",
+            "l3pp": f"RESEARCH Arm L3PP ({LADDER_RESEARCH_ARMS['l3pp']['label']})",
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -3012,6 +3125,10 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         ("scale_comparison", "s100", "s105", "Scale 1.00", "Scale 1.05", "1.05 - 1.00",
          "## Upgraded trail-distance scale 1.00 vs 1.05 (production engine replay) - EXPERIMENTAL, NOT shipped",
          "delta_s105_minus_s100"),
+        ("ladder_minus2pp_comparison", "s105", "l2pp", "Current", "-2pp", "-2pp - current",
+         "## RESEARCH ladder -2pp (clipping tiers) vs current - NOT adopted", "delta_l2pp_minus_current"),
+        ("ladder_minus3pp_comparison", "s105", "l3pp", "Current", "-3pp", "-3pp - current",
+         "## RESEARCH ladder -3pp (clipping tiers) vs current - NOT adopted", "delta_l3pp_minus_current"),
     ):
         tight = report.get(_comp_key)
         if not tight:
@@ -3172,7 +3289,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
     parser.add_argument(
         "--arm",
-        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "both", "trailing", "tight", "scale"),
+        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp", "both", "trailing", "tight", "scale", "ladder"),
         default="both",
         help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape. "
         "'tight' runs the EXPERIMENTAL T3 vs T3-tight comparison (optionally on a custom tape "
@@ -3201,11 +3318,12 @@ def main() -> int:
     )
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "l2pp", "l3pp"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-catalog", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-protection-telemetry", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--worker-exit-binding", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
@@ -3214,13 +3332,14 @@ def main() -> int:
             args.arm_mode, args.worker_bars, args.worker_out,
             catalog_path=args.worker_catalog,
             protection_telemetry=args.worker_protection_telemetry,
+            exit_binding=args.worker_exit_binding,
         )
 
     if args.refresh_tape is not None:
         return _refresh_tape(args.refresh_tape, args.spread_override)
 
-    if args.signals is not None and args.arm not in ("tight", "t3tight", "scale", "s100", "s105"):
-        parser.error("--signals is only supported with --arm tight/t3tight/scale/s100/s105")
+    if args.signals is not None and args.arm not in ("tight", "t3tight", "scale", "s100", "s105", "ladder", "l2pp", "l3pp"):
+        parser.error("--signals is only supported with --arm tight/t3tight/scale/s100/s105/ladder/l2pp/l3pp")
 
     bars_json_resolved = args.bars_json.resolve() if args.bars_json is not None else None
     if args.live_bars and bars_json_resolved != PINNED_TAPE_PATH.resolve():
@@ -3251,6 +3370,8 @@ def main() -> int:
         tight_arms: Dict[str, Dict[str, Any]] = {}
         scale_arms: Dict[str, Dict[str, Any]] = {}
         scale_single_res: Dict[str, Dict[str, Any]] = {}
+        ladder_arms: Dict[str, Dict[str, Any]] = {}
+        ladder_single_res: Dict[str, Dict[str, Any]] = {}
 
         if args.arm in ("a", "both", "trailing"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
@@ -3293,6 +3414,19 @@ def main() -> int:
                 args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json",
                 catalog_path=args.signals, protection_telemetry=True,
             )
+        if args.arm == "ladder":
+            # RESEARCH: current ladder vs -2pp / -3pp clipping-tier candidates
+            # on the identical tape + catalog (not adopted; controller decides).
+            for mode in ("s105", "l2pp", "l3pp"):
+                ladder_arms[mode] = _run_arm_subprocess(
+                    mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json",
+                    catalog_path=args.signals, protection_telemetry=True, exit_binding=True,
+                )
+        elif args.arm in ("l2pp", "l3pp"):
+            ladder_single_res[args.arm] = _run_arm_subprocess(
+                args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json",
+                catalog_path=args.signals, protection_telemetry=True, exit_binding=True,
+            )
 
     if args.arm == "tight":
         _err_t3 = int(tight_arms["t3"]["summary"]["error_count"])
@@ -3312,11 +3446,19 @@ def main() -> int:
             "s105_error_count": _err_s105,
             "all_gates_passed": bool(_err_s100 == 0 and _err_s105 == 0),
         }
+    elif args.arm == "ladder":
+        _errs = {m: int(ladder_arms[m]["summary"]["error_count"]) for m in ("s105", "l2pp", "l3pp")}
+        gates = {
+            "mode": "ladder_research",
+            "error_counts": _errs,
+            "all_gates_passed": all(v == 0 for v in _errs.values()),
+        }
     else:
         gates = _evaluate_gates(
             arm_a_res, arm_b_res, arm_c_res,
             arm_other=arm_t3tight_res
             or next((scale_single_res[m] for m in ("s100", "s105") if scale_single_res.get(m)), None)
+            or next((ladder_single_res[m] for m in ("l2pp", "l3pp") if ladder_single_res.get(m)), None)
             or next((arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]), None),
         )
 
@@ -3374,6 +3516,46 @@ def main() -> int:
                 "initial SL unchanged). Replay arm-param overrides only; not production, not shipped."
             ),
         )
+    ladder_minus2pp_comparison: Optional[Dict[str, Any]] = None
+    ladder_minus3pp_comparison: Optional[Dict[str, Any]] = None
+    binding_evidence: Optional[Dict[str, Any]] = None
+    if args.arm == "ladder":
+        _ladder_note = (
+            "RESEARCH binding-ladder backtest driving the PRODUCTION engine on the identical tape + "
+            "signal set. Current = upgraded ATR-relative config + 1.05 trail scale. Candidates reduce "
+            "ONLY the clipping tiers' protected-% (0.40/0.60/1.00, identified by exit binding telemetry) "
+            "by 2 / 3 percentage points; activation ratios and all other knobs unchanged. NOT adopted; "
+            "the controller decides from this evidence."
+        )
+        ladder_minus2pp_comparison = _build_side_by_side_comparison(
+            ladder_arms, LADDER_RESEARCH_ARMS, "s105", "l2pp",
+            ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "overrides_vs_current", "delta_l2pp_minus_current",
+            note=_ladder_note,
+        )
+        ladder_minus3pp_comparison = _build_side_by_side_comparison(
+            ladder_arms, LADDER_RESEARCH_ARMS, "s105", "l3pp",
+            ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS, "overrides_vs_current", "delta_l3pp_minus_current",
+            note=_ladder_note,
+        )
+        # Tail / worst-trade evidence per arm (research metric addition).
+        for _comp in (ladder_minus2pp_comparison, ladder_minus3pp_comparison):
+            for _m in _comp["arms"]:
+                _rows = sorted(ladder_arms[_m]["results"], key=lambda r: float(r["sim_gbp"]))
+                _comp["arms"][_m]["tail"] = {
+                    "worst_trade_gbp": round(float(_rows[0]["sim_gbp"]), 2) if _rows else 0.0,
+                    "worst_trade_msg": _rows[0]["msg_id"] if _rows else None,
+                    "worst_3_trades_gbp": round(sum(float(r["sim_gbp"]) for r in _rows[:3]), 2),
+                }
+        binding_evidence = {
+            m: [
+                {"msg_id": r["msg_id"], "exit_reason": r.get("exit_reason"),
+                 "peak_mfe_dollars": r.get("peak_mfe_dollars"),
+                 "realized_pts_per_oz": r.get("realized_pts_per_oz"),
+                 "exit_binding": r.get("exit_binding") or []}
+                for r in ladder_arms[m]["results"]
+            ]
+            for m in ("s105", "l2pp", "l3pp")
+        }
     signals_meta = None
     if args.signals is not None:
         _sp = json.loads(args.signals.read_text(encoding="utf-8"))
@@ -3412,7 +3594,12 @@ def main() -> int:
         "arm_t4": arm_t_res["t4"],
         "arm_t3tight": arm_t3tight_res or tight_arms.get("t3tight"),
         "arm_s100": scale_arms.get("s100") or scale_single_res.get("s100"),
-        "arm_s105": scale_arms.get("s105") or scale_single_res.get("s105"),
+        "arm_s105": scale_arms.get("s105") or scale_single_res.get("s105") or ladder_arms.get("s105"),
+        "arm_l2pp": ladder_arms.get("l2pp") or ladder_single_res.get("l2pp"),
+        "arm_l3pp": ladder_arms.get("l3pp") or ladder_single_res.get("l3pp"),
+        "ladder_minus2pp_comparison": ladder_minus2pp_comparison,
+        "ladder_minus3pp_comparison": ladder_minus3pp_comparison,
+        "binding_evidence": binding_evidence,
         "tight_comparison": tight_comparison,
         "scale_comparison": scale_comparison,
         "signals_meta": signals_meta,
