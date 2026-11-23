@@ -670,3 +670,48 @@ def test_scale_atr_rise_cannot_loosen_established_stop():
     second = _eng("BUY", entry, 3708.0, pol, atr=8.0, r=32.0, peak=3708.0, sl=established)
     assert second["atr_sl"] < established
     assert second["should_update"] is False
+
+
+# ---------------------------------------------------------------------------
+# 11. Consolidated per-component binding-SL log (logging only, opt-in)
+# ---------------------------------------------------------------------------
+
+def test_binding_sl_log_lists_components_and_winner(monkeypatch, caplog):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    monkeypatch.setattr(config, "DYNAMIC_ATR_AUTO_BE_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_AUTO_BE_ENABLED", True)
+    ex = _ex(4.0)
+    sig = _sig(3700.0, 3690.0)
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 6.0, "BUY"))
+    lines = [r.getMessage() for r in caplog.records if "[T3 BINDING-SL]" in r.getMessage()]
+    assert lines, "consolidated binding-SL log must be emitted when armed + opt-in"
+    line = lines[-1]
+    for label in ("ATR_TRAIL=", "MFE_LOCK=", "R_LOCK=", "BE_LOCK=", "AUTO_BE=", "MILESTONE=", "WINNER=", "broker_sl="):
+        assert label in line, "missing component label " + label
+    assert "WINNER=MFE_LOCK" in line
+    assert "broker_sl=3704.8" in line
+
+
+def test_binding_sl_log_silent_at_defaults(caplog):
+    ex = _ex(4.0)
+    sig = _sig(3700.0, 3690.0)
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 6.0, "BUY"))
+    assert not any("[T3 BINDING-SL]" in r.getMessage() for r in caplog.records)
+
+
+def test_binding_sl_helper_formats_absent_as_dash(caplog):
+    ex = mt5_executor.MT5Executor(dry_run=True)
+    ts = {"atr_sl": 3700.4, "mfe_lock_sl": 3704.8, "mfe_lock_tier": 1.5, "mfe_lock_fraction": 0.80,
+          "r_lock_floor": None, "be_sl": 3700.5, "auto_be_sl": 3700.0, "milestone_floor": None,
+          "stop_source": "MFE_LOCK", "candidate_sl": 3704.8}
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        ex._log_t3_binding_sl("L1", 101, ts)
+    line = [r.getMessage() for r in caplog.records if "[T3 BINDING-SL]" in r.getMessage()][-1]
+    assert "R_LOCK=-" in line and "MILESTONE=-" in line
+    assert "ATR_TRAIL=3700.4" in line and "MFE_LOCK=3704.8" in line
+    assert "BE_LOCK=3700.5" in line and "AUTO_BE=3700.0" in line
+    assert "tier=1.50, pct=0.80" in line
+    assert "WINNER=MFE_LOCK -> broker_sl=3704.8" in line

@@ -8004,6 +8004,27 @@ class MT5Executor:
             return None
         return max(cands) if is_buy else min(cands)
 
+    def _log_t3_binding_sl(self, lk: str, t_int: int, trail_step: Dict[str, Any]) -> None:
+        """Consolidated per-component proposed SL + binding winner (logging only, opt-in).
+
+        Lists the SL each stop-management component proposes and which one wins
+        (broker-submitted). Absent candidates render as '-'. Never alters the stop.
+        """
+        def fmt(v: Any) -> str:
+            return "-" if v is None else f"{v}"
+        tier = float(trail_step.get("mfe_lock_tier") or 0.0)
+        pct = float(trail_step.get("mfe_lock_fraction") or 0.0)
+        logger.info(
+            f"[T3 BINDING-SL] {lk} #{t_int}: "
+            f"ATR_TRAIL={fmt(trail_step.get('atr_sl'))} | "
+            f"MFE_LOCK={fmt(trail_step.get('mfe_lock_sl'))} (tier={tier:.2f}, pct={pct:.2f}) | "
+            f"R_LOCK={fmt(trail_step.get('r_lock_floor'))} | "
+            f"BE_LOCK={fmt(trail_step.get('be_sl'))} | "
+            f"AUTO_BE={fmt(trail_step.get('auto_be_sl'))} | "
+            f"MILESTONE={fmt(trail_step.get('milestone_floor'))} | "
+            f"WINNER={trail_step.get('stop_source') or '-'} -> broker_sl={fmt(trail_step.get('candidate_sl'))}"
+        )
+
     def _log_t3_protection(
         self,
         lk: str,
@@ -8475,6 +8496,8 @@ class MT5Executor:
                 _forward_update_sig("fsm_floor", float(trail_step["milestone_floor"]))
             if t3_active:
                 self._log_t3_protection(lk, t_int, lv, trail_step, policy, digits)
+                if trail_step.get("armed"):
+                    self._log_t3_binding_sl(lk, t_int, trail_step)
 
             if trail_step.get("should_sweep_pending") or ("TP1" in seen_cleared):
                 sweep_pendings = True
