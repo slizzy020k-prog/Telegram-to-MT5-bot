@@ -5853,6 +5853,23 @@ def _resolve_edit_layer_sl(
     if is_prot_sig and _is_num(sig.get("sl")) and float(sig["sl"]) > 0.0:
         cands.append(float(sig["sl"]))
 
+    # Live broker SL fallback (defense-in-depth): a tracked-state gap must never let a
+    # provider edit loosen a protective stop. Mirror _resolve_ticket_current_sl by reading
+    # the actual broker stop for the layer ticket and treating it as an additional floor.
+    if is_prot_layer and isinstance(l_data, dict) and executor is not None:
+        ti = _safe_ticket_int(l_data.get("ticket"))
+        if ti is not None and ti > 0:
+            try:
+                is_buy_f = str(direction or "BUY").strip().upper() == "BUY"
+                sym_f = sig.get("symbol") or DEFAULT_SYMBOL
+                s_info_f = executor.get_symbol_info(sym_f)
+                digs_f = int(getattr(s_info_f, "digits", 2)) if s_info_f is not None else 2
+                live_floor = executor._resolve_ticket_current_sl(sig, ti, l_data, is_buy_f, digs_f)
+                if _is_num(live_floor) and float(live_floor) > 0.0:
+                    cands.append(float(live_floor))
+            except Exception:
+                pass
+
     if not cands:
         return candidate_sl
     is_buy = str(direction or "BUY").strip().upper() == "BUY"

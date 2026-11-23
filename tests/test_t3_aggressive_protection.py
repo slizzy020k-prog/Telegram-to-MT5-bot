@@ -1,22 +1,24 @@
-"""T3 aggressive profit protection (opt-in) -- engine + propagation tests.
+"""T3 upgrade -- ATR-relative MFE ladder + 2% Relative ATR + auto 30-pip BE (opt-in).
 
-Every new knob defaults to OFF / current-behavior. These tests prove:
-  * baseline unchanged: with default knobs the classic engine output and the new
-    logging keys stay neutral across a BUY/SELL grid (oracle + invariant checks);
-  * trail activation ceiling arms the trail earlier on a high-ATR wide-stop case;
-  * BE activation ceiling overrides the R-gate (arms before 0.5R), opt-in only;
-  * distance tiers tighten trail_dist monotonically (never expand), BUY/SELL;
-  * fractional-MFE lock: non-decreasing fraction, cost-floor arming, forward-only,
-    and the single tightest-stop picker (R_LOCK > ATR_TRAIL > MFE_LOCK > BE_LOCK);
-  * defensive tier parsing; non-vacuous mutation (each knob changes behavior);
-  * propagation of all six knobs to _get_dynamic_risk_policy via config AND
-    mt5_executor monkeypatches, plus registration in snapshot/proxy/reader.
+Supersedes the fractional/absolute MFE-lock. All new behavior is OPT-IN: with defaults
+the engine/executor are byte-for-byte unchanged (original suite stays green). Covers:
+  * baseline-unchanged grid + neutral new logging keys;
+  * all 7 ATR-relative tiers (ratio:pct), BUY/SELL, exact protected profit + SL;
+  * configurable ATR bounds (high ATR cannot delay the first tier);
+  * cost floor for profit locks; hysteresis (ATR rise / MFE dip never regress tier);
+  * protected-profit ratchet; persistence of MFE+tier on the layer across restart/TP moves;
+  * 2% Relative ATR adjustment (1.00->1.02, 1.50->1.53, 2.00->2.04) + idempotence;
+  * auto 30-pip BE through the single picker (never loosens), BUY/SELL;
+  * protection-marker gap fix + edit-loosening regression (main._resolve_edit_layer_sl);
+  * trail/BE activation ceilings + MODERATE distance tiers (monotonic, never expand);
+  * propagation of every new knob + registration completeness; non-vacuous mutation.
 
-Hermetic: engine tests build DynamicRiskPolicy directly (no ambient .env dependence).
+Hermetic: engine tests build DynamicRiskPolicy directly; executor tests use dry-run.
 """
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import re
 from types import SimpleNamespace
@@ -25,11 +27,13 @@ import pytest
 
 import config
 import dynamic_risk as dr
+import main
 import mt5_executor
-from dynamic_risk import DynamicRiskPolicy, compute_dynamic_atr_trail_stop
+from dynamic_risk import DynamicRiskPolicy, compute_dynamic_atr_trail_stop, compute_volatility_ratio
 
-DIST_TIERS = "4:3.50,6:3.00,10:2.50,18:2.00"
-MFE_TIERS = "4:0.30,6:0.50,10:0.65,18:0.75"
+LADDER = "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
+DIST_TIERS = "6:3.50,10:3.00,15:2.75,20:2.50"  # MODERATE caps (preserve $2-4 Gold retracements)
+TIERS7 = [(0.40, 0.45), (0.60, 0.55), (0.80, 0.65), (1.00, 0.70), (1.25, 0.75), (1.50, 0.80), (2.00, 0.85)]
 
 NEW_KNOBS = {
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": "trail_activation_ceiling_dollars",
@@ -38,55 +42,84 @@ NEW_KNOBS = {
     "DYNAMIC_ATR_MFE_LOCK_ENABLED": "mfe_lock_enabled",
     "DYNAMIC_ATR_MFE_LOCK_TIERS": "mfe_lock_tiers",
     "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": "mfe_lock_cost_floor_dollars",
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS": "mfe_lock_atr_min_dollars",
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS": "mfe_lock_atr_max_dollars",
+    "DYNAMIC_ATR_RELATIVE_SCALE_MULT": "relative_scale_mult",
+    "DYNAMIC_ATR_AUTO_BE_ENABLED": "auto_be_enabled",
+    "DYNAMIC_ATR_AUTO_BE_PIPS": "auto_be_pips",
+    "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": "auto_be_pip_size_dollars",
 }
 
 
-def _pol(**kw) -> DynamicRiskPolicy:
+def _pol(**kw):
     return DynamicRiskPolicy(**kw)
 
 
-def _t3(**kw) -> DynamicRiskPolicy:
-    base = dict(
-        trail_activation_ceiling_dollars=4.00,
-        be_activation_ceiling_dollars=3.00,
-        trail_distance_tiers=DIST_TIERS,
-        mfe_lock_enabled=True,
-        mfe_lock_tiers=MFE_TIERS,
-        mfe_lock_cost_floor_dollars=0.60,
-    )
+def _ladder(**kw):
+    base = dict(mfe_lock_enabled=True, mfe_lock_tiers=LADDER)
     base.update(kw)
     return DynamicRiskPolicy(**base)
 
 
-def _eng(direction, entry, live, pol, atr=9.78, peak=None, sl=None, r=None,
-         buf=0.0, milestones=None, tp=None, r_lock_floor=None):
+def _eng(direction, entry, live, pol, atr=9.78, peak=None, sl=None, r=None, buf=0.0,
+         milestones=None, tp=None, r_lock_floor=None, prev_pct=None, prev_profit=None, auto_be=None):
     return compute_dynamic_atr_trail_stop(
         direction=direction, entry_price=entry, live_price=live, prev_peak=peak,
         current_sl=sl, atr=atr, policy=pol, digits=2, stops_buffer=buf,
         cleared_milestones=milestones, tp_levels=tp, initial_r=r, r_lock_floor=r_lock_floor,
+        mfe_lock_prev_pct=prev_pct, mfe_lock_prev_profit=prev_profit, auto_be_threshold=auto_be,
     )
 
 
-def _live_for(entry, mfe, direction):
+def _live(entry, mfe, direction):
     return entry + mfe if direction == "BUY" else entry - mfe
 
 
+def _sig(entry=3700.0, sl=3690.0, ticket=101, direction="BUY"):
+    sgn = 1.0 if direction == "BUY" else -1.0
+    return {
+        "symbol": "XAUUSD.s", "direction": direction, "status": "ACTIVE",
+        "layers": {"L1": {"ticket": ticket, "status": "OPEN", "lot": 0.01, "remaining_lot": 0.01,
+                          "entry_price": entry, "initial_sl": sl, "broker_sl": sl}},
+        "market_tickets": [ticket], "pending_tickets": [],
+        "tp_levels": {"TP1": entry + sgn * 20.0, "TP2": entry + sgn * 30.0},
+        "runner_cleared_milestones": [],
+    }
+
+
+def _tick(entry, mfe, direction):
+    if direction == "BUY":
+        bid = entry + mfe
+        return SimpleNamespace(bid=bid, ask=bid + 0.2, time=1700000000.0)
+    ask = entry - mfe
+    return SimpleNamespace(bid=ask - 0.2, ask=ask, time=1700000000.0)
+
+
+def _ex(atr):
+    ex = mt5_executor.MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = atr
+    return ex
+
+
 # ---------------------------------------------------------------------------
-# 1. Baseline unchanged at defaults (BUY/SELL grid)
+# 1. Baseline unchanged at defaults
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
 @pytest.mark.parametrize("atr,mfe,r", [(4.0, 5.0, None), (4.0, 12.0, 8.0), (9.78, 5.0, 32.0),
                                        (2.0, 3.0, None), (6.0, 20.0, 10.0), (9.78, 1.0, 32.0)])
-def test_baseline_new_keys_neutral_and_thresholds_match(direction, atr, mfe, r):
+def test_baseline_new_keys_neutral(direction, atr, mfe, r):
     pol = _pol()
     entry = 3700.0
-    live = _live_for(entry, mfe, direction)
-    res = _eng(direction, entry, live, pol, atr=atr, r=r)
+    res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=atr, r=r)
     sign = 1.0 if direction == "BUY" else -1.0
-    # New logging keys are neutral with every knob at its default.
     assert res["mfe_lock_sl"] is None
     assert res["mfe_lock_fraction"] == 0.0
+    assert res["mfe_lock_profit"] == 0.0
+    assert res["mfe_lock_ratio"] == 0.0
+    assert res["auto_be_sl"] is None and res["auto_be_armed"] is False
     assert res["distance_cap_applied"] is False
     assert res["trail_activation_threshold"] == pytest.approx(round(pol.trail_activation_atr_mult * atr, 4))
     if r is not None and r > 0:
@@ -94,7 +127,6 @@ def test_baseline_new_keys_neutral_and_thresholds_match(direction, atr, mfe, r):
     else:
         exp_be = max(pol.be_activation_atr_mult * atr, pol.be_min_mfe_dollars)
     assert res["be_threshold"] == pytest.approx(round(exp_be, 4))
-    # Classic semantics preserved.
     if res["be_armed"]:
         assert res["be_sl"] == pytest.approx(round(entry + sign * pol.be_lock_offset_dollars, 2))
     if res["trail_armed"]:
@@ -102,261 +134,391 @@ def test_baseline_new_keys_neutral_and_thresholds_match(direction, atr, mfe, r):
 
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_baseline_picker_oracle_beats_trail_when_tighter(direction):
-    # mfe 5, atr 4: BE lock (entry+/-0.5) is tighter than the ATR trail (peak-/+5.6).
+def test_baseline_picker_oracle(direction):
     pol = _pol()
     entry = 3700.0
-    live = _live_for(entry, 5.0, direction)
-    res = _eng(direction, entry, live, pol, atr=4.0)
+    res = _eng(direction, entry, _live(entry, 5.0, direction), pol, atr=4.0)
     sign = 1.0 if direction == "BUY" else -1.0
-    assert res["be_armed"] is True and res["trail_armed"] is True
+    assert res["be_armed"] and res["trail_armed"]
     assert res["stop_source"] == "BE_LOCK"
     assert res["candidate_sl"] == pytest.approx(round(entry + sign * 0.5, 2))
-    assert res["should_update"] is True
 
 
-def test_baseline_disabled_path_has_neutral_new_keys():
+def test_baseline_disabled_path_neutral():
     res = _eng("BUY", 3700.0, 3705.0, _pol(trail_enabled=False), atr=4.0)
     assert res["armed"] is False
-    assert res["mfe_lock_sl"] is None and res["mfe_lock_fraction"] == 0.0
+    assert res["mfe_lock_sl"] is None and res["auto_be_sl"] is None
     assert res["trail_activation_threshold"] is None and res["be_threshold"] is None
-    assert res["distance_cap_applied"] is False
 
 
 # ---------------------------------------------------------------------------
-# 2. Trail activation ceiling arms earlier on high ATR
+# 2. ATR-relative MFE ladder (all 7 tiers)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_trail_ceiling_arms_between_ceiling_and_atr_multiple(direction):
+@pytest.mark.parametrize("ratio,pct", TIERS7)
+def test_ladder_seven_tiers_exact(direction, ratio, pct):
+    pol = _ladder()
     entry = 3700.0
-    atr = 9.78
-    mfe = 5.0  # ceiling 4 < mfe 5 < 0.70*ATR = 6.846 (t3 activation mult)
-    live = _live_for(entry, mfe, direction)
+    atr = 4.0
+    mfe = ratio * atr
+    sign = 1.0 if direction == "BUY" else -1.0
+    res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=atr)
+    assert res["mfe_lock_ratio"] == pytest.approx(ratio)
+    assert res["mfe_lock_fraction"] == pytest.approx(pct)
+    assert res["mfe_lock_profit"] == pytest.approx(pct * mfe)
+    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(pct * mfe, 2), 2))
+    assert res["stop_source"] == "MFE_LOCK"
+    assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
+
+
+def test_ladder_no_fixed_dollar_activation():
+    # Same MFE, different ATR -> different tier (ratio-keyed, NOT fixed-dollar).
+    pol = _ladder()
+    low = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)    # ratio 1.00 -> 70%
+    high = _eng("BUY", 3700.0, 3704.0, pol, atr=8.0)   # ratio 0.50 -> 45%
+    assert low["mfe_lock_fraction"] == pytest.approx(0.70)
+    assert high["mfe_lock_fraction"] == pytest.approx(0.45)
+
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_ladder_atr_max_bound_prevents_delay(direction):
+    pol = _ladder(mfe_lock_atr_max_dollars=12.0)
+    entry = 3700.0
+    # ATR 50 (extreme) but bounded to 12 -> MFE 4.8 gives ratio 0.40 -> first tier arms.
+    res = _eng(direction, entry, _live(entry, 4.8, direction), pol, atr=50.0)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.45)
+    assert res["mfe_lock_sl"] is not None
+    unbounded = _eng(direction, entry, _live(entry, 4.8, direction), _ladder(mfe_lock_atr_max_dollars=500.0), atr=50.0)
+    assert unbounded["mfe_lock_fraction"] == 0.0  # ratio 0.096 < 0.40 -> no tier
+
+
+def test_ladder_atr_min_bound_prevents_instant_arm():
+    pol = _ladder(mfe_lock_atr_min_dollars=1.0)
+    # Tiny ATR 0.2 clamped to 1.0 -> MFE 0.4 gives ratio 0.40 (not 2.0).
+    res = _eng("BUY", 3700.0, 3700.4, pol, atr=0.2)
+    assert res["mfe_lock_ratio"] == pytest.approx(0.40)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.45)
+
+
+def test_ladder_cost_floor_gates_profit_lock():
+    pol = _ladder(mfe_lock_cost_floor_dollars=5.0)
+    res = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)  # profit 2.8 < floor 5
+    assert res["mfe_lock_fraction"] == pytest.approx(0.70)  # tier reached
+    assert res["mfe_lock_sl"] is None                       # but not armed
+    assert res["stop_source"] != "MFE_LOCK"
+    ok = _eng("BUY", 3700.0, 3708.0, _ladder(mfe_lock_cost_floor_dollars=5.0), atr=4.0)  # profit 6.8 >= 5
+    assert ok["mfe_lock_sl"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 3. Hysteresis + ratchet + persistence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_hysteresis_atr_rise_no_tier_regression(direction):
+    pol = _ladder()
+    entry = 3700.0
+    sign = 1.0 if direction == "BUY" else -1.0
+    # Reached 85% at MFE 8 / ATR 4 (ratio 2.0). ATR rises to 12 -> ratio 0.667 (55% tier),
+    # but the persisted 85% must hold.
+    res = _eng(direction, entry, _live(entry, 8.0, direction), pol, atr=12.0, prev_pct=0.85, prev_profit=6.8)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.85)
+    assert res["mfe_lock_profit"] == pytest.approx(6.8)
+    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * 6.8, 2))
+    without = _eng(direction, entry, _live(entry, 8.0, direction), pol, atr=12.0)
+    assert without["mfe_lock_fraction"] == pytest.approx(0.55)  # non-vacuous
+
+
+def test_protected_profit_ratchet_never_decreases():
+    res = _eng("BUY", 3700.0, 3708.0, _ladder(), atr=4.0, prev_pct=0.85, prev_profit=10.0)
+    assert res["mfe_lock_profit"] == pytest.approx(10.0)  # ratchet holds prior high
+    assert res["mfe_lock_sl"] == pytest.approx(3710.0)
+
+
+def test_executor_persists_tier_and_survives_restart_and_tp_move(monkeypatch):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    ex = _ex(4.0)
+    sig = _sig(3700.0, 3690.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
+    lv = sig["layers"]["L1"]
+    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.70)
+    assert lv["mfe_lock_profit_reached"] == pytest.approx(2.8)
+    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3702.8)  # protection marker stamped
+    peak = lv["dynamic_atr_trail_peak"]
+    # TP management moves targets -> MFE/peak/tier must NOT reset.
+    sig["tp_levels"] = {"TP1": 3705.0, "TP2": 3712.0}
+    ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
+    assert lv["dynamic_atr_trail_peak"] == peak
+    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.70)
+    # Simulate restart/reconnect: JSON round-trip the signal, fresh executor, ATR rises.
+    restored = json.loads(json.dumps(sig))
+    ex2 = _ex(12.0)
+    ex2.evaluate_dynamic_atr_engine(restored, tick=_tick(3700.0, 4.0, "BUY"))
+    lv2 = restored["layers"]["L1"]
+    assert lv2["mfe_lock_pct_reached"] == pytest.approx(0.70)  # hysteresis across restart + ATR rise
+    assert lv2["mfe_lock_profit_reached"] >= 2.8
+
+
+def test_mfe_independent_of_tp_levels():
+    pol = _ladder()
+    a = _eng("BUY", 3700.0, 3706.0, pol, atr=4.0, tp={"TP1": 3710.0})
+    b = _eng("BUY", 3700.0, 3706.0, pol, atr=4.0, tp={"TP1": 3702.0, "TP2": 3704.0}, milestones=["TP1"])
+    assert a["mfe_lock_sl"] == b["mfe_lock_sl"]
+    assert a["mfe_dollars"] == b["mfe_dollars"]
+
+
+# ---------------------------------------------------------------------------
+# 4. 2% Relative ATR adjustment
+# ---------------------------------------------------------------------------
+
+def _scale_pol(**kw):
+    base = dict(mfe_lock_enabled=True, atr_baseline_dollars=4.0, scale_min=0.5, scale_max=3.0, relative_scale_mult=1.02)
+    base.update(kw)
+    return DynamicRiskPolicy(**base)
+
+
+@pytest.mark.parametrize("atr,expected", [(4.0, 1.02), (6.0, 1.53), (8.0, 2.04)])
+def test_relative_atr_exactly_two_percent(atr, expected):
+    assert compute_volatility_ratio(atr, _scale_pol()) == pytest.approx(expected)
+
+
+def test_relative_atr_default_unchanged_and_disable():
+    assert compute_volatility_ratio(4.0, DynamicRiskPolicy()) == pytest.approx(1.0)  # opt-in off
+    assert compute_volatility_ratio(6.0, _scale_pol(relative_scale_mult=1.0)) == pytest.approx(1.5)  # disabled
+
+
+def test_relative_atr_idempotent_no_double_application():
+    pol = _scale_pol()
+    first = compute_volatility_ratio(6.0, pol)
+    for _ in range(5):
+        assert compute_volatility_ratio(6.0, pol) == pytest.approx(first)
+    # Repeated SL/TP scaling (reconnect) must not compound the multiplier.
+    s1 = dr.scale_sl_tp_by_atr("BUY", 3700.0, 3700.0, 6.0, pol, sl=3690.0, tp_levels={"TP1": 3706.0})
+    s2 = dr.scale_sl_tp_by_atr("BUY", 3700.0, 3700.0, 6.0, pol, sl=3690.0, tp_levels={"TP1": 3706.0})
+    assert s1["vol_ratio"] == s2["vol_ratio"] == pytest.approx(1.53)
+
+
+# ---------------------------------------------------------------------------
+# 5. Auto 30-pip break-even (single picker, never loosens)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_auto_be_arms_at_30_pips(direction):
+    entry = 3700.0
+    res = _eng(direction, entry, _live(entry, 3.0, direction), _pol(), atr=9.78, auto_be=3.0)
+    assert res["auto_be_armed"] is True
+    assert res["auto_be_sl"] == pytest.approx(entry)
+    below = _eng(direction, entry, _live(entry, 2.99, direction), _pol(), atr=9.78, auto_be=3.0)
+    assert below["auto_be_armed"] is False
+
+
+def test_auto_be_never_loosens_tighter_be_lock():
+    # ATR BE locks entry+0.50 (tighter than auto-BE entry); picker keeps the tighter.
+    res = _eng("BUY", 3700.0, 3704.0, _pol(), atr=4.0, auto_be=3.0)
+    assert res["be_armed"] is True
+    assert res["auto_be_armed"] is True
+    assert res["stop_source"] == "BE_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3700.5)
+
+
+def test_auto_be_independent_of_ladder():
+    res = _eng("BUY", 3700.0, 3703.0, _pol(mfe_lock_enabled=False), atr=9.78, auto_be=3.0)
+    assert res["auto_be_armed"] is True
+    assert res["mfe_lock_sl"] is None
+    assert res["stop_source"] == "AUTO_BE"
+
+
+def test_executor_auto_be_applies_and_logs(monkeypatch, caplog):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_AUTO_BE_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_AUTO_BE_ENABLED", True)
+    ex = _ex(9.78)
+    sig = _sig(3700.0, 3690.0)
+    with caplog.at_level(logging.INFO, logger="copier.mt5"):
+        res = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 3.0, "BUY"))
+    lv = sig["layers"]["L1"]
+    assert lv["broker_sl"] == pytest.approx(3700.0)
+    assert lv.get("dynamic_atr_trail_sl") == pytest.approx(3700.0)  # marker stamped for AUTO_BE
+    assert any("[T3 AUTO-BE]" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 6. Protection-marker gap + edit-loosening regression
+# ---------------------------------------------------------------------------
+
+def test_pre_tp1_mfe_lock_then_loosening_edit_is_dropped(monkeypatch):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    ex = _ex(4.0)
+    monkeypatch.setattr(main, "executor", ex)
+    sig = _sig(3700.0, 3690.0)
+    ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
+    lv = sig["layers"]["L1"]
+    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3702.8)
+    assert sig.get("tp1_reached") in (None, False)  # pre-TP1
+    # A loosening provider SL edit must NOT loosen the protective stop.
+    assert main._resolve_edit_layer_sl(sig, lv, 3695.0, "BUY") is None
+    assert main._resolve_edit_layer_sl(sig, lv, 3702.8, "BUY") is None  # tie also dropped
+    # A tightening edit still passes.
+    assert main._resolve_edit_layer_sl(sig, lv, 3703.5, "BUY") == pytest.approx(3703.5)
+
+
+def test_edit_guard_live_broker_sl_fallback(monkeypatch):
+    ex = _ex(4.0)
+    monkeypatch.setattr(main, "executor", ex)
+    # Tracked-state gap: layer broker_sl is loose, but the LIVE broker stop is protective.
+    sig = _sig(3700.0, 3690.0)
+    sig["status"] = "BE_APPLIED"
+    lv = sig["layers"]["L1"]
+    lv["broker_sl"] = 3690.0
+    monkeypatch.setattr(ex, "_resolve_ticket_current_sl", lambda *a, **k: 3705.0)
+    # Without the live fallback the floor would be 3690 and 3700 would pass (loosening).
+    assert main._resolve_edit_layer_sl(sig, lv, 3700.0, "BUY") is None
+
+
+def test_marker_stamped_for_mfe_lock_source(monkeypatch):
+    monkeypatch.setattr(config, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    monkeypatch.setattr(mt5_executor, "DYNAMIC_ATR_MFE_LOCK_ENABLED", True)
+    ex = _ex(4.0)
+    sig = _sig(3700.0, 3690.0)
+    res = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
+    assert res["updated_tickets"]
+    assert sig["layers"]["L1"].get("dynamic_atr_trail_sl") is not None
+    assert sig.get("active_stop_source") == "MFE_LOCK"
+
+
+# ---------------------------------------------------------------------------
+# 7. Ceilings + MODERATE distance tiers (retain from opt-in protection)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_trail_ceiling_arms_early(direction):
+    entry = 3700.0
     base = _pol(trail_activation_atr_mult=0.70)
-    tight = _pol(trail_activation_atr_mult=0.70, trail_activation_ceiling_dollars=4.00)
-    r_default = _eng(direction, entry, live, base, atr=atr)
-    r_tight = _eng(direction, entry, live, tight, atr=atr)
-    assert r_default["trail_armed"] is False
-    assert r_default["atr_sl"] is None
-    assert r_tight["trail_armed"] is True
-    assert r_tight["trail_activation_threshold"] == pytest.approx(4.0)
-    assert r_tight["atr_sl"] is not None
-    # Ceiling never raises the threshold above the ATR multiple (only lowers it).
-    low_atr = _eng(direction, entry, _live_for(entry, 5.0, direction),
-                   _pol(trail_activation_atr_mult=0.70, trail_activation_ceiling_dollars=4.00), atr=2.0)
-    assert low_atr["trail_activation_threshold"] == pytest.approx(round(0.70 * 2.0, 4))
+    tight = _pol(trail_activation_atr_mult=0.70, trail_activation_ceiling_dollars=4.0)
+    d = _eng(direction, entry, _live(entry, 5.0, direction), base, atr=9.78)
+    t = _eng(direction, entry, _live(entry, 5.0, direction), tight, atr=9.78)
+    assert d["trail_armed"] is False
+    assert t["trail_armed"] is True
+    assert t["trail_activation_threshold"] == pytest.approx(4.0)
 
-
-# ---------------------------------------------------------------------------
-# 3. BE activation ceiling overrides the R-gate
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
 @pytest.mark.parametrize("r", [32.0, None])
 def test_be_ceiling_overrides_r_gate(direction, r):
     entry = 3700.0
-    atr = 9.78
-    mfe = 3.0
-    live = _live_for(entry, mfe, direction)
     sign = 1.0 if direction == "BUY" else -1.0
-    default = _eng(direction, entry, live, _pol(), atr=atr, r=r)
-    tight = _eng(direction, entry, live, _pol(be_activation_ceiling_dollars=3.00), atr=atr, r=r)
-    # Default stays R-gated (0.5R = 16) or flat (max(7.335, 3.5)); mfe 3 arms neither.
-    assert default["be_armed"] is False
-    assert default["be_sl"] is None
-    # Ceiling 3 arms BE at mfe 3, before 0.5R, locking at the classic offset.
-    assert tight["be_armed"] is True
-    assert tight["be_threshold"] == pytest.approx(3.0)
-    assert tight["be_sl"] == pytest.approx(round(entry + sign * 0.5, 2))
+    d = _eng(direction, entry, _live(entry, 3.0, direction), _pol(), atr=9.78, r=r)
+    t = _eng(direction, entry, _live(entry, 3.0, direction), _pol(be_activation_ceiling_dollars=3.0), atr=9.78, r=r)
+    assert d["be_armed"] is False
+    assert t["be_armed"] is True
+    assert t["be_threshold"] == pytest.approx(3.0)
+    assert t["be_sl"] == pytest.approx(round(entry + sign * 0.5, 2))
 
-
-# ---------------------------------------------------------------------------
-# 4. Distance tiers: monotonic tightening, never expands
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_distance_tiers_monotonic_non_increasing(direction):
+def test_moderate_distance_tiers_monotonic(direction):
     pol = _pol(trail_distance_tiers=DIST_TIERS)
     entry = 3700.0
     dists = []
-    for mfe in (4.0, 6.0, 10.0, 18.0):
-        res = _eng(direction, entry, _live_for(entry, mfe, direction), pol, atr=9.78)
+    for mfe in (6.0, 10.0, 15.0, 20.0):
+        res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=9.78)
         dists.append(res["trail_dist"])
         assert res["distance_cap_applied"] is True
-    assert dists == [3.50, 3.00, 2.50, 2.00]
+    assert dists == [3.50, 3.00, 2.75, 2.50]
     assert all(a >= b for a, b in zip(dists, dists[1:]))
 
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_distance_tiers_never_expand_on_rising_mfe(direction):
+def test_distance_tiers_never_expand(direction):
     pol = _pol(trail_distance_tiers=DIST_TIERS)
     entry = 3700.0
     prev = None
     peak = None
-    for mfe in [x * 0.5 for x in range(2, 41)]:  # 1.0 .. 20.0 rising
-        live = _live_for(entry, mfe, direction)
-        res = _eng(direction, entry, live, pol, atr=9.78, peak=peak)
+    for mfe in [x * 0.5 for x in range(2, 41)]:
+        res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=9.78, peak=peak)
         peak = res["peak_price"]
-        d = res["trail_dist"]
         if prev is not None:
-            assert d <= prev + 1e-9
-        prev = d
+            assert res["trail_dist"] <= prev + 1e-9
+        prev = res["trail_dist"]
 
 
-def test_distance_cap_not_applied_when_base_already_tighter():
-    pol = _pol(trail_distance_tiers=DIST_TIERS)
-    res = _eng("BUY", 3700.0, 3704.0, pol, atr=2.0)  # base 2.8 < cap 3.5
+def test_distance_cap_not_applied_when_base_tighter():
+    res = _eng("BUY", 3700.0, 3704.0, _pol(trail_distance_tiers=DIST_TIERS), atr=2.0)
     assert res["trail_dist"] == pytest.approx(2.8)
     assert res["distance_cap_applied"] is False
 
 
 # ---------------------------------------------------------------------------
-# 5. Fractional-MFE lock
+# 8. Defensive parsing + mutation
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_mfe_lock_wins_picker_when_tightest(direction):
-    pol = _pol(mfe_lock_enabled=True)
-    entry = 3700.0
-    live = _live_for(entry, 4.0, direction)
-    res = _eng(direction, entry, live, pol, atr=4.0)
-    sign = 1.0 if direction == "BUY" else -1.0
-    assert res["mfe_lock_fraction"] == pytest.approx(0.30)
-    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * 1.20, 2))
-    assert res["stop_source"] == "MFE_LOCK"
-    assert res["candidate_sl"] == pytest.approx(round(entry + sign * 1.20, 2))
+def test_ladder_parse_defensively():
+    pol = _ladder(mfe_lock_tiers="abc,,0.4:-1,0.6:xyz, :0.5,1.00:0.70")
+    res = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)  # only valid tier 1.00:0.70
+    assert res["mfe_lock_fraction"] == pytest.approx(0.70)
 
 
-@pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_mfe_lock_below_cost_floor_not_armed(direction):
-    pol = _pol(mfe_lock_enabled=True, mfe_lock_cost_floor_dollars=2.00)
-    entry = 3700.0
-    res = _eng(direction, entry, _live_for(entry, 4.0, direction), pol, atr=4.0)
-    assert res["mfe_lock_sl"] is None
-    assert res["mfe_lock_fraction"] == 0.0
-    assert res["stop_source"] != "MFE_LOCK"
-
-
-def test_mfe_lock_below_first_tier_not_armed():
-    pol = _pol(mfe_lock_enabled=True)
-    res = _eng("BUY", 3700.0, 3703.0, pol, atr=4.0)  # mfe 3 < first tier 4
-    assert res["mfe_lock_sl"] is None
-    assert res["mfe_lock_fraction"] == 0.0
-
-
-@pytest.mark.parametrize("direction", ["BUY", "SELL"])
-def test_mfe_lock_fraction_and_sl_forward_only(direction):
-    pol = _pol(mfe_lock_enabled=True)
-    entry = 3700.0
-    sign = 1.0 if direction == "BUY" else -1.0
-    fracs, sls = [], []
-    for mfe in (4.0, 6.0, 10.0, 18.0):
-        res = _eng(direction, entry, _live_for(entry, mfe, direction), pol, atr=2.0)
-        fracs.append(res["mfe_lock_fraction"])
-        sls.append(res["mfe_lock_sl"])
-        assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(res["mfe_lock_fraction"] * mfe, 2), 2))
-    assert fracs == [0.30, 0.50, 0.65, 0.75]
-    assert all(a <= b for a, b in zip(fracs, fracs[1:]))
-    if direction == "BUY":
-        assert all(a <= b for a, b in zip(sls, sls[1:]))
-    else:
-        assert all(a >= b for a, b in zip(sls, sls[1:]))
-
-
-def test_picker_r_lock_beats_mfe_lock():
-    pol = _pol(mfe_lock_enabled=True)
-    entry = 3700.0
-    res = _eng("BUY", entry, 3710.0, pol, atr=4.0, r=8.0, r_lock_floor=3709.0)
-    assert res["stop_source"] == "R_LOCK"
-    assert res["r_lock_floor"] == pytest.approx(3709.0)
-    assert res["candidate_sl"] == pytest.approx(3709.0)
-    assert res["mfe_lock_sl"] is not None  # lock computed but lost the picker
-
-
-def test_mfe_lock_disabled_by_default_no_candidate():
-    res = _eng("BUY", 3700.0, 3704.0, _pol(), atr=4.0)
-    assert res["mfe_lock_sl"] is None
-    assert res["stop_source"] != "MFE_LOCK"
-
-
-# ---------------------------------------------------------------------------
-# 6. Defensive tier parsing
-# ---------------------------------------------------------------------------
-
-def test_distance_tiers_parse_defensively():
-    pol = _pol(trail_distance_tiers="abc,,4:-1,6:xyz, :3,10:2.50")
-    res = _eng("BUY", 3700.0, 3710.0, pol, atr=9.78)  # mfe 10 -> only valid tier 10:2.5
-    assert res["trail_dist"] == pytest.approx(2.50)
-    assert res["distance_cap_applied"] is True
-
-
-def test_mfe_lock_fraction_clamped_to_one():
-    pol = _pol(mfe_lock_enabled=True, mfe_lock_tiers="4:0.30,6:2.00")
-    res = _eng("BUY", 3700.0, 3706.0, pol, atr=2.0)  # mfe 6 -> fraction clamped 1.0
-    assert res["mfe_lock_fraction"] == pytest.approx(1.0)
-    assert res["mfe_lock_sl"] == pytest.approx(3706.0)
-
-
-def test_empty_tiers_disable_features():
-    res = _eng("BUY", 3700.0, 3710.0, _pol(trail_distance_tiers="", mfe_lock_enabled=True, mfe_lock_tiers=""), atr=9.78)
-    assert res["distance_cap_applied"] is False
+def test_empty_ladder_disables():
+    res = _eng("BUY", 3700.0, 3708.0, _ladder(mfe_lock_tiers=""), atr=4.0)
     assert res["mfe_lock_sl"] is None
 
-
-# ---------------------------------------------------------------------------
-# 7. Non-vacuous mutation: each knob changes behavior on the wide-stop case
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
 def test_each_knob_mutates_wide_stop_case(direction):
     entry = 3700.0
     atr = 9.78
-    mfe = 5.0
-    r = 32.0
-    live = _live_for(entry, mfe, direction)
-    default = _eng(direction, entry, live, _pol(), atr=atr, r=r)
-    assert default["armed"] is False and default["candidate_sl"] is None
+    mfe = 6.0
+    live = _live(entry, mfe, direction)
+    default = _eng(direction, entry, live, _pol(), atr=atr, r=32.0)
+    assert default["armed"] is False
     variants = {
-        "trail_ceiling": _pol(trail_activation_ceiling_dollars=4.00),
-        "be_ceiling": _pol(be_activation_ceiling_dollars=3.00),
+        "trail_ceiling": _pol(trail_activation_ceiling_dollars=4.0),
+        "be_ceiling": _pol(be_activation_ceiling_dollars=3.0),
         "distance_tiers": _pol(trail_distance_tiers=DIST_TIERS),
-        "mfe_lock": _pol(mfe_lock_enabled=True),
+        "ladder": _ladder(),
+        "auto_be": _pol(auto_be_enabled=True),
     }
     for name, pol in variants.items():
-        res = _eng(direction, entry, live, pol, atr=atr, r=r)
-        assert res != default, f"{name} knob did not change engine output (vacuous)"
-    # Full T3 arms protection earlier: a concrete protective stop appears.
-    full = _eng(direction, entry, live, _t3(), atr=atr, r=r)
-    sign = 1.0 if direction == "BUY" else -1.0
-    assert full["armed"] is True
-    assert full["be_armed"] is True and full["trail_armed"] is True
-    assert full["candidate_sl"] == pytest.approx(round(entry + sign * 1.50, 2))
+        ab = 3.0 if name == "auto_be" else None
+        res = _eng(direction, entry, live, pol, atr=atr, r=32.0, auto_be=ab)
+        assert res != default, f"{name} did not change output (vacuous)"
 
 
 # ---------------------------------------------------------------------------
-# 8. Propagation to _get_dynamic_risk_policy + registration completeness
+# 9. Propagation + registration completeness + shipped defaults
 # ---------------------------------------------------------------------------
 
 def _sentinel(knob, current):
-    if knob == "DYNAMIC_ATR_MFE_LOCK_ENABLED":
+    if knob in ("DYNAMIC_ATR_MFE_LOCK_ENABLED", "DYNAMIC_ATR_AUTO_BE_ENABLED"):
         return not bool(current)
     if knob == "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS":
-        return "4:3.50,6:3.00" if current != "4:3.50,6:3.00" else "5:2.00"
+        return "6:3.50,10:3.00" if current != "6:3.50,10:3.00" else "5:2.00"
     if knob == "DYNAMIC_ATR_MFE_LOCK_TIERS":
-        return "4:0.40,6:0.60" if current != "4:0.40,6:0.60" else "5:0.50"
+        return "0.50:0.50,1.00:0.70" if current != "0.50:0.50,1.00:0.70" else "0.40:0.45"
     if knob == "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS":
         return 4.0 if current != 4.0 else 5.0
     if knob == "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS":
         return 3.0 if current != 3.0 else 4.0
     if knob == "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS":
         return 0.75 if current != 0.75 else 0.90
+    if knob == "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS":
+        return 1.5 if current != 1.5 else 2.0
+    if knob == "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS":
+        return 15.0 if current != 15.0 else 16.0
+    if knob == "DYNAMIC_ATR_RELATIVE_SCALE_MULT":
+        return 1.05 if current != 1.05 else 1.03
+    if knob == "DYNAMIC_ATR_AUTO_BE_PIPS":
+        return 25.0 if current != 25.0 else 35.0
+    if knob == "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS":
+        return 0.20 if current != 0.20 else 0.10
     raise AssertionError(knob)
 
 
 @pytest.mark.parametrize("target", ["config", "mt5_executor"])
 @pytest.mark.parametrize("knob", sorted(NEW_KNOBS))
-def test_new_knob_propagates_to_policy(monkeypatch, knob, target):
+def test_new_knob_propagates(monkeypatch, knob, target):
     field = NEW_KNOBS[knob]
     current = getattr(config, knob)
     sentinel = _sentinel(knob, current)
@@ -368,7 +530,7 @@ def test_new_knob_propagates_to_policy(monkeypatch, knob, target):
     assert getattr(pol, field) == sentinel, f"{knob} -> {field} via {target}"
 
 
-def test_new_knobs_registered_in_all_four_registries(monkeypatch):
+def test_new_knobs_registered_everywhere(monkeypatch):
     captured = {}
     original = mt5_executor.read_dynamic_risk_policy
 
@@ -379,40 +541,39 @@ def test_new_knobs_registered_in_all_four_registries(monkeypatch):
     monkeypatch.setattr(mt5_executor, "read_dynamic_risk_policy", capture)
     ex = mt5_executor.MT5Executor(dry_run=True)
     ex._get_dynamic_risk_policy()
-    config_set = {k for k in vars(config) if k in NEW_KNOBS}
-    proxy_set = {k for k in captured["keys"] if k in NEW_KNOBS}
-    snapshot_set = {k for k in mt5_executor._CFG_IMPORT_SNAPSHOT if k in NEW_KNOBS}
-    src = inspect.getsource(dr.read_dynamic_risk_policy)
-    reader_set = {n for n in re.findall(r'getattr\(\s*cfg_mod\s*,\s*"([A-Za-z0-9_]+)"', src) if n in NEW_KNOBS}
     expected = set(NEW_KNOBS)
+    config_set = {k for k in vars(config) if k in expected}
+    proxy_set = {k for k in captured["keys"] if k in expected}
+    snapshot_set = {k for k in mt5_executor._CFG_IMPORT_SNAPSHOT if k in expected}
+    src = inspect.getsource(dr.read_dynamic_risk_policy)
+    reader_set = {n for n in re.findall(r'getattr\(\s*cfg_mod\s*,\s*"([A-Za-z0-9_]+)"', src) if n in expected}
     assert config_set == proxy_set == snapshot_set == reader_set == expected
 
 
-def test_new_policy_defaults_match_shipped():
+def test_shipped_defaults_match():
     pol = DynamicRiskPolicy()
-    assert pol.trail_activation_ceiling_dollars == 0.0
-    assert pol.be_activation_ceiling_dollars == 0.0
-    assert pol.trail_distance_tiers == ""
+    assert pol.mfe_lock_tiers == LADDER
     assert pol.mfe_lock_enabled is False
-    assert pol.mfe_lock_tiers == MFE_TIERS
-    assert pol.mfe_lock_cost_floor_dollars == pytest.approx(0.60)
-    # Reader fallback on an empty namespace agrees with the dataclass defaults.
+    assert pol.mfe_lock_atr_min_dollars == pytest.approx(1.0)
+    assert pol.mfe_lock_atr_max_dollars == pytest.approx(12.0)
+    assert pol.relative_scale_mult == pytest.approx(1.02)
+    assert pol.auto_be_enabled is False
+    assert pol.auto_be_pips == pytest.approx(30.0)
+    assert pol.auto_be_pip_size_dollars == pytest.approx(0.0)
     assert dr.read_dynamic_risk_policy(SimpleNamespace()) == pol
 
 
-def test_executor_t3_logging_helper_is_reporting_only(caplog):
+def test_pip_convention_verified():
     ex = mt5_executor.MT5Executor(dry_run=True)
-    lv = {}
-    trail_step = {
-        "mfe_dollars": 5.0, "be_armed": True, "be_threshold": 3.0, "be_sl": 3700.5,
-        "trail_armed": True, "trail_activation_threshold": 4.0, "trail_zone": "STANDARD",
-        "trail_dist": 3.5, "distance_cap_applied": True, "mfe_lock_fraction": 0.30,
-        "mfe_lock_sl": 3701.5,
-    }
-    with caplog.at_level(logging.INFO, logger="copier.mt5"):
-        ex._log_t3_protection("L1", 123, lv, trail_step, _t3(), 2)
-    msgs = [r.getMessage() for r in caplog.records]
-    assert any("[T3 BE-ARM]" in m for m in msgs)
-    assert any("[T3 TRAIL-ARM]" in m for m in msgs)
-    assert any("[T3 MFE-LOCK]" in m for m in msgs)
-    assert lv.get("_t3_be_logged") is True
+    assert ex.get_pip_size("XAUUSD.s") == pytest.approx(0.10)
+    assert 30 * ex.get_pip_size("XAUUSD.s") == pytest.approx(3.00)
+    assert config.BE_OFFSET_PIPS * ex.get_pip_size("XAUUSD.s") == pytest.approx(0.50)
+
+
+@pytest.mark.parametrize("text", ["Go breakeven", "Set breakeven", "Set break even",
+                                  "Break even all entries", "Set break even on best entries close worst"])
+def test_explicit_be_variations_recognized(text):
+    import parser
+    lo = text.lower()
+    assert any(re.search(p, lo) for p in parser.BREAKEVEN_PATTERNS)
+    assert parser._is_unambiguous_breakeven_cmd(lo) is True

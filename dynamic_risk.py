@@ -73,8 +73,14 @@ class DynamicRiskPolicy:
     be_activation_ceiling_dollars: float = 0.0
     trail_distance_tiers: str = ""
     mfe_lock_enabled: bool = False
-    mfe_lock_tiers: str = "4:0.30,6:0.50,10:0.65,18:0.75"
+    mfe_lock_tiers: str = "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
     mfe_lock_cost_floor_dollars: float = 0.60
+    mfe_lock_atr_min_dollars: float = 1.00
+    mfe_lock_atr_max_dollars: float = 12.00
+    relative_scale_mult: float = 1.02
+    auto_be_enabled: bool = False
+    auto_be_pips: float = 30.0
+    auto_be_pip_size_dollars: float = 0.0
     tp_trail_enabled: bool = True
     tp_lift_atr_mult: float = 0.50
     tp_lift_progress_pct: float = 0.75
@@ -166,8 +172,14 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         be_activation_ceiling_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)),
         trail_distance_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS", "") or "").strip(),
         mfe_lock_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ENABLED", False)),
-        mfe_lock_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_TIERS", "4:0.30,6:0.50,10:0.65,18:0.75") or "4:0.30,6:0.50,10:0.65,18:0.75").strip(),
+        mfe_lock_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_TIERS", "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85") or "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85").strip(),
         mfe_lock_cost_floor_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 0.60), 0.60)),
+        mfe_lock_atr_min_dollars=max(0.01, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS", 1.00), 1.00)),
+        mfe_lock_atr_max_dollars=max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS", 12.00), 12.00)),
+        relative_scale_mult=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_RELATIVE_SCALE_MULT", 1.02), 1.02)),
+        auto_be_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_ENABLED", False)),
+        auto_be_pips=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIPS", 30.0), 30.0)),
+        auto_be_pip_size_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", 0.0), 0.0)),
         tp_trail_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_TP_TRAIL_ENABLED", True)),
         tp_lift_atr_mult=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_ATR_MULT", 0.50), 0.50)),
         tp_lift_progress_pct=_clamp(_safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", 0.75), 0.75), 0.10, 0.99),
@@ -180,7 +192,16 @@ def compute_volatility_ratio(atr: float, policy: DynamicRiskPolicy) -> float:
     atr_f = _safe_float(atr, 0.0)
     if atr_f <= 0.0 or policy.atr_baseline_dollars <= 0.0:
         return 1.0
-    return round(_clamp(atr_f / policy.atr_baseline_dollars, policy.scale_min, policy.scale_max), 4)
+    base = round(_clamp(atr_f / policy.atr_baseline_dollars, policy.scale_min, policy.scale_max), 4)
+    # T3 opt-in 2% Relative ATR adjustment, applied ONCE at source (recomputed from
+    # ATR/baseline every call, so it is idempotent across repeated calcs/reconnects).
+    # Gated on the opt-in MFE ladder so shipped defaults stay byte-for-byte unchanged;
+    # set DYNAMIC_ATR_RELATIVE_SCALE_MULT=1.0 to disable even when opted in.
+    if getattr(policy, "mfe_lock_enabled", False):
+        mult = _safe_float(getattr(policy, "relative_scale_mult", 1.0), 1.0)
+        if mult != 1.0:
+            return round(base * mult, 4)
+    return base
 
 
 def compute_atr_fallback_sl_distance(atr: float, policy: DynamicRiskPolicy) -> Optional[float]:
@@ -575,6 +596,9 @@ def compute_dynamic_atr_trail_stop(
     *,
     r_lock_floor: Optional[float] = None,
     initial_r: Optional[float] = None,
+    mfe_lock_prev_pct: Optional[float] = None,
+    mfe_lock_prev_profit: Optional[float] = None,
+    auto_be_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
 
@@ -632,6 +656,11 @@ def compute_dynamic_atr_trail_stop(
             "trail_zone": "STANDARD",
             "mfe_lock_sl": None,
             "mfe_lock_fraction": 0.0,
+            "mfe_lock_profit": 0.0,
+            "mfe_lock_ratio": 0.0,
+            "mfe_lock_tier": 0.0,
+            "auto_be_sl": None,
+            "auto_be_armed": False,
             "trail_activation_threshold": None,
             "be_threshold": None,
             "distance_cap_applied": False,
@@ -704,24 +733,47 @@ def compute_dynamic_atr_trail_stop(
     trail_armed = mfe + 1e-9 >= trail_activation_threshold
     atr_sl = round(peak_px - sign * trail_dist, digits) if trail_armed else None
 
-    # T3 opt-in: fractional-MFE profit lock candidate. fraction is non-decreasing with
-    # MFE and MFE is monotonic, so locked_profit is non-decreasing (forward-only). Arm
-    # only when it covers the spread+slippage cost floor (never a net-loss nominal lock).
+    # T3 opt-in: ATR-RELATIVE MFE protection ladder (NO fixed-dollar MFE activation).
+    # ratio = MFE / bounded_ATR; tier = highest whose ratio threshold <= ratio; protects
+    # pct fraction of MFE. HYSTERESIS: the persisted highest pct/profit never regresses
+    # even if ATR rises or MFE dips; protected_profit ratchets (forward-only). Arm the
+    # profit lock only when it covers the spread+slippage cost floor.
     mfe_lock_sl: Optional[float] = None
     mfe_lock_fraction = 0.0
+    mfe_lock_profit = 0.0
+    mfe_lock_ratio = 0.0
+    mfe_lock_tier = 0.0
     if policy.mfe_lock_enabled:
         mfe_pos = max(0.0, mfe)
-        fraction = 0.0
-        for thr, frac in _parse_mfe_lock_tiers(policy.mfe_lock_tiers):
-            if mfe_pos + 1e-9 >= thr:
-                fraction = max(fraction, frac)
+        atr_min = max(0.01, _safe_float(policy.mfe_lock_atr_min_dollars, 1.0))
+        atr_max = max(atr_min, _safe_float(policy.mfe_lock_atr_max_dollars, 12.0))
+        atr_bound = _clamp(atr_f, atr_min, atr_max)
+        ratio = (mfe_pos / atr_bound) if atr_bound > 0.0 else 0.0
+        mfe_lock_ratio = ratio
+        pct = 0.0
+        tier = 0.0
+        for thr, p in _parse_mfe_lock_tiers(policy.mfe_lock_tiers):
+            if ratio + 1e-9 >= thr:
+                if p >= pct:
+                    pct, tier = p, thr
             else:
                 break
-        locked_profit = fraction * mfe_pos
+        prev_pct = max(0.0, _safe_float(mfe_lock_prev_pct, 0.0))
+        pct = max(pct, prev_pct)  # hysteresis: never regress to a lower tier/pct
+        protected = max(pct * mfe_pos, max(0.0, _safe_float(mfe_lock_prev_profit, 0.0)))
+        mfe_lock_fraction = pct
+        mfe_lock_profit = protected
+        mfe_lock_tier = tier
         cost_floor = max(0.0, _safe_float(policy.mfe_lock_cost_floor_dollars, 0.0))
-        if mfe_pos > 0.0 and locked_profit + 1e-9 >= cost_floor:
-            mfe_lock_fraction = fraction
-            mfe_lock_sl = round(entry_price + sign * round(locked_profit, digits), digits)
+        if mfe_pos > 0.0 and pct > 0.0 and protected + 1e-9 >= cost_floor:
+            mfe_lock_sl = round(entry_price + sign * round(protected, digits), digits)
+
+    # T3 opt-in: automatic provider 30-pip break-even (SL -> entry), independent of the
+    # ATR ladder. The executor passes auto_be_threshold = pips * verified pip size.
+    auto_be_sl: Optional[float] = None
+    auto_be_thr = _safe_float(auto_be_threshold, 0.0)
+    if auto_be_thr > 0.0 and mfe + 1e-9 >= auto_be_thr:
+        auto_be_sl = round(entry_price, digits)
 
     milestone_floor = (
         _compute_milestone_floor(sign, entry_price, cleared_milestones, tp_levels, policy.be_lock_offset_dollars, digits)
@@ -740,6 +792,8 @@ def compute_dynamic_atr_trail_stop(
         candidates.append((3, "MFE_LOCK", mfe_lock_sl))
     if be_sl is not None:
         candidates.append((4, "BE_LOCK", be_sl))
+    if auto_be_sl is not None:
+        candidates.append((5, "AUTO_BE", auto_be_sl))
 
     armed = bool(candidates)
     if not armed:
@@ -763,14 +817,19 @@ def compute_dynamic_atr_trail_stop(
             "trail_zone": trail_zone,
             "mfe_lock_sl": mfe_lock_sl,
             "mfe_lock_fraction": mfe_lock_fraction,
+            "mfe_lock_profit": round(mfe_lock_profit, 4),
+            "mfe_lock_ratio": round(mfe_lock_ratio, 4),
+            "mfe_lock_tier": round(mfe_lock_tier, 4),
+            "auto_be_sl": auto_be_sl,
+            "auto_be_armed": auto_be_sl is not None,
             "trail_activation_threshold": round(trail_activation_threshold, 4),
             "be_threshold": round(be_threshold, 4),
             "distance_cap_applied": distance_cap_applied,
         }
 
-    # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > MFE_LOCK > BE_LOCK.
-    # (BE_LOCK moved 3 -> 4 to seat MFE_LOCK at 3; with the lock disabled the relative
-    # order of the remaining candidates is unchanged, so default tie-breaks are identical.)
+    # Tie-break priority: R_LOCK > MILESTONE_FLOOR > ATR_TRAIL > MFE_LOCK > BE_LOCK > AUTO_BE.
+    # (With the opt-in candidates disabled the relative order of the remaining candidates
+    # is unchanged, so default tie-breaks are identical.)
     # The picker always keeps the tightest stop, so a floor can only tighten it.
     _, stop_source, raw_sl = min(
         candidates,
@@ -805,6 +864,11 @@ def compute_dynamic_atr_trail_stop(
         "trail_zone": trail_zone,
         "mfe_lock_sl": mfe_lock_sl,
         "mfe_lock_fraction": mfe_lock_fraction,
+        "mfe_lock_profit": round(mfe_lock_profit, 4),
+        "mfe_lock_ratio": round(mfe_lock_ratio, 4),
+        "mfe_lock_tier": round(mfe_lock_tier, 4),
+        "auto_be_sl": auto_be_sl,
+        "auto_be_armed": auto_be_sl is not None,
         "trail_activation_threshold": round(trail_activation_threshold, 4),
         "be_threshold": round(be_threshold, 4),
         "distance_cap_applied": distance_cap_applied,

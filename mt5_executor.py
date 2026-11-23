@@ -31,15 +31,21 @@ from config import (
     DAILY_PNL_CACHE_TTL_SECONDS,
     DEFAULT_SYMBOL,
     DEFAULT_TP_STEP_PIPS,
+    DYNAMIC_ATR_AUTO_BE_ENABLED,
+    DYNAMIC_ATR_AUTO_BE_PIPS,
+    DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS,
     DYNAMIC_ATR_BASELINE_DOLLARS,
     DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS,
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS,
+    DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS,
     DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS,
     DYNAMIC_ATR_MFE_LOCK_ENABLED,
     DYNAMIC_ATR_MFE_LOCK_TIERS,
     DYNAMIC_ATR_PERIOD,
+    DYNAMIC_ATR_RELATIVE_SCALE_MULT,
     DYNAMIC_ATR_SLTP_ENABLED,
     DYNAMIC_ATR_TIMEFRAME,
     DYNAMIC_ATR_TP_LIFT_ATR_MULT,
@@ -223,6 +229,12 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_MFE_LOCK_ENABLED",
         "DYNAMIC_ATR_MFE_LOCK_TIERS",
         "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS",
+        "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS",
+        "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS",
+        "DYNAMIC_ATR_RELATIVE_SCALE_MULT",
+        "DYNAMIC_ATR_AUTO_BE_ENABLED",
+        "DYNAMIC_ATR_AUTO_BE_PIPS",
+        "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS",
         "DYNAMIC_ATR_TP_TRAIL_ENABLED",
         "DYNAMIC_ATR_TP_LIFT_ATR_MULT",
         "DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT",
@@ -1448,6 +1460,12 @@ class MT5Executor:
             DYNAMIC_ATR_MFE_LOCK_ENABLED=_cfg("DYNAMIC_ATR_MFE_LOCK_ENABLED", DYNAMIC_ATR_MFE_LOCK_ENABLED),
             DYNAMIC_ATR_MFE_LOCK_TIERS=_cfg("DYNAMIC_ATR_MFE_LOCK_TIERS", DYNAMIC_ATR_MFE_LOCK_TIERS),
             DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS=_cfg("DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS),
+            DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS=_cfg("DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS", DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS),
+            DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS=_cfg("DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS", DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS),
+            DYNAMIC_ATR_RELATIVE_SCALE_MULT=_cfg("DYNAMIC_ATR_RELATIVE_SCALE_MULT", DYNAMIC_ATR_RELATIVE_SCALE_MULT),
+            DYNAMIC_ATR_AUTO_BE_ENABLED=_cfg("DYNAMIC_ATR_AUTO_BE_ENABLED", DYNAMIC_ATR_AUTO_BE_ENABLED),
+            DYNAMIC_ATR_AUTO_BE_PIPS=_cfg("DYNAMIC_ATR_AUTO_BE_PIPS", DYNAMIC_ATR_AUTO_BE_PIPS),
+            DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS=_cfg("DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS),
             DYNAMIC_ATR_TP_TRAIL_ENABLED=_cfg("DYNAMIC_ATR_TP_TRAIL_ENABLED", DYNAMIC_ATR_TP_TRAIL_ENABLED),
             DYNAMIC_ATR_TP_LIFT_ATR_MULT=_cfg("DYNAMIC_ATR_TP_LIFT_ATR_MULT", DYNAMIC_ATR_TP_LIFT_ATR_MULT),
             DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT=_cfg("DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT", DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT),
@@ -1495,6 +1513,12 @@ class MT5Executor:
             front_run_offset=fr_off,
         )
         self.last_dynamic_risk_snapshot = snap
+        if policy.mfe_lock_enabled and policy.relative_scale_mult != 1.0 and snap.get("applied") and atr > 0.0 and policy.atr_baseline_dollars > 0.0:
+            base_ratio = round(min(max(atr / policy.atr_baseline_dollars, policy.scale_min), policy.scale_max), 4)
+            logger.info(
+                f"[T3 REL-ATR] {direction} {symbol}: original={base_ratio:.4f} "
+                f"adjusted={snap['vol_ratio']:.4f} mult={policy.relative_scale_mult:.4f}"
+            )
         if snap.get("applied"):
             logger.info(
                 f"[DYNAMIC RISK] {direction} {symbol} ({snap['mode']} {snap['timeframe']} "
@@ -8014,17 +8038,26 @@ class MT5Executor:
                     f"(trail_dist=${trail_step.get('trail_dist', 0.0):.2f}, cap_applied={bool(trail_step.get('distance_cap_applied'))})"
                 )
         if policy.mfe_lock_enabled:
-            frac = float(trail_step.get("mfe_lock_fraction") or 0.0)
+            pct = float(trail_step.get("mfe_lock_fraction") or 0.0)
+            profit = float(trail_step.get("mfe_lock_profit") or 0.0)
+            ratio = float(trail_step.get("mfe_lock_ratio") or 0.0)
+            tier = float(trail_step.get("mfe_lock_tier") or 0.0)
             lock_sl = trail_step.get("mfe_lock_sl")
-            if lv.get("_t3_mfe_frac") != frac or (lock_sl is not None and not lv.get("_t3_mfe_logged")):
-                lv["_t3_mfe_frac"] = frac
+            if lv.get("_t3_mfe_frac") != pct or (lock_sl is not None and not lv.get("_t3_mfe_logged")):
+                lv["_t3_mfe_frac"] = pct
                 if lock_sl is not None:
                     lv["_t3_mfe_logged"] = True
                 logger.info(
-                    f"[T3 MFE-LOCK] {lk} #{t_int}: mfe=${mfe:.2f} fraction={frac:.2f} "
-                    f"locked=${round(frac * mfe, digits):.2f} cost_floor=${policy.mfe_lock_cost_floor_dollars:.2f} "
+                    f"[T3 MFE-LOCK] {lk} #{t_int}: mfe=${mfe:.2f} MFE/ATR={ratio:.3f} tier={tier:.2f} "
+                    f"pct={pct:.2f} protected=${profit:.2f} cost_floor=${policy.mfe_lock_cost_floor_dollars:.2f} "
                     f"armed={lock_sl is not None} sl={lock_sl}"
                 )
+        if trail_step.get("auto_be_armed") and not lv.get("_t3_auto_be_logged"):
+            lv["_t3_auto_be_logged"] = True
+            logger.info(
+                f"[T3 AUTO-BE] {lk} #{t_int}: mfe=${mfe:.2f} >= {policy.auto_be_pips:.0f} pips "
+                f"-> SL=entry {trail_step.get('auto_be_sl')}"
+            )
 
     def evaluate_dynamic_atr_engine(
         self,
@@ -8048,6 +8081,7 @@ class MT5Executor:
             or policy.be_activation_ceiling_dollars > 0.0
             or bool(str(policy.trail_distance_tiers or "").strip())
             or bool(policy.mfe_lock_enabled)
+            or bool(policy.auto_be_enabled)
         )
         empty_disabled = {
             "enabled": False,
@@ -8132,6 +8166,12 @@ class MT5Executor:
         sym_info = self.get_symbol_info(symbol)
         digits = _int_num(getattr(sym_info, "digits", 2), 2) if sym_info else 2
         pip_size = self.get_pip_size(symbol)
+        # Auto 30-pip BE threshold in dollars (verified pip convention: gold $0.10/pip).
+        # 0.0 pip-size knob = use get_pip_size(symbol); >0 overrides explicitly. Opt-in.
+        auto_be_threshold = None
+        if policy.auto_be_enabled:
+            be_pip_sz = policy.auto_be_pip_size_dollars if policy.auto_be_pip_size_dollars > 0.0 else pip_size
+            auto_be_threshold = max(0.0, policy.auto_be_pips) * be_pip_sz
         stops_buffer = self._compute_stops_buffer(sym_info)
         live_price = float(tick.bid) if is_buy else float(tick.ask)
 
@@ -8403,10 +8443,20 @@ class MT5Executor:
                 apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
                 r_lock_floor=r_lock_floor,
                 initial_r=initial_r,
+                mfe_lock_prev_pct=lv.get("mfe_lock_pct_reached"),
+                mfe_lock_prev_profit=lv.get("mfe_lock_profit_reached"),
+                auto_be_threshold=auto_be_threshold,
             )
             if trail_step.get("peak_price") is not None:
                 lv["dynamic_atr_trail_peak"] = trail_step["peak_price"]
                 lv["mfe_peak_price"] = trail_step["peak_price"]
+            if policy.mfe_lock_enabled:
+                # Persist the highest ladder tier/pct + ratcheted profit on the layer record
+                # (JSON-safe; survives restart/reconnect via the signal state). Hysteresis.
+                prev_pct = _num(lv.get("mfe_lock_pct_reached"), 0.0)
+                prev_prof = _num(lv.get("mfe_lock_profit_reached"), 0.0)
+                lv["mfe_lock_pct_reached"] = round(max(prev_pct, _num(trail_step.get("mfe_lock_fraction"), 0.0)), 6)
+                lv["mfe_lock_profit_reached"] = round(max(prev_prof, _num(trail_step.get("mfe_lock_profit"), 0.0)), 6)
             last_trail_dist = trail_step.get("trail_dist") or last_trail_dist
             last_trail_mult = trail_step.get("trail_mult") or last_trail_mult
             last_trail_zone = trail_step.get("trail_zone") or last_trail_zone
@@ -8466,7 +8516,9 @@ class MT5Executor:
                     "atr": trail_step.get("atr", round(atr, 4)),
                     "pending_swept": [],
                 })
-            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK"):
+            if stop_source in ("ATR_TRAIL", "MILESTONE_FLOOR", "R_LOCK") or (
+                t3_active and stop_source in ("MFE_LOCK", "BE_LOCK", "AUTO_BE")
+            ):
                 lv["dynamic_atr_trail_sl"] = cand_sl
                 lv["dynamic_atr_trail_dist"] = trail_step["trail_dist"]
                 lv["dynamic_atr_trail_atr"] = trail_step["atr"]

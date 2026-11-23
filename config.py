@@ -611,11 +611,40 @@ DYNAMIC_ATR_TRAIL_DISTANCE_TIERS: str = (os.getenv("DYNAMIC_ATR_TRAIL_DISTANCE_T
 # Fractional-MFE profit lock: locks fraction*MFE above entry once it covers the
 # spread+slippage cost floor. Disabled by default; tiers used only when enabled.
 DYNAMIC_ATR_MFE_LOCK_ENABLED: bool = _env_bool("DYNAMIC_ATR_MFE_LOCK_ENABLED", False)
-DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "4:0.30,6:0.50,10:0.65,18:0.75").strip()
+# ATR-RELATIVE MFE protection ladder "ratio:pct,..." (NO fixed-dollar MFE activation).
+# tier arms when MFE/ATR >= ratio; protects pct fraction of MFE. Hysteresis keeps the
+# highest tier reached per layer. Used only when DYNAMIC_ATR_MFE_LOCK_ENABLED is True.
+DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85").strip()
 # Spread+slippage floor: the lock arms only when fraction*MFE >= this floor, so it
 # never locks a nominal profit that is a net loss after costs.
 DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 0.60, min_val=0.0, max_val=50.0
+)
+# Bound the ATR used for the MFE/ATR ratio so a high-ATR regime cannot delay the first
+# ladder tier indefinitely (and a tiny ATR cannot trigger it instantly). Opt-in only.
+DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS", 1.00, min_val=0.01, max_val=100.0, positive_only=True
+)
+DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS", 12.00, min_val=0.10, max_val=500.0, positive_only=True
+)
+# 2% Relative ATR adjustment: multiplies compute_volatility_ratio by EXACTLY this factor,
+# applied ONCE at source. Part of the opt-in T3 upgrade (applied only when the MFE ladder
+# is enabled) so shipped defaults are unchanged; set 1.0 to disable even when opted in.
+DYNAMIC_ATR_RELATIVE_SCALE_MULT: float = _env_float(
+    "DYNAMIC_ATR_RELATIVE_SCALE_MULT", 1.02, min_val=0.50, max_val=2.00, positive_only=True
+)
+# Automatic provider 30-pip break-even (SL -> entry), independent of the ATR ladder and
+# fed through the same tightest-stop picker. Opt-in (default False). Pip convention is
+# VERIFIED: get_pip_size gold = $0.10, so 30 pips = $3.00 (BE_OFFSET_PIPS 5 -> $0.50).
+DYNAMIC_ATR_AUTO_BE_ENABLED: bool = _env_bool("DYNAMIC_ATR_AUTO_BE_ENABLED", False)
+DYNAMIC_ATR_AUTO_BE_PIPS: float = _env_float(
+    "DYNAMIC_ATR_AUTO_BE_PIPS", 30.0, min_val=0.0, max_val=1000.0
+)
+# Pip-size source for auto-BE: 0.0 = use executor.get_pip_size(symbol) (verified gold $0.10);
+# >0 overrides the dollar value of one provider pip explicitly.
+DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS", 0.0, min_val=0.0, max_val=10.0
 )
 
 DYNAMIC_ATR_TP_TRAIL_ENABLED: bool = _env_bool("DYNAMIC_ATR_TP_TRAIL_ENABLED", True)
