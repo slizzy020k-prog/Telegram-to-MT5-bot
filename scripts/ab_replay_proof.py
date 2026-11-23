@@ -317,6 +317,27 @@ _DYNAMIC_ATR_PINNED_PARAMS: Dict[str, Any] = {
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
 }
 
+# Shipped defaults for the opt-in T3 protection knobs (5ac5fe2 / 5f47b48 /
+# 09aae20). The live .env may ACTIVATE these; every engine arm must see the
+# shipped default for any knob its own param set does not explicitly pin, so
+# all pre-existing arms stay byte-identical regardless of ambient activation
+# (same .env-independence philosophy as _DYNAMIC_ATR_PINNED_PARAMS).
+_OPT_IN_PROTECTION_SHIPPED_DEFAULTS: Dict[str, Any] = {
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 0.0,
+    "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 0.0,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "",
+    "DYNAMIC_ATR_MFE_LOCK_ENABLED": False,
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85",
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS": 1.00,
+    "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS": 12.00,
+    "DYNAMIC_ATR_RELATIVE_SCALE_MULT": 1.02,
+    "DYNAMIC_ATR_AUTO_BE_ENABLED": False,
+    "DYNAMIC_ATR_AUTO_BE_PIPS": 30.0,
+    "DYNAMIC_ATR_AUTO_BE_PIP_SIZE_DOLLARS": 0.0,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": 1.00,
+}
+
 # Calibrated v3.6.0 parameters (M1 Swarm Consensus + 9 canonical Rev 2 defaults)
 ARM_B_CALIBRATED_PARAMS: Dict[str, Any] = {
     "PROFIT_RATCHET_ENABLED": True,
@@ -434,6 +455,35 @@ TIGHT_COMPARISON_ARMS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# EXPERIMENTAL - 5% trail-distance scale backtest (engine commit 09aae20).
+# BOTH arms are the CURRENT upgraded ATR-relative config (192d4f7 'upgraded'
+# arm); the ONLY delta is DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT, applied by the
+# production engine AFTER the zone clamp + distance-tier cap (widens the ATR
+# trail distance ~5% even when a cap binds; MFE ladder / activation / auto-BE /
+# initial SL untouched; never-loosen preserved). s100 pins scale 1.0 explicitly
+# so the comparison is hermetic vs ambient .env. Replay arm-param overrides ONLY.
+ARM_T3TIGHT_SCALE100_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_T3TIGHT_EXPERIMENTAL_PARAMS,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": 1.00,
+}
+ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_T3TIGHT_EXPERIMENTAL_PARAMS,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT": 1.05,
+}
+
+# Side-by-side registry for "--arm scale" (upgraded scale 1.00 vs 1.05). Kept
+# SEPARATE from TIGHT_COMPARISON_ARMS so "--arm tight" stays byte-identical.
+SCALE_COMPARISON_ARMS: Dict[str, Dict[str, Any]] = {
+    "s100": {
+        "params": ARM_T3TIGHT_SCALE100_EXPERIMENTAL_PARAMS,
+        "label": "Upgraded ATR-relative config, trail distance scale 1.00",
+    },
+    "s105": {
+        "params": ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS,
+        "label": "Upgraded ATR-relative config, trail distance scale 1.05 (+5% retracement room, 09aae20)",
+    },
+}
+
 # Registry of the experimental trailing arms (order = report order).
 TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
     "t1": {
@@ -456,7 +506,7 @@ TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
 
 # Arm modes that drive the production ATR engine on the simulated replay
 # clock (Arm A stays the frozen 4544f7f reference with the wall clock).
-_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight",)
+_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight", "s100", "s105")
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
@@ -1811,6 +1861,10 @@ def _run_worker_main(
         if arm_mode in _ENGINE_ARM_MODES:
             for k, v in ARM_B_CALIBRATED_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+            # Neutralize ambient .env activation of the opt-in protection knobs
+            # BEFORE config import; arm-specific overrides below win.
+            for k, v in _OPT_IN_PROTECTION_SHIPPED_DEFAULTS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
         if arm_mode in ("c", "cx"):
             for k, v in ARM_C_CALIBRATED_PARAMS.items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
@@ -1825,6 +1879,10 @@ def _run_worker_main(
         elif arm_mode == "t3tight":
             # EXPERIMENTAL replay-only T3-tight override; never a production default.
             for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        elif arm_mode in SCALE_COMPARISON_ARMS:
+            # EXPERIMENTAL replay-only distance-scale override; never a production default.
+            for k, v in SCALE_COMPARISON_ARMS[arm_mode]["params"].items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
@@ -1848,16 +1906,43 @@ def _run_worker_main(
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
             _pin_arm_cx_params(config, mt5_executor, main)
-        else:  # t1..t4 / t3tight: EXPERIMENTAL override layered on top of Arm B
+        else:  # t1..t4 / t3tight / s100 / s105: EXPERIMENTAL override on Arm B
             _pin_arm_b_params(config, mt5_executor, main)
-            _arm_params = (
-                TRAILING_EXPERIMENT_ARMS[arm_mode]["params"]
-                if arm_mode in TRAILING_EXPERIMENT_ARMS
-                else TIGHT_COMPARISON_ARMS[arm_mode]["params"]
-            )
+            if arm_mode in TRAILING_EXPERIMENT_ARMS:
+                _arm_params = TRAILING_EXPERIMENT_ARMS[arm_mode]["params"]
+            elif arm_mode in TIGHT_COMPARISON_ARMS:
+                _arm_params = TIGHT_COMPARISON_ARMS[arm_mode]["params"]
+            else:
+                _arm_params = SCALE_COMPARISON_ARMS[arm_mode]["params"]
             _pin_arm_experimental_params(
                 _arm_params, config, mt5_executor, main, f"Arm {arm_mode.upper()}",
             )
+
+        # Hermetic opt-in isolation (module level): pin shipped defaults for any
+        # protection knob the arm's own param set does not explicitly carry, so
+        # ambient .env activation can never leak into an existing arm.
+        if arm_mode in _ENGINE_ARM_MODES:
+            if arm_mode == "b":
+                _pinned_keys = set(ARM_B_CALIBRATED_PARAMS)
+            elif arm_mode in ("c", "cx"):
+                _pinned_keys = set(ARM_B_CALIBRATED_PARAMS) | set(ARM_C_CALIBRATED_PARAMS)
+                if arm_mode == "cx":
+                    _pinned_keys |= set(ARM_CX_EXPERIMENTAL_PARAMS)
+            elif arm_mode in TRAILING_EXPERIMENT_ARMS:
+                _pinned_keys = set(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
+            elif arm_mode in TIGHT_COMPARISON_ARMS:
+                _pinned_keys = set(TIGHT_COMPARISON_ARMS[arm_mode]["params"])
+            else:
+                _pinned_keys = set(SCALE_COMPARISON_ARMS[arm_mode]["params"])
+            for _k, _v in _OPT_IN_PROTECTION_SHIPPED_DEFAULTS.items():
+                if _k in _pinned_keys:
+                    continue
+                for _mod in (config, mt5_executor, main):
+                    if hasattr(_mod, _k):
+                        setattr(_mod, _k, _v)
+                if hasattr(main, "_MAIN_CFG_SNAPSHOT") and isinstance(main._MAIN_CFG_SNAPSHOT, dict):
+                    if _k in main._MAIN_CFG_SNAPSHOT:
+                        main._MAIN_CFG_SNAPSHOT[_k] = _v
 
         # Arms B and C run on the simulated replay clock: the trade-age guard
         # reads the wall clock, and the replay simulates the RECORDED week.
@@ -1921,6 +2006,8 @@ def _run_worker_main(
                 effective.update(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
             elif arm_mode == "t3tight":
                 effective.update(ARM_T3TIGHT_EXPERIMENTAL_PARAMS)
+            elif arm_mode in SCALE_COMPARISON_ARMS:
+                effective.update(SCALE_COMPARISON_ARMS[arm_mode]["params"])
             arm_params_snapshot = {
                 "arm": arm_mode,
                 "pinned_params": effective,
@@ -1955,6 +2042,15 @@ def _run_worker_main(
                         for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items()
                         if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
                     )
+                )
+            elif arm_mode in SCALE_COMPARISON_ARMS:
+                arm_params_snapshot["experimental"] = True
+                arm_params_snapshot["experimental_note"] = (
+                    "EXPERIMENTAL distance-scale arm-param override (replay arm-param only; "
+                    "not production, not shipped). Upgraded ATR-relative config (192d4f7) "
+                    "with DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT="
+                    + str(SCALE_COMPARISON_ARMS[arm_mode]["params"]["DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"])
+                    + " (09aae20). Delta vs scale 1.00: DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT only."
                 )
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
@@ -2652,7 +2748,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             )
     else:
         single = arm_a or arm_b or arm_c or next(
-            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight"] if report.get(f"arm_{m}")), None
+            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight", "s100", "s105"] if report.get(f"arm_{m}")), None
         )
         assert single is not None
         ss = single["summary"]
@@ -2662,6 +2758,8 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "c": "Arm C (R Lock Only)",
             **{m: f"EXPERIMENTAL Arm {m.upper()} ({TRAILING_EXPERIMENT_ARMS[m]['label']})" for m in TRAILING_EXPERIMENT_ARMS},
             "t3tight": f"EXPERIMENTAL Arm T3TIGHT ({TIGHT_COMPARISON_ARMS['t3tight']['label']})",
+            "s100": f"EXPERIMENTAL Arm S100 ({SCALE_COMPARISON_ARMS['s100']['label']})",
+            "s105": f"EXPERIMENTAL Arm S105 ({SCALE_COMPARISON_ARMS['s105']['label']})",
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -2908,20 +3006,28 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 "and need an explicit owner decision.",
             ]
 
-    tight = report.get("tight_comparison")
-    if tight:
-        mt3 = tight["arms"]["t3"]["metrics"]
-        mtt = tight["arms"]["t3tight"]["metrics"]
-        d = tight["delta_tight_minus_t3"]
+    for _comp_key, _lk, _rk, _ll, _rl, _dl, _title, _dkey in (
+        ("tight_comparison", "t3", "t3tight", "T3", "T3-tight", "tight - T3",
+         "## T3 vs T3-tight (production engine replay) - EXPERIMENTAL, NOT shipped", "delta_tight_minus_t3"),
+        ("scale_comparison", "s100", "s105", "Scale 1.00", "Scale 1.05", "1.05 - 1.00",
+         "## Upgraded trail-distance scale 1.00 vs 1.05 (production engine replay) - EXPERIMENTAL, NOT shipped",
+         "delta_s105_minus_s100"),
+    ):
+        tight = report.get(_comp_key)
+        if not tight:
+            continue
+        mt3 = tight["arms"][_lk]["metrics"]
+        mtt = tight["arms"][_rk]["metrics"]
+        d = tight[_dkey]
         lines += [
             "",
-            "## T3 vs T3-tight (production engine replay) - EXPERIMENTAL, NOT shipped",
+            _title,
             "",
             "- {}".format(tight["note"]),
             "- Slippage allowance: `${:.2f}/oz per side` on top of the tape's per-bar spread.".format(tight["slippage_estimate_dollars_per_side"]),
             "- Commission estimate: `${:.2f}/oz round turn` ($7 per 1.00 lot RT; documented assumption).".format(tight["commission_estimate_dollars_per_oz_round_turn"]),
             "",
-            "| Metric | T3 | T3-tight | Delta (tight - T3) |",
+            "| Metric | {} | {} | Delta ({}) |".format(_ll, _rl, _dl),
             "|---|---:|---:|---:|",
         ]
 
@@ -2970,18 +3076,18 @@ def _render_markdown(report: Dict[str, Any]) -> str:
         lines += [
             "",
             "- Premature definition: {}".format(mt3["premature_definition"]),
-            "- Never protected T3: `{}` | T3-tight: `{}`".format(mt3["never_protected_trades"] or "none", mtt["never_protected_trades"] or "none"),
-            "- Premature trades T3: `{}` | T3-tight: `{}`".format(mt3["premature_stop_out_trades"] or "none", mtt["premature_stop_out_trades"] or "none"),
-            "- Exit reasons T3: `{}`".format(mt3["exit_reason_distribution"]),
-            "- Exit reasons T3-tight: `{}`".format(mtt["exit_reason_distribution"]),
+            "- Never protected {}: `{}` | {}: `{}`".format(_ll, mt3["never_protected_trades"] or "none", _rl, mtt["never_protected_trades"] or "none"),
+            "- Premature trades {}: `{}` | {}: `{}`".format(_ll, mt3["premature_stop_out_trades"] or "none", _rl, mtt["premature_stop_out_trades"] or "none"),
+            "- Exit reasons {}: `{}`".format(_ll, mt3["exit_reason_distribution"]),
+            "- Exit reasons {}: `{}`".format(_rl, mtt["exit_reason_distribution"]),
             "",
             "### Per-trade side by side",
             "",
-            "| Msg | Dir | Peak MFE $/oz | T3 GBP | T3 exit (stage) | T3 protect (min) | T3-tight GBP | T3-tight exit (stage) | T3-tight protect (min) |",
+            "| Msg | Dir | Peak MFE $/oz | {} GBP | {} exit (stage) | {} protect (min) | {} GBP | {} exit (stage) | {} protect (min) |".format(_ll, _ll, _ll, _rl, _rl, _rl),
             "|---|---|---:|---:|---|---:|---:|---|---:|",
         ]
         for row in tight["per_trade"]:
-            a, b = row["t3"], row["t3tight"]
+            a, b = row[_lk], row[_rk]
             ta = a["time_to_first_protection_min"]
             tb = b["time_to_first_protection_min"]
             lines.append(
@@ -2999,11 +3105,74 @@ def _render_markdown(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_side_by_side_comparison(
+    arms_payloads: Dict[str, Dict[str, Any]],
+    registry: Dict[str, Dict[str, Any]],
+    left: str,
+    right: str,
+    base_params: Dict[str, Any],
+    overrides_key: str,
+    delta_key: str,
+    note: str,
+) -> Dict[str, Any]:
+    """Side-by-side comparison payload for two engine-driven arms (pure reporting).
+
+    Shared by --arm tight (t3 vs t3tight) and --arm scale (s100 vs s105); the
+    structure/keys are identical so existing tight reports stay byte-identical.
+    """
+    def _side_row(r: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "sim_gbp": float(r["sim_gbp"]),
+            "exit_reason": r.get("exit_reason"),
+            "max_stage": int(r.get("max_stage") or 0),
+            "peak_mfe_dollars": round(float(r["peak_mfe_dollars"]), 2),
+            "realized_usd_per_oz": round(float(r["realized_pts_per_oz"]), 2),
+            "time_to_first_protection_min": r.get("time_to_first_protection_min"),
+            "first_protect_source": r.get("first_protect_source"),
+        }
+    _l_rows = {r["msg_id"]: r for r in arms_payloads[left]["results"]}
+    _r_rows = {r["msg_id"]: r for r in arms_payloads[right]["results"]}
+    _m_l = _tight_comparison_metrics(arms_payloads[left]["results"])
+    _m_r = _tight_comparison_metrics(arms_payloads[right]["results"])
+    return {
+        "experimental": True,
+        "note": note,
+        "slippage_estimate_dollars_per_side": SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE,
+        "commission_estimate_dollars_per_oz_round_turn": COMMISSION_ESTIMATE_DOLLARS_PER_OZ_ROUND_TURN,
+        "arms": {
+            m: {
+                "label": registry[m]["label"],
+                "params": registry[m]["params"],
+                overrides_key: {
+                    k: v for k, v in registry[m]["params"].items()
+                    if base_params.get(k) != v
+                },
+                "metrics": _m_l if m == left else _m_r,
+            }
+            for m in (left, right)
+        },
+        "per_trade": [
+            {"msg_id": mid, "dir": _l_rows[mid]["dir"], left: _side_row(_l_rows[mid]),
+             right: _side_row(_r_rows[mid])}
+            for mid in _l_rows
+        ],
+        delta_key: {
+            "net_profit_gbp": round(_m_r["net_profit_gbp"] - _m_l["net_profit_gbp"], 2),
+            "net_expectancy_gbp": round(_m_r["net_expectancy_gbp"] - _m_l["net_expectancy_gbp"], 4),
+            "mfe_given_back_gbp": round(_m_r["mfe_given_back_gbp"] - _m_l["mfe_given_back_gbp"], 2),
+            "premature_stop_outs": _m_r["premature_stop_outs"] - _m_l["premature_stop_outs"],
+            "cost_adjusted_net_profit_gbp": round(
+                _m_r["cost_adjusted"]["net_profit_gbp"] - _m_l["cost_adjusted"]["net_profit_gbp"], 2
+            ),
+        },
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
     parser.add_argument(
         "--arm",
-        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "both", "trailing", "tight"),
+        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105", "both", "trailing", "tight", "scale"),
         default="both",
         help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape. "
         "'tight' runs the EXPERIMENTAL T3 vs T3-tight comparison (optionally on a custom tape "
@@ -3032,7 +3201,7 @@ def main() -> int:
     )
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "s100", "s105"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-catalog", type=Path, default=None, help=argparse.SUPPRESS)
@@ -3050,8 +3219,8 @@ def main() -> int:
     if args.refresh_tape is not None:
         return _refresh_tape(args.refresh_tape, args.spread_override)
 
-    if args.signals is not None and args.arm not in ("tight", "t3tight"):
-        parser.error("--signals is only supported with --arm tight or --arm t3tight")
+    if args.signals is not None and args.arm not in ("tight", "t3tight", "scale", "s100", "s105"):
+        parser.error("--signals is only supported with --arm tight/t3tight/scale/s100/s105")
 
     bars_json_resolved = args.bars_json.resolve() if args.bars_json is not None else None
     if args.live_bars and bars_json_resolved != PINNED_TAPE_PATH.resolve():
@@ -3080,6 +3249,8 @@ def main() -> int:
         arm_t_res: Dict[str, Optional[Dict[str, Any]]] = {m: None for m in TRAILING_EXPERIMENT_ARMS}
         arm_t3tight_res: Optional[Dict[str, Any]] = None
         tight_arms: Dict[str, Dict[str, Any]] = {}
+        scale_arms: Dict[str, Dict[str, Any]] = {}
+        scale_single_res: Dict[str, Dict[str, Any]] = {}
 
         if args.arm in ("a", "both", "trailing"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
@@ -3109,6 +3280,19 @@ def main() -> int:
                 "t3tight", REPO_ROOT, bars_file, io_dir / "arm_t3tight.json",
                 catalog_path=args.signals, protection_telemetry=True,
             )
+        if args.arm == "scale":
+            # EXPERIMENTAL upgraded-config distance scale 1.00 vs 1.05 on the
+            # identical tape + catalog. Existing arms/modes are untouched.
+            for mode in ("s100", "s105"):
+                scale_arms[mode] = _run_arm_subprocess(
+                    mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json",
+                    catalog_path=args.signals, protection_telemetry=True,
+                )
+        elif args.arm in ("s100", "s105"):
+            scale_single_res[args.arm] = _run_arm_subprocess(
+                args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json",
+                catalog_path=args.signals, protection_telemetry=True,
+            )
 
     if args.arm == "tight":
         _err_t3 = int(tight_arms["t3"]["summary"]["error_count"])
@@ -3119,12 +3303,21 @@ def main() -> int:
             "t3tight_error_count": _err_tt,
             "all_gates_passed": bool(_err_t3 == 0 and _err_tt == 0),
         }
+    elif args.arm == "scale":
+        _err_s100 = int(scale_arms["s100"]["summary"]["error_count"])
+        _err_s105 = int(scale_arms["s105"]["summary"]["error_count"])
+        gates = {
+            "mode": "scale_comparison",
+            "s100_error_count": _err_s100,
+            "s105_error_count": _err_s105,
+            "all_gates_passed": bool(_err_s100 == 0 and _err_s105 == 0),
+        }
     else:
         gates = _evaluate_gates(
             arm_a_res, arm_b_res, arm_c_res,
-            arm_other=arm_t3tight_res or next(
-                (arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]), None
-            ),
+            arm_other=arm_t3tight_res
+            or next((scale_single_res[m] for m in ("s100", "s105") if scale_single_res.get(m)), None)
+            or next((arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]), None),
         )
 
     # EXPERIMENTAL Phase 3+4 trailing A/B evidence (replay arm-param overrides
@@ -3157,57 +3350,30 @@ def main() -> int:
         trailing_gates = _evaluate_trailing_gates(arm_a_res, arm_b_res, variants)
     tight_comparison: Optional[Dict[str, Any]] = None
     if args.arm == "tight":
-        def _side_row(r: Dict[str, Any]) -> Dict[str, Any]:
-            return {
-                "sim_gbp": float(r["sim_gbp"]),
-                "exit_reason": r.get("exit_reason"),
-                "max_stage": int(r.get("max_stage") or 0),
-                "peak_mfe_dollars": round(float(r["peak_mfe_dollars"]), 2),
-                "realized_usd_per_oz": round(float(r["realized_pts_per_oz"]), 2),
-                "time_to_first_protection_min": r.get("time_to_first_protection_min"),
-                "first_protect_source": r.get("first_protect_source"),
-            }
-        _t3_rows = {r["msg_id"]: r for r in tight_arms["t3"]["results"]}
-        _tt_rows = {r["msg_id"]: r for r in tight_arms["t3tight"]["results"]}
-        _m_t3 = _tight_comparison_metrics(tight_arms["t3"]["results"])
-        _m_tt = _tight_comparison_metrics(tight_arms["t3tight"]["results"])
-        tight_comparison = {
-            "experimental": True,
-            "note": (
+        tight_comparison = _build_side_by_side_comparison(
+            tight_arms, TIGHT_COMPARISON_ARMS, "t3", "t3tight",
+            ARM_T3_EXPERIMENTAL_PARAMS, "overrides_vs_t3", "delta_tight_minus_t3",
+            note=(
                 "EXPERIMENTAL T3 vs T3-tight comparison driving the PRODUCTION engine "
                 "(dynamic_risk.compute_dynamic_atr_trail_stop via mt5_executor.evaluate_dynamic_atr_engine) "
                 "on the identical tape + signal set. T3-tight = T3 plus the six opt-in 5ac5fe2 knobs. "
                 "Replay arm-param overrides only; not production, not shipped."
             ),
-            "slippage_estimate_dollars_per_side": SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE,
-            "commission_estimate_dollars_per_oz_round_turn": COMMISSION_ESTIMATE_DOLLARS_PER_OZ_ROUND_TURN,
-            "arms": {
-                m: {
-                    "label": TIGHT_COMPARISON_ARMS[m]["label"],
-                    "params": TIGHT_COMPARISON_ARMS[m]["params"],
-                    "overrides_vs_t3": {
-                        k: v for k, v in TIGHT_COMPARISON_ARMS[m]["params"].items()
-                        if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
-                    },
-                    "metrics": _m_t3 if m == "t3" else _m_tt,
-                }
-                for m in ("t3", "t3tight")
-            },
-            "per_trade": [
-                {"msg_id": mid, "dir": _t3_rows[mid]["dir"], "t3": _side_row(_t3_rows[mid]),
-                 "t3tight": _side_row(_tt_rows[mid])}
-                for mid in _t3_rows
-            ],
-            "delta_tight_minus_t3": {
-                "net_profit_gbp": round(_m_tt["net_profit_gbp"] - _m_t3["net_profit_gbp"], 2),
-                "net_expectancy_gbp": round(_m_tt["net_expectancy_gbp"] - _m_t3["net_expectancy_gbp"], 4),
-                "mfe_given_back_gbp": round(_m_tt["mfe_given_back_gbp"] - _m_t3["mfe_given_back_gbp"], 2),
-                "premature_stop_outs": _m_tt["premature_stop_outs"] - _m_t3["premature_stop_outs"],
-                "cost_adjusted_net_profit_gbp": round(
-                    _m_tt["cost_adjusted"]["net_profit_gbp"] - _m_t3["cost_adjusted"]["net_profit_gbp"], 2
-                ),
-            },
-        }
+        )
+    scale_comparison: Optional[Dict[str, Any]] = None
+    if args.arm == "scale":
+        scale_comparison = _build_side_by_side_comparison(
+            scale_arms, SCALE_COMPARISON_ARMS, "s100", "s105",
+            ARM_T3TIGHT_SCALE100_EXPERIMENTAL_PARAMS, "overrides_vs_s100", "delta_s105_minus_s100",
+            note=(
+                "EXPERIMENTAL upgraded-config trail-distance scale 1.00 vs 1.05 comparison driving the "
+                "PRODUCTION engine (dynamic_risk.compute_dynamic_atr_trail_stop via "
+                "mt5_executor.evaluate_dynamic_atr_engine) on the identical tape + signal set. "
+                "Only delta: DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT (09aae20), applied AFTER the zone "
+                "clamp + distance-tier cap (trail distance only; MFE ladder / activation / auto-BE / "
+                "initial SL unchanged). Replay arm-param overrides only; not production, not shipped."
+            ),
+        )
     signals_meta = None
     if args.signals is not None:
         _sp = json.loads(args.signals.read_text(encoding="utf-8"))
@@ -3245,7 +3411,10 @@ def main() -> int:
         "arm_t3": arm_t_res["t3"] or tight_arms.get("t3"),
         "arm_t4": arm_t_res["t4"],
         "arm_t3tight": arm_t3tight_res or tight_arms.get("t3tight"),
+        "arm_s100": scale_arms.get("s100") or scale_single_res.get("s100"),
+        "arm_s105": scale_arms.get("s105") or scale_single_res.get("s105"),
         "tight_comparison": tight_comparison,
+        "scale_comparison": scale_comparison,
         "signals_meta": signals_meta,
         "trailing_experiments": trailing_experiments,
         "trailing_gates": trailing_gates,

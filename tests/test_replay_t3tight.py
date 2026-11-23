@@ -485,3 +485,108 @@ def test_rapid_atr_change_tier_hysteresis_in_replay(tmp_path):
     # later ATR spike must not regress the persisted pct (hysteresis).
     assert float(rt["max_mfe_lock_pct"]) >= 0.75
     assert float(rt["sim_gbp"]) > 0.0
+
+
+# ---------------------------------------------------------------------------
+# 5% trail-distance scale backtest (engine 09aae20): upgraded config at
+# DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT 1.00 vs 1.05. Scale applies AFTER the
+# zone clamp + distance-tier cap; trail distance ONLY; never-loosen preserved.
+# ---------------------------------------------------------------------------
+
+SCALE_KNOB = "DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"
+
+
+def test_scale_arms_are_upgraded_plus_single_knob():
+    base = harness.ARM_T3TIGHT_EXPERIMENTAL_PARAMS
+    assert harness.ARM_T3TIGHT_SCALE100_EXPERIMENTAL_PARAMS == {**base, SCALE_KNOB: 1.00}
+    assert harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS == {**base, SCALE_KNOB: 1.05}
+    delta = {
+        k: v for k, v in harness.ARM_T3TIGHT_SCALE105_EXPERIMENTAL_PARAMS.items()
+        if harness.ARM_T3TIGHT_SCALE100_EXPERIMENTAL_PARAMS.get(k) != v
+    }
+    assert delta == {SCALE_KNOB: 1.05}
+    assert set(harness.SCALE_COMPARISON_ARMS) == {"s100", "s105"}
+    # Existing registries untouched.
+    assert set(harness.TIGHT_COMPARISON_ARMS) == {"t3", "t3tight"}
+    assert set(harness.TRAILING_EXPERIMENT_ARMS) == {"t1", "t2", "t3", "t4"}
+
+
+def test_production_picker_distance_scale_widens_after_cap():
+    import dynamic_risk
+
+    pol100 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.00})
+    pol105 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05})
+    # MFE $12, ATR $10: EXTENDED clamp gives 5.5, distance tier (MFE>=10) caps
+    # to 3.00; the scale must widen EVEN THOUGH the cap binds.
+    kw = dict(live=3612.0, peak=3612.0, atr=10.0, sl=3562.0)
+    r100 = _pick(pol100, **kw)
+    r105 = _pick(pol105, **kw)
+    assert r100["trail_dist"] == pytest.approx(3.00)
+    assert r105["trail_dist"] == pytest.approx(round(3.00 * 1.05, 2))
+    assert r105["trail_dist"] / r100["trail_dist"] == pytest.approx(1.05, abs=0.005)
+    assert r100["atr_sl"] == pytest.approx(3612.0 - 3.00)
+    assert r105["atr_sl"] == pytest.approx(3612.0 - round(3.00 * 1.05, 2))
+    # Everything except the ATR trail distance is unchanged.
+    for key in ("mfe_lock_sl", "mfe_lock_profit", "mfe_lock_fraction", "mfe_lock_tier",
+                "mfe_lock_ratio", "trail_activation_threshold", "be_threshold",
+                "auto_be_sl", "be_sl"):
+        assert r100[key] == r105[key], f"scale leaked into {key}"
+    # Here the trail (peak - 3.00 = 3609.00) is TIGHTER than the ladder lock
+    # (entry + 0.70*12 = 3608.40), so ATR_TRAIL wins the picker. The widened
+    # trail (3608.85) still beats the lock but is slightly looser than 1.00.
+    assert r100["stop_source"] == r105["stop_source"] == "ATR_TRAIL"
+    assert r100["candidate_sl"] == pytest.approx(3609.00)
+    assert r105["candidate_sl"] == pytest.approx(3612.0 - round(3.00 * 1.05, 2))
+    assert r105["candidate_sl"] <= r100["candidate_sl"]
+    assert r105["candidate_sl"] >= r105["mfe_lock_sl"]  # picker keeps the tightest
+    # Uncapped case: MFE $5, ATR $12 -> clamp 5.5, no tier cap; scale still applies.
+    u100 = _pick(pol100, live=3605.0, atr=12.0)
+    u105 = _pick(pol105, live=3605.0, atr=12.0)
+    assert u100["trail_dist"] == pytest.approx(5.50)
+    assert u105["trail_dist"] == pytest.approx(round(5.50 * 1.05, 2))
+
+
+def test_production_picker_distance_scale_never_loosens():
+    pol105 = _policy(**{**TIGHT_KNOBS, SCALE_KNOB: 1.05})
+    # An already-tighter established stop must never be loosened by the wider trail.
+    res = _pick(pol105, live=3612.0, peak=3612.0, atr=10.0, sl=3609.50)
+    assert res["should_update"] is False
+    # Constant scale preserves monotonic forward-only trail as the peak rises.
+    early = _pick(pol105, live=3612.0, peak=3612.0, atr=10.0, sl=3562.0)
+    later = _pick(pol105, live=3615.0, peak=3615.0, atr=10.0, sl=early["candidate_sl"])
+    assert later["atr_sl"] >= early["atr_sl"]
+    assert later["trail_dist"] <= early["trail_dist"]
+
+
+def test_two_run_determinism_s105_on_nov23(tmp_path):
+    bars = harness.fetch_m1_bars(bars_json_path=NOV23_TAPE)
+    bars_file = tmp_path / "bars.json"
+    bars_file.write_text(json.dumps({"bars": bars}), encoding="utf-8")
+    run1 = harness._run_arm_subprocess(
+        "s105", REPO_ROOT, bars_file, tmp_path / "s105_run1.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True,
+    )
+    run2 = harness._run_arm_subprocess(
+        "s105", REPO_ROOT, bars_file, tmp_path / "s105_run2.json",
+        catalog_path=NOV23_SIGNALS, protection_telemetry=True,
+    )
+    assert run1["bars_sha256"] == run2["bars_sha256"] == NOV23_BARS_SHA256
+    assert run1["arm_params"] == run2["arm_params"]
+    assert run1["arm_params"]["pinned_params"][SCALE_KNOB] == 1.05
+    assert run1["summary"]["error_count"] == 0
+    assert len(run1["results"]) == 9
+    assert json.dumps(run1["results"], sort_keys=True) == json.dumps(run2["results"], sort_keys=True)
+    assert json.dumps(run1["summary"], sort_keys=True) == json.dumps(run2["summary"], sort_keys=True)
+
+
+@pytest.mark.parametrize("kind", ["normal_retracement", "high_atr"])
+def test_scale_retracement_scenarios_premature_not_worse(tmp_path, kind):
+    s100 = _run_scenario(tmp_path, kind, "s100")
+    s105 = _run_scenario(tmp_path, kind, "s105")
+    assert s100["summary"]["error_count"] == 0
+    assert s105["summary"]["error_count"] == 0
+    m100 = harness._tight_comparison_metrics(s100["results"])
+    m105 = harness._tight_comparison_metrics(s105["results"])
+    # More retracement room must not INCREASE premature stop-outs.
+    assert m105["premature_stop_outs"] <= m100["premature_stop_outs"]
+    assert m105["stop_modify_failures"] == 0
