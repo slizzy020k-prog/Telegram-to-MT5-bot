@@ -207,6 +207,69 @@ def _enrich_rlock_trace(st: Dict[str, Any], tiers: Any) -> None:
     st["r_lock_min_profit_margin"] = min_margin
     st["r_lock_structural_blocked"] = bool(min_margin is not None and max_td < min_margin - 1e-9)
 
+
+# ---------------------------------------------------------------------------
+# T3-tight comparison telemetry (opt-in per worker run; REPORTING ONLY).
+# Enabled exclusively for the new "--arm tight" / "--arm t3tight" modes, so
+# every pre-existing arm's output stays byte-identical. Never alters a picker
+# decision: it wraps the (already-traced) production picker and only records
+# WHEN protection first armed on the simulated replay clock.
+# ---------------------------------------------------------------------------
+_PROTECTION_TELEMETRY = False
+_PROTECTION_TRACE: Dict[str, Any] = {}
+# Round-turn slippage estimate for the cost-adjusted metric view ($/oz per side).
+# Spread is already modeled per-bar from the tape (bid/ask); this adds an explicit
+# slippage allowance on top. Reporting constant only - never fed to the engine.
+SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE = 0.10
+
+
+def _reset_protection_trace(msg_id: str) -> None:
+    global _PROTECTION_TRACE
+    _PROTECTION_TRACE = {
+        "msg_id": msg_id,
+        "first_protect_utc": None,
+        "first_protect_source": None,
+        "first_be_arm_utc": None,
+        "first_trail_arm_utc": None,
+        "first_mfe_lock_utc": None,
+        "in_profit_candidate_calls": 0,
+    }
+
+
+def _install_protection_trace(mt5_executor_mod: Any) -> None:
+    """Record first-protection timing around the production picker (reporting only)."""
+    orig = mt5_executor_mod.compute_dynamic_atr_trail_stop
+
+    def _traced(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+        res = orig(*args, **kwargs)
+        st = _PROTECTION_TRACE
+        if st:
+            now_iso = _REPLAY_CLOCK.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            be_armed = bool(res.get("be_armed"))
+            trail_armed = bool(res.get("trail_armed"))
+            lock_armed = res.get("mfe_lock_sl") is not None
+            if be_armed and st["first_be_arm_utc"] is None:
+                st["first_be_arm_utc"] = now_iso
+            if trail_armed and st["first_trail_arm_utc"] is None:
+                st["first_trail_arm_utc"] = now_iso
+            if lock_armed and st["first_mfe_lock_utc"] is None:
+                st["first_mfe_lock_utc"] = now_iso
+            if (be_armed or trail_armed or lock_armed) and st["first_protect_utc"] is None:
+                st["first_protect_utc"] = now_iso
+                st["first_protect_source"] = (
+                    "BE_LOCK" if be_armed else ("ATR_TRAIL" if trail_armed else "MFE_LOCK")
+                )
+            entry = kwargs.get("entry_price")
+            cand = res.get("candidate_sl")
+            if isinstance(entry, (int, float)) and isinstance(cand, (int, float)):
+                sign = 1.0 if str(kwargs.get("direction") or "BUY").strip().upper() == "BUY" else -1.0
+                if sign * (float(cand) - float(entry)) > 1e-9:
+                    st["in_profit_candidate_calls"] += 1
+        return res
+
+    mt5_executor_mod.compute_dynamic_atr_trail_stop = _traced
+
+
 # Canonical DYNAMIC_ATR_* trail + BE knobs pinned for BOTH arms so the replay
 # is independent of the ambient .env (Phase 1.1, Hole 2). Values equal the
 # shipped v3.9.0 production defaults; pinning makes them immune to .env drift.
@@ -313,6 +376,34 @@ ARM_T4_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
     "DYNAMIC_ATR_TRAIL_MAX_DOLLARS": 6.50,
 }
 
+# EXPERIMENTAL - T3-tight validation arm (replay-validation brief 2026-11-20).
+# T3 (activation 0.70x + STANDARD clamp $5.50) PLUS the six opt-in protection
+# knobs shipped in engine commit 5ac5fe2. Replay arm-param override ONLY:
+# never written to config.py / .env, never a default arm. The canonical pinned
+# fixture and the existing arms (a/b/c/cx/t1..t4) are deliberately untouched.
+ARM_T3TIGHT_EXPERIMENTAL_PARAMS: Dict[str, Any] = {
+    **ARM_T3_EXPERIMENTAL_PARAMS,
+    "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 4.00,
+    "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 3.00,
+    "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "4:3.50,6:3.00,10:2.50,18:2.00",
+    "DYNAMIC_ATR_MFE_LOCK_ENABLED": True,
+    "DYNAMIC_ATR_MFE_LOCK_TIERS": "4:0.30,6:0.50,10:0.65,18:0.75",
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
+}
+
+# Side-by-side comparison registry for "--arm tight" (T3 vs T3-tight). Kept
+# SEPARATE from TRAILING_EXPERIMENT_ARMS so "--arm trailing" stays byte-identical.
+TIGHT_COMPARISON_ARMS: Dict[str, Dict[str, Any]] = {
+    "t3": {
+        "params": ARM_T3_EXPERIMENTAL_PARAMS,
+        "label": "T3: activation 0.70x + STANDARD clamp $5.50",
+    },
+    "t3tight": {
+        "params": ARM_T3TIGHT_EXPERIMENTAL_PARAMS,
+        "label": "T3-tight: T3 + six opt-in protection knobs (5ac5fe2)",
+    },
+}
+
 # Registry of the experimental trailing arms (order = report order).
 TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
     "t1": {
@@ -335,7 +426,7 @@ TRAILING_EXPERIMENT_ARMS: Dict[str, Dict[str, Any]] = {
 
 # Arm modes that drive the production ATR engine on the simulated replay
 # clock (Arm A stays the frozen 4544f7f reference with the wall clock).
-_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS)
+_ENGINE_ARM_MODES: Tuple[str, ...] = ("b", "c", "cx") + tuple(TRAILING_EXPERIMENT_ARMS) + ("t3tight",)
 
 # Exact 12 filled Nov 17-19 XAUUSD.s trades (verified against MT5 deals, signals_state.json, copier.log)
 TRADE_CATALOG: List[Dict[str, Any]] = [
@@ -1405,6 +1496,8 @@ async def _run_single_trade_worker(
     total_lot = round(sum(l[1] for l in trade["layers"]), 4)
     avg_entry = round(sum(l[1] * l[2] for l in trade["layers"]) / total_lot, 4)
     _reset_picker_trace(msg_id)
+    if _PROTECTION_TELEMETRY:
+        _reset_protection_trace(msg_id)
     m5_atr_series = _compute_m5_atr_by_m1(bars) if _PRODUCTION_ENGINE_ARM else None
 
     # Fresh isolated runtime state per trade
@@ -1547,7 +1640,7 @@ async def _run_single_trade_worker(
     final_exit_utc = exit_utc or spy.last_exit_utc()
     rollover_flag = _is_rollover_utc(final_exit_utc)
 
-    return {
+    res = {
         "msg_id": msg_id,
         "dir": trade["dir"],
         "open_utc": trade["open_utc"],
@@ -1606,9 +1699,38 @@ async def _run_single_trade_worker(
         "r_lock_structural_blocked": bool(_PICKER_TRACE.get("r_lock_structural_blocked", False)),
         "r_lock_win_details": list(_PICKER_TRACE.get("r_lock_win_details") or []),
     }
+    if _PROTECTION_TELEMETRY:
+        pt = _PROTECTION_TRACE
+        tt_min: Optional[float] = None
+        if pt.get("first_protect_utc"):
+            try:
+                tt_min = round(
+                    (_parse_utc(pt["first_protect_utc"]) - _parse_utc(trade["open_utc"])).total_seconds() / 60.0,
+                    2,
+                )
+            except Exception:
+                tt_min = None
+        res.update(
+            {
+                "first_protect_utc": pt.get("first_protect_utc"),
+                "first_protect_source": pt.get("first_protect_source"),
+                "first_be_arm_utc": pt.get("first_be_arm_utc"),
+                "first_trail_arm_utc": pt.get("first_trail_arm_utc"),
+                "first_mfe_lock_utc": pt.get("first_mfe_lock_utc"),
+                "in_profit_candidate_calls": int(pt.get("in_profit_candidate_calls", 0)),
+                "time_to_first_protection_min": tt_min,
+            }
+        )
+    return res
 
 
-def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
+def _run_worker_main(
+    arm_mode: str,
+    bars_path: Path,
+    out_path: Path,
+    catalog_path: Optional[Path] = None,
+    protection_telemetry: bool = False,
+) -> int:
     runtime_tmp = tempfile.TemporaryDirectory(prefix=f"ab_replay_{arm_mode}_")
     try:
         rdir = Path(runtime_tmp.name)
@@ -1634,6 +1756,10 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
             # EXPERIMENTAL replay-only trailing override; never a production default.
             for k, v in TRAILING_EXPERIMENT_ARMS[arm_mode]["params"].items():
                 os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
+        elif arm_mode == "t3tight":
+            # EXPERIMENTAL replay-only T3-tight override; never a production default.
+            for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items():
+                os.environ[k] = str(v).lower() if isinstance(v, bool) else str(v)
 
         import config  # noqa: E402
         import main  # noqa: E402
@@ -1656,11 +1782,15 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
             _pin_arm_b_params(config, mt5_executor, main)
             _pin_arm_c_params(config, mt5_executor, main)
             _pin_arm_cx_params(config, mt5_executor, main)
-        else:  # t1..t4: EXPERIMENTAL trailing override layered on top of Arm B
+        else:  # t1..t4 / t3tight: EXPERIMENTAL override layered on top of Arm B
             _pin_arm_b_params(config, mt5_executor, main)
+            _arm_params = (
+                TRAILING_EXPERIMENT_ARMS[arm_mode]["params"]
+                if arm_mode in TRAILING_EXPERIMENT_ARMS
+                else TIGHT_COMPARISON_ARMS[arm_mode]["params"]
+            )
             _pin_arm_experimental_params(
-                TRAILING_EXPERIMENT_ARMS[arm_mode]["params"],
-                config, mt5_executor, main, f"Arm {arm_mode.upper()}",
+                _arm_params, config, mt5_executor, main, f"Arm {arm_mode.upper()}",
             )
 
         # Arms B and C run on the simulated replay clock: the trade-age guard
@@ -1674,6 +1804,9 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
         globals()["_PRODUCTION_ENGINE_ARM"] = arm_mode in _ENGINE_ARM_MODES
         if _PRODUCTION_ENGINE_ARM:
             _install_picker_trace(mt5_executor)
+        globals()["_PROTECTION_TELEMETRY"] = bool(protection_telemetry)
+        if _PROTECTION_TELEMETRY:
+            _install_protection_trace(mt5_executor)
 
         async def _no_notify(*_args: Any, **_kwargs: Any) -> None:
             return None
@@ -1682,6 +1815,23 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
 
         bars_payload = json.loads(bars_path.read_text(encoding="utf-8"))
         bars = bars_payload["bars"] if isinstance(bars_payload, dict) else bars_payload
+
+        # Optional signal-set override (Nov-23 / synthetic scenarios). The default
+        # catalog stays the canonical 12-trade Nov 17-19 list, byte-identical.
+        catalog: List[Dict[str, Any]] = TRADE_CATALOG
+        catalog_sha: Optional[str] = None
+        if catalog_path is not None:
+            cat_payload = json.loads(catalog_path.read_text(encoding="utf-8"))
+            catalog = cat_payload["trades"] if isinstance(cat_payload, dict) else cat_payload
+            if not isinstance(catalog, list) or not catalog:
+                raise RuntimeError(f"Signal catalog empty or invalid: {catalog_path}")
+            for t in catalog:
+                for key in ("msg_id", "dir", "open_utc", "layers", "sl", "tp_levels"):
+                    if key not in t:
+                        raise RuntimeError(f"Signal catalog entry missing {key!r}: {t.get('msg_id')}")
+            catalog_sha = hashlib.sha256(
+                json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
 
         # Arm params snapshot: record the exact strategy parameters + config
         # used for this run so every output JSON is self-describing.
@@ -1703,6 +1853,8 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
                 effective.update(ARM_CX_EXPERIMENTAL_PARAMS)
             if arm_mode in TRAILING_EXPERIMENT_ARMS:
                 effective.update(TRAILING_EXPERIMENT_ARMS[arm_mode]["params"])
+            elif arm_mode == "t3tight":
+                effective.update(ARM_T3TIGHT_EXPERIMENTAL_PARAMS)
             arm_params_snapshot = {
                 "arm": arm_mode,
                 "pinned_params": effective,
@@ -1726,12 +1878,24 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
                         if ARM_B_CALIBRATED_PARAMS.get(k) != v
                     )
                 )
+            elif arm_mode == "t3tight":
+                arm_params_snapshot["experimental"] = True
+                arm_params_snapshot["experimental_note"] = (
+                    "EXPERIMENTAL T3-tight arm-param override (replay arm-param only; not "
+                    "production, not shipped). T3 plus the six opt-in 5ac5fe2 protection "
+                    "knobs. Delta vs T3: "
+                    + ", ".join(
+                        f"{k}={v}"
+                        for k, v in ARM_T3TIGHT_EXPERIMENTAL_PARAMS.items()
+                        if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
+                    )
+                )
         arm_params_snapshot["gbp_rate_per_pt_001_lot"] = GBP_PER_PT_001_LOT
         arm_params_snapshot["server_offset_sec"] = MT5_SERVER_OFFSET_SEC
 
         async def _run_all() -> List[Dict[str, Any]]:
             out: List[Dict[str, Any]] = []
-            for idx, trade in enumerate(TRADE_CATALOG):
+            for idx, trade in enumerate(catalog):
                 res = await _run_single_trade_worker(
                     main,
                     StateManager,
@@ -1756,6 +1920,11 @@ def _run_worker_main(arm_mode: str, bars_path: Path, out_path: Path) -> int:
             "results": results,
             "summary": agg,
         }
+        if catalog_sha is not None:
+            payload["catalog_sha256"] = catalog_sha
+        if protection_telemetry:
+            payload["protection_telemetry"] = True
+            payload["slippage_estimate_dollars_per_side"] = SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         return 0
@@ -2005,6 +2174,126 @@ def _trailing_experiment_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+def _tight_comparison_metrics(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Full brief metric set for one arm of the T3 vs T3-tight comparison.
+
+    Pure reporting over the per-trade result rows (no engine change). Where
+    definitions overlap _trailing_experiment_metrics they are identical:
+    win/loss = sign of simulated net GBP; giveback floors realized at 0;
+    premature = protected-stop exit (*_SL except initial BROKER_SL) realizing
+    < 50% of peak MFE. Additions required by the replay-validation brief:
+      * avg losing trade,
+      * avg time to first protection (opt-in picker telemetry; minutes from
+        open_utc to the first BE/trail/MFE-lock arm on the replay clock),
+      * spread+slippage-adjusted view: spread is already modeled per-bar from
+        the tape bid/ask; slippage adds a flat round-turn allowance of
+        2 * SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE $/oz on top,
+      * TP1-TP4 completion rates (fraction of trades reaching max_stage >= k).
+    """
+    n = len(results)
+    wins = [r for r in results if float(r["sim_gbp"]) > 0.0]
+    losses = [r for r in results if float(r["sim_gbp"]) < 0.0]
+    flats = n - len(wins) - len(losses)
+    gross_profit = round(sum(float(r["sim_gbp"]) for r in wins), 2)
+    gross_loss = round(sum(float(r["sim_gbp"]) for r in losses), 2)
+    net = round(sum(float(r["sim_gbp"]) for r in results), 2)
+    profit_factor = round(gross_profit / abs(gross_loss), 3) if gross_loss < 0.0 else None
+
+    def _lot_gbp(r: Dict[str, Any], usd_per_oz: float) -> float:
+        return usd_per_oz * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT
+
+    peak_mfe_gbp = round(sum(_lot_gbp(r, float(r["peak_mfe_dollars"])) for r in results), 2)
+    captured_gbp = round(sum(_lot_gbp(r, float(r["realized_pts_per_oz"])) for r in results), 2)
+    giveback_gbp = round(
+        sum(_lot_gbp(r, max(0.0, float(r["peak_mfe_dollars"]) - max(float(r["realized_pts_per_oz"]), 0.0))) for r in results),
+        2,
+    )
+    caps_all = [float(r["mfe_capture_pct"]) for r in results if r.get("mfe_capture_pct") is not None]
+    caps_win = [float(r["mfe_capture_pct"]) for r in wins if r.get("mfe_capture_pct") is not None]
+
+    premature: List[str] = []
+    exit_buckets: Dict[str, int] = {}
+    exit_reason_dist: Dict[str, int] = {}
+    for r in results:
+        reason = str(r.get("exit_reason") or "UNKNOWN")
+        bucket = _classify_exit_reason(reason)
+        exit_buckets[bucket] = exit_buckets.get(bucket, 0) + 1
+        exit_reason_dist[reason] = exit_reason_dist.get(reason, 0) + 1
+        if (
+            bucket == "protected_stop"
+            and float(r["peak_mfe_dollars"]) > 0.0
+            and float(r["realized_pts_per_oz"]) < 0.5 * float(r["peak_mfe_dollars"])
+        ):
+            premature.append(r["msg_id"])
+
+    tt_vals = [
+        float(r["time_to_first_protection_min"])
+        for r in results
+        if r.get("time_to_first_protection_min") is not None
+    ]
+    never_protected = [r["msg_id"] for r in results if r.get("first_protect_utc") is None]
+
+    slip = SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE
+    adj_rows = [
+        round(float(r["sim_gbp"]) - 2.0 * slip * (float(r["total_lot"]) / 0.01) * GBP_PER_PT_001_LOT, 2)
+        for r in results
+    ]
+    adj_net = round(sum(adj_rows), 2)
+    adj_wins = [v for v in adj_rows if v > 0.0]
+    adj_losses = [v for v in adj_rows if v < 0.0]
+    adj_gp = round(sum(adj_wins), 2)
+    adj_gl = round(sum(adj_losses), 2)
+    adj_pf = round(adj_gp / abs(adj_gl), 3) if adj_gl < 0.0 else None
+
+    tp_completion = {
+        f"TP{k}": round(sum(1 for r in results if int(r.get("max_stage") or 0) >= k) / n, 4) if n else 0.0
+        for k in range(1, 5)
+    }
+    errors = [{"msg_id": r["msg_id"], "error": r["error"]} for r in results if r.get("error")]
+
+    return {
+        "total_trades": n,
+        "wins": len(wins),
+        "losses": len(losses),
+        "flats_be": flats,
+        "win_rate_pct": round(100.0 * len(wins) / n, 1) if n else 0.0,
+        "gross_profit_gbp": gross_profit,
+        "gross_loss_gbp": gross_loss,
+        "net_profit_gbp": net,
+        "net_expectancy_gbp": round(net / n, 4) if n else 0.0,
+        "profit_factor": profit_factor,
+        "avg_winner_gbp": round(gross_profit / len(wins), 4) if wins else 0.0,
+        "avg_loser_gbp": round(gross_loss / len(losses), 4) if losses else 0.0,
+        "peak_mfe_gbp": peak_mfe_gbp,
+        "mfe_captured_gbp": captured_gbp,
+        "mfe_given_back_gbp": giveback_gbp,
+        "avg_mfe_capture_pct_all": round(sum(caps_all) / len(caps_all), 1) if caps_all else None,
+        "avg_mfe_capture_pct_winners": round(sum(caps_win) / len(caps_win), 1) if caps_win else None,
+        "premature_stop_outs": len(premature),
+        "premature_stop_out_trades": premature,
+        "premature_definition": "protected-stop exit (*_SL except initial BROKER_SL) realizing < 50% of peak MFE",
+        "avg_time_to_first_protection_min": round(sum(tt_vals) / len(tt_vals), 2) if tt_vals else None,
+        "trades_protected": len(tt_vals),
+        "never_protected_trades": never_protected,
+        "slippage_estimate_dollars_per_side": slip,
+        "cost_adjusted": {
+            "basis": "tape per-bar spread already in bid/ask + flat round-turn slippage allowance (2 x per-side estimate)",
+            "net_profit_gbp": adj_net,
+            "net_expectancy_gbp": round(adj_net / n, 4) if n else 0.0,
+            "profit_factor": adj_pf,
+            "wins": len(adj_wins),
+            "losses": len(adj_losses),
+        },
+        "tp_completion_rates": tp_completion,
+        "exit_bucket_distribution": exit_buckets,
+        "exit_reason_distribution": exit_reason_dist,
+        "initial_stop_loss_exits": exit_buckets.get("initial_stop_loss", 0),
+        "protected_stop_exits": exit_buckets.get("protected_stop", 0),
+        "error_count": len(errors),
+        "errors": errors,
+    }
+
+
 def _evaluate_trailing_gates(
     arm_a: Dict[str, Any],
     arm_b: Dict[str, Any],
@@ -2083,7 +2372,14 @@ def _evaluate_trailing_gates(
     return out
 
 
-def _run_arm_subprocess(arm_mode: str, code_root: Path, bars_path: Path, out_path: Path) -> Dict[str, Any]:
+def _run_arm_subprocess(
+    arm_mode: str,
+    code_root: Path,
+    bars_path: Path,
+    out_path: Path,
+    catalog_path: Optional[Path] = None,
+    protection_telemetry: bool = False,
+) -> Dict[str, Any]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(code_root)
     cmd = [
@@ -2097,6 +2393,10 @@ def _run_arm_subprocess(arm_mode: str, code_root: Path, bars_path: Path, out_pat
         "--worker-out",
         str(out_path),
     ]
+    if catalog_path is not None:
+        cmd += ["--worker-catalog", str(catalog_path)]
+    if protection_telemetry:
+        cmd += ["--worker-protection-telemetry"]
     proc = subprocess.run(
         cmd, cwd=str(code_root), env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace",
@@ -2139,6 +2439,7 @@ def _evaluate_gates(
     arm_a: Optional[Dict[str, Any]],
     arm_b: Optional[Dict[str, Any]],
     arm_c: Optional[Dict[str, Any]] = None,
+    arm_other: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     # Arm C is compared against ARM B (not against Arm A): the R lock is an
     # increment on Arm B, and the gate is absent when Arm C was not run.
@@ -2183,7 +2484,7 @@ def _evaluate_gates(
             "all_gates_passed": bool(g1 and g2 and g3 and g4 and g5 is not False),
         }
 
-    single = arm_a or arm_b or arm_c
+    single = arm_a or arm_b or arm_c or arm_other
     assert single is not None
     ss = single["summary"]
     g4_single = ss["error_count"] == 0 and len(ss["unflagged_rollover_exits"]) == 0
@@ -2246,7 +2547,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             )
     else:
         single = arm_a or arm_b or arm_c or next(
-            (report.get(f"arm_{m}") for m in TRAILING_EXPERIMENT_ARMS if report.get(f"arm_{m}")), None
+            (report.get(f"arm_{m}") for m in list(TRAILING_EXPERIMENT_ARMS) + ["t3tight"] if report.get(f"arm_{m}")), None
         )
         assert single is not None
         ss = single["summary"]
@@ -2255,6 +2556,7 @@ def _render_markdown(report: Dict[str, Any]) -> str:
             "b": "Arm B (`v3.6.0` Calibrated)",
             "c": "Arm C (R Lock Only)",
             **{m: f"EXPERIMENTAL Arm {m.upper()} ({TRAILING_EXPERIMENT_ARMS[m]['label']})" for m in TRAILING_EXPERIMENT_ARMS},
+            "t3tight": f"EXPERIMENTAL Arm T3TIGHT ({TIGHT_COMPARISON_ARMS['t3tight']['label']})",
         }.get(single["arm"], "Arm " + str(single["arm"]))
         lines += [
             f"## {label} Summary",
@@ -2501,6 +2803,83 @@ def _render_markdown(report: Dict[str, Any]) -> str:
                 "and need an explicit owner decision.",
             ]
 
+    tight = report.get("tight_comparison")
+    if tight:
+        mt3 = tight["arms"]["t3"]["metrics"]
+        mtt = tight["arms"]["t3tight"]["metrics"]
+        d = tight["delta_tight_minus_t3"]
+        lines += [
+            "",
+            "## T3 vs T3-tight (production engine replay) - EXPERIMENTAL, NOT shipped",
+            "",
+            "- {}".format(tight["note"]),
+            "- Slippage allowance: `${:.2f}/oz per side` on top of the tape's per-bar spread.".format(tight["slippage_estimate_dollars_per_side"]),
+            "",
+            "| Metric | T3 | T3-tight | Delta (tight - T3) |",
+            "|---|---:|---:|---:|",
+        ]
+
+        def _fmt(v: Any, fmt: str) -> str:
+            if v is None:
+                return "n/a"
+            try:
+                return fmt.format(v)
+            except (TypeError, ValueError):
+                return str(v)
+
+        def _row(label: str, a: Any, b: Any, delta: Any = None, fmt: str = "{}") -> None:
+            dv = delta if delta is not None else (
+                round(b - a, 4) if isinstance(a, (int, float)) and isinstance(b, (int, float)) else "-"
+            )
+            lines.append("| {} | `{}` | `{}` | `{}` |".format(
+                label, _fmt(a, fmt), _fmt(b, fmt), _fmt(dv, fmt) if isinstance(dv, (int, float)) else dv))
+
+        _row("Net profit (GBP)", mt3["net_profit_gbp"], mtt["net_profit_gbp"], d["net_profit_gbp"], "{:+.2f}")
+        _row("Net expectancy (GBP/trade)", mt3["net_expectancy_gbp"], mtt["net_expectancy_gbp"], d["net_expectancy_gbp"], "{:+.4f}")
+        _row("Profit factor", mt3["profit_factor"], mtt["profit_factor"])
+        _row("Wins / losses / flats", "{}/{}/{}".format(mt3["wins"], mt3["losses"], mt3["flats_be"]), "{}/{}/{}".format(mtt["wins"], mtt["losses"], mtt["flats_be"]), "-")
+        _row("Avg winner (GBP)", mt3["avg_winner_gbp"], mtt["avg_winner_gbp"], fmt="{:+.4f}")
+        _row("Avg loser (GBP)", mt3["avg_loser_gbp"], mtt["avg_loser_gbp"], fmt="{:+.4f}")
+        _row("Peak MFE (GBP, lot-wtd)", mt3["peak_mfe_gbp"], mtt["peak_mfe_gbp"], fmt="{:.2f}")
+        _row("MFE captured (GBP)", mt3["mfe_captured_gbp"], mtt["mfe_captured_gbp"], fmt="{:+.2f}")
+        _row("MFE given back (GBP)", mt3["mfe_given_back_gbp"], mtt["mfe_given_back_gbp"], d["mfe_given_back_gbp"], "{:+.2f}")
+        _row("Avg MFE capture % (all)", mt3["avg_mfe_capture_pct_all"], mtt["avg_mfe_capture_pct_all"])
+        _row("Premature stop-outs (<50% peak)", mt3["premature_stop_outs"], mtt["premature_stop_outs"], d["premature_stop_outs"])
+        _row("Avg time to first protection (min)", mt3["avg_time_to_first_protection_min"], mtt["avg_time_to_first_protection_min"])
+        _row("Trades never protected", len(mt3["never_protected_trades"]), len(mtt["never_protected_trades"]))
+        _row("Cost-adj net (GBP)", mt3["cost_adjusted"]["net_profit_gbp"], mtt["cost_adjusted"]["net_profit_gbp"], d["cost_adjusted_net_profit_gbp"], "{:+.2f}")
+        _row("Cost-adj expectancy (GBP)", mt3["cost_adjusted"]["net_expectancy_gbp"], mtt["cost_adjusted"]["net_expectancy_gbp"], fmt="{:+.4f}")
+        _row("Cost-adj profit factor", mt3["cost_adjusted"]["profit_factor"], mtt["cost_adjusted"]["profit_factor"])
+        for k in range(1, 5):
+            _row("TP{} completion rate".format(k), mt3["tp_completion_rates"]["TP{}".format(k)], mtt["tp_completion_rates"]["TP{}".format(k)], fmt="{:.2%}")
+        _row("Initial stop-loss exits", mt3["initial_stop_loss_exits"], mtt["initial_stop_loss_exits"])
+        _row("Protected-stop exits", mt3["protected_stop_exits"], mtt["protected_stop_exits"])
+        _row("Errors", mt3["error_count"], mtt["error_count"])
+        lines += [
+            "",
+            "- Premature definition: {}".format(mt3["premature_definition"]),
+            "- Never protected T3: `{}` | T3-tight: `{}`".format(mt3["never_protected_trades"] or "none", mtt["never_protected_trades"] or "none"),
+            "- Premature trades T3: `{}` | T3-tight: `{}`".format(mt3["premature_stop_out_trades"] or "none", mtt["premature_stop_out_trades"] or "none"),
+            "- Exit reasons T3: `{}`".format(mt3["exit_reason_distribution"]),
+            "- Exit reasons T3-tight: `{}`".format(mtt["exit_reason_distribution"]),
+            "",
+            "### Per-trade side by side",
+            "",
+            "| Msg | Dir | Peak MFE $/oz | T3 GBP | T3 exit (stage) | T3 protect (min) | T3-tight GBP | T3-tight exit (stage) | T3-tight protect (min) |",
+            "|---|---|---:|---:|---|---:|---:|---|---:|",
+        ]
+        for row in tight["per_trade"]:
+            a, b = row["t3"], row["t3tight"]
+            ta = a["time_to_first_protection_min"]
+            tb = b["time_to_first_protection_min"]
+            lines.append(
+                "| `{}` | {} | `{:.2f}` | `{:+.2f}` | `{}` (S{}) | `{}` | `{:+.2f}` | `{}` (S{}) | `{}` |".format(
+                    row["msg_id"], row["dir"], a["peak_mfe_dollars"], a["sim_gbp"], a["exit_reason"], a["max_stage"],
+                    ta if ta is not None else "never", b["sim_gbp"], b["exit_reason"], b["max_stage"],
+                    tb if tb is not None else "never",
+                )
+            )
+
     lines += ["", "## Gates Evaluation", ""]
     for k, v in gates.items():
         lines.append(f"- **{k}:** `{v}`")
@@ -2512,9 +2891,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="12-Trade XAUUSD.s M1-Bar A/B Replay Proof")
     parser.add_argument(
         "--arm",
-        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "both", "trailing"),
+        choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight", "both", "trailing", "tight"),
         default="both",
-        help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape.",
+        help="'trailing' runs the EXPERIMENTAL Phase 3+4 A/B (A + B + T1..T4) on the pinned tape. "
+        "'tight' runs the EXPERIMENTAL T3 vs T3-tight comparison (optionally on a custom tape "
+        "via --bars-json + --signals).",
     )
     parser.add_argument("--json-out", type=Path, default=None)
     parser.add_argument("--md-out", type=Path, default=None)
@@ -2532,19 +2913,33 @@ def main() -> int:
         help="Re-fetch live bars to a NEW tape file (never the canonical fixture) and print a diff summary for human review.",
     )
     parser.add_argument("--spread-override", type=float, default=None)
+    parser.add_argument(
+        "--signals", type=Path, default=None,
+        help="Signal-set JSON (catalog) for --arm tight/t3tight, e.g. tests/fixtures/signals_2026-11-23.json. "
+        "Default: the canonical 12-trade Nov 17-19 catalog.",
+    )
     # Internal worker args
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4"), default="a", help=argparse.SUPPRESS)
+    parser.add_argument("--arm-mode", choices=("a", "b", "c", "cx", "t1", "t2", "t3", "t4", "t3tight"), default="a", help=argparse.SUPPRESS)
     parser.add_argument("--worker-bars", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--worker-out", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-catalog", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-protection-telemetry", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.worker:
         assert args.worker_bars is not None and args.worker_out is not None
-        return _run_worker_main(args.arm_mode, args.worker_bars, args.worker_out)
+        return _run_worker_main(
+            args.arm_mode, args.worker_bars, args.worker_out,
+            catalog_path=args.worker_catalog,
+            protection_telemetry=args.worker_protection_telemetry,
+        )
 
     if args.refresh_tape is not None:
         return _refresh_tape(args.refresh_tape, args.spread_override)
+
+    if args.signals is not None and args.arm not in ("tight", "t3tight"):
+        parser.error("--signals is only supported with --arm tight or --arm t3tight")
 
     bars_json_resolved = args.bars_json.resolve() if args.bars_json is not None else None
     if args.live_bars and bars_json_resolved != PINNED_TAPE_PATH.resolve():
@@ -2571,6 +2966,8 @@ def main() -> int:
         arm_c_res: Optional[Dict[str, Any]] = None
         arm_cx_res: Optional[Dict[str, Any]] = None
         arm_t_res: Dict[str, Optional[Dict[str, Any]]] = {m: None for m in TRAILING_EXPERIMENT_ARMS}
+        arm_t3tight_res: Optional[Dict[str, Any]] = None
+        tight_arms: Dict[str, Dict[str, Any]] = {}
 
         if args.arm in ("a", "both", "trailing"):
             arm_a_res = _run_arm_a_isolated(bars_file, io_dir / "arm_a.json")
@@ -2587,8 +2984,36 @@ def main() -> int:
                 arm_t_res[mode] = _run_arm_subprocess(mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json")
         elif args.arm in TRAILING_EXPERIMENT_ARMS:
             arm_t_res[args.arm] = _run_arm_subprocess(args.arm, REPO_ROOT, bars_file, io_dir / f"arm_{args.arm}.json")
+        if args.arm == "tight":
+            # EXPERIMENTAL T3 vs T3-tight on the identical tape + catalog, with
+            # opt-in protection telemetry. Existing arms/modes are untouched.
+            for mode in ("t3", "t3tight"):
+                tight_arms[mode] = _run_arm_subprocess(
+                    mode, REPO_ROOT, bars_file, io_dir / f"arm_{mode}.json",
+                    catalog_path=args.signals, protection_telemetry=True,
+                )
+        elif args.arm == "t3tight":
+            arm_t3tight_res = _run_arm_subprocess(
+                "t3tight", REPO_ROOT, bars_file, io_dir / "arm_t3tight.json",
+                catalog_path=args.signals, protection_telemetry=True,
+            )
 
-    gates = _evaluate_gates(arm_a_res, arm_b_res, arm_c_res)
+    if args.arm == "tight":
+        _err_t3 = int(tight_arms["t3"]["summary"]["error_count"])
+        _err_tt = int(tight_arms["t3tight"]["summary"]["error_count"])
+        gates = {
+            "mode": "tight_comparison",
+            "t3_error_count": _err_t3,
+            "t3tight_error_count": _err_tt,
+            "all_gates_passed": bool(_err_t3 == 0 and _err_tt == 0),
+        }
+    else:
+        gates = _evaluate_gates(
+            arm_a_res, arm_b_res, arm_c_res,
+            arm_other=arm_t3tight_res or next(
+                (arm_t_res[m] for m in TRAILING_EXPERIMENT_ARMS if arm_t_res[m]), None
+            ),
+        )
 
     # EXPERIMENTAL Phase 3+4 trailing A/B evidence (replay arm-param overrides
     # only; production defaults untouched). Present only in --arm trailing mode.
@@ -2618,10 +3043,72 @@ def main() -> int:
             },
         }
         trailing_gates = _evaluate_trailing_gates(arm_a_res, arm_b_res, variants)
+    tight_comparison: Optional[Dict[str, Any]] = None
+    if args.arm == "tight":
+        def _side_row(r: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "sim_gbp": float(r["sim_gbp"]),
+                "exit_reason": r.get("exit_reason"),
+                "max_stage": int(r.get("max_stage") or 0),
+                "peak_mfe_dollars": round(float(r["peak_mfe_dollars"]), 2),
+                "realized_usd_per_oz": round(float(r["realized_pts_per_oz"]), 2),
+                "time_to_first_protection_min": r.get("time_to_first_protection_min"),
+                "first_protect_source": r.get("first_protect_source"),
+            }
+        _t3_rows = {r["msg_id"]: r for r in tight_arms["t3"]["results"]}
+        _tt_rows = {r["msg_id"]: r for r in tight_arms["t3tight"]["results"]}
+        _m_t3 = _tight_comparison_metrics(tight_arms["t3"]["results"])
+        _m_tt = _tight_comparison_metrics(tight_arms["t3tight"]["results"])
+        tight_comparison = {
+            "experimental": True,
+            "note": (
+                "EXPERIMENTAL T3 vs T3-tight comparison driving the PRODUCTION engine "
+                "(dynamic_risk.compute_dynamic_atr_trail_stop via mt5_executor.evaluate_dynamic_atr_engine) "
+                "on the identical tape + signal set. T3-tight = T3 plus the six opt-in 5ac5fe2 knobs. "
+                "Replay arm-param overrides only; not production, not shipped."
+            ),
+            "slippage_estimate_dollars_per_side": SLIPPAGE_ESTIMATE_DOLLARS_PER_SIDE,
+            "arms": {
+                m: {
+                    "label": TIGHT_COMPARISON_ARMS[m]["label"],
+                    "params": TIGHT_COMPARISON_ARMS[m]["params"],
+                    "overrides_vs_t3": {
+                        k: v for k, v in TIGHT_COMPARISON_ARMS[m]["params"].items()
+                        if ARM_T3_EXPERIMENTAL_PARAMS.get(k) != v
+                    },
+                    "metrics": _m_t3 if m == "t3" else _m_tt,
+                }
+                for m in ("t3", "t3tight")
+            },
+            "per_trade": [
+                {"msg_id": mid, "dir": _t3_rows[mid]["dir"], "t3": _side_row(_t3_rows[mid]),
+                 "t3tight": _side_row(_tt_rows[mid])}
+                for mid in _t3_rows
+            ],
+            "delta_tight_minus_t3": {
+                "net_profit_gbp": round(_m_tt["net_profit_gbp"] - _m_t3["net_profit_gbp"], 2),
+                "net_expectancy_gbp": round(_m_tt["net_expectancy_gbp"] - _m_t3["net_expectancy_gbp"], 4),
+                "mfe_given_back_gbp": round(_m_tt["mfe_given_back_gbp"] - _m_t3["mfe_given_back_gbp"], 2),
+                "premature_stop_outs": _m_tt["premature_stop_outs"] - _m_t3["premature_stop_outs"],
+                "cost_adjusted_net_profit_gbp": round(
+                    _m_tt["cost_adjusted"]["net_profit_gbp"] - _m_t3["cost_adjusted"]["net_profit_gbp"], 2
+                ),
+            },
+        }
+    signals_meta = None
+    if args.signals is not None:
+        _sp = json.loads(args.signals.read_text(encoding="utf-8"))
+        _tr = _sp["trades"] if isinstance(_sp, dict) else _sp
+        signals_meta = {k: v for k, v in _sp.items() if k != "trades"} if isinstance(_sp, dict) else {}
+        signals_meta["trade_count"] = len(_tr)
+        signals_meta["catalog_sha256"] = hashlib.sha256(
+            json.dumps(_tr, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
     fixture_meta = None
-    if bars_source == "pinned_fixture":
+    if not use_live and args.bars_json is not None:
         _fb, fixture_payload, _fp = load_tape(args.bars_json)
-        fixture_meta = {k: v for k, v in fixture_payload.items() if k != "bars"}
+        if _fp:
+            fixture_meta = {k: v for k, v in fixture_payload.items() if k != "bars"}
     report: Dict[str, Any] = {
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "symbol": SYMBOL,
@@ -2642,8 +3129,11 @@ def main() -> int:
         "arm_cx": arm_cx_res,
         "arm_t1": arm_t_res["t1"],
         "arm_t2": arm_t_res["t2"],
-        "arm_t3": arm_t_res["t3"],
+        "arm_t3": arm_t_res["t3"] or tight_arms.get("t3"),
         "arm_t4": arm_t_res["t4"],
+        "arm_t3tight": arm_t3tight_res or tight_arms.get("t3tight"),
+        "tight_comparison": tight_comparison,
+        "signals_meta": signals_meta,
         "trailing_experiments": trailing_experiments,
         "trailing_gates": trailing_gates,
         "gates": gates,

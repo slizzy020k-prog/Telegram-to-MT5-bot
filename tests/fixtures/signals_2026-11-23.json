@@ -1,0 +1,448 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_2026-11-23.json",
+  "built_utc": "2026-11-23T02:50:41Z",
+  "source": "trades_ledger.jsonl (fills/exits) + signals_state.json (ATR-scaled SL/TP) for the 9 brief msg ids",
+  "conventions": {
+    "layers": "only live-filled layers, exact MT5 fill prices, all initialized at open_utc (canonical-catalog convention)",
+    "sl": "common filled-layer initial_sl when unanimous, else signal-level dynamic_risk.sl",
+    "tp_levels": "signals_state.json dynamic_risk.tp_levels (ATR-scaled, as live)",
+    "actual_mt5_gbp": "live ledger realized_pnl (GBP, live fx ~0.7633; replay uses pinned 0.7589)"
+  },
+  "trades": [
+    {
+      "msg_id": "10283",
+      "dir": "SELL",
+      "open_utc": "2026-11-22T23:55:55Z",
+      "close_utc": "2026-11-23T00:12:17Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3584.66
+        ]
+      ],
+      "sl": 3613.28,
+      "tp_levels": {
+        "TP1": 3574.88,
+        "TP2": 3550.38,
+        "TP3": 3524.13,
+        "TP4": 3489.13,
+        "TP5": 3436.63
+      },
+      "actual_mt5_gbp": 6.09,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "10289",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T00:25:39Z",
+      "close_utc": "2026-11-23T00:28:29Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3577.92
+        ]
+      ],
+      "sl": 3598.29,
+      "tp_levels": {
+        "TP1": 3571.38,
+        "TP2": 3550.38,
+        "TP3": 3503.13,
+        "TP4": 3459.38,
+        "TP5": 3441.88
+      },
+      "actual_mt5_gbp": 2.29,
+      "actual_exit_reason": "MANUAL (live: Closed manually / from MT5 app)"
+    },
+    {
+      "msg_id": "13305",
+      "dir": "BUY",
+      "open_utc": "2026-11-22T23:55:13Z",
+      "close_utc": "2026-11-23T00:48:58Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3586.75
+        ],
+        [
+          "L2",
+          0.01,
+          3582.17
+        ]
+      ],
+      "sl": 3548.75,
+      "tp_levels": {
+        "TP1": 3602.12,
+        "TP2": 3607.37,
+        "TP3": 3619.62,
+        "TP4": 3645.87,
+        "TP5": 3663.37
+      },
+      "actual_mt5_gbp": -18.77,
+      "actual_exit_reason": "MANUAL (live: Closed manually / from MT5 app)"
+    },
+    {
+      "msg_id": "10304",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T00:44:55Z",
+      "close_utc": "2026-11-23T00:54:12Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3576.92
+        ],
+        [
+          "L2",
+          0.01,
+          3580.17
+        ]
+      ],
+      "sl": 3610.5,
+      "tp_levels": {
+        "TP1": 3571.38,
+        "TP2": 3550.38,
+        "TP3": 3503.13,
+        "TP4": 3459.38,
+        "TP5": 3441.88
+      },
+      "actual_mt5_gbp": 1.0,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "10306",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T00:54:57Z",
+      "close_utc": "2026-11-23T01:00:05Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3577.1
+        ]
+      ],
+      "sl": 3610.5,
+      "tp_levels": {
+        "TP1": 3571.38,
+        "TP2": 3550.38,
+        "TP3": 3503.13,
+        "TP4": 3459.38,
+        "TP5": 3441.88
+      },
+      "actual_mt5_gbp": 0.51,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "10310",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T01:02:19Z",
+      "close_utc": "2026-11-23T01:03:35Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3579.33
+        ]
+      ],
+      "sl": 3614.33,
+      "tp_levels": {
+        "TP1": 3566.69,
+        "TP2": 3526.88,
+        "TP3": 3444.19,
+        "TP4": 3367.63,
+        "TP5": 3337.01
+      },
+      "actual_mt5_gbp": 0.38,
+      "actual_exit_reason": "BE_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "10321",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T01:06:04Z",
+      "close_utc": "2026-11-23T01:06:28Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3593.67
+        ]
+      ],
+      "sl": 3613.62,
+      "tp_levels": {
+        "TP1": 3588.0,
+        "TP2": 3580.0,
+        "TP3": 3565.0,
+        "TP4": 3540.0,
+        "TP5": 3500.0
+      },
+      "actual_mt5_gbp": -0.21,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "13312",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T01:06:04Z",
+      "close_utc": "2026-11-23T01:06:29Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3593.73
+        ]
+      ],
+      "sl": 3619.5,
+      "tp_levels": {
+        "TP1": 3589.0,
+        "TP2": 3582.0,
+        "TP3": 3579.0,
+        "TP4": 3572.0,
+        "TP5": 3562.0
+      },
+      "actual_mt5_gbp": 0.63,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    },
+    {
+      "msg_id": "10328",
+      "dir": "SELL",
+      "open_utc": "2026-11-23T01:09:26Z",
+      "close_utc": "2026-11-23T01:11:40Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3602.78
+        ]
+      ],
+      "sl": 3622.73,
+      "tp_levels": {
+        "TP1": 3595.38,
+        "TP2": 3572.63,
+        "TP3": 3520.13,
+        "TP4": 3458.88,
+        "TP5": 3423.88
+      },
+      "actual_mt5_gbp": 0.67,
+      "actual_exit_reason": "DYNAMIC_ATR_TRAIL_SL (live: Trailed / Breakeven Stop Loss Hit)"
+    }
+  ],
+  "provenance": {
+    "10283": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156017610,
+        156018178,
+        156018179,
+        156018180
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3613.28,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 11.45,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 31.8425,
+      "ledger_exit_price": 3576.68,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 13.66,
+      "entry_bar_index": 55
+    },
+    "10289": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156036739,
+        156037430,
+        156037432,
+        156037434
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3598.29,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 8.1479,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 25.8425,
+      "ledger_exit_price": 3574.92,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 4.39,
+      "entry_bar_index": 85
+    },
+    "13305": {
+      "chat_id": -1003712081715,
+      "entry_type": "ZONE",
+      "tickets": [
+        156016992,
+        156016998,
+        156017000,
+        156017002
+      ],
+      "filled_lots": 0.02,
+      "layers_filled": [
+        "L1",
+        "L2"
+      ],
+      "sl_used": 3548.75,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 11.45,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 32.0625,
+      "ledger_exit_price": 3575.8,
+      "ledger_exit_stage": 0,
+      "ledger_peak_profit_per_oz": 5.05,
+      "entry_bar_index": 55
+    },
+    "10304": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156045541,
+        156045545,
+        156045546,
+        156045547
+      ],
+      "filled_lots": 0.02,
+      "layers_filled": [
+        "L1",
+        "L2"
+      ],
+      "sl_used": 3610.5,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 7.4271,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 29.145,
+      "ledger_exit_price": 3578.93,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 7.32,
+      "entry_bar_index": 104
+    },
+    "10306": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156050841,
+        156050843,
+        156050844,
+        156050845
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3610.5,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 7.2607,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 29.1,
+      "ledger_exit_price": 3576.43,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 6.57,
+      "entry_bar_index": 114
+    },
+    "10310": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156056336,
+        156056387,
+        156056389,
+        156056390
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3614.33,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 7.46,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 27.125,
+      "ledger_exit_price": 3578.83,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 4.61,
+      "entry_bar_index": 122
+    },
+    "10321": {
+      "chat_id": -1004369388188,
+      "entry_type": "MARKET",
+      "tickets": [
+        156062386
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3613.62,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "signal raw_tp1..5 (provider edit; scaled map empty)",
+      "scaled_atr_at_entry": 7.9807,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 19.95,
+      "ledger_exit_price": 3593.74,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 5.88,
+      "entry_bar_index": 126
+    },
+    "13312": {
+      "chat_id": -1003712081715,
+      "entry_type": "ZONE",
+      "tickets": [
+        156062372,
+        156062384,
+        156062394,
+        156062396
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3619.5,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "signal raw_tp1..5 (provider edit; scaled map empty)",
+      "scaled_atr_at_entry": 7.9807,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 22.4425,
+      "ledger_exit_price": 3592.93,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 6.3,
+      "entry_bar_index": 126
+    },
+    "10328": {
+      "chat_id": -1004369388188,
+      "entry_type": "ZONE",
+      "tickets": [
+        156067525,
+        156068362,
+        156068364,
+        156068366
+      ],
+      "filled_lots": 0.01,
+      "layers_filled": [
+        "L1"
+      ],
+      "sl_used": 3622.73,
+      "sl_source": "filled-layer initial_sl (unanimous)",
+      "tp_source": "dynamic_risk.tp_levels (ATR-scaled)",
+      "scaled_atr_at_entry": 7.9807,
+      "scaled_vol_ratio": 1.75,
+      "ledger_initial_r_per_oz": 19.425,
+      "ledger_exit_price": 3601.82,
+      "ledger_exit_stage": 1,
+      "ledger_peak_profit_per_oz": 6.72,
+      "entry_bar_index": 129
+    }
+  }
+}

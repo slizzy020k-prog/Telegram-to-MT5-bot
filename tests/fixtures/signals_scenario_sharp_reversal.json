@@ -1,0 +1,35 @@
+{
+  "schema": "mt5-copier-replay-signals/1",
+  "tape_fixture": "tape_scenario_sharp_reversal.json",
+  "built_utc": "2026-11-23T02:58:37Z",
+  "source": "SYNTHETIC scenario 'sharp_reversal': High ATR (~10), wide stop R=$38, ~$5 MFE spike then sharp reversal through entry to SL (Nov-23 msg 13305 shape).",
+  "conventions": {
+    "layers": "single L1 0.01 lot at 3600.00 for clean per-scenario attribution"
+  },
+  "trades": [
+    {
+      "msg_id": "syn_sharp_reversal",
+      "dir": "BUY",
+      "open_utc": "2026-11-23T07:25:00Z",
+      "close_utc": "2026-11-23T07:38:00Z",
+      "layers": [
+        [
+          "L1",
+          0.01,
+          3600.0
+        ]
+      ],
+      "sl": 3562.0,
+      "tp_levels": {
+        "TP1": 3610.0,
+        "TP2": 3618.0,
+        "TP3": 3628.0,
+        "TP4": 3640.0,
+        "TP5": 3655.0
+      },
+      "actual_mt5_gbp": 0.0,
+      "actual_exit_reason": "SYNTHETIC scenario (no live counterpart)"
+    }
+  ],
+  "provenance": {}
+}
