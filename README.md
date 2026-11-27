@@ -15,7 +15,7 @@ A fast, automated Python bot on Windows that reads **Gold (`XAUUSD`)** trading s
 
 ### 1. Reading Signals Automatically
 - **Strict Signal Intent Whitelist (Gold-Only by Default):** Works even when the provider writes `"Buy now"`, `"Sell with limit 3890"`, or `"Sell limit 3895-3887"` without typing `"XAUUSD"`. Only explicit `Buy/Sell now` (or market commands), `Buy/Sell limit/stop/with limit` + price/zone, or `Buy/Sell` + a real Gold price (`>= 500`) are accepted. Casual chat, victory recaps, conflicting directions, and non-Gold pairs (`EURUSD`, `NAS100`, `BTCUSD`, etc.) are rejected with a `[PARSER IGNORED]` log entry.
-- **4-Layer Entries (`0.05` Lots Base):** Complete signals split into **4 layers** `[0.01, 0.01, 0.01, 0.02]` (`L1..L4`), scaled proportionally by `RISK_LOT_MULTIPLIER`, hard-capped at `MAX_ORDERS_PER_SIGNAL = 4` live orders:
+- **4-Layer Entries (`0.02` per layer live):** Complete signals split into **4 layers** `[0.02, 0.02, 0.02, 0.02]` (`L1..L4`), scaled proportionally by `RISK_LOT_MULTIPLIER`, hard-capped at `MAX_ORDERS_PER_SIGNAL` live orders (the live `.env` runs **1 layer per signal at 0.02**):
   - **Price Zone (`Buy 3895-3887`):** Spreads `L1..L4` evenly across the zone (`0%`, `33%`, `67%`, `100%`), placing Market orders for any price already reached and Limit orders for deeper levels (pending limits front-run by `+$0.50` so spread/round-number bounces still fill). If live price reaches `TP1` **before** the zone fills, the unfilled pending limits are invalidated (cancelled) instead of filling late.
   - **Single-Price Signals:** Consolidated to **1 order** (`SINGLE_PRICE_CONSOLIDATE_ORDERS=true`) with price-aware Market/Limit routing; a later zone edit expands `L2..L4` cleanly.
   - **Market Now / Bare Price (`STAGED_MARKET_ENTRY=true`):** An unpriced `"Buy/Sell now"` (or bare `"BUY 3728"` within `AUTO_MARKET_SLIPPAGE_PIPS = 15` / `$1.50` of live price) executes **only `L1` (`0.01`) at market**, then waits for the provider's zone/limit edit before placing `L2..L4` — no stacking 4 layers at one price. An edit adding only `SL`/`TP` updates targets without duplicate orders.
@@ -163,9 +163,9 @@ All values below are the **shipped defaults** (verified against `config.py` at v
 ### Layers & Entries
 | Setting | Default | Meaning |
 | :--- | :--- | :--- |
-| `BASE_LAYER_LOTS` | `[0.01, 0.01, 0.01, 0.02]` | Lot sizes for `L1..L4` (`0.05` total) |
+| `BASE_LAYER_LOTS` | `[0.02, 0.02, 0.02, 0.02]` (live) | Lot sizes for `L1..L4` |
 | `RISK_LOT_MULTIPLIER` | `1.0` | Scales all 4 layers proportionally |
-| `MAX_ORDERS_PER_SIGNAL` | `4` | Hard cap on live orders per signal |
+| `MAX_ORDERS_PER_SIGNAL` | `1` (live) | Hard cap on live orders per signal |
 | `STAGED_MARKET_ENTRY` | `true` | Bare market signals open only `L1`; `L2..L4` wait for the zone edit |
 | `SINGLE_PRICE_CONSOLIDATE_ORDERS` | `true` | Single-price entries place 1 consolidated order |
 | `TP_FRONT_RUN_OFFSET` | `0.50` | Broker TP starts `$0.50` in front of `TP1` |

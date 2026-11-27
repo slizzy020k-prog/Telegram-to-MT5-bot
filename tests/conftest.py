@@ -44,6 +44,9 @@ def _apply_isolated_env() -> None:
     # runs against the shipped defaults and the ambient live .env cannot leak into it.
     # Tests that exercise the new configuration set the knob explicitly.
     os.environ["MAX_ORDERS_PER_SIGNAL"] = "4"
+    os.environ["BASE_LAYER_LOTS"] = "[0.01, 0.01, 0.01, 0.02]"
+    os.environ["LAYER_LOTS"] = '{"L1": 0.01, "L2": 0.01, "L3": 0.01, "L4": 0.02}'
+    os.environ["SINGLE_PRICE_LOT"] = "0.01"
     os.environ["DYNAMIC_SL_ATR_MULT"] = "2.50"
     os.environ["DYNAMIC_SL_MAX_DOLLARS"] = "35.00"
     os.environ["R_LOCK_TIERS"] = "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75"
