@@ -189,7 +189,7 @@ async def test_2_stub_l1_only_and_zone_edit_expansion_never_exceeds_4_layers(tmp
         assert len(sig_a["market_tickets"]) == 1
         assert len(sig_a["pending_tickets"]) == 0
         assert set(sig_a["layers"].keys()) == {"L1"}
-        assert sig_a["layers"]["L1"]["lot"] == pytest.approx(0.01)
+        assert sig_a["layers"]["L1"]["lot"] == pytest.approx(0.02)
 
         # Edit "Buy now" with TP/SL only (no zone) -> stays at 1 layer!
         await main.handle_message_edited(
@@ -247,7 +247,7 @@ async def test_2_stub_l1_only_and_zone_edit_expansion_never_exceeds_4_layers(tmp
         assert len(sig_b1["market_tickets"]) + len(sig_b1["pending_tickets"]) == 1
         assert set(sig_b1["layers"].keys()) == {"L1"}
         assert sig_b1["layers"]["L1"]["target_price"] == pytest.approx(3853.0)
-        assert sig_b1["layers"]["L1"]["lot"] == pytest.approx(0.01)
+        assert sig_b1["layers"]["L1"]["lot"] == pytest.approx(0.02)
 
         # 2) Edit adding TP & SL only (still single price 3853) -> updates SL/TP on L1, still 1 order (no stacking!)
         await main.handle_message_edited(

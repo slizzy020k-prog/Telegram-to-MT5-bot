@@ -140,7 +140,7 @@ async def test_1_end_to_end_trade_reading_execution_and_exact_broker_sl_tp_place
         sent_requests.clear()
         await main.handle_new_message(FakeEvent(101, "Buy 3895-3887\nTP1 3900\nTP2 3910\nTP3 3920\nSL 3875"))
         assert len(sent_requests) == 4
-        assert [r["volume"] for r in sent_requests] == [0.01, 0.01, 0.01, 0.02]
+        assert [r["volume"] for r in sent_requests] == [0.02, 0.02, 0.02, 0.02]
         assert all(r["sl"] == pytest.approx(3875.0) for r in sent_requests)
         assert all(r["tp"] == pytest.approx(3899.5) for r in sent_requests)  # v3.1 All-at-TP1 (final_tp)
         sig_101 = main.state_mgr.get_signal(101, chat_id=-1001234567890)
@@ -150,7 +150,7 @@ async def test_1_end_to_end_trade_reading_execution_and_exact_broker_sl_tp_place
         sent_requests.clear()
         await main.handle_new_message(FakeEvent(102, "Sell 3910-3918\nTP1 3900\nTP2 3890\nTP3 3880\nSL 3928"))
         assert len(sent_requests) == 4
-        assert [r["volume"] for r in sent_requests] == [0.01, 0.01, 0.01, 0.02]
+        assert [r["volume"] for r in sent_requests] == [0.02, 0.02, 0.02, 0.02]
         assert all(r["sl"] == pytest.approx(3928.0) for r in sent_requests)
         assert all(r["tp"] == pytest.approx(3900.5) for r in sent_requests)
 

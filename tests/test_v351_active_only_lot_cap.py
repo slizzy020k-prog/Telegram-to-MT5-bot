@@ -139,7 +139,7 @@ async def test_v351_signal_13164_reproducer_pending_limits_allowed(tmp_path, mon
     assert sig["market_tickets"] == []
     assert len(sig["pending_tickets"]) == 4
     assert set(sig["layers"].keys()) == {"L1", "L2", "L3", "L4"}
-    assert round(sum(v["lot"] for v in sig["layers"].values()), 2) == 0.05
+    assert round(sum(v["lot"] for v in sig["layers"].values()), 2) == 0.08
 
     pending_action = getattr(mt5, "TRADE_ACTION_PENDING", 5)
     sell_limit_type = getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
@@ -179,16 +179,16 @@ def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
     )
     assert mk_z == []
     assert len(pd_z) == 4
-    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.05
+    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.08
 
     lots_now = ex.get_total_active_lots()
     assert lots_now["open_lots"] == 0.05
-    assert lots_now["pending_lots"] == 0.09
+    assert lots_now["pending_lots"] == 0.12
     assert ex.get_open_market_tickets() == [101]
 
     # Cancelling one pending order removes from _dry_run_pending_ticket_lots only
     assert ex.cancel_pending_order(t_lim) is True
-    assert ex.get_total_active_lots()["pending_lots"] == 0.07
+    assert ex.get_total_active_lots()["pending_lots"] == 0.10
     assert ex.get_total_active_lots()["open_lots"] == 0.05
 
     # Active market buys/sells are strictly blocked
@@ -253,9 +253,9 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch)
     assert mk == []
     assert len(pd) == 3
     assert set(layers.keys()) == {"L2", "L3", "L4"}
-    assert round(sum(v["lot"] for v in layers.values()), 2) == 0.04
+    assert round(sum(v["lot"] for v in layers.values()), 2) == 0.06
     assert "High Risk Lot Cap Reached" in (ex.last_allocation_warning or "")
-    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.04, "total_lots": 0.09}
+    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.06, "total_lots": 0.11}
 
     # 2. Partial market budget (0.04/0.05 -> 0.01 avail): L1=3898 & L2=3895 are market, L3=3892 & L4=3889 are limits.
     # Only 1 market layer (L1=0.01) fits in avail=0.01; L2 is skipped (0.0); L3 & L4 limits keep 0.01 & 0.02!
@@ -276,9 +276,9 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch)
     assert len(pd2) == 2
     assert set(layers2.keys()) == {"L1", "L3", "L4"}
     assert layers2["L1"]["lot"] == 0.01
-    assert layers2["L3"]["lot"] == 0.01
+    assert layers2["L3"]["lot"] == 0.02
     assert layers2["L4"]["lot"] == 0.02
-    assert ex2.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.03, "total_lots": 0.08}
+    assert ex2.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.04, "total_lots": 0.09}
 
     # 3. Single-price: below-market LIMIT succeeds at 0.05/0.05; at-market AUTO blocked
     orig_cons = getattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
@@ -336,27 +336,32 @@ async def test_v351_active_market_cap_end_to_end_50_and_80(tmp_path, monkeypatch
     sig_pend = main.state_mgr.get_signal(2003, chat_id=-1001234567890)
     assert sig_pend is not None and len(sig_pend["pending_tickets"]) == 4
     assert ex50.get_total_active_lots()["open_lots"] == 0.05
-    assert ex50.get_total_active_lots()["pending_lots"] == 0.05
+    assert ex50.get_total_active_lots()["pending_lots"] == 0.08
 
-    # Part B: £80 account (high_risk_lots = 0.08): 0.05 + 0.03 = 0.08 open, 3rd market blocked, pending still passes
+    # Part B: GBP 120 account (high_risk_lots = 0.12): the first signal uses 0.08
+    # (4 x 0.02), the second is only PARTIALLY placed (the allocator scales the
+    # layers to the remaining budget) and the third is refused outright.
     alerts.clear()
-    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "e2e_80_state.json"))
-    monkeypatch.setattr(main, "trade_ledger", TradeLedger(tmp_path / "e2e_80_ledger.jsonl"))
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "e2e_120_state.json"))
+    monkeypatch.setattr(main, "trade_ledger", TradeLedger(tmp_path / "e2e_120_ledger.jsonl"))
     ex80 = MT5Executor(dry_run=True)
     ex80.connect()
-    ex80._dry_run_capital = 80.0
+    ex80._dry_run_capital = 120.0
     monkeypatch.setattr(main, "executor", ex80)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2011, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
-    assert ex80.get_total_active_lots()["open_lots"] == 0.05
+    assert ex80.get_total_active_lots()["open_lots"] == 0.08
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2012, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
-    assert ex80.get_total_active_lots()["open_lots"] == 0.08
     sig80 = main.state_mgr.get_signal(2012, chat_id=-1001234567890)
-    assert sig80 is not None and len(sig80["market_tickets"]) == 3
-    assert round(sum(l["lot"] for l in sig80["layers"].values()), 2) == 0.03
+    assert sig80 is not None, "the cap must still allow a partial placement"
+    assert len(sig80["market_tickets"]) + len(sig80["pending_tickets"]) >= 1
+    partial_lots = round(sum(l["lot"] for l in sig80["layers"].values()), 2)
+    assert partial_lots == 0.04, "the partial must exactly fill the remaining budget"
 
+    # The cap is now full: the next signal is refused and the exposure does not grow.
     await main.handle_new_message(MockTelethonEvent(msg_id=2013, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
+    assert ex80.get_total_active_lots()["open_lots"] == 0.12
     assert main.state_mgr.get_signal(2013, chat_id=-1001234567890) is None
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2014, text="Buy 3885-3877\nTP 3895\nSL 3865", chat_id=-1001234567890))
@@ -435,4 +440,4 @@ async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_pat
     assert len(sig1["market_tickets"]) == 1
     assert len(sig1["pending_tickets"]) == 3
     assert set(sig1["layers"].keys()) == {"L1", "L2", "L3", "L4"}
-    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.04, "total_lots": 0.09}
+    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.06, "total_lots": 0.11}

@@ -248,7 +248,7 @@ async def test_late_edit_after_3_minutes_adds_layers_and_replaces_fallback_tp_an
         assert sig is not None
         # 1) "TOP" promoted to "L1", and L2, L3, L4 added across 3858-3850 -> 4 total orders ([0.01, 0.01, 0.01, 0.02])!
         assert set(sig["layers"].keys()) == {"L1", "L2", "L3", "L4"}
-        assert [sig["layers"][f"L{i}"]["lot"] for i in range(1, 5)] == [0.01, 0.01, 0.01, 0.02]
+        assert [sig["layers"][f"L{i}"]["lot"] for i in range(1, 5)] == [0.01, 0.02, 0.02, 0.02]
         assert len(sig["market_tickets"]) == 1
         assert len(sig["pending_tickets"]) == 3
         assert sig["layers"]["L2"]["target_price"] == pytest.approx(3855.33)

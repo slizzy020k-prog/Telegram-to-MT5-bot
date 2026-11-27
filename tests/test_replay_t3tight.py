@@ -227,7 +227,8 @@ def test_production_picker_atr_relative_ladder():
     for thr, p in _ladder():
         if ratio + 1e-9 >= thr:
             exp_pct, exp_tier = p, thr
-    protected = exp_pct * mfe
+    noise = max(0.60, min(0.25 * atr_bound, 0.35 * mfe))
+    protected = min(exp_pct * mfe, mfe - noise)
     assert exp_pct > 0.0  # non-vacuous: this MFE/ATR must reach a tier
     assert res["mfe_lock_ratio"] == pytest.approx(ratio, abs=5e-5)  # engine rounds ratio to 4dp
     assert res["mfe_lock_tier"] == pytest.approx(exp_tier)
@@ -252,13 +253,15 @@ def test_production_picker_all_seven_atr_tiers(thr, pct):
     atr = 10.0  # inside the [1, 12] bounds -> ratio == MFE/10
     mfe = thr * atr + 0.05  # just above this tier, below the next
     res = _pick(pol, live=3600.0 + mfe, atr=atr)
+    noise = max(0.60, min(0.25 * atr, 0.35 * mfe))
+    protected = min(pct * mfe, mfe - noise)
     assert res["mfe_lock_tier"] == pytest.approx(thr)
     assert res["mfe_lock_fraction"] == pytest.approx(pct)
-    assert res["mfe_lock_profit"] == pytest.approx(pct * mfe, abs=5e-5)
-    assert res["mfe_lock_sl"] == pytest.approx(3600.0 + pct * mfe, abs=0.011)  # broker 2dp
+    assert res["mfe_lock_profit"] == pytest.approx(protected, abs=5e-5)
+    assert res["mfe_lock_sl"] == pytest.approx(3600.0 + protected, abs=0.011)  # broker 2dp
     # The picker can only be TIGHTER than the ladder lock, never looser
     # (allowing the broker 2-digit rounding of the lock itself).
-    assert res["candidate_sl"] >= 3600.0 + pct * mfe - 0.011
+    assert res["candidate_sl"] >= 3600.0 + protected - 0.011
 
 
 def test_production_picker_tier_hysteresis_no_regression():
@@ -338,8 +341,10 @@ def test_production_picker_sell_mirror():
     mfe = 3600.0 - 3595.0
     ratio = mfe / 12.0
     exp_pct = max((p for thr, p in _ladder() if ratio + 1e-9 >= thr), default=0.0)
+    noise = max(0.60, min(0.25 * 12.0, 0.35 * mfe))
+    protected = min(exp_pct * mfe, mfe - noise)
     assert res["mfe_lock_fraction"] == pytest.approx(exp_pct)
-    assert res["mfe_lock_sl"] == pytest.approx(3600.0 - exp_pct * mfe, abs=0.011)
+    assert res["mfe_lock_sl"] == pytest.approx(3600.0 - protected, abs=0.011)
     assert res["stop_source"] == "MFE_LOCK"
     assert res["auto_be_sl"] == pytest.approx(3600.0)
 

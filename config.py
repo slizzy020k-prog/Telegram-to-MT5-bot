@@ -135,9 +135,9 @@ def _is_positive_number(val: Any) -> bool:
 def _parse_base_layer_lots() -> List[float]:
     """
     Parse BASE_LAYER_LOTS (or legacy LAYER_LOTS) into 4 strictly positive floats.
-    Falls back safely to [0.01, 0.01, 0.01, 0.02] on malformed or wrong-length input.
+    Falls back safely to [0.02, 0.02, 0.02, 0.02] on malformed or wrong-length input.
     """
-    default_lots = [0.01, 0.01, 0.01, 0.02]
+    default_lots = [0.02, 0.02, 0.02, 0.02]
     raw_base = os.getenv("BASE_LAYER_LOTS")
     if raw_base and raw_base.strip():
         stripped = raw_base.strip()
@@ -198,7 +198,7 @@ def _parse_base_layer_lots() -> List[float]:
 LAYER_NAMES: Tuple[str, ...] = ("L1", "L2", "L3", "L4")
 LEGACY_LAYER_MAP: Dict[str, str] = {"TOP": "L1", "MID": "L2", "BOTTOM": "L4"}
 
-# Base 4-layer lot split: [0.01, 0.01, 0.01, 0.02] (all layers start at TP1; deepest runner(s) scale TP1->TP4)
+# Base 4-layer lot split: [0.02, 0.02, 0.02, 0.02] (all layers start at TP1; deepest runner(s) scale TP1->TP4)
 BASE_LAYER_LOTS: List[float] = _parse_base_layer_lots()
 RISK_LOT_MULTIPLIER: float = _env_float(
     "RISK_LOT_MULTIPLIER", 1.0, min_val=0.01, max_val=100.0, positive_only=True
@@ -345,7 +345,7 @@ MAGIC_NUMBER: int = _env_int("MAGIC_NUMBER", 777001, min_val=1)
 DEFAULT_SYMBOL: str = (os.getenv("DEFAULT_SYMBOL") or "XAUUSD.s").strip() or "XAUUSD.s"
 
 # Legacy single-price lot setting (retained for backward compatibility)
-SINGLE_PRICE_LOT: float = _env_float("SINGLE_PRICE_LOT", 0.01, min_val=0.01, max_val=100.0, positive_only=True)
+SINGLE_PRICE_LOT: float = _env_float("SINGLE_PRICE_LOT", 0.02, min_val=0.01, max_val=100.0, positive_only=True)
 
 # Seconds between live checks of mt5.terminal_info().trade_allowed
 CHECK_ALGO_TRADING_INTERVAL: int = _env_int("CHECK_ALGO_TRADING_INTERVAL", 30, min_val=1, max_val=3600)
@@ -648,7 +648,7 @@ DYNAMIC_ATR_MFE_LOCK_ENABLED: bool = _env_bool("DYNAMIC_ATR_MFE_LOCK_ENABLED", F
 # ATR-RELATIVE MFE protection ladder "ratio:pct,..." (NO fixed-dollar MFE activation).
 # tier arms when MFE/ATR >= ratio; protects pct fraction of MFE. Hysteresis keeps the
 # highest tier reached per layer. Used only when DYNAMIC_ATR_MFE_LOCK_ENABLED is True.
-DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85").strip()
+DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93").strip()
 # Spread+slippage floor: the lock arms only when fraction*MFE >= this floor, so it
 # never locks a nominal profit that is a net loss after costs.
 DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS: float = _env_float(

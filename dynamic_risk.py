@@ -74,7 +74,7 @@ class DynamicRiskPolicy:
     be_activation_ceiling_dollars: float = 0.0
     trail_distance_tiers: str = ""
     mfe_lock_enabled: bool = False
-    mfe_lock_tiers: str = "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
+    mfe_lock_tiers: str = "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93"
     mfe_lock_cost_floor_dollars: float = 0.60
     mfe_lock_atr_min_dollars: float = 1.00
     mfe_lock_atr_max_dollars: float = 12.00
@@ -179,7 +179,7 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         be_activation_ceiling_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)),
         trail_distance_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS", "") or "").strip(),
         mfe_lock_enabled=bool(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ENABLED", False)),
-        mfe_lock_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_TIERS", "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85") or "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85").strip(),
+        mfe_lock_tiers=str(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_TIERS", "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93") or "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93").strip(),
         mfe_lock_cost_floor_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 0.60), 0.60)),
         mfe_lock_atr_min_dollars=max(0.01, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS", 1.00), 1.00)),
         mfe_lock_atr_max_dollars=max(0.10, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS", 12.00), 12.00)),
@@ -585,6 +585,18 @@ def _parse_distance_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
     return _parse_tier_pairs(raw, positive_only=True)
 
 
+# Fraction of the ATR the locked stop must stay below the peak so that ordinary
+# noise cannot clip it. The effective noise floor is the larger of this and the
+# configured cost floor (the spread + slippage).
+_MFE_LOCK_NOISE_ATR_MULT = 0.25
+# ... but the giveback must never eat more than this share of the peak, otherwise a
+# high-volatility regime would swallow the whole excursion (the replay harness
+# measured exactly that: a 0.25x-ATR floor on the Nov-17-19 tape cut the MFE
+# capture from 45% to 40%). The lock therefore gives back the SMALLER of a quarter
+# of the ATR and this share of the peak, and never less than the cost floor.
+_MFE_LOCK_NOISE_MAX_PEAK_FRACTION = 0.35
+
+
 def _parse_mfe_lock_tiers(raw: Any) -> Tuple[Tuple[float, float], ...]:
     """MFE-lock fractions: threshold >= 0, fraction clamped to [0, 1]."""
     return _parse_tier_pairs(raw, max_value=1.0)
@@ -670,6 +682,7 @@ def compute_dynamic_atr_trail_stop(
             "mfe_lock_fraction": 0.0,
             "mfe_lock_profit": 0.0,
             "mfe_lock_ratio": 0.0,
+            "mfe_lock_noise_floor": 0.0,
             "mfe_lock_tier": 0.0,
             "auto_be_sl": None,
             "auto_be_armed": False,
@@ -767,6 +780,7 @@ def compute_dynamic_atr_trail_stop(
     mfe_lock_profit = 0.0
     mfe_lock_ratio = 0.0
     mfe_lock_tier = 0.0
+    mfe_lock_noise_floor = 0.0
     if policy.mfe_lock_enabled:
         mfe_pos = max(0.0, mfe)
         atr_min = max(0.01, _safe_float(policy.mfe_lock_atr_min_dollars, 1.0))
@@ -784,12 +798,33 @@ def compute_dynamic_atr_trail_stop(
                 break
         prev_pct = max(0.0, _safe_float(mfe_lock_prev_pct, 0.0))
         pct = max(pct, prev_pct)  # hysteresis: never regress to a lower tier/pct
-        protected = max(pct * mfe_pos, max(0.0, _safe_float(mfe_lock_prev_profit, 0.0)))
+        cost_floor = max(0.0, _safe_float(policy.mfe_lock_cost_floor_dollars, 0.0))
+        # NOISE FLOOR: the lock is only useful if it sits far enough below the peak to
+        # survive ordinary noise. A lock at a fixed fraction of a SMALL peak lands
+        # inside the spread (gold: ~$0.52) and is clipped by noise long before the
+        # move is over -- the "stopped out at a pound while it went on for three"
+        # complaint. The retained profit is therefore capped so the stop stays at
+        # least (cost floor + a slice of the ATR) BELOW the peak, while the tier
+        # fraction keeps as much of the peak as the noise allows.
+        noise_floor = round(
+            max(
+                cost_floor,
+                min(
+                    _MFE_LOCK_NOISE_ATR_MULT * atr_bound,
+                    _MFE_LOCK_NOISE_MAX_PEAK_FRACTION * mfe_pos,
+                ),
+            ),
+            4,
+        )
+        protected_by_pct = pct * mfe_pos
+        protected_by_noise = mfe_pos - noise_floor
+        protected = min(protected_by_pct, protected_by_noise)
+        protected = max(protected, max(0.0, _safe_float(mfe_lock_prev_profit, 0.0)))
         mfe_lock_fraction = pct
         mfe_lock_profit = protected
         mfe_lock_tier = tier
-        cost_floor = max(0.0, _safe_float(policy.mfe_lock_cost_floor_dollars, 0.0))
-        if mfe_pos > 0.0 and pct > 0.0 and protected + 1e-9 >= cost_floor:
+        mfe_lock_noise_floor = noise_floor
+        if mfe_pos > 0.0 and pct > 0.0 and protected > 0.0 and protected + 1e-9 >= cost_floor:
             mfe_lock_sl = round(entry_price + sign * round(protected, digits), digits)
 
     # T3 opt-in: automatic provider 30-pip break-even (SL -> entry), independent of the
@@ -861,6 +896,7 @@ def compute_dynamic_atr_trail_stop(
             "mfe_lock_sl": mfe_lock_sl,
             "mfe_lock_fraction": mfe_lock_fraction,
             "mfe_lock_profit": round(mfe_lock_profit, 4),
+            "mfe_lock_noise_floor": round(mfe_lock_noise_floor, 4),
             "mfe_lock_ratio": round(mfe_lock_ratio, 4),
             "mfe_lock_tier": round(mfe_lock_tier, 4),
             "auto_be_sl": auto_be_sl,
@@ -917,6 +953,7 @@ def compute_dynamic_atr_trail_stop(
         "mfe_lock_sl": mfe_lock_sl,
         "mfe_lock_fraction": mfe_lock_fraction,
         "mfe_lock_profit": round(mfe_lock_profit, 4),
+        "mfe_lock_noise_floor": round(mfe_lock_noise_floor, 4),
         "mfe_lock_ratio": round(mfe_lock_ratio, 4),
         "mfe_lock_tier": round(mfe_lock_tier, 4),
         "auto_be_sl": auto_be_sl,

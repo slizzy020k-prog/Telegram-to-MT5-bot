@@ -31,9 +31,9 @@ import main
 import mt5_executor
 from dynamic_risk import DynamicRiskPolicy, compute_dynamic_atr_trail_stop, compute_volatility_ratio
 
-LADDER = "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
+LADDER = "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93"
 DIST_TIERS = "6:3.50,10:3.00,15:2.75,20:2.50"  # MODERATE caps (preserve $2-4 Gold retracements)
-TIERS7 = [(0.40, 0.45), (0.60, 0.55), (0.80, 0.65), (1.00, 0.70), (1.25, 0.75), (1.50, 0.80), (2.00, 0.85)]
+TIERS7 = [(0.30, 0.60), (0.50, 0.70), (0.75, 0.78), (1.00, 0.84), (1.40, 0.88), (1.80, 0.91), (2.50, 0.93)]
 
 NEW_KNOBS = {
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": "trail_activation_ceiling_dollars",
@@ -167,10 +167,20 @@ def test_ladder_seven_tiers_exact(direction, ratio, pct):
     mfe = ratio * atr
     sign = 1.0 if direction == "BUY" else -1.0
     res = _eng(direction, entry, _live(entry, mfe, direction), pol, atr=atr)
+    # The retained profit is the tier fraction of the peak, but never closer to the
+    # peak than the noise floor (the cost floor + a slice of the bounded ATR), so
+    # ordinary noise cannot clip the lock.
+    noise = max(0.60, min(0.25 * atr, 0.35 * mfe))
+    expected = min(pct * mfe, mfe - noise)
     assert res["mfe_lock_ratio"] == pytest.approx(ratio)
     assert res["mfe_lock_fraction"] == pytest.approx(pct)
-    assert res["mfe_lock_profit"] == pytest.approx(pct * mfe)
-    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(pct * mfe, 2), 2))
+    assert res["mfe_lock_noise_floor"] == pytest.approx(noise)
+    assert res["mfe_lock_profit"] == pytest.approx(expected)
+    # At every tier the peak leaves room for the noise floor, so the lock arms and
+    # binds. (The "peak too small to lock" case is covered in
+    # tests/test_profit_lock_balance.py.)
+    assert expected + 1e-9 >= 0.60
+    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(expected, 2), 2))
     assert res["stop_source"] == "MFE_LOCK"
     assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
 
@@ -178,10 +188,10 @@ def test_ladder_seven_tiers_exact(direction, ratio, pct):
 def test_ladder_no_fixed_dollar_activation():
     # Same MFE, different ATR -> different tier (ratio-keyed, NOT fixed-dollar).
     pol = _ladder()
-    low = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)    # ratio 1.00 -> 70%
-    high = _eng("BUY", 3700.0, 3704.0, pol, atr=8.0)   # ratio 0.50 -> 45%
-    assert low["mfe_lock_fraction"] == pytest.approx(0.70)
-    assert high["mfe_lock_fraction"] == pytest.approx(0.45)
+    low = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)    # ratio 1.00 -> 84%
+    high = _eng("BUY", 3700.0, 3704.0, pol, atr=8.0)   # ratio 0.50 -> 70%
+    assert low["mfe_lock_fraction"] == pytest.approx(0.84)
+    assert high["mfe_lock_fraction"] == pytest.approx(0.70)
 
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
@@ -190,10 +200,10 @@ def test_ladder_atr_max_bound_prevents_delay(direction):
     entry = 3700.0
     # ATR 50 (extreme) but bounded to 12 -> MFE 4.8 gives ratio 0.40 -> first tier arms.
     res = _eng(direction, entry, _live(entry, 4.8, direction), pol, atr=50.0)
-    assert res["mfe_lock_fraction"] == pytest.approx(0.45)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.60)
     assert res["mfe_lock_sl"] is not None
     unbounded = _eng(direction, entry, _live(entry, 4.8, direction), _ladder(mfe_lock_atr_max_dollars=500.0), atr=50.0)
-    assert unbounded["mfe_lock_fraction"] == 0.0  # ratio 0.096 < 0.40 -> no tier
+    assert unbounded["mfe_lock_fraction"] == 0.0  # ratio 0.096 < 0.30 -> no tier
 
 
 def test_ladder_atr_min_bound_prevents_instant_arm():
@@ -201,16 +211,18 @@ def test_ladder_atr_min_bound_prevents_instant_arm():
     # Tiny ATR 0.2 clamped to 1.0 -> MFE 0.4 gives ratio 0.40 (not 2.0).
     res = _eng("BUY", 3700.0, 3700.4, pol, atr=0.2)
     assert res["mfe_lock_ratio"] == pytest.approx(0.40)
-    assert res["mfe_lock_fraction"] == pytest.approx(0.45)
+    assert res["mfe_lock_fraction"] == pytest.approx(0.60)
 
 
 def test_ladder_cost_floor_gates_profit_lock():
     pol = _ladder(mfe_lock_cost_floor_dollars=5.0)
-    res = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)  # profit 2.8 < floor 5
-    assert res["mfe_lock_fraction"] == pytest.approx(0.70)  # tier reached
+    res = _eng("BUY", 3700.0, 3704.0, pol, atr=4.0)  # MFE 4.0 < floor + noise 10
+    assert res["mfe_lock_fraction"] == pytest.approx(0.84)  # tier reached
     assert res["mfe_lock_sl"] is None                       # but not armed
     assert res["stop_source"] != "MFE_LOCK"
-    ok = _eng("BUY", 3700.0, 3708.0, _ladder(mfe_lock_cost_floor_dollars=5.0), atr=4.0)  # profit 6.8 >= 5
+    # The lock only arms when the RETAINED profit still covers the cost floor, i.e.
+    # when the peak leaves room for the noise floor AND the cost floor.
+    ok = _eng("BUY", 3700.0, 3714.0, _ladder(mfe_lock_cost_floor_dollars=5.0), atr=4.0)  # MFE 14
     assert ok["mfe_lock_sl"] is not None
 
 
@@ -230,7 +242,7 @@ def test_hysteresis_atr_rise_no_tier_regression(direction):
     assert res["mfe_lock_profit"] == pytest.approx(6.8)
     assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * 6.8, 2))
     without = _eng(direction, entry, _live(entry, 8.0, direction), pol, atr=12.0)
-    assert without["mfe_lock_fraction"] == pytest.approx(0.55)  # non-vacuous
+    assert without["mfe_lock_fraction"] == pytest.approx(0.70)  # non-vacuous
 
 
 def test_protected_profit_ratchet_never_decreases():
@@ -246,22 +258,22 @@ def test_executor_persists_tier_and_survives_restart_and_tp_move(monkeypatch):
     sig = _sig(3700.0, 3690.0)
     ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
     lv = sig["layers"]["L1"]
-    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.70)
-    assert lv["mfe_lock_profit_reached"] == pytest.approx(2.8)
-    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3702.8)  # protection marker stamped
+    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.84)
+    assert lv["mfe_lock_profit_reached"] == pytest.approx(3.0)
+    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3703.0)  # protection marker stamped
     peak = lv["dynamic_atr_trail_peak"]
     # TP management moves targets -> MFE/peak/tier must NOT reset.
     sig["tp_levels"] = {"TP1": 3705.0, "TP2": 3712.0}
     ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
     assert lv["dynamic_atr_trail_peak"] == peak
-    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.70)
+    assert lv["mfe_lock_pct_reached"] == pytest.approx(0.84)
     # Simulate restart/reconnect: JSON round-trip the signal, fresh executor, ATR rises.
     restored = json.loads(json.dumps(sig))
     ex2 = _ex(12.0)
     ex2.evaluate_dynamic_atr_engine(restored, tick=_tick(3700.0, 4.0, "BUY"))
     lv2 = restored["layers"]["L1"]
-    assert lv2["mfe_lock_pct_reached"] == pytest.approx(0.70)  # hysteresis across restart + ATR rise
-    assert lv2["mfe_lock_profit_reached"] >= 2.8
+    assert lv2["mfe_lock_pct_reached"] == pytest.approx(0.84)  # hysteresis across restart + ATR rise
+    assert lv2["mfe_lock_profit_reached"] >= 3.0
 
 
 def test_mfe_independent_of_tp_levels():
@@ -358,7 +370,7 @@ def test_pre_tp1_mfe_lock_then_loosening_edit_is_dropped(monkeypatch):
     sig = _sig(3700.0, 3690.0)
     ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3700.0, 4.0, "BUY"))
     lv = sig["layers"]["L1"]
-    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3702.8)
+    assert lv["dynamic_atr_trail_sl"] == pytest.approx(3703.0)
     assert sig.get("tp1_reached") in (None, False)  # pre-TP1
     # A loosening provider SL edit must NOT loosen the protective stop.
     assert main._resolve_edit_layer_sl(sig, lv, 3695.0, "BUY") is None
@@ -697,7 +709,7 @@ def test_binding_sl_log_lists_components_and_winner(monkeypatch, caplog):
     for label in ("ATR_TRAIL=", "MFE_LOCK=", "R_LOCK=", "BE_LOCK=", "AUTO_BE=", "MILESTONE=", "WINNER=", "broker_sl="):
         assert label in line, "missing component label " + label
     assert "WINNER=MFE_LOCK" in line
-    assert "broker_sl=3704.8" in line
+    assert "broker_sl=3705.0" in line
 
 
 def test_binding_sl_log_silent_at_defaults(caplog):
@@ -764,9 +776,11 @@ def test_interim_floor_matches_research_ifk50(direction):
 
 def test_interim_floor_binds_only_when_tighter_than_ladder():
     entry = 3700.0
-    # MFE 2 / ATR 4: ladder 45% -> 0.90; floor k0.5 -> 2.00 (tighter for BUY).
+    # MFE 2 / ATR 4: ladder 70% of 2.00 = 1.40, but the noise floor (the smaller of
+    # 0.25 * ATR = 1.00 and 35% of the peak = 0.70) caps the retained profit at 1.30;
+    # floor k0.5 -> 2.00 (tighter for BUY).
     res = _eng("BUY", entry, 3702.0, _ifpol(0.50, mfe_lock_enabled=True), atr=4.0)
-    assert res["mfe_lock_sl"] == pytest.approx(3700.9)
+    assert res["mfe_lock_sl"] == pytest.approx(3701.3)
     assert res["interim_floor_sl"] == pytest.approx(3702.0)
     assert res["stop_source"] == "INTERIM_FLOOR"
     assert res["candidate_sl"] == pytest.approx(3702.0)
@@ -774,12 +788,13 @@ def test_interim_floor_binds_only_when_tighter_than_ladder():
 
 def test_interim_floor_never_loosens_tighter_mfe_lock():
     entry = 3700.0
-    # MFE 8 / ATR 4: ladder 85% -> 6.80 (tighter); floor 2.00 must NOT win.
+    # MFE 8 / ATR 4: ladder 91% of 8.00 = 7.28, capped by the noise floor
+    # (0.25 x ATR = 1.00) to 7.00; floor 2.00 is looser and must NOT win.
     res = _eng("BUY", entry, 3708.0, _ifpol(0.50, mfe_lock_enabled=True), atr=4.0)
-    assert res["mfe_lock_sl"] == pytest.approx(3706.8)
+    assert res["mfe_lock_sl"] == pytest.approx(3707.0)
     assert res["interim_floor_sl"] == pytest.approx(3702.0)
     assert res["stop_source"] == "MFE_LOCK"
-    assert res["candidate_sl"] == pytest.approx(3706.8)
+    assert res["candidate_sl"] == pytest.approx(3707.0)
 
 
 def test_interim_floor_step_guard_blocks_loosening():

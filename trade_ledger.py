@@ -491,10 +491,21 @@ def build_trade_record(
     # measurable.
     CONTRACT_OZ_PER_LOT = 100.0
     mfe_per_oz = _safe_float((mfe_dict or {}).get("peak_profit_per_oz"), 0.0) if mfe_dict else 0.0
-    lots_for_mfe = _safe_float(signal_data.get("total_lots"), 0.0)
+    # The excursion belongs to the size that was actually OPEN. Using the signal's
+    # total lots (the whole ladder) inflated the MFE and the giveback by the ratio
+    # of planned to filled size -- e.g. 5x for a signal that only ever filled L1.
+    # The FILLED size (what was actually open) is the only correct basis for the
+    # excursion. Production signal state has no "filled_lots" key, so the locally
+    # computed filled_lots is used first; only if that is zero do we fall back to
+    # the planned total.
+    lots_for_mfe = _safe_float(filled_lots, 0.0)
+    if lots_for_mfe <= 0.0:
+        lots_for_mfe = _safe_float(signal_data.get("filled_lots"), 0.0)
+    if lots_for_mfe <= 0.0:
+        lots_for_mfe = _safe_float(total_lots, 0.0)
     if lots_for_mfe <= 0.0:
         # Fall back to the layer-derived total when the signal carries no size.
-        lots_for_mfe = _safe_float(total_lots, 0.0)
+        lots_for_mfe = _safe_float(signal_data.get("total_lots"), 0.0)
     mfe_cash: Optional[float] = None
     if mfe_per_oz > 0.0 and lots_for_mfe > 0.0:
         mfe_cash = round(mfe_per_oz * lots_for_mfe * CONTRACT_OZ_PER_LOT, 2)

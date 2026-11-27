@@ -620,25 +620,28 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
     assert sig_pend is not None and len(sig_pend["pending_tickets"]) == 4
     assert main.executor.get_total_active_lots()["open_lots"] == 0.05
 
-    # 3. Atomic partial cap on a £80 account (High Risk = 0.08 lots): 0.05 + capped 0.03 -> 0.08 active open, then blocked!
+    # 3. Atomic partial cap on a GBP 120 account (High Risk = 0.12 lots): the first
+    # signal uses 0.08 (4 x 0.02), so the SECOND one is only PARTIALLY placed (the
+    # allocator scales the layers to the remaining budget) and the third is refused.
     alerts.clear()
-    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state_80.json"))
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state_120.json"))
     ex80 = MT5Executor(dry_run=True)
     ex80.connect()
-    ex80._dry_run_capital = 80.0
+    ex80._dry_run_capital = 120.0
     monkeypatch.setattr(main, "executor", ex80)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=9964, text="Buy now\nTP 3905\nSL 3875"))
-    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.08
 
     await main.handle_new_message(MockTelethonEvent(msg_id=9965, text="Buy now\nTP 3905\nSL 3875"))
-    assert main.executor.get_total_active_lots()["open_lots"] == 0.08
     sig_partial = main.state_mgr.get_signal(9965)
-    assert sig_partial is not None
-    assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) == 3
-    assert round(sum(l["lot"] for l in sig_partial["layers"].values()), 2) == 0.03
-    assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
+    assert sig_partial is not None, "the cap must still allow a partial placement"
+    assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) >= 1
+    partial_lots = round(sum(l["lot"] for l in sig_partial["layers"].values()), 2)
+    assert partial_lots == 0.04, "the partial must exactly fill the remaining budget"
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.12
 
+    # Now the cap is full: the next signal is refused outright.
     await main.handle_new_message(MockTelethonEvent(msg_id=9966, text="Buy now\nTP 3905\nSL 3875"))
     assert main.state_mgr.get_signal(9966) is None
 

@@ -165,7 +165,7 @@ def test_heavy_open_lots_uncapped_with_default_config(monkeypatch):
     mk, pd, layers = ex.execute_4layer_market("XAUUSD.s", "BUY", sl=3875.0, final_tp=3904.5, raw_tp1=3905.0)
     assert len(mk) == 4
     assert pd == []
-    assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.01, 0.01, 0.01, 0.02]
+    assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.02, 0.02, 0.02, 0.02]
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ async def test_saved_messages_lotcap_toggle_on_and_off(tmp_path, monkeypatch):
     assert any("Unlimited (OFF)" in r for r in evt_off.replies)
 
     assert ex.check_and_cap_order_lot(0.50, symbol="XAUUSD.s") == (0.50, None)
-    assert ex.allocate_4layer_lots("XAUUSD.s") == ([0.01, 0.01, 0.01, 0.02], None)
+    assert ex.allocate_4layer_lots("XAUUSD.s") == ([0.02, 0.02, 0.02, 0.02], None)
 
 
 @pytest.mark.asyncio

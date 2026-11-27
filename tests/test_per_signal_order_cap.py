@@ -66,7 +66,7 @@ def test_zone_entry_honours_the_per_signal_order_cap():
     mk, pd, layers = _zone_ex(ex, max_layers=1)
     assert set(layers.keys()) == {"L1"}
     assert len(mk) + len(pd) == 1
-    assert round(sum(v["lot"] for v in layers.values()), 4) == 0.01
+    assert round(sum(v["lot"] for v in layers.values()), 4) == 0.02
 
 
 def test_zone_entry_cap_of_two_places_l1_and_l2():

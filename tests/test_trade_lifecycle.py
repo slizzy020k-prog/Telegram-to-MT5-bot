@@ -1578,13 +1578,13 @@ def test_build_trade_record_adds_cash_mfe_and_giveback():
     )
 
     assert rec["schema_version"] == 4
-    # 11.12 $/oz * 0.05 lots * 100 oz/lot = 55.60
-    assert rec["mfe_cash"] == pytest.approx(55.60)
-    assert rec["giveback_cash"] == pytest.approx(55.04)
+    # 11.12 $/oz * 0.01 lots (FILLED, not the 0.05 planned) * 100 oz/lot = 11.12
+    assert rec["mfe_cash"] == pytest.approx(11.12)
+    assert rec["giveback_cash"] == pytest.approx(10.56)
     assert rec["initial_r_per_oz"] == pytest.approx(20.0)
-    # R at exit = MFE cash / risk cash = 55.60 / (20.0 * 0.05 * 100) = 0.556.
-    # (The plan's draft expectation of 0.278 is inconsistent with its own
-    #  mfe_cash/initial_r_per_oz expectations: 11.12 / 20.0 = 0.556.)
+    # R at exit = MFE cash / risk cash = 11.12 / (20.0 * 0.01 * 100) = 0.556.
+    # The ratio is scale-invariant: both the excursion and the risk now use the
+    # FILLED lots, so the R figure is unchanged while the cash figures are real.
     assert rec["r_at_exit"] == pytest.approx(0.556)
     # 06:19:09 -> 09:19:51 = 3h00m42s
     assert rec["exit_age_seconds"] == pytest.approx(10842, abs=2)
@@ -1909,11 +1909,11 @@ def test_build_trade_record_converts_the_giveback_into_the_account_currency():
 
     # mfe_cash stays in the symbol PROFIT currency (USD), so r_at_exit -- a
     # ratio of two USD amounts -- is unchanged and currency-neutral.
-    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["mfe_cash"] == pytest.approx(11.12)
     assert rec["r_at_exit"] == pytest.approx(0.556)
     # The giveback is converted into the ACCOUNT currency BEFORE the subtraction.
-    assert rec["giveback_cash"] == pytest.approx(round(55.60 * 0.7645 - 0.56, 2))
-    assert rec["giveback_cash"] != pytest.approx(55.04)
+    assert rec["giveback_cash"] == pytest.approx(round(11.12 * 0.7645 - 0.56, 2))
+    assert rec["giveback_cash"] != pytest.approx(10.56)
     assert rec["giveback_currency"] == "GBP"
     assert rec["fx_rate_to_account"] == pytest.approx(0.7645)
 
@@ -1933,7 +1933,7 @@ def test_build_trade_record_leaves_the_giveback_unknown_without_a_rate():
     assert rec["giveback_cash"] is None
     assert rec["fx_rate_to_account"] is None
     # The price-based telemetry is unaffected by the missing rate.
-    assert rec["mfe_cash"] == pytest.approx(55.60)
+    assert rec["mfe_cash"] == pytest.approx(11.12)
     assert rec["r_at_exit"] == pytest.approx(0.556)
 
 
