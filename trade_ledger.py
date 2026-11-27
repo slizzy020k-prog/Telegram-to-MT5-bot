@@ -25,6 +25,7 @@ VALID_EXIT_REASON_CODES = {
     "TP_CEILING",
     "BROKER_SL",
     "MANUAL",
+    "EA_CLOSE",
     "PARTIAL_BANK",
     "ATR_TRAIL",
     "FSM_FLOOR",
@@ -179,6 +180,8 @@ def normalize_exit_reason_code(
         return "TP_CEILING"
     if "broker_sl" in low or "stop loss" in low or up == "SL":
         return "BROKER_SL"
+    if "ea_close" in low or "closed by the copier" in low or "closed by the bot" in low:
+        return "EA_CLOSE"
     if (
         "manual" in low
         or "/bank" in low
@@ -544,6 +547,27 @@ def build_trade_record(
 
     lifecycle_action = signal_data.get("lifecycle_action")
 
+    # --- Reconcile the realised P&L against the broker's exit deals -------------
+    # The deal profit is the only authority. The signal-level figure is the sum the
+    # copier accumulated while the signal was alive; when the two disagree (a
+    # partially booked layer, a close that landed outside the accounting window)
+    # the DEAL sum wins and the variance is recorded so the gap stays auditable.
+    deal_pnl = 0.0
+    deal_layers = 0
+    deal_bearing = 0
+    for _le in layer_exits:
+        if _le.get("exit_deal_tickets"):
+            deal_bearing += 1
+            if _is_num(_le.get("realized_pnl")):
+                deal_pnl += float(_le["realized_pnl"])
+                deal_layers += 1
+    realized_pnl_variance: Optional[float] = None
+    if deal_bearing > 0 and deal_layers == deal_bearing:
+        _variance = round(_safe_float(realized_pnl, 0.0) - deal_pnl, 2)
+        if abs(_variance) > 0.01:
+            realized_pnl_variance = _variance
+            realized_pnl = deal_pnl
+
     record: Dict[str, Any] = {
         "schema_version": 4,
         "closed_at": datetime.now(timezone.utc).isoformat(),
@@ -579,6 +603,8 @@ def build_trade_record(
         "trail_tier_used": trail_tier_used,
         "layer_exits": layer_exits,
         "realized_pnl": round(_safe_float(realized_pnl, 0.0), 2),
+        "realized_pnl_variance": realized_pnl_variance,
+        "realized_pnl_layers_counted": deal_layers,
         "currency": str(currency or "GBP"),
         "dry_run": bool(dry_run),
     }
@@ -685,6 +711,11 @@ class TradeLedger:
         today_trades = 0
         today_pnl = 0.0
         pnls: List[float] = []
+        mfe_surrendered = 0.0
+        today_mfe_surrendered = 0.0
+        r_values: List[float] = []
+        reached_half_r = 0
+        reached_one_r = 0
 
         for t in trades:
             pnl = round(_safe_float(t.get("realized_pnl"), 0.0), 2)
@@ -697,6 +728,23 @@ class TradeLedger:
             else:
                 breakevens += 1
 
+            # Cash surrendered after the peak excursion: the number that shows whether
+            # the protection engine actually keeps what it finds.
+            gb = t.get("giveback_cash")
+            gb_val = _safe_float(gb, 0.0) if _is_num(gb) else 0.0
+            mfe_surrendered += gb_val
+
+            # R-at-exit distribution: if nothing ever reaches 0.5R the R-relative
+            # ladders can never engage, and the account is running on luck.
+            r_val = t.get("r_at_exit")
+            if _is_num(r_val):
+                r_f = float(r_val)
+                r_values.append(r_f)
+                if r_f >= 0.5:
+                    reached_half_r += 1
+                if r_f >= 1.0:
+                    reached_one_r += 1
+
             rec_date = t.get("server_date")
             if not rec_date:
                 closed_at = str(t.get("closed_at") or "")
@@ -704,6 +752,7 @@ class TradeLedger:
             if rec_date == target_date:
                 today_trades += 1
                 today_pnl += pnl
+                today_mfe_surrendered += gb_val
 
         win_rate = round((wins / total_trades) * 100.0, 1) if total_trades > 0 else 0.0
         avg_pnl = round(total_pnl / total_trades, 2) if total_trades > 0 else 0.0
@@ -723,4 +772,10 @@ class TradeLedger:
             "worst_trade_pnl": round(min(pnls), 2) if pnls else 0.0,
             "last_exit_reason": last_trade.get("exit_reason"),
             "last_closed_at": last_trade.get("closed_at"),
+            "mfe_surrendered_cash": round(mfe_surrendered, 2),
+            "today_mfe_surrendered_cash": round(today_mfe_surrendered, 2),
+            "r_at_exit_max": round(max(r_values), 4) if r_values else None,
+            "r_at_exit_avg": round(sum(r_values) / len(r_values), 4) if r_values else None,
+            "trades_reached_0_5r": reached_half_r,
+            "trades_reached_1r": reached_one_r,
         }

@@ -66,6 +66,9 @@ from config import (
     UNPRICED_TP_GRACE_SECONDS,
     DAILY_LOSS_PAUSE_PCT,
     EMERGENCY_CUTOFF_LOSS_PCT,
+    ENTRY_BLACKOUT_ENABLED,
+    ENTRY_BLACKOUT_UTC_END_HOUR,
+    ENTRY_BLACKOUT_UTC_START_HOUR,
     FLOAT_LOSS_FORCE_CLOSE_PCT,
     CATCHUP_WINDOW_SECONDS,
     CATCHUP_MAX_MESSAGES,
@@ -563,6 +566,26 @@ async def _account_closed_tickets(
             added_profit += raw_p
             total_banked += raw_p
 
+        # Persist the deal-level close facts on the LAYER so the ledger can reconcile
+        # the realised P&L against the broker's exit deals. Without this the live path
+        # only accumulated sig["banked_profit"] and the per-layer exit deal tickets
+        # were never written, so the ledger had nothing to reconcile against.
+        _layers_live = sig.get("layers")
+        if isinstance(_layers_live, dict):
+            for _lk_live, _lv_live in _layers_live.items():
+                if not isinstance(_lv_live, dict):
+                    continue
+                if _safe_ticket_int(_lv_live.get("ticket")) != _safe_ticket_int(t):
+                    continue
+                _info_live = info_d or {}
+                if _is_num(_info_live.get("exit_price")):
+                    _lv_live["exit_price"] = round(float(_info_live["exit_price"]), 4)
+                if _is_num(_info_live.get("profit")):
+                    _lv_live["realized_pnl"] = round(float(_info_live["profit"]), 2)
+                if _info_live.get("exit_deal_tickets"):
+                    _lv_live["exit_deal_tickets"] = list(_info_live["exit_deal_tickets"])
+                break
+
     sig["accounted_tickets"] = accounted
     sig["accounted_deal_tickets"] = accounted_deals
     sig["pending_pnl_tickets"] = pending_pnl
@@ -658,6 +681,28 @@ def _merge_dynamic_risk_into_signal_fields(
         "tp_levels": t_map or tp_levels,
         "dynamic_risk": dict(snap),
     }
+
+
+def _entry_blackout_active(now: Optional[datetime] = None) -> Tuple[bool, str]:
+    """Return (blocked, window description) for the configured session blackout.
+
+    No NEW entries are opened inside the window (UTC hours). On live account 36393319
+    68% of the copier's loss came from a single broker-server hour and the whole
+    -GBP 104.99 day of 2026-11-18 sat inside it. Trade-management commands (close, BE,
+    cancel) are NOT blocked: only new exposure is.
+    """
+    if not bool(_main_cfg("ENTRY_BLACKOUT_ENABLED", ENTRY_BLACKOUT_ENABLED)):
+        return False, ""
+    try:
+        start = int(_main_cfg("ENTRY_BLACKOUT_UTC_START_HOUR", ENTRY_BLACKOUT_UTC_START_HOUR)) % 24
+        end = int(_main_cfg("ENTRY_BLACKOUT_UTC_END_HOUR", ENTRY_BLACKOUT_UTC_END_HOUR)) % 24
+    except Exception:
+        return False, ""
+    if start == end:
+        return False, ""
+    hour = (now or datetime.now(timezone.utc)).hour
+    blocked = (start <= hour < end) if start < end else (hour >= start or hour < end)
+    return blocked, f"{start:02d}:00-{end:02d}:00 UTC"
 
 
 def _main_cfg(name: str, default: Any) -> Any:
@@ -3512,6 +3557,8 @@ def _classify_deal_exit_code(
             return "TP1_BANK"
         return "TP_CEILING"
 
+    if raw_rc == "EA_CLOSE":
+        return "EA_CLOSE"
     if raw_rc in ("MANUAL/BOT", "MANUAL"):
         return "MANUAL"
     return None
@@ -3875,6 +3922,8 @@ async def _reconcile_live_mt5_signals(
                         bt_layer["exit_price"] = round(float(bt_info["exit_price"]), 4)
                     if _is_num(bt_info.get("profit")):
                         bt_layer["realized_pnl"] = round(float(bt_info["profit"]), 2)
+                    if bt_info.get("exit_deal_tickets"):
+                        bt_layer["exit_deal_tickets"] = list(bt_info["exit_deal_tickets"])
 
             updates: Dict[str, Any] = {
                 "market_tickets": new_mk_tickets,
@@ -3917,6 +3966,7 @@ async def _reconcile_live_mt5_signals(
                 r_reason_map = {
                     "TP": "Broker Take Profit Hit",
                     "SL": "Trailed / Breakeven Stop Loss Hit",
+                    "EA_CLOSE": "Closed by the copier (EA)",
                     "MANUAL/BOT": "Closed manually / from MT5 app",
                     "UNKNOWN": "Closed on broker",
                 }
@@ -4018,6 +4068,7 @@ async def _reconcile_live_mt5_signals(
             reason_map = {
                 "TP": "🎯 Broker Take Profit Hit",
                 "SL": "🛑 Stop Loss Hit (incl. trailed / breakeven SL)",
+                "EA_CLOSE": "🤖 Closed by the copier (EA)",
                 "MANUAL/BOT": "✋ Closed manually / from MT5 app",
                 "UNKNOWN": "Closed on broker",
             }
@@ -4954,6 +5005,19 @@ async def _handle_trade_management_action(
         if executor.get_daily_drawdown_status().get("pause_new_signals"):
             await check_and_enforce_daily_drawdown()
 
+        blackout_blocked, blackout_window = _entry_blackout_active()
+        if blackout_blocked:
+            logger.warning(
+                f"Entry blocked by the session blackout window ({blackout_window}). "
+                f"No order was placed."
+            )
+            return (
+                f"🕒 **Entry Blocked — Session Blackout**\n"
+                f"No new entries are opened between {blackout_window}.\n"
+                f"The signal was NOT executed.",
+                False,
+            )
+
         passed, reason = await _mt5_call(
             executor.check_preflight,
             symbol=symbol,
@@ -5502,6 +5566,19 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
         if executor.get_daily_drawdown_status().get("pause_new_signals"):
             await check_and_enforce_daily_drawdown()
 
+        blackout_blocked, blackout_window = _entry_blackout_active()
+        if blackout_blocked:
+            logger.warning(
+                f"Entry blocked by the session blackout window ({blackout_window}). "
+                f"No order was placed."
+            )
+            return (
+                f"🕒 **Entry Blocked — Session Blackout**\n"
+                f"No new entries are opened between {blackout_window}.\n"
+                f"The signal was NOT executed.",
+                False,
+            )
+
         passed, reason = await _mt5_call(
             executor.check_preflight,
             symbol=symbol,
@@ -5545,6 +5622,7 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
                 raw_tp4=raw_tp4,
                 raw_tp5=raw_tp5,
                 tp_levels=tp_levels or None,
+                max_layers=MAX_ORDERS_PER_SIGNAL,
             )
             zone_completed = True
             is_zone = True
@@ -5585,7 +5663,7 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
                 raw_tp4=raw_tp4,
                 raw_tp5=raw_tp5,
                 tp_levels=tp_levels or None,
-                max_layers=1 if is_market_stub else None,
+                max_layers=1 if is_market_stub else MAX_ORDERS_PER_SIGNAL,
             )
             zone_completed = not is_market_stub
         else:
@@ -7906,6 +7984,19 @@ async def handle_saved_messages_command(event: Any) -> None:
         if executor.get_daily_drawdown_status().get("pause_new_signals"):
             await check_and_enforce_daily_drawdown()
 
+        blackout_blocked, blackout_window = _entry_blackout_active()
+        if blackout_blocked:
+            logger.warning(
+                f"Entry blocked by the session blackout window ({blackout_window}). "
+                f"No order was placed."
+            )
+            return (
+                f"🕒 **Entry Blocked — Session Blackout**\n"
+                f"No new entries are opened between {blackout_window}.\n"
+                f"The signal was NOT executed.",
+                False,
+            )
+
         passed, reason = await _mt5_call(
             executor.check_preflight,
             symbol=symbol,
@@ -7942,6 +8033,7 @@ async def handle_saved_messages_command(event: Any) -> None:
                 raw_tp4=raw_tp4,
                 raw_tp5=raw_tp5,
                 tp_levels=tp_levels or None,
+                max_layers=MAX_ORDERS_PER_SIGNAL,
             )
             zone_completed = True
             is_zone = True
@@ -8240,7 +8332,12 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"`{ledger_stats['total_trades']}` trades (`{ledger_stats['wins']}W/{ledger_stats['losses']}L`), "
             f"Win Rate: `{ledger_stats['win_rate_pct']:.1f}%`, "
             f"Total PnL: `{format_profit(ledger_stats['total_realized_pnl'], curr)}`, "
-            f"Today ({ledger_stats['today_trades']}): `{format_profit(ledger_stats['today_realized_pnl'], curr)}`"
+            f"Today ({ledger_stats['today_trades']}): `{format_profit(ledger_stats['today_realized_pnl'], curr)}`\n"
+            f"• Protection Quality: MFE surrendered (all/today): "
+            f"`{format_profit(ledger_stats['mfe_surrendered_cash'], curr)}` / "
+            f"`{format_profit(ledger_stats['today_mfe_surrendered_cash'], curr)}` | "
+            f"R-at-exit max/avg: `{ledger_stats['r_at_exit_max']}` / `{ledger_stats['r_at_exit_avg']}` | "
+            f"reached 0.5R: `{ledger_stats['trades_reached_0_5r']}`, 1.0R: `{ledger_stats['trades_reached_1r']}`"
         )
         return
 
@@ -8539,6 +8636,8 @@ async def handle_saved_messages_command(event: Any) -> None:
         lots_str = " / ".join(f"{b:.2f}" for b in BASE_LAYER_LOTS)
         srv_date = await _trading_day_str_async()
         ledger_stats = trade_ledger.get_stats(server_date=srv_date)
+        fin = await _mt5_call(executor.get_account_financials)
+        curr = (fin or {}).get("currency", "GBP")
 
         await event.reply(
             f"🧪 **Telegram-to-MT5 v3.0 End-to-End Diagnostics:**\n\n"
@@ -8556,7 +8655,9 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"`BE>=${_main_cfg('DYNAMIC_ATR_BE_MIN_MFE_DOLLARS', DYNAMIC_ATR_BE_MIN_MFE_DOLLARS):.2f}` | "
             f"`TP_Lift={'ON' if _main_cfg('DYNAMIC_ATR_TP_TRAIL_ENABLED', DYNAMIC_ATR_TP_TRAIL_ENABLED) else 'OFF'}`\n"
             f"   - 4-Layer Lots: `[{lots_str}]` x `{RISK_LOT_MULTIPLIER}` (`{sum(BASE_LAYER_LOTS) * RISK_LOT_MULTIPLIER:.2f}` total)\n"
-            f"6. **State & Ledger:** 🟢 PERSISTENT DISK OK (`{ledger_stats['total_trades']}` closed trades, Win Rate `{ledger_stats['win_rate_pct']:.1f}%`)\n\n"
+            f"6. **State & Ledger:** 🟢 PERSISTENT DISK OK (`{ledger_stats['total_trades']}` closed trades, "
+            f"Win Rate `{ledger_stats['win_rate_pct']:.1f}%`, MFE surrendered `{format_profit(ledger_stats['mfe_surrendered_cash'], curr)}`, "
+            f"R-at-exit max `{ledger_stats['r_at_exit_max']}`, reached 0.5R `{ledger_stats['trades_reached_0_5r']}`)\n\n"
             f"💡 _Send `/testorder` to test live limit placement, or `/health` for full telemetry._"
         )
         return

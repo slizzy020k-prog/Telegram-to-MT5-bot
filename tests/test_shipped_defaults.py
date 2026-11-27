@@ -62,6 +62,7 @@ _SHIPPED_POLICY_DEFAULTS = {
     "trail_step_dollars": 0.25,
     "be_activation_atr_mult": 0.75,
     "be_min_mfe_dollars": 3.50,
+    "be_r_activation_mult": 0.50,
     "be_lock_offset_dollars": 0.50,
     "trail_activation_ceiling_dollars": 0.0,
     "be_activation_ceiling_dollars": 0.0,
@@ -154,6 +155,7 @@ _SHIPPED_CONFIG_LITERALS = {
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS": 0.25,
     "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.75,
     "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 3.50,
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT": 0.50,
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 0.0,
     "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 0.0,
@@ -197,7 +199,7 @@ def test_shipped_config_dynamic_knob_set_is_complete(shipped_config):
     dynamic_knobs = {k for k in vars(shipped_config) if k.startswith("DYNAMIC_")}
     pinned = {k for k in _SHIPPED_CONFIG_LITERALS if k.startswith("DYNAMIC_")}
     assert dynamic_knobs == pinned
-    assert len(dynamic_knobs) == 51
+    assert len(dynamic_knobs) == 52
 
 
 def test_shipped_r_lock_via_reader_fallback(shipped_config):

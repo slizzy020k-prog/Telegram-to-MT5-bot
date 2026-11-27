@@ -38,6 +38,28 @@ def _apply_isolated_env() -> None:
     os.environ["DYNAMIC_ATR_TRAIL_DISTANCE_TIERS"] = ""
     os.environ["DYNAMIC_ATR_TRAIL_DISTANCE_SCALE_MULT"] = "1.0"
     os.environ["DYNAMIC_ATR_INTERIM_FLOOR_ENABLED"] = "false"
+    # Hermeticity (2): the 2026-11-27 live-performance audit re-tuned the live .env
+    # (single-layer ladder, tighter ATR stop, reachable R-lock tiers, real circuit
+    # breakers). Neutralize every knob that change touched so the baseline suite always
+    # runs against the shipped defaults and the ambient live .env cannot leak into it.
+    # Tests that exercise the new configuration set the knob explicitly.
+    os.environ["MAX_ORDERS_PER_SIGNAL"] = "4"
+    os.environ["DYNAMIC_SL_ATR_MULT"] = "2.50"
+    os.environ["DYNAMIC_SL_MAX_DOLLARS"] = "35.00"
+    os.environ["R_LOCK_TIERS"] = "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75"
+    os.environ["DAILY_LOSS_PAUSE_PCT"] = "0.0"
+    os.environ["FLOAT_LOSS_FORCE_CLOSE_PCT"] = "0.0"
+    os.environ["EMERGENCY_CUTOFF_LOSS_PCT"] = "0.0"
+    os.environ["STOP_LEVEL_STOPS_DISTANCE_MULT"] = "2.0"
+    os.environ["SL_REJECT_BACKOFF_SECONDS"] = "5.0"
+    os.environ["DYNAMIC_ATR_BE_R_ACTIVATION_MULT"] = "0.50"
+    os.environ["DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS"] = "0.0"
+    os.environ["DYNAMIC_ATR_MFE_LOCK_TIERS"] = (
+        "0.40:0.45,0.60:0.55,0.80:0.65,1.00:0.70,1.25:0.75,1.50:0.80,2.00:0.85"
+    )
+    os.environ["ENTRY_BLACKOUT_ENABLED"] = "false"
+    os.environ["ENTRY_BLACKOUT_UTC_START_HOUR"] = "0"
+    os.environ["ENTRY_BLACKOUT_UTC_END_HOUR"] = "2"
 
 
 _apply_isolated_env()

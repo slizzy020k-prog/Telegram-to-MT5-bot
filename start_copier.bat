@@ -22,13 +22,13 @@ echo        TELEGRAM TO MT5 AUTONOMOUS XAUUSD COPIER PRO v3.9.0 (T3 + R-Lock) (P
 echo  ==============================================================================
 echo    * Mode:        LIVE BROKER
 echo    * Symbol:      XAUUSD.s (PU Prime)
-echo    * Lots:        0.01 / 0.01 / 0.01 / 0.02 (0.05 Base Exposure, 4 Layers)
+echo    * Lots:        Live .env (layer count / base lots / lot cap)
 echo    * Targets:     All Start @ TP1 - Dynamic Deepest Runner Scales TP1 to TP4
 echo    * Protection:  Anti-Choke Runner FSM (10p Tight Zone, 12p x 2-Tick Guard)
 echo    * Trailing:    T3 Profile (0.70x ATR Activation + $5.50 Clamp)
 echo    * R-Lock:      Profit Staircase ON (R-Relative Floors)
 echo    * Lot Cap:     High-Risk Lot Cap ON
-echo    * Drawdown:    80%% Daily-Loss Pause Guard
+echo    * Drawdown:    Daily-Loss Pause + Float-Loss + Emergency Cutoff (live .env)
 echo    * Safety:      Single-Instance Mutex + Reconnect Catch-Up + JSONL Ledger
 echo    * Remote:      Telegram Saved Messages Phone Controls Active (/health)
 echo  ==============================================================================

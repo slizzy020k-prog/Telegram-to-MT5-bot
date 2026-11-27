@@ -67,6 +67,7 @@ class DynamicRiskPolicy:
     trail_step_dollars: float = 0.25
     be_activation_atr_mult: float = 0.75
     be_min_mfe_dollars: float = 3.50
+    be_r_activation_mult: float = 0.50
     be_lock_offset_dollars: float = 0.50
     # T3 aggressive profit protection (opt-in; defaults preserve shipped behavior).
     trail_activation_ceiling_dollars: float = 0.0
@@ -170,6 +171,9 @@ def read_dynamic_risk_policy(cfg_mod: Any) -> DynamicRiskPolicy:
         trail_step_dollars=max(0.05, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_STEP_DOLLARS", 0.25), 0.25)),
         be_activation_atr_mult=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75), 0.75)),
         be_min_mfe_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50), 3.50)),
+        be_r_activation_mult=max(
+            0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_R_ACTIVATION_MULT", 0.50), 0.50)
+        ),
         be_lock_offset_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50), 0.50)),
         trail_activation_ceiling_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)),
         be_activation_ceiling_dollars=max(0.0, _safe_float(getattr(cfg_mod, "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", 0.0), 0.0)),
@@ -605,6 +609,7 @@ def compute_dynamic_atr_trail_stop(
     mfe_lock_prev_pct: Optional[float] = None,
     mfe_lock_prev_profit: Optional[float] = None,
     auto_be_threshold: Optional[float] = None,
+    clamp_buffer: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compute forward-only BE Lock, Dynamic ATR Trail SL, and Milestone Floor for an open position.
 
@@ -692,10 +697,11 @@ def compute_dynamic_atr_trail_stop(
     r_val = _safe_float(initial_r, 0.0)
     r_gated = r_val > 0.0
     if r_gated:
-        # The BE lock waits for half the trade's own risk, and never arms closer
-        # than the trail's minimum distance ($2.50).
+        # The BE lock waits for a multiple of the trade's own risk (default half of
+        # it), and never arms closer than the trail's minimum distance ($2.50).
+        # The multiple only changes WHEN the lock arms, never WHERE it locks.
         be_threshold = max(
-            0.5 * r_val,
+            max(0.0, policy.be_r_activation_mult) * r_val,
             max(0.0, policy.be_activation_atr_mult) * atr_f,
             max(0.0, policy.trail_min_dollars),
         )
@@ -877,8 +883,14 @@ def compute_dynamic_atr_trail_stop(
     # The R floor is "in effect" only when it won the picker.
     active_r_lock = r_lock_candidate if stop_source == "R_LOCK" else None
     buf = max(0.0, _safe_float(stops_buffer, 0.0))
-    if buf > 0.0:
-        raw_sl = min(raw_sl, live_price - buf) if sign > 0 else max(raw_sl, live_price + buf)
+    # The clamp distance is >= the broker's minimum stop distance, and may be larger
+    # (see the optional `clamp_buffer`) to absorb the price race between our tick
+    # read and the broker's evaluation of the order. A stop pinned exactly at the
+    # broker minimum is rejected with retcode 10016 "Invalid stops" the moment the
+    # price moves, so the ratchet never lands and the winner decays to scratch.
+    clamp_buf = buf if clamp_buffer is None else max(buf, _safe_float(clamp_buffer, 0.0))
+    if clamp_buf > 0.0:
+        raw_sl = min(raw_sl, live_price - clamp_buf) if sign > 0 else max(raw_sl, live_price + clamp_buf)
     cand_sl = round(raw_sl, digits)
     cur_f = _safe_float(current_sl, 0.0)
     should_upd = True if cur_f <= 0.0 else ((sign * (cand_sl - cur_f)) >= max(1e-6, policy.trail_step_dollars - 1e-9))

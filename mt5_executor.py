@@ -39,6 +39,7 @@ from config import (
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    DYNAMIC_ATR_BE_R_ACTIVATION_MULT,
     DYNAMIC_ATR_INTERIM_FLOOR_ENABLED,
     DYNAMIC_ATR_INTERIM_FLOOR_K,
     DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS,
@@ -109,7 +110,9 @@ from config import (
     RUNNER_DEEPEST_COUNT_FULL,
     RUNNER_MAX_TP_STAGE,
     SINGLE_PRICE_CONSOLIDATE_ORDERS,
+    SL_REJECT_BACKOFF_SECONDS,
     STOP_LEVEL_SAFETY_BUFFER_DOLLARS,
+    STOP_LEVEL_STOPS_DISTANCE_MULT,
     TIERED_STAGE_BANKING_ENABLED,
     TP1_CLOSE_PROXIMITY_PIPS,
     TP1_LOCK_BUFFER,
@@ -229,6 +232,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS",
         "DYNAMIC_ATR_BE_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS",
+        "DYNAMIC_ATR_BE_R_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS",
         "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED",
         "DYNAMIC_ATR_INTERIM_FLOOR_K",
@@ -1463,6 +1467,7 @@ class MT5Executor:
             DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS=_cfg("DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS),
             DYNAMIC_ATR_BE_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_ACTIVATION_MULT", DYNAMIC_ATR_BE_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_MIN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", DYNAMIC_ATR_BE_MIN_MFE_DOLLARS),
+            DYNAMIC_ATR_BE_R_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_R_ACTIVATION_MULT", DYNAMIC_ATR_BE_R_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS=_cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
             DYNAMIC_ATR_INTERIM_FLOOR_ENABLED=_cfg("DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", DYNAMIC_ATR_INTERIM_FLOOR_ENABLED),
             DYNAMIC_ATR_INTERIM_FLOOR_K=_cfg("DYNAMIC_ATR_INTERIM_FLOOR_K", DYNAMIC_ATR_INTERIM_FLOOR_K),
@@ -2766,10 +2771,15 @@ class MT5Executor:
         multiplier: Optional[float] = None,
         exclude_tickets: Optional[Sequence[int]] = None,
         allow_duplicate_price: bool = False,
+        max_layers: Optional[int] = None,
     ) -> Tuple[List[int], List[int], Dict[str, Dict[str, Any]]]:
         """
         Split a Zone entry into 4 layers across [0%, 33.3%, 66.7%, 100%] (L1..L4 -> TP1/TP2/TP3/TP5).
         Returns (market_tickets, pending_tickets, layers_data).
+
+        `max_layers` caps the number of live layers this signal may place (the same
+        mechanism the single-price and market paths already use). With the shipped
+        default (MAX_ORDERS_PER_SIGNAL = 4) every layer is placed exactly as before.
         """
         self.last_dynamic_risk_snapshot = None
         if zone is None:
@@ -2802,8 +2812,15 @@ class MT5Executor:
             )
             for l_name in LAYER_NAMES
         ]
+        # MAX_ORDERS_PER_SIGNAL is a hard cap on live orders per signal for EVERY entry
+        # type (see ARCHITECTURE_v3.md). The zone path used to place all four layers
+        # unconditionally, so the cap was silently ignored for the entry type that
+        # carries the most live exposure.
+        active_names, masked_base_lots = self._resolve_active_layer_subset(
+            base_lots=base_lots, max_layers=max_layers
+        )
         alloc_lots, warn = self.allocate_4layer_lots(
-            resolved_sym, base_lots=base_lots, multiplier=multiplier, market_mask=market_mask
+            resolved_sym, base_lots=masked_base_lots, multiplier=multiplier, market_mask=market_mask
         )
         if sum(alloc_lots) <= 0.0:
             self.last_error = warn or "High Risk Lot Cap reached"
@@ -2835,6 +2852,7 @@ class MT5Executor:
         layer_specs = [
             (l_name, tiers[l_name], alloc_lots[idx], layer_tps[l_name])
             for idx, l_name in enumerate(LAYER_NAMES)
+            if l_name in active_names and _num(alloc_lots[idx], 0.0) > 0.0
         ]
         return self._execute_4layer_specs(
             symbol=resolved_sym,
@@ -3322,6 +3340,85 @@ class MT5Executor:
                     logger.debug(f"Position #{ticket} SL/TP modify skipped: within broker trade_freeze_level.")
                     return False
 
+            # --- UNIFIED STOPS-LEVEL CHOKE POINT -------------------------------------
+            # Every SL/TP write passes through here. A stop closer to the market than
+            # the broker allows is rejected with retcode 10016 ("Invalid stops"), and a
+            # REJECTED stop protects nothing: the position keeps whatever stop it had
+            # while the engine keeps proposing the same doomed candidate every cycle
+            # (45 live rejections on 2026-11-27, 14,488 in the demo log on 2026-11-24).
+            #
+            # The limit is read from a FRESH tick (the price moves between the tick the
+            # engine used to build the candidate and the broker's evaluation of the
+            # order) and it is TWICE the broker's minimum stop distance
+            # (STOP_LEVEL_STOPS_DISTANCE_MULT, default 2.0 -> $0.40 on XAUUSD.s), so an
+            # 8-point advance during the round-trip cannot invalidate the stop again.
+            stops_lvl = _num(getattr(sym_info, "trade_stops_level", 0.0), 0.0) if sym_info else 0.0
+            pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+            mult = float(_cfg("STOP_LEVEL_STOPS_DISTANCE_MULT", STOP_LEVEL_STOPS_DISTANCE_MULT) or 0.0)
+            min_stop_dist = max(1.0, mult) * max(0.0, stops_lvl) * (pt or 0.01)
+            pos_is_buy = _int_num(getattr(p, "type", 0), 0) == 0
+            bid = 0.0
+            ask = 0.0
+            if min_stop_dist > 0.0:
+                fresh_tick = self.get_tick(p_symbol)
+                if fresh_tick is not None:
+                    bid = _num(getattr(fresh_tick, "bid", 0.0), 0.0)
+                    ask = _num(getattr(fresh_tick, "ask", 0.0), 0.0)
+            if bid <= 0.0 and ask > 0.0:
+                bid = ask
+            if ask <= 0.0 and bid > 0.0:
+                ask = bid
+            sl_skipped = False
+            tp_skipped = False
+            if bid > 0.0 and ask > 0.0:
+                # A BUY's stop must stay BELOW the bid and its take-profit ABOVE the ask;
+                # a SELL's stop must stay ABOVE the ask and its take-profit BELOW the bid.
+                # The stop side is the strict one (it is what triggers first), the
+                # take-profit side is the opposite side of the spread.
+                sl_limit = round(bid - min_stop_dist, digits) if pos_is_buy else round(ask + min_stop_dist, digits)
+                tp_limit = round(ask + min_stop_dist, digits) if pos_is_buy else round(bid - min_stop_dist, digits)
+                sl_ref = bid if pos_is_buy else ask
+                tp_ref = ask if pos_is_buy else bid
+                if sl_changed and ((pos_is_buy and new_sl > sl_limit) or (not pos_is_buy and new_sl < sl_limit)):
+                    if (pos_is_buy and new_sl > sl_ref) or (not pos_is_buy and new_sl < sl_ref):
+                        # On the wrong side of the market: no stop can be placed there.
+                        sl_skipped = True
+                    else:
+                        pulled = sl_limit
+                        if cur_sl > 0.0 and ((pos_is_buy and pulled < cur_sl) or (not pos_is_buy and pulled > cur_sl)):
+                            # Pulling it back would loosen the existing protection: keep it.
+                            sl_skipped = True
+                        else:
+                            new_sl = pulled
+                            sl_changed = abs(new_sl - cur_sl) > 1e-6
+                if tp_changed and ((pos_is_buy and new_tp < tp_limit) or (not pos_is_buy and new_tp > tp_limit)):
+                    if (pos_is_buy and new_tp <= tp_ref) or (not pos_is_buy and new_tp >= tp_ref):
+                        tp_skipped = True
+                    else:
+                        new_tp = tp_limit
+                        tp_changed = abs(new_tp - cur_tp) > 1e-6
+            if sl_skipped:
+                new_sl = cur_sl
+                sl_changed = False
+            if tp_skipped:
+                new_tp = cur_tp
+                tp_changed = False
+            if sl_skipped or tp_skipped:
+                # Refused BEFORE it reached the broker. Report it exactly like a broker
+                # 10016 so the caller backs off and retries once the price has moved.
+                self._log_stops_level_rejection(ticket, "candidate stop too close to the market")
+                if require_both or (sl_skipped and not tp_changed) or (tp_skipped and not sl_changed):
+                    self.last_error = "10016 Invalid stops (candidate too close to the market)"
+                    self.last_modify_result = {
+                        "ok": False,
+                        "sl_ok": False,
+                        "tp_ok": False,
+                        "retcode": 10016,
+                        "applied_sl": cur_sl,
+                        "applied_tp": cur_tp,
+                    }
+                    return False
+
             request = {
                 "action": _mt5_const("TRADE_ACTION_SLTP", 6),
                 "position": ticket,
@@ -3343,14 +3440,32 @@ class MT5Executor:
 
             result = mt5.order_send(request)
             retcode = getattr(result, "retcode", None) if result else None
+            # A leg refused by the choke point was NOT applied, whatever the broker says
+            # about the request as a whole.
+            sl_applied_ok = not sl_skipped
+            tp_applied_ok = not tp_skipped
             if result and result.retcode == done_code:
                 logger.info(f"Updated SL/TP on Position #{ticket}: SL={new_sl}, TP={new_tp}")
-                self.last_modify_result = {"ok": True, "sl_ok": True, "tp_ok": True, "retcode": retcode}
+                self.last_modify_result = {
+                    "ok": True,
+                    "sl_ok": sl_applied_ok,
+                    "tp_ok": tp_applied_ok,
+                    "retcode": retcode,
+                    "applied_sl": new_sl,
+                    "applied_tp": new_tp,
+                }
                 return True
             comment = getattr(result, "comment", "") if result else mt5.last_error()
             if _is_mod_ok(result):
                 logger.debug(f"Position #{ticket} SL/TP already at SL={new_sl}, TP={new_tp} (No changes).")
-                self.last_modify_result = {"ok": True, "sl_ok": True, "tp_ok": True, "retcode": retcode}
+                self.last_modify_result = {
+                    "ok": True,
+                    "sl_ok": sl_applied_ok,
+                    "tp_ok": tp_applied_ok,
+                    "retcode": retcode,
+                    "applied_sl": new_sl,
+                    "applied_tp": new_tp,
+                }
                 return True
 
             if retcode == frozen_code:
@@ -3379,7 +3494,7 @@ class MT5Executor:
                             f"Updated TP independently on Position #{ticket}: TP={new_tp} "
                             f"(combined SL/TP rejected: {comment})"
                         )
-                if sl_changed:
+                if sl_changed and not sl_skipped:
                     res_sl = mt5.order_send({
                         "action": _mt5_const("TRADE_ACTION_SLTP", 6),
                         "position": ticket,
@@ -3404,8 +3519,61 @@ class MT5Executor:
 
             self.last_error = str(comment)
             self.last_modify_result = {"ok": False, "sl_ok": False, "tp_ok": False, "retcode": retcode}
-            logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
+            if retcode == _mt5_const("TRADE_RETCODE_INVALID_STOPS", 10016):
+                # 10016 is an EXPECTED broker rejection, not a fault: the candidate
+                # stop sat inside the broker's minimum stop distance at the moment the
+                # order was evaluated. It is rate-limited per ticket (INFO on the first
+                # hit, DEBUG afterwards) so a 1s retry loop cannot flood the log while
+                # the rejection still stays visible in production.
+                self._log_stops_level_rejection(ticket, comment)
+            else:
+                logger.error(f"Failed to update SL/TP on Position #{ticket}: {comment}")
             return False
+
+    def _sl_modify_applied(self, before: Any = None, ok: bool = True) -> bool:
+        """True when the last `modify_position_sltp` actually moved the stop.
+
+        `before` is the `last_modify_result` object seen before the call: when the
+        modify was mocked it never updated that attribute, so the caller's success
+        is trusted instead of a stale flag.
+        """
+        res = getattr(self, "last_modify_result", None)
+        if before is not None and res is before:
+            return bool(ok)
+        if isinstance(res, dict) and "sl_ok" in res:
+            return bool(res.get("sl_ok"))
+        return bool(ok)
+
+    def _log_stops_level_rejection(self, ticket: int, comment: Any, kind: str = "Position") -> None:
+        """Log an expected broker stops-level rejection once per ticket (then DEBUG).
+
+        The rejection is not a fault, but it MUST stay visible in the production log:
+        a stop the broker refuses protects nothing, and the engine's back-off means
+        the same candidate is not retried until the price has moved. The copier log
+        runs at INFO, so the first rejection per ticket is logged at INFO and the
+        repeats at DEBUG (they are the normal 1s-cycle noise this fix removes).
+        """
+        counts = getattr(self, "_stops_reject_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._stops_reject_counts = counts
+        key = int(ticket)
+        n = int(counts.get(key, 0)) + 1
+        if len(counts) > 256:
+            # Bounded bookkeeping: keep the most recent 256 tickets.
+            for stale in sorted(counts, key=lambda k: counts[k])[: len(counts) - 256]:
+                counts.pop(stale, None)
+        counts[key] = n
+        if n == 1 or n % 25 == 0:
+            logger.info(
+                f"Broker refused the stop for {kind} #{ticket} as too close to the market "
+                f"(stops level), attempt {n}: {comment}. The stop is left unchanged and the "
+                f"ratchet retries once the price has moved."
+            )
+        else:
+            logger.debug(
+                f"Broker stops-level rejection #{n} on {kind} #{ticket}: {comment}"
+            )
 
     def modify_pending_order_sltp(self, ticket: int, sl: Optional[float], tp: Optional[float]) -> bool:
         """Modify SL and TP of a pending MT5 order (thread-safe)."""
@@ -3564,7 +3732,12 @@ class MT5Executor:
                     return True
 
             self.last_error = str(comment)
-            logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
+            if _int_num(getattr(result, "retcode", None), 0) == _mt5_const(
+                "TRADE_RETCODE_INVALID_STOPS", 10016
+            ):
+                self._log_stops_level_rejection(ticket, comment, kind="Pending Order")
+            else:
+                logger.error(f"Failed to update SL/TP on Pending Order #{ticket}: {comment}")
             return False
 
     def modify_pending_order_price_sltp(
@@ -3970,8 +4143,38 @@ class MT5Executor:
                 net_profit = total_gross + total_comm + total_swap + total_fee
                 profit = round(net_profit, 2)
 
+                # The real MT5 reason vocabulary (ENUM_DEAL_REASON):
+                #   CLIENT 0, MOBILE 1, WEB 2, EXPERT 3, SL 4, TP 5, SO 6,
+                #   ROLLOVER 7, VMARGIN 8, SPLIT 9.
+                # The old classifier only understood SL (4) and TP (5) and mapped every
+                # other reason to "MANUAL/BOT", so a SO (6) stop-out and an EXPERT (3)
+                # copier close were both booked in the ledger as manual closes -- two
+                # live records worth -GBP 105.43 of broker stop-outs were labelled
+                # "Closed manually / from MT5 app".
                 sl_const = _mt5_const("DEAL_REASON_SL", 4)
                 tp_const = _mt5_const("DEAL_REASON_TP", 5)
+                so_const = _mt5_const("DEAL_REASON_SO", 6)
+                expert_const = _mt5_const("DEAL_REASON_EXPERT", 3)
+                human_reasons = {
+                    _mt5_const("DEAL_REASON_CLIENT", 0),
+                    _mt5_const("DEAL_REASON_MOBILE", 1),
+                    _mt5_const("DEAL_REASON_WEB", 2),
+                }
+
+                def _classify_exit_reason(ed_reason: Any, comment: Any) -> str:
+                    """Map an MT5 deal reason (+ its comment) onto the copier's raw vocabulary."""
+                    c = str(comment or "").strip().lower()
+                    if ed_reason == so_const:
+                        return "SL"        # stop-out executed by the broker
+                    if ed_reason == expert_const:
+                        return "EA_CLOSE"  # closed programmatically by the copier
+                    if ed_reason == tp_const:
+                        return "TP"        # take-profit executed by the broker
+                    if ed_reason == sl_const:
+                        return "SL"        # stop-loss executed by the broker
+                    if ed_reason in human_reasons:
+                        return "MANUAL/BOT"  # closed by a human
+                    return "MANUAL/BOT"
 
                 exit_deals_info: List[Dict[str, Any]] = []
                 total_exit_vol = 0.0
@@ -3992,7 +4195,7 @@ class MT5Executor:
                     ed_fee = _num(getattr(ed, "fee", 0.0))
                     ed_net = round(ed_gross + ed_comm + ed_swap + ed_fee, 2)
                     ed_raw_r = getattr(ed, "reason", None)
-                    ed_reason = "SL" if ed_raw_r == sl_const else ("TP" if ed_raw_r == tp_const else "MANUAL/BOT")
+                    ed_reason = _classify_exit_reason(ed_raw_r, getattr(ed, "comment", ""))
                     exit_deals_info.append({
                         "deal_ticket": dtkt or None,
                         "profit": ed_net,
@@ -4018,13 +4221,7 @@ class MT5Executor:
                         exit_deals_info[0]["profit"] = round(exit_deals_info[0]["profit"] + in_costs, 2)
 
                 d = exit_deals_raw[-1]
-                d_reason = getattr(d, "reason", None)
-                if d_reason == sl_const:
-                    reason = "SL"
-                elif d_reason == tp_const:
-                    reason = "TP"
-                else:
-                    reason = "MANUAL/BOT"
+                reason = _classify_exit_reason(getattr(d, "reason", None), getattr(d, "comment", ""))
 
                 last_epx = _num(getattr(d, "price", 0.0), 0.0)
                 exit_price = (
@@ -4054,7 +4251,7 @@ class MT5Executor:
                     "deals_settled": True,
                 }
 
-        fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
+        fallback_reason = "EA_CLOSE" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
         return {
             "profit": self._cached_pos_profits.get(t_int, 0.0),
             "gross_profit": self._cached_pos_profits.get(t_int, 0.0),
@@ -4136,7 +4333,7 @@ class MT5Executor:
             return {"profit": rich["profit"], "reason": rich["reason"]}
         except Exception as e:
             logger.warning(f"Could not determine close info for #{t_int}: {e}")
-            fallback_reason = "MANUAL/BOT" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
+            fallback_reason = "EA_CLOSE" if t_int in getattr(self, "_bot_closed_tickets", set()) else "UNKNOWN"
             rich = {
                 "profit": self._cached_pos_profits.get(t_int, 0.0),
                 "reason": fallback_reason,
@@ -4833,7 +5030,14 @@ class MT5Executor:
         if not is_buy and cur_sl > 0.0 and cur_sl <= new_sl + 1e-6:
             return cur_sl
 
-        if self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p_tp):
+        # The candidate BE stop is validated by the SHARED choke point inside
+        # modify_position_sltp (fresh tick + twice the broker's minimum stop distance), so
+        # the auto-BE path and the ATR binding-SL path apply identical safety checks.
+        # A candidate that the broker would refuse never reaches mt5.order_send, so the
+        # 10016 loop cannot start.
+        _before = getattr(self, "last_modify_result", None)
+        _ok = self.modify_position_sltp(ticket=ticket, sl=new_sl, tp=p_tp)
+        if _ok and self._sl_modify_applied(_before, _ok):
             return new_sl
 
         # Instant 0ms fallback to exact entry (0.0p) when +offset_value is inside broker stops_level
@@ -4843,12 +5047,15 @@ class MT5Executor:
                 return cur_sl
             if not is_buy and cur_sl > 0.0 and cur_sl <= exact_sl + 1e-6:
                 return cur_sl
-            if exact_sl != new_sl and self.modify_position_sltp(ticket=ticket, sl=exact_sl, tp=p_tp):
-                logger.info(
-                    f"Ticket #{ticket} moved to exact-entry BE {exact_sl} "
-                    f"(0.0p instant fallback; +{offset_value:.2f} buffer rejected by stops_level)"
-                )
-                return exact_sl
+            if exact_sl != new_sl:
+                _before_exact = getattr(self, "last_modify_result", None)
+                _ok_exact = self.modify_position_sltp(ticket=ticket, sl=exact_sl, tp=p_tp)
+                if _ok_exact and self._sl_modify_applied(_before_exact, _ok_exact):
+                    logger.info(
+                        f"Ticket #{ticket} moved to exact-entry BE {exact_sl} "
+                        f"(0.0p instant fallback; +{offset_value:.2f} buffer rejected by stops_level)"
+                    )
+                    return exact_sl
 
         return None
 
@@ -4999,6 +5206,7 @@ class MT5Executor:
         mk_tickets = [int(t) for t in (signal_data.get("market_tickets") or []) if t is not None]
         pd_tickets = [int(t) for t in (signal_data.get("pending_tickets") or []) if t is not None]
         be_done_set = {int(t) for t in (signal_data.get("be_done_tickets") or []) if t is not None}
+        prev_deferred_set = {int(t) for t in (signal_data.get("be_deferred_tickets") or []) if t is not None}
 
         modified_tickets: List[int] = []
         deferred_tickets: List[int] = []
@@ -5145,10 +5353,14 @@ class MT5Executor:
                 )
             else:
                 deferred_tickets.append(ticket)
-                logger.warning(
+                defer_msg = (
                     f"Layer {layer_name or 'OPEN'} (Ticket #{ticket}) open at {p_open} but inside stops_level / underwater; "
                     f"armed for 0.5s auto-BE retry."
                 )
+                if ticket in prev_deferred_set:
+                    logger.debug(defer_msg)  # repeat deferral: throttle to DEBUG (no 0.5s WARNING spam)
+                else:
+                    logger.warning(defer_msg)  # first notice of this deferral episode
 
         if promoted_tickets:
             signal_data["market_tickets"] = mk_tickets
@@ -5748,6 +5960,25 @@ class MT5Executor:
             return 0.0
         safety_buf = float(_cfg("STOP_LEVEL_SAFETY_BUFFER_DOLLARS", STOP_LEVEL_SAFETY_BUFFER_DOLLARS)) if (not self.dry_run or raw_dist > 0.0) else 0.0
         return raw_dist + max(0.0, safety_buf)
+
+    def _compute_sl_clamp_distance(self, sym_info: Any) -> float:
+        """Return the distance a clamped SL must keep from the live price.
+
+        This is the broker's minimum stop distance (trade_stops_level * point) scaled
+        by STOP_LEVEL_STOPS_DISTANCE_MULT (default 2.0 -> $0.40 on XAUUSD.s). A stop
+        clamped to exactly the broker minimum is rejected with retcode 10016 ("Invalid
+        stops") whenever the price moves between our tick read and the broker's
+        evaluation of the order; the rejected stop then protects nothing and the engine
+        re-proposes it every cycle. The multiplier absorbs that race so the ratchet can
+        actually land.
+        """
+        stops_lvl = _num(getattr(sym_info, "trade_stops_level", 0.0), 0.0) if sym_info else 0.0
+        pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
+        raw_dist = max(0.0, stops_lvl * (pt or 0.01))
+        if raw_dist <= 0.0:
+            return 0.0
+        mult = float(_cfg("STOP_LEVEL_STOPS_DISTANCE_MULT", STOP_LEVEL_STOPS_DISTANCE_MULT) or 0.0)
+        return max(1.0, mult) * raw_dist
 
     def _clamp_sl_for_broker_stops(
         self,
@@ -7102,6 +7333,7 @@ class MT5Executor:
                 reason_label_map = {
                     "TP": "Broker Take Profit Hit",
                     "SL": "Trailed Stop Loss Hit (Locked in Gain)",
+                    "EA_CLOSE": "Closed by the copier (EA)",
                     "MANUAL/BOT": "Closed Manually / from MT5",
                 }
                 sl_code = "BROKER_SL"
@@ -7115,10 +7347,12 @@ class MT5Executor:
                 code_map = {
                     "TP": "TP_CEILING",
                     "SL": sl_code,
+                    "EA_CLOSE": "EA_CLOSE",
                     "MANUAL/BOT": "MANUAL",
                 }
                 ext_reason = reason_label_map.get(raw_rc, "Trailed Stop Loss Hit (Locked in Gain)")
-                ext_code = code_map.get(raw_rc, sl_code)
+                # An unclassified close must NOT be booked as a stop-loss exit.
+                ext_code = code_map.get(raw_rc, "MANUAL")
                 bsl = _num(
                     signal_data.get("broker_sl")
                     or signal_data.get("trail_stop")
@@ -7677,6 +7911,9 @@ class MT5Executor:
         stops_lvl = _num(getattr(sym_info, "trade_stops_level", 50.0), 50.0) if sym_info else 50.0
         pt = _num(getattr(sym_info, "point", 0.01), 0.01) if sym_info else 0.01
         min_stop_dist = stops_lvl * (pt or 0.01)
+        # Clamp distance for a candidate SL: the broker's minimum stop distance plus
+        # the tick-race tolerance (see `_compute_sl_clamp_distance`).
+        clamp_dist = self._compute_sl_clamp_distance(sym_info)
 
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
         configured_max_stage = max(
@@ -7889,10 +8126,13 @@ class MT5Executor:
             cand_sl = round(ref_px - eff_pips * pip_size, digits) if is_buy else round(ref_px + eff_pips * pip_size, digits)
 
         if live_px is not None:
-            if is_buy and (live_px - cand_sl) < min_stop_dist:
-                cand_sl = round(live_px - min_stop_dist, digits)
-            elif not is_buy and (cand_sl - live_px) < min_stop_dist:
-                cand_sl = round(live_px + min_stop_dist, digits)
+            # Clamp with the race-tolerant distance, not the bare broker minimum: a
+            # stop pinned exactly at the minimum is rejected with retcode 10016 the
+            # moment the price ticks, so it never lands and protects nothing.
+            if is_buy and (live_px - cand_sl) < clamp_dist:
+                cand_sl = round(live_px - clamp_dist, digits)
+            elif not is_buy and (cand_sl - live_px) < clamp_dist:
+                cand_sl = round(live_px + clamp_dist, digits)
 
         raw_rts = signal_data.get("runner_tickets") or (
             [signal_data["runner_ticket"]] if signal_data.get("runner_ticket") else []
@@ -8214,6 +8454,7 @@ class MT5Executor:
             be_pip_sz = policy.auto_be_pip_size_dollars if policy.auto_be_pip_size_dollars > 0.0 else pip_size
             auto_be_threshold = max(0.0, policy.auto_be_pips) * be_pip_sz
         stops_buffer = self._compute_stops_buffer(sym_info)
+        clamp_buffer = self._compute_sl_clamp_distance(sym_info)
         live_price = float(tick.bid) if is_buy else float(tick.ask)
 
         tp_levels = self._ensure_signal_tp_levels(signal_data, direction, pip_size, digits)
@@ -8479,6 +8720,7 @@ class MT5Executor:
                 policy=policy,
                 digits=digits,
                 stops_buffer=stops_buffer,
+                clamp_buffer=clamp_buffer,
                 cleared_milestones=sig_cleared,
                 tp_levels=tp_levels,
                 apply_milestone_floor=(role not in ("BANK_TP1", "LATE_RECOVERY")),
@@ -8535,13 +8777,32 @@ class MT5Executor:
             sl_dist_ok = sign * (live_price - float(cand_sl)) >= stops_buffer - 1e-9
             if not (cur_sl_freeze_ok and cand_sl_freeze_ok and sl_dist_ok):
                 continue
-            if not self.modify_position_sltp(t_int, sl=cand_sl, tp=None):
+            # Back off after a broker stops-level rejection. The candidate stop was
+            # inside the broker's minimum distance when the broker evaluated it, so
+            # the price has to move before the same stop can be accepted; re-sending
+            # it every engine cycle only produces retcode-10016 noise.
+            if _num(lv.get("_sl_reject_until"), 0.0) > time.time():
+                continue
+            _before_mod = getattr(self, "last_modify_result", None)
+            _mod_ok = self.modify_position_sltp(t_int, sl=cand_sl, tp=None)
+            if not _mod_ok or not self._sl_modify_applied(_before_mod, _mod_ok):
+                if _int_num((self.last_modify_result or {}).get("retcode"), 0) == _mt5_const(
+                    "TRADE_RETCODE_INVALID_STOPS", 10016
+                ):
+                    backoff = float(_cfg("SL_REJECT_BACKOFF_SECONDS", SL_REJECT_BACKOFF_SECONDS) or 0.0)
+                    if backoff > 0.0:
+                        lv["_sl_reject_until"] = time.time() + backoff
+                        logger.info(
+                            f"[T3 SL BACKOFF] #{t_int}: the broker refused the stop as too close "
+                            f"to the market (stops level); retrying in {backoff:.1f}s."
+                        )
                 continue
 
             was_be_locked = bool(lv.get("be_locked"))
             stop_source = str(trail_step.get("stop_source") or "ATR_TRAIL")
-            lv["sl"] = cand_sl
-            lv["broker_sl"] = cand_sl
+            _applied_sl = _num((self.last_modify_result or {}).get("applied_sl"), 0.0) or cand_sl
+            lv["sl"] = _applied_sl
+            lv["broker_sl"] = _applied_sl
             if trail_step.get("be_armed") and not was_be_locked:
                 lv["be_locked"] = True
                 signal_data["roles_locked"] = True

@@ -425,11 +425,39 @@ LOCK_FILE_PATH: Path = Path(os.getenv("LOCK_FILE_PATH") or str(BASE_DIR / "copie
 STOP_LEVEL_SAFETY_BUFFER_DOLLARS: float = _env_float(
     "STOP_LEVEL_SAFETY_BUFFER_DOLLARS", 0.05, min_val=0.0, max_val=5.0
 )
+# Multiplier applied to the broker's minimum stop distance when a candidate stop is
+# clamped to the legal side of the price. A stop pinned exactly AT the broker minimum
+# is rejected (retcode 10016 "Invalid stops") as soon as the price ticks between our
+# read and the broker's evaluation of the order, and a rejected stop protects nothing.
+# 2.0 -> $0.40 on XAUUSD.s (trade_stops_level 20 x point 0.01), which absorbs the
+# 8-point advance seen during the network round-trip. 1.0 restores the old
+# boundary-exact behaviour.
+STOP_LEVEL_STOPS_DISTANCE_MULT: float = _env_float(
+    "STOP_LEVEL_STOPS_DISTANCE_MULT", 2.0, min_val=1.0, max_val=10.0
+)
+# Back-off (seconds) applied to a layer after the broker rejected its stop with
+# retcode 10016, so a 1s engine cadence cannot spam the broker with the same
+# doomed stop. 0.0 disables the back-off.
+SL_REJECT_BACKOFF_SECONDS: float = _env_float(
+    "SL_REJECT_BACKOFF_SECONDS", 5.0, min_val=0.0, max_val=120.0
+)
 HARD_MAX_SPREAD_DOLLARS: float = _env_float(
     "HARD_MAX_SPREAD_DOLLARS", 1.25, min_val=0.20, max_val=20.0, positive_only=True
 )
 MIN_VALID_SPREAD_DOLLARS: float = _env_float(
     "MIN_VALID_SPREAD_DOLLARS", 0.05, min_val=0.0, max_val=5.0
+)
+# Session blackout: no NEW entries are opened inside this UTC window (the broker
+# server clock runs +2h, so 00:00-02:00 UTC == 02:00-04:00 server). On live account
+# 36393319 68% of the copier's loss came from the 02:00 server hour alone and the
+# whole -GBP 104.99 day of 2026-11-18 was inside it. Set ENTRY_BLACKOUT_ENABLED=false
+# to disable the window.
+ENTRY_BLACKOUT_ENABLED: bool = _env_bool("ENTRY_BLACKOUT_ENABLED", False)
+ENTRY_BLACKOUT_UTC_START_HOUR: int = _env_int(
+    "ENTRY_BLACKOUT_UTC_START_HOUR", 0, min_val=0, max_val=23
+)
+ENTRY_BLACKOUT_UTC_END_HOUR: int = _env_int(
+    "ENTRY_BLACKOUT_UTC_END_HOUR", 2, min_val=0, max_val=23
 )
 TIERED_STAGE_BANKING_ENABLED: bool = _env_bool("TIERED_STAGE_BANKING_ENABLED", True)
 CANCEL_PENDING_ON_BE: bool = _env_bool("CANCEL_PENDING_ON_BE", True)
@@ -577,6 +605,12 @@ DYNAMIC_ATR_BE_ACTIVATION_MULT: float = _env_float(
 )
 DYNAMIC_ATR_BE_MIN_MFE_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50, min_val=0.0, max_val=50.0
+)
+# When the trade's own initial risk per ounce is known, the breakeven lock waits for
+# this multiple of that risk before it arms (instead of a flat dollar amount). It only
+# changes WHEN the lock arms, never WHERE it locks (the stop stays at entry +/- offset).
+DYNAMIC_ATR_BE_R_ACTIVATION_MULT: float = _env_float(
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT", 0.50, min_val=0.05, max_val=2.0
 )
 DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS: float = _env_float(
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50, min_val=0.0, max_val=10.0
