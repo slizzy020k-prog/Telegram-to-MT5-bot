@@ -332,7 +332,7 @@ async def test_3_channel_prompts_replies_and_edits_trail_and_step_tp1_to_tp4(tmp
             assert sig_buy["tp_stage"] == "TP2"
             assert sig_buy["layers"]["L4"]["tp"] == pytest.approx(3910.0)
             floor_tp1 = sig_buy["runner_sl_floor"]
-            assert floor_tp1 == pytest.approx(3895.5)
+            assert floor_tp1 == pytest.approx(3896.2)   # entry + the $1.20 BE lock offset
 
             # Step 2: Edit original message #301 during RUNNER_ACTIVE with looser SL (3870) + new TP2 3912 TP3 3924
             # Verify ratchet_sl_only=True blocks loosening SL back to 3870 while updating TP2 & TP3!
@@ -456,12 +456,12 @@ async def test_4_saved_messages_user_prompts_end_to_end_lifecycle(tmp_path):
     assert len(sig_410["market_tickets"]) == 4
 
     # Target #401 explicitly while #410 is the latest signal!
-    # Wait: #401 already applied /be (be_sl=3895.5), so loosening back to 3886.0 MUST be blocked by v3.6 guard,
-    # whereas tightening SL to 3896.0 succeeds on #401 while #410 stays 3880.0!
+    # Wait: #401 already applied /be (be_sl=3896.2), so loosening back to 3886.0 MUST be blocked by v3.6 guard,
+    # whereas tightening SL to 3896.5 succeeds on #401 while #410 stays 3880.0!
     await _send_saved(411, "/sl 3886 #401")
     assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3885.0)
-    await _send_saved(4111, "/sl 3896 #401")
-    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3896.0)
+    await _send_saved(4111, "/sl 3896.5 #401")
+    assert main.state_mgr.get_signal(401, chat_id="me")["sl"] == pytest.approx(3896.5)
     assert main.state_mgr.get_signal(410, chat_id="me")["sl"] == pytest.approx(3880.0)
 
     # `close 50%` on latest (#410) -> closes 1 market ticket, leaves 3 open

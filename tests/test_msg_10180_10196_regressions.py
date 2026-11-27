@@ -523,9 +523,11 @@ def test_progressive_trail_tightening_zones(monkeypatch):
     assert home["trail_zone"] == "HOME_RUN" and home["trail_mult"] == pytest.approx(0.80)
     assert home["trail_dist"] == pytest.approx(3.20)
 
-    # v3.9.0: each zone honours its OWN floor (ATR 0.50 x mult would be below it):
+    # ATR-relative stages: at ATR 0.50 the thresholds are min($10, 2.5 x ATR) = $1.25
+    # and min($18, 4.0 x ATR) = $2.00, so even a $5.00 MFE is already HOME_RUN in a
+    # calm session. Each zone still honours its OWN floor:
     # STANDARD $2.50, EXTENDED $2.20, HOME_RUN $2.00.
-    for mfe, zone, mult, floor in ((5.00, "STANDARD", 1.40, 2.50), (12.00, "EXTENDED", 1.00, 2.20), (20.00, "HOME_RUN", 0.80, 2.00)):
+    for mfe, zone, mult, floor in ((5.00, "HOME_RUN", 0.80, 2.00), (12.00, "HOME_RUN", 0.80, 2.00), (20.00, "HOME_RUN", 0.80, 2.00)):
         res = _trail(3850.0, mfe, 0.50)
         assert res["trail_zone"] == zone
         assert res["trail_mult"] == pytest.approx(mult)

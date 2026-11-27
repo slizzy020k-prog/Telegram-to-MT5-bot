@@ -239,7 +239,7 @@ def test_production_picker_atr_relative_ladder():
     assert res["trail_armed"] is True
     assert res["trail_activation_threshold"] == pytest.approx(4.00)
     assert res["be_armed"] is True
-    assert res["be_threshold"] == pytest.approx(3.00)
+    assert res["be_threshold"] == pytest.approx(3.00)  # the $3.00 activation ceiling
     assert res["auto_be_armed"] is True
     assert res["auto_be_sl"] == pytest.approx(entry)
     # Tightest-stop picker: the ladder lock beats BE/auto-BE/trail here.
@@ -739,7 +739,7 @@ def test_wick_gate_close_confirmation_suppresses_until_close():
     assert gated["wick_gate_suppressed"] is True
     # Re-pick = tightest OTHER candidate: BE_LOCK 3600.50 (> auto-BE 3600, > trail).
     assert gated["stop_source"] == "BE_LOCK"
-    assert gated["candidate_sl"] == pytest.approx(3600.50)
+    assert gated["candidate_sl"] == pytest.approx(3601.20)  # entry + the $1.20 BE lock offset
     assert gated["should_update"] is True
     # MFE/peak fields untouched (wick tracking preserved, independent of TP moves).
     assert gated["mfe_dollars"] == res["mfe_dollars"]
@@ -801,7 +801,7 @@ def test_wick_gate_never_loosens_and_sell_mirror():
     gsell = harness._apply_wick_gate(ress, kws, trs)
     assert gsell["mfe_lock_sl"] is None
     assert gsell["stop_source"] == "BE_LOCK"
-    assert gsell["candidate_sl"] == pytest.approx(3599.50)
+    assert gsell["candidate_sl"] == pytest.approx(3598.80)  # entry - the $1.20 BE lock offset
 
 
 def test_wick_research_arms_params_identical_to_baseline():

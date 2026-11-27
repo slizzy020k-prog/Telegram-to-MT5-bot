@@ -492,7 +492,7 @@ def test_tp1_scaling_4layer_dynamic_selection_and_early_floor_fix(monkeypatch):
     assert sig["layers"]["L3"]["status"] == "CLOSED"
     assert sig["layers"]["L4"]["tp"] == 3910.0 and sig["layers"]["L4"]["tp_stage"] == "TP2"
     assert sig["market_tickets"] == [104]
-    assert sig["runner_sl_floor"] == pytest.approx(3887.50)
+    assert sig["runner_sl_floor"] == pytest.approx(3888.2)   # entry + the $1.20 BE lock offset
     with patch.object(ex, "get_tick", return_value=_make_tick(3898.30, 3898.60)):
         assert ex.manage_designated_runner(sig) is True
         assert sig["runner_ticket"] == 104

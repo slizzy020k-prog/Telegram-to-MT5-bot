@@ -259,7 +259,7 @@ BE_LAYERS: List[str] = [
     for item in _parse_json_list("BE_LAYERS", _default_be_layers)
     if str(item).strip()
 ] or list(_default_be_layers)
-BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 5.0, min_val=0.0, max_val=50.0)
+BE_OFFSET_PIPS: float = _env_float("BE_OFFSET_PIPS", 12.0, min_val=0.0, max_val=50.0)
 
 # Manual /trail, /be, entry proximity & deprecated shortfall compatibility constants
 TP1_LOCK_BUFFER: float = _env_float("TP1_LOCK_BUFFER", 0.50, min_val=0.0, max_val=50.0)
@@ -601,19 +601,30 @@ _cfg_logger.info(
 )
 
 DYNAMIC_ATR_BE_ACTIVATION_MULT: float = _env_float(
-    "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.75, min_val=0.0, max_val=20.0
+    "DYNAMIC_ATR_BE_ACTIVATION_MULT", 0.50, min_val=0.0, max_val=20.0
 )
 DYNAMIC_ATR_BE_MIN_MFE_DOLLARS: float = _env_float(
-    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 3.50, min_val=0.0, max_val=50.0
+    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", 0.60, min_val=0.0, max_val=50.0
+)
+# The breakeven lock's OWN cost floor (the round-trip spread + slippage). It is
+# added to BE_OFFSET_PIPS to form the minimum excursion the lock may arm on, so a
+# breakeven exit always lands outside the spread instead of inside the noise.
+DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS: float = _env_float(
+    "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS", 0.60, min_val=0.0, max_val=50.0
+)
+# Pre-flight guard: a target closer to the entry than this many live spreads cannot
+# pay for the round trip, so the signal is rejected before any order is placed.
+MIN_TP1_SPREAD_MULTIPLE: float = _env_float(
+    "MIN_TP1_SPREAD_MULTIPLE", 3.0, min_val=0.0, max_val=50.0
 )
 # When the trade's own initial risk per ounce is known, the breakeven lock waits for
 # this multiple of that risk before it arms (instead of a flat dollar amount). It only
 # changes WHEN the lock arms, never WHERE it locks (the stop stays at entry +/- offset).
 DYNAMIC_ATR_BE_R_ACTIVATION_MULT: float = _env_float(
-    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT", 0.50, min_val=0.05, max_val=2.0
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT", 0.25, min_val=0.05, max_val=2.0
 )
 DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS: float = _env_float(
-    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 0.50, min_val=0.0, max_val=10.0
+    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", 1.20, min_val=0.0, max_val=10.0
 )
 
 # ---------------------------------------------------------------------------
@@ -652,7 +663,7 @@ DYNAMIC_ATR_MFE_LOCK_TIERS: str = (os.getenv("DYNAMIC_ATR_MFE_LOCK_TIERS") or "0
 # Spread+slippage floor: the lock arms only when fraction*MFE >= this floor, so it
 # never locks a nominal profit that is a net loss after costs.
 DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS: float = _env_float(
-    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 0.60, min_val=0.0, max_val=50.0
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS", 1.00, min_val=0.0, max_val=50.0
 )
 # Bound the ATR used for the MFE/ATR ratio so a high-ATR regime cannot delay the first
 # ladder tier indefinitely (and a tiny ATR cannot trigger it instantly). Opt-in only.

@@ -210,9 +210,10 @@ def test_trail_stop_unchanged_when_r_lock_floor_is_none():
     )
     assert res["r_lock_floor"] is None
     assert res["stop_source"] == "ATR_TRAIL"
-    # MFE 10.00 -> EXTENDED zone -> mult 1.00 -> v3.9.0 per-stage clamp [2.20, 5.50]:
-    # trail_dist = clamp(2.00, 2.20, 5.50) = 2.20 -> atr_sl = 3905.00 - 2.20 = 3902.80.
-    assert res["candidate_sl"] == pytest.approx(3902.80)
+    # MFE 10.00 at ATR 20.0 -> EXTENDED zone -> mult 1.00 and the trail IS armed
+    # (the activation is 1.00 x ATR = 20.00 -> the $4.00 ceiling caps it), so the
+    # ATR trail (3905.00 - 2.00) is the tightest candidate.
+    assert res["candidate_sl"] == pytest.approx(3903.00)
     assert res["should_update"] is True
 
 
@@ -228,8 +229,10 @@ def test_trail_stop_is_unchanged_across_a_baseline_grid():
     # SELL never reaches a positive MFE here, so it is never armed.
     expected = {
         ("BUY", 0.0): (None, None, 1.4, "STANDARD"),
-        # v3.9.0: Stage-B floor $2.20 (was the $2.50 global floor) -> 3905.00 - 2.20.
-        ("BUY", 2.0): (3902.8, "ATR_TRAIL", 1.0, "EXTENDED"),
+        # ATR-relative stages at ATR 2.0: the HOME_RUN threshold is
+        # min($18, 4.0 x ATR) = $8.00, so a $10.00 MFE is already HOME_RUN ->
+        # mult 0.80, HOME_RUN floor $2.00 -> 3905.00 - 2.00 = 3903.00.
+        ("BUY", 2.0): (3903.0, "ATR_TRAIL", 0.8, "HOME_RUN"),
         ("BUY", 20.0): (None, None, 1.0, "EXTENDED"),
         ("SELL", 0.0): (None, None, 1.4, "STANDARD"),
         ("SELL", 2.0): (None, None, 1.4, "STANDARD"),
@@ -301,7 +304,7 @@ def test_trail_stop_r_lock_never_loosens_an_existing_stop():
         digits=2,
         r_lock_floor=3902.8,   # the R lock wins the picker, but it is looser than the stop in place
     )
-    assert res["stop_source"] == "R_LOCK"
+    assert res["stop_source"] == "ATR_TRAIL"
     assert res["candidate_sl"] >= 3900.0
     # the existing stop is already tighter, so no SL update may be sent
     assert res["should_update"] is False
@@ -1264,7 +1267,8 @@ def test_executor_applies_r_lock_floor(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0     # wide ATR -> the ATR trail is not armed (MFE < activation), so the R floor wins
+    ex._dry_run_atr = 40.0     # a very wide ATR: neither the ATR trail (0.70 x ATR = 28.00) nor the
+                              # BE lock (0.50 x ATR = 20.00) arms at MFE $11.00, so the R floor wins
 
     sig = _atr_signal(3895.0, 3880.0)   # R = 15.0
     # Live price is $11.00 in favour -> 0.73R -> tier 0.5R reached -> floor = entry
@@ -1287,7 +1291,7 @@ def test_executor_r_lock_is_inert_when_disabled(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0
+    ex._dry_run_atr = 40.0     # wide ATR -> neither the trail nor the BE lock arms
 
     sig = _atr_signal(3895.0, 3880.0)
     ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
@@ -1306,7 +1310,7 @@ def test_executor_r_lock_skipped_without_initial_sl(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0
+    ex._dry_run_atr = 40.0
 
     sig = _atr_signal(3895.0, 3880.0)
     sig["layers"]["L1"].pop("initial_sl")     # a signal opened before the upgrade
@@ -1378,7 +1382,7 @@ def test_executor_r_lock_skips_a_layer_without_initial_sl_and_logs_it_once(monke
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0
+    ex._dry_run_atr = 40.0
 
     sig = _atr_signal(3895.0, 3880.0)
     sig["layers"]["L1"].pop("initial_sl")
@@ -1412,7 +1416,7 @@ def test_executor_r_lock_records_the_trail_bookkeeping_when_it_wins(monkeypatch)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 200.0
-    ex._dry_run_atr = 20.0
+    ex._dry_run_atr = 40.0
 
     sig = _atr_signal(3895.0, 3880.0)
     ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3906.0, ask=3906.2, time=1700000000.0))
@@ -2225,18 +2229,22 @@ def test_gated_be_lock_waits_for_half_the_initial_risk():
 @pytest.mark.parametrize(
     "initial_r,atr,mfe,armed",
     [
-        (22.0, 4.0, 10.99, False),    # 0.5R = $11.00 dominates
-        (22.0, 4.0, 11.00, True),
+        (44.0, 4.0, 10.99, False),    # 0.25 * R = $11.00 dominates
+        (44.0, 4.0, 11.00, True),
         (3.0, 20.0, 14.99, False),    # 0.75 * ATR = $15.00 dominates
         (3.0, 20.0, 15.00, True),
-        (3.0, 2.0, 2.49, False),      # the $2.50 trail minimum dominates
-        (3.0, 2.0, 2.50, True),
+        (3.0, 2.0, 3.49, False),      # the $3.50 flat BE minimum dominates
+        (3.0, 2.0, 3.50, True),
     ],
 )
-def test_gated_be_threshold_is_half_r_the_atr_multiple_or_the_trail_minimum(
+def test_gated_be_threshold_is_half_r_the_atr_multiple_or_the_flat_floor(
     initial_r, atr, mfe, armed
 ):
-    """The gated threshold is max(0.5R, 0.75 * ATR, $2.50) - whichever is largest."""
+    """The gated threshold is max(0.25 * R, 0.75 * ATR, $3.50, offset + cost floor).
+
+    The old $2.50 trail minimum no longer gates the lock: it was the term that
+    stopped the breakeven lock from ever arming on a real move.
+    """
     res = _gated_stop(
         entry_price=3900.0,
         live_price=3900.0 + mfe,
@@ -2429,7 +2437,8 @@ def test_executor_keeps_the_flat_be_lock_when_the_r_lock_is_off(monkeypatch):
     sig = _atr_signal(3900.0, 3878.0)          # R = 22.0
     ex.evaluate_dynamic_atr_engine(sig, tick=SimpleNamespace(bid=3905.0, ask=3905.2, time=1700000000.0))
 
-    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.50)
+    # The flat (non-R-gated) BE lock sits at entry + the $1.20 lock offset.
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3901.20)
     assert sig.get("active_stop_source") == "BE_LOCK"
 
 
@@ -2448,9 +2457,10 @@ def test_executor_r_lock_wins_the_picker_from_half_r_upward(monkeypatch):
     ex.evaluate_dynamic_atr_engine(one_r, tick=SimpleNamespace(bid=3922.0, ask=3922.2, time=1700000000.0))
     assert one_r.get("active_stop_source") == "R_LOCK"
     assert one_r["layers"]["L1"]["broker_sl"] == pytest.approx(3905.5)      # entry + 0.25R
-    # the BE lock keeps the classic breakeven level; the R ladder only changed
-    # WHEN it arms, so the R_LOCK candidate is the tighter of the two
-    assert one_r["layers"]["L1"]["be_sl"] == pytest.approx(3900.50)
+    # the BE lock keeps the classic breakeven level (entry + the $1.20 offset);
+    # the R ladder only changed WHEN it arms, so the R_LOCK candidate is the
+    # tighter of the two
+    assert one_r["layers"]["L1"]["be_sl"] == pytest.approx(3901.20)
 
 # --- v3.8.1 (F4): the R-gated BE lock must never be less protective --------
 

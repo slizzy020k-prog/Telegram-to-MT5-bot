@@ -122,8 +122,27 @@ def test_atr_trail_dist_clamps_to_range(monkeypatch):
     assert res_high["trail_mult"] == 1.5
     assert res_high["trail_dist"] == 8.00, f"Expected clamped to max=8.00, got {res_high['trail_dist']}"
 
-    # ATR=0.5 -> 1.5 * 0.5 = 0.75 clamped to min=$2.50 floor (same STANDARD zone)
+    # ATR=0.5 with MFE $1.00 stays in the STANDARD zone (the ATR-relative EXTENDED
+    # stage only opens at min($10, 2.5 x ATR) = $1.25), so the BASE 1.5x multiplier
+    # still applies: 1.5 * 0.5 = 0.75 clamped to the min=$2.50 floor.
     res_low = dynamic_risk.compute_dynamic_atr_trail_stop(
+        direction="BUY",
+        entry_price=3850.0,
+        live_price=3851.0,
+        prev_peak=3851.0,
+        current_sl=3840.0,
+        atr=0.5,
+        policy=policy,
+        digits=2,
+    )
+    assert res_low["trail_zone"] == "STANDARD", f"Expected STANDARD zone, got {res_low['trail_zone']}"
+    assert res_low["trail_mult"] == 1.5
+    assert res_low["trail_dist"] == 2.50, f"Expected clamped to min=$2.50 floor, got {res_low['trail_dist']}"
+
+    # ATR=0.5 with a $9.00 MFE has already reached the ATR-relative HOME_RUN stage
+    # (min($18, 4.0 x ATR) = $2.00), so the HOME_RUN multiplier (0.80x) applies and
+    # the distance floors at the HOME_RUN minimum of $2.00.
+    res_low_run = dynamic_risk.compute_dynamic_atr_trail_stop(
         direction="BUY",
         entry_price=3850.0,
         live_price=3859.0,
@@ -133,8 +152,9 @@ def test_atr_trail_dist_clamps_to_range(monkeypatch):
         policy=policy,
         digits=2,
     )
-    assert res_low["trail_zone"] == "STANDARD", f"Expected STANDARD zone, got {res_low['trail_zone']}"
-    assert res_low["trail_dist"] == 2.50, f"Expected clamped to min=$2.50 floor, got {res_low['trail_dist']}"
+    assert res_low_run["trail_zone"] == "HOME_RUN", f"Expected HOME_RUN zone, got {res_low_run['trail_zone']}"
+    assert res_low_run["trail_mult"] == 0.8
+    assert res_low_run["trail_dist"] == 2.00, f"Expected clamped to min=$2.00 floor, got {res_low_run['trail_dist']}"
 
 
 # ---------------------------------------------------------------------------
@@ -155,9 +175,10 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
     # 1.5x ATR ladder. It used to start at live=3850.00 (entry 3840 -> MFE $10.00), which
     # lands exactly on the EXTENDED boundary ($10.00) where the multiplier tightens to
     # 1.00x and trail_dist drops to the $2.50 floor.
-    # First tick at 3845 (entry=3840, peak=3845, MFE=$5.00 -> STANDARD 1.5x,
-    # atr=2.0 -> trail_dist = clamp(1.5*2.0=3.0, 2.50, 8.00) = 3.0)
-    # raw cand = 3845 - 3.0 = 3842.0
+    # First tick at 3845 (entry=3840, peak=3845, MFE=$5.00). The ATR-relative
+    # EXTENDED stage opens at min($10, 2.5 * atr=2.0) = $5.00, so this tick is
+    # already EXTENDED (1.0x) -> trail_dist = clamp(1.0*2.0=2.0, 2.20, 5.50) = 2.2
+    # raw cand = 3845 - 2.2 = 3842.8
     r1 = dynamic_risk.compute_dynamic_atr_trail_stop(
         direction="BUY",
         entry_price=3840.0,
@@ -168,11 +189,11 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
         policy=policy,
         digits=2,
     )
-    assert r1["trail_zone"] == "STANDARD", f"Expected STANDARD zone, got {r1['trail_zone']}"
-    assert r1["trail_dist"] == 3.0
+    assert r1["trail_zone"] == "EXTENDED", f"Expected EXTENDED zone, got {r1['trail_zone']}"
+    assert r1["trail_dist"] == 2.2
     assert r1["should_update"] is True
     stop1 = r1["candidate_sl"]
-    assert stop1 == 3842.0, f"Initial candidate_sl wrong: {stop1}"
+    assert stop1 == 3842.8, f"Initial candidate_sl wrong: {stop1}"
 
     # Second tick — price moves up to 3847 (peak=3847, MFE=$7.00 -> still STANDARD)
     r2 = dynamic_risk.compute_dynamic_atr_trail_stop(
@@ -185,10 +206,10 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
         policy=policy,
         digits=2,
     )
-    assert r2["trail_zone"] == "STANDARD", f"Expected STANDARD zone, got {r2['trail_zone']}"
+    assert r2["trail_zone"] == "EXTENDED", f"Expected EXTENDED zone, got {r2['trail_zone']}"
     assert r2["should_update"] is True
     stop2 = r2["candidate_sl"]
-    assert stop2 == 3844.0, f"Trail stop should ratchet up with price: {stop2} <= {stop1}"
+    assert stop2 == 3844.8, f"Trail stop should ratchet up with price: {stop2} <= {stop1}"
     assert stop2 > stop1
 
     # Third tick — price pulls back to 3846 (peak remains 3847, current_sl=3844.0)
@@ -202,7 +223,7 @@ def test_atr_trail_ratchets_forward_only(monkeypatch):
         policy=policy,
         digits=2,
     )
-    # On pullback, peak is still 3847, so candidate_sl is still 3844.0 -> no forward progress
+    # On pullback, peak is still 3847, so candidate_sl is still 3844.8 -> no forward progress
     assert r3["should_update"] is False
     assert r3["candidate_sl"] == stop2, f"Trail stop must NOT move backwards on a pullback: {r3['candidate_sl']} != {stop2}"
     assert r3["peak_price"] == 3847.0, f"Trail peak must NOT move backwards: {r3['peak_price']}"

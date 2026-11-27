@@ -38,6 +38,7 @@ from config import (
     DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS,
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
+    DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
     DYNAMIC_ATR_BE_R_ACTIVATION_MULT,
     DYNAMIC_ATR_INTERIM_FLOOR_ENABLED,
@@ -96,6 +97,7 @@ from config import (
     MAX_ORDERS_PER_SIGNAL,
     MAX_TP_DISTANCE_DOLLARS,
     MIN_SL_BUFFER_PIPS,
+    MIN_TP1_SPREAD_MULTIPLE,
     MIN_VALID_SPREAD_DOLLARS,
     MT5_LOGIN,
     MT5_PASSWORD,
@@ -232,6 +234,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS",
         "DYNAMIC_ATR_BE_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS",
+        "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS",
         "DYNAMIC_ATR_BE_R_ACTIVATION_MULT",
         "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS",
         "DYNAMIC_ATR_INTERIM_FLOOR_ENABLED",
@@ -1271,6 +1274,47 @@ class MT5Executor:
         spread_points = round((ask - bid) / point, 1)
         logger.info(f"Pre-flight check: Current spread on {resolved} is {spread_points} points.")
 
+        # P5: a target that sits inside a few spreads of the entry cannot pay for the
+        # round trip (the entry pays the spread and so does the exit). Reject it here,
+        # before any order is placed. The entry reference is the price the copier
+        # will actually get: the zone's L1 tier, the single price, or the live quote.
+        if (
+            isinstance(raw_tp1, (int, float))
+            and not isinstance(raw_tp1, bool)
+            and float(raw_tp1) > 0.0
+        ):
+            entry_ref: Optional[float] = None
+            if (
+                isinstance(single_price, (int, float))
+                and not isinstance(single_price, bool)
+                and float(single_price) > 0.0
+            ):
+                entry_ref = float(single_price)
+            elif zone is not None:
+                try:
+                    _tiers = getattr(zone, "tiers", None)
+                    _l1 = _tiers.get("L1") if isinstance(_tiers, dict) else None
+                    if (
+                        isinstance(_l1, (int, float))
+                        and not isinstance(_l1, bool)
+                        and float(_l1) > 0.0
+                    ):
+                        entry_ref = float(_l1)
+                except Exception:
+                    entry_ref = None
+            if entry_ref is None:
+                entry_ref = float(ask) if direction_norm == "BUY" else float(bid)
+            live_spread = float(ask) - float(bid)
+            _mult = float(_cfg("MIN_TP1_SPREAD_MULTIPLE", MIN_TP1_SPREAD_MULTIPLE))
+            min_edge = _mult * live_spread
+            edge = abs(float(raw_tp1) - entry_ref)
+            if _mult > 0.0 and edge < min_edge:
+                return False, (
+                    f"TP1 is too close to the entry (|TP1 - entry| = {edge:.2f} < {min_edge:.2f} = "
+                    f"{_mult:.1f} x the live spread {live_spread:.2f}) - the round-trip cost "
+                    f"would eat the target"
+                )
+
         def _stash_ctx() -> None:
             self._last_preflight_ctx = {
                 "symbol": resolved,
@@ -1467,6 +1511,9 @@ class MT5Executor:
             DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS=_cfg("DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS", DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS),
             DYNAMIC_ATR_BE_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_ACTIVATION_MULT", DYNAMIC_ATR_BE_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_MIN_MFE_DOLLARS=_cfg("DYNAMIC_ATR_BE_MIN_MFE_DOLLARS", DYNAMIC_ATR_BE_MIN_MFE_DOLLARS),
+            DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS=_cfg(
+                "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS", DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS
+            ),
             DYNAMIC_ATR_BE_R_ACTIVATION_MULT=_cfg("DYNAMIC_ATR_BE_R_ACTIVATION_MULT", DYNAMIC_ATR_BE_R_ACTIVATION_MULT),
             DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS=_cfg("DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS", DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS),
             DYNAMIC_ATR_INTERIM_FLOOR_ENABLED=_cfg("DYNAMIC_ATR_INTERIM_FLOOR_ENABLED", DYNAMIC_ATR_INTERIM_FLOOR_ENABLED),
@@ -8715,6 +8762,7 @@ class MT5Executor:
                 entry_price=entry_px,
                 live_price=live_price,
                 prev_peak=lv.get("dynamic_atr_trail_peak"),
+                prev_zone=lv.get("dynamic_atr_trail_zone"),
                 current_sl=cur_sl,
                 atr=atr,
                 policy=policy,

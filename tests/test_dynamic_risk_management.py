@@ -408,9 +408,9 @@ def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch, shipped_config)
     assert config.DYNAMIC_ATR_TRAIL_MIN_DOLLARS == pytest.approx(2.50)
     assert config.DYNAMIC_ATR_TRAIL_MAX_DOLLARS == pytest.approx(8.00)  # v3.9.0 Stage-A cap
     assert config.DYNAMIC_ATR_TRAIL_STEP_DOLLARS == pytest.approx(0.25)
-    assert config.DYNAMIC_ATR_BE_ACTIVATION_MULT == pytest.approx(0.75)
-    assert config.DYNAMIC_ATR_BE_MIN_MFE_DOLLARS == pytest.approx(3.50)
-    assert config.DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS == pytest.approx(0.50)
+    assert config.DYNAMIC_ATR_BE_ACTIVATION_MULT == pytest.approx(0.50)
+    assert config.DYNAMIC_ATR_BE_MIN_MFE_DOLLARS == pytest.approx(0.60)
+    assert config.DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS == pytest.approx(1.20)
     assert config.DYNAMIC_ATR_TP_TRAIL_ENABLED is True
     assert config.DYNAMIC_ATR_TP_LIFT_ATR_MULT == pytest.approx(0.50)
     assert config.DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT == pytest.approx(0.75)
@@ -428,9 +428,9 @@ def test_decommission_and_pure_dynamic_atr_defaults(monkeypatch, shipped_config)
     # v3.9.0: Stage A trail max default tightened 12.00 -> 8.00 (per-stage clamps).
     assert pol.trail_max_dollars == pytest.approx(8.00)
     assert pol.trail_step_dollars == pytest.approx(0.25)
-    assert pol.be_activation_atr_mult == pytest.approx(0.75)
-    assert pol.be_min_mfe_dollars == pytest.approx(3.50)
-    assert pol.be_lock_offset_dollars == pytest.approx(0.50)
+    assert pol.be_activation_atr_mult == pytest.approx(0.50)
+    assert pol.be_min_mfe_dollars == pytest.approx(0.60)
+    assert pol.be_lock_offset_dollars == pytest.approx(1.20)
     assert pol.tp_trail_enabled is True
     assert pol.tp_lift_atr_mult == pytest.approx(0.50)
     assert pol.tp_lift_progress_pct == pytest.approx(0.75)
@@ -544,16 +544,17 @@ def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
     assert sig["layers"]["L1"]["dynamic_atr_trail_peak"] == pytest.approx(3902.0)
 
     # 6) Volatility contracts ATR=1.00 -> trail_dist clamped to min $2.50
-    # Candidate SL = 3902.0 - 2.50 = 3899.50 > 3896.00 -> SL ratchets forward!
+    # The breakeven lock (entry + $1.20) is now the TIGHTEST candidate, so the stop
+    # ratchets to the breakeven lock rather than to the ATR trail.
     ex._dry_run_atr = 1.00
     res_tighten = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3902.0, 3902.3))
     assert len(res_tighten["updated_tickets"]) == 1
-    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3899.50)
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.00)
 
     # 7) Small movement < step filter ($0.25) is ignored
     res_small = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3902.10, 3902.30))
     assert res_small["updated_tickets"] == []
-    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3899.50)
+    assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3900.00)
 
     # 8) Stops-level clamping via compute_dynamic_atr_trail_stop
     pol = dynamic_risk.read_dynamic_risk_policy(config)

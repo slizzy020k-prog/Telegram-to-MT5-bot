@@ -73,9 +73,11 @@ _OTHER_TRAIL_KNOBS = {
     "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS": 2.00,
     "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS": 4.00,
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS": 0.25,
-    "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.75,
-    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 3.50,
-    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
+    "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.50,
+    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 0.60,
+    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 1.20,
+    "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS": 0.60,
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT": 0.25,
 }
 
 
@@ -281,11 +283,11 @@ def test_tightest_candidate_picker(profile_loader, profile):
     assert tighter["stop_source"] == "R_LOCK"
     assert tighter["candidate_sl"] == pytest.approx(atr_sl + 1.0)
     # STANDARD zone under the tighter MAX: dist clamp(8.4, [2.50, 5.50]) = 5.5 ->
-    # atr_sl 3852.5 still beats the armed BE lock (3850.50): tightest wins.
+    # atr_sl 3852.5 still beats the armed BE lock (3851.20): tightest wins.
     std = _trail(pol, 8.0, 6.0)
     assert std["trail_zone"] == "STANDARD"
     assert std["trail_dist"] == pytest.approx(5.5)
-    assert std["be_armed"] is True and std["be_sl"] == pytest.approx(3850.5)
+    assert std["be_armed"] is True and std["be_sl"] == pytest.approx(3851.2)
     assert std["stop_source"] == "ATR_TRAIL" and std["candidate_sl"] == pytest.approx(3852.5)
 
 

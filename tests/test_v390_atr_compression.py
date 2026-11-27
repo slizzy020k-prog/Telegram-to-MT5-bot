@@ -113,17 +113,20 @@ def test_select_progressive_trail_mult_contract_unchanged():
         (5.0, 6.0, 8.0, "STANDARD", 1.40),
         (12.0, 6.0, 5.5, "EXTENDED", 1.00),
         (20.0, 6.0, 4.0, "HOME_RUN", 0.80),
-        # ATR=1: raw 1.4 / 1.0 / 0.8 -> each stage floors at its OWN min.
-        (5.0, 1.0, 2.5, "STANDARD", 1.40),
-        (12.0, 1.0, 2.2, "EXTENDED", 1.00),
+        # ATR=1: the ATR-relative stages are min($10, 2.5 x ATR) = $2.50 and
+        # min($18, 4.0 x ATR) = $4.00, so even a $5.00 MFE is already HOME_RUN.
+        # Each stage still floors at its OWN min.
+        (5.0, 1.0, 2.0, "HOME_RUN", 0.80),
+        (12.0, 1.0, 2.0, "HOME_RUN", 0.80),
         (20.0, 1.0, 2.0, "HOME_RUN", 0.80),
         # ATR=4: interior values pass through unclamped in every stage.
         (5.0, 4.0, 5.6, "STANDARD", 1.40),
         (12.0, 4.0, 4.0, "EXTENDED", 1.00),
         (20.0, 4.0, 3.2, "HOME_RUN", 0.80),
-        # ATR=2: Stage A interior, Stages B/C hit their floors.
-        (5.0, 2.0, 2.8, "STANDARD", 1.40),
-        (12.0, 2.0, 2.2, "EXTENDED", 1.00),
+        # ATR=2: the ATR-relative EXTENDED stage opens at min($10, 2.5 x ATR) =
+        # $5.00 and the HOME_RUN stage at min($18, 4.0 x ATR) = $8.00.
+        (5.0, 2.0, 2.2, "EXTENDED", 1.00),
+        (12.0, 2.0, 2.0, "HOME_RUN", 0.80),
         (20.0, 2.0, 2.0, "HOME_RUN", 0.80),
         # ATR=10: every stage caps.
         (5.0, 10.0, 8.0, "STANDARD", 1.40),
@@ -134,6 +137,11 @@ def test_select_progressive_trail_mult_contract_unchanged():
         (10.0, 6.0, 5.5, "EXTENDED", 1.00),
         (17.99, 6.0, 5.5, "EXTENDED", 1.00),
         (18.0, 6.0, 4.0, "HOME_RUN", 0.80),
+        # Exact ATR-relative boundaries with ATR=1: EXTENDED at $2.50, HOME_RUN at $4.00.
+        (2.49, 1.0, 2.5, "STANDARD", 1.40),
+        (2.50, 1.0, 2.2, "EXTENDED", 1.00),
+        (3.99, 1.0, 2.2, "EXTENDED", 1.00),
+        (4.00, 1.0, 2.0, "HOME_RUN", 0.80),
     ],
 )
 def test_trail_dist_grid(mfe, atr, dist, zone, mult):
@@ -401,20 +409,23 @@ def test_r_gated_be_and_r_lock_staircase_integration():
 def test_r_gate_delays_be_but_never_changes_the_lock_level():
     pol = _policy()
     entry = 3900.0
-    # Wide stop R=20, ATR=4: gated threshold max(10, 3, 2.5) = 10 vs flat max(3, 3.5) = 3.5.
-    gated = _trail(pol, 5.0, 4.0, entry=entry, initial_r=20.0)
+    # Wide stop R=40, ATR=4: gated threshold max(0.25 x 40 = 10, 0.75 x 4 = 3, 3.50) = 10
+    # vs the flat (non-R-gated) max(3, 3.50) = 3.50.
+    gated = _trail(pol, 5.0, 4.0, entry=entry, initial_r=40.0)
     flat = _trail(pol, 5.0, 4.0, entry=entry)
     assert gated["be_armed"] is False and flat["be_armed"] is True
-    g10 = _trail(pol, 10.0, 4.0, entry=entry, initial_r=20.0)
+    g10 = _trail(pol, 10.0, 4.0, entry=entry, initial_r=40.0)
     f10 = _trail(pol, 10.0, 4.0, entry=entry)
     assert g10["be_armed"] is True and g10["should_sweep_pending"] is True
     # The gate changes WHEN, never WHERE: both lock at entry + $0.50.
     assert g10["be_sl"] == pytest.approx(entry + 0.50) == f10["be_sl"]
-    # Small R=2, ATR=4: threshold max(1, 3, 2.5) = 3 -> arms at $3.00.
-    small = _trail(pol, 3.0, 4.0, entry=entry, initial_r=2.0)
+    # Small R=2, ATR=4: the flat $3.50 minimum dominates -> arms at $3.50.
+    small = _trail(pol, 3.49, 4.0, entry=entry, initial_r=2.0)
+    assert small["be_armed"] is False
+    small = _trail(pol, 3.50, 4.0, entry=entry, initial_r=2.0)
     assert small["be_armed"] is True and small["be_sl"] == pytest.approx(entry + 0.50)
     # SELL mirror: lock at entry - $0.50.
-    sell = _trail(pol, 10.0, 4.0, entry=entry, direction="SELL", initial_r=20.0)
+    sell = _trail(pol, 10.0, 4.0, entry=entry, direction="SELL", initial_r=40.0)
     assert sell["be_armed"] is True and sell["be_sl"] == pytest.approx(entry - 0.50)
 
 

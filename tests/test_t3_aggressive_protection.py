@@ -125,10 +125,16 @@ def test_baseline_new_keys_neutral(direction, atr, mfe, r):
     assert res["auto_be_sl"] is None and res["auto_be_armed"] is False
     assert res["distance_cap_applied"] is False
     assert res["trail_activation_threshold"] == pytest.approx(round(pol.trail_activation_atr_mult * atr, 4))
+    be_floor = pol.be_lock_offset_dollars + pol.be_min_distance_dollars
     if r is not None and r > 0:
-        exp_be = max(0.5 * r, pol.be_activation_atr_mult * atr, pol.trail_min_dollars)
+        exp_be = max(
+            pol.be_r_activation_mult * r,
+            pol.be_activation_atr_mult * atr,
+            pol.be_min_mfe_dollars,
+            be_floor,
+        )
     else:
-        exp_be = max(pol.be_activation_atr_mult * atr, pol.be_min_mfe_dollars)
+        exp_be = max(pol.be_activation_atr_mult * atr, pol.be_min_mfe_dollars, be_floor)
     assert res["be_threshold"] == pytest.approx(round(exp_be, 4))
     if res["be_armed"]:
         assert res["be_sl"] == pytest.approx(round(entry + sign * pol.be_lock_offset_dollars, 2))
@@ -144,7 +150,7 @@ def test_baseline_picker_oracle(direction):
     sign = 1.0 if direction == "BUY" else -1.0
     assert res["be_armed"] and res["trail_armed"]
     assert res["stop_source"] == "BE_LOCK"
-    assert res["candidate_sl"] == pytest.approx(round(entry + sign * 0.5, 2))
+    assert res["candidate_sl"] == pytest.approx(round(entry + sign * 1.2, 2))  # the $1.20 BE lock offset
 
 
 def test_baseline_disabled_path_neutral():
@@ -170,19 +176,25 @@ def test_ladder_seven_tiers_exact(direction, ratio, pct):
     # The retained profit is the tier fraction of the peak, but never closer to the
     # peak than the noise floor (the cost floor + a slice of the bounded ATR), so
     # ordinary noise cannot clip the lock.
-    noise = max(0.60, min(0.25 * atr, 0.35 * mfe))
+    noise = max(pol.mfe_lock_cost_floor_dollars, min(0.25 * atr, 0.35 * mfe))
     expected = min(pct * mfe, mfe - noise)
     assert res["mfe_lock_ratio"] == pytest.approx(ratio)
     assert res["mfe_lock_fraction"] == pytest.approx(pct)
     assert res["mfe_lock_noise_floor"] == pytest.approx(noise)
     assert res["mfe_lock_profit"] == pytest.approx(expected)
-    # At every tier the peak leaves room for the noise floor, so the lock arms and
-    # binds. (The "peak too small to lock" case is covered in
+    # The lock only binds when the retained profit clears the cost floor. On the
+    # first tier the peak is too small for that (the cost floor eats it), so the
+    # lock stays disarmed. (The "peak too small to lock" case is also covered in
     # tests/test_profit_lock_balance.py.)
-    assert expected + 1e-9 >= 0.60
-    assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(expected, 2), 2))
-    assert res["stop_source"] == "MFE_LOCK"
-    assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
+    if expected + 1e-9 >= pol.mfe_lock_cost_floor_dollars:
+        assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(expected, 2), 2))
+        if res["stop_source"] == "MFE_LOCK":
+            assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
+        else:
+            # Another candidate (the breakeven lock) is tighter, so it wins the picker.
+            assert sign * (res["candidate_sl"] - res["mfe_lock_sl"]) >= 0
+    else:
+        assert res["mfe_lock_sl"] is None
 
 
 def test_ladder_no_fixed_dollar_activation():
@@ -335,7 +347,7 @@ def test_auto_be_never_loosens_tighter_be_lock():
     assert res["be_armed"] is True
     assert res["auto_be_armed"] is True
     assert res["stop_source"] == "BE_LOCK"
-    assert res["candidate_sl"] == pytest.approx(3700.5)
+    assert res["candidate_sl"] == pytest.approx(3701.2)  # the $1.20 BE lock offset
 
 
 def test_auto_be_independent_of_ladder():
@@ -429,7 +441,7 @@ def test_be_ceiling_overrides_r_gate(direction, r):
     assert d["be_armed"] is False
     assert t["be_armed"] is True
     assert t["be_threshold"] == pytest.approx(3.0)
-    assert t["be_sl"] == pytest.approx(round(entry + sign * 0.5, 2))
+    assert t["be_sl"] == pytest.approx(round(entry + sign * 1.20, 2))  # the $1.20 BE lock offset
 
 
 @pytest.mark.parametrize("direction", ["BUY", "SELL"])
@@ -589,7 +601,7 @@ def test_pip_convention_verified():
     ex = mt5_executor.MT5Executor(dry_run=True)
     assert ex.get_pip_size("XAUUSD.s") == pytest.approx(0.10)
     assert 30 * ex.get_pip_size("XAUUSD.s") == pytest.approx(3.00)
-    assert config.BE_OFFSET_PIPS * ex.get_pip_size("XAUUSD.s") == pytest.approx(0.50)
+    assert config.BE_OFFSET_PIPS * ex.get_pip_size("XAUUSD.s") == pytest.approx(1.20)
 
 
 @pytest.mark.parametrize("text", ["Go breakeven", "Set breakeven", "Set break even",
@@ -776,11 +788,11 @@ def test_interim_floor_matches_research_ifk50(direction):
 
 def test_interim_floor_binds_only_when_tighter_than_ladder():
     entry = 3700.0
-    # MFE 2 / ATR 4: ladder 70% of 2.00 = 1.40, but the noise floor (the smaller of
-    # 0.25 * ATR = 1.00 and 35% of the peak = 0.70) caps the retained profit at 1.30;
-    # floor k0.5 -> 2.00 (tighter for BUY).
+    # MFE 2 / ATR 4: ladder 70% of 2.00 = 1.40, but the noise floor (the larger of
+    # the $1.00 cost floor and the smaller of 0.25 * ATR = 1.00 / 35% of the peak =
+    # 0.70) caps the retained profit at 1.00; floor k0.5 -> 2.00 (tighter for BUY).
     res = _eng("BUY", entry, 3702.0, _ifpol(0.50, mfe_lock_enabled=True), atr=4.0)
-    assert res["mfe_lock_sl"] == pytest.approx(3701.3)
+    assert res["mfe_lock_sl"] == pytest.approx(3701.0)
     assert res["interim_floor_sl"] == pytest.approx(3702.0)
     assert res["stop_source"] == "INTERIM_FLOOR"
     assert res["candidate_sl"] == pytest.approx(3702.0)

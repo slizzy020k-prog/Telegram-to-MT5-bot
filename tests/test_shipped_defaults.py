@@ -60,16 +60,17 @@ _SHIPPED_POLICY_DEFAULTS = {
     "trail_homerun_min_dollars": 2.00,
     "trail_homerun_max_dollars": 4.00,
     "trail_step_dollars": 0.25,
-    "be_activation_atr_mult": 0.75,
-    "be_min_mfe_dollars": 3.50,
-    "be_r_activation_mult": 0.50,
-    "be_lock_offset_dollars": 0.50,
+    "be_activation_atr_mult": 0.50,
+    "be_min_mfe_dollars": 0.60,
+    "be_min_distance_dollars": 0.60,
+    "be_r_activation_mult": 0.25,
+    "be_lock_offset_dollars": 1.20,
     "trail_activation_ceiling_dollars": 0.0,
     "be_activation_ceiling_dollars": 0.0,
     "trail_distance_tiers": "",
     "mfe_lock_enabled": False,
     "mfe_lock_tiers": "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93",
-    "mfe_lock_cost_floor_dollars": 0.60,
+    "mfe_lock_cost_floor_dollars": 1.00,
     "mfe_lock_atr_min_dollars": 1.00,
     "mfe_lock_atr_max_dollars": 12.00,
     "relative_scale_mult": 1.02,
@@ -153,16 +154,17 @@ _SHIPPED_CONFIG_LITERALS = {
     "DYNAMIC_ATR_TRAIL_HOMERUN_MIN_DOLLARS": 2.00,
     "DYNAMIC_ATR_TRAIL_HOMERUN_MAX_DOLLARS": 4.00,
     "DYNAMIC_ATR_TRAIL_STEP_DOLLARS": 0.25,
-    "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.75,
-    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 3.50,
-    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT": 0.50,
-    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 0.50,
+    "DYNAMIC_ATR_BE_ACTIVATION_MULT": 0.50,
+    "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": 0.60,
+    "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS": 0.60,
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT": 0.25,
+    "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": 1.20,
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": 0.0,
     "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": 0.0,
     "DYNAMIC_ATR_TRAIL_DISTANCE_TIERS": "",
     "DYNAMIC_ATR_MFE_LOCK_ENABLED": False,
     "DYNAMIC_ATR_MFE_LOCK_TIERS": "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93",
-    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 0.60,
+    "DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS": 1.00,
     "DYNAMIC_ATR_MFE_LOCK_ATR_MIN_DOLLARS": 1.00,
     "DYNAMIC_ATR_MFE_LOCK_ATR_MAX_DOLLARS": 12.00,
     "DYNAMIC_ATR_RELATIVE_SCALE_MULT": 1.02,
@@ -185,6 +187,7 @@ _SHIPPED_CONFIG_LITERALS = {
     "DAILY_LOSS_CLOSE_OPEN_TRADES": False,
     "AUTO_ADJUST_LOTS_TO_BALANCE": False,
     "BE_LAYERS": ["L1", "L2", "L3", "L4"],
+    "MIN_TP1_SPREAD_MULTIPLE": 3.0,
     "CLOSE_ON_SIGNAL_DELETED": True,
     "DELETED_SIGNAL_POLL_INTERVAL_SECONDS": 1.5,
 }
@@ -199,7 +202,7 @@ def test_shipped_config_dynamic_knob_set_is_complete(shipped_config):
     dynamic_knobs = {k for k in vars(shipped_config) if k.startswith("DYNAMIC_")}
     pinned = {k for k in _SHIPPED_CONFIG_LITERALS if k.startswith("DYNAMIC_")}
     assert dynamic_knobs == pinned
-    assert len(dynamic_knobs) == 52
+    assert len(dynamic_knobs) == 53
 
 
 def test_shipped_r_lock_via_reader_fallback(shipped_config):
