@@ -6,10 +6,10 @@ happen to a signal; `mt5_executor.py` carries the decision out against the broke
 
 Why the R floor exists
 -----------------------
-The ATR engine arms its breakeven lock at ``max(0.75 * ATR, $3.50)`` of favourable
-excursion regardless of how far the trade can lose. A $22/oz stop and a $2.00 scalp
-therefore both become risk-free after the same $3.50 -- the wide trade risks $22 to
-make $3.50 risk-free. The R floor scales the lock to each trade's own initial risk
+The ATR engine arms its breakeven lock at ``max(0.50 * ATR, $0.60, $1.20 + $0.60)``
+of favourable excursion regardless of how far the trade can lose. A $22/oz stop and a
+$2.00 scalp therefore both become risk-free after the same ~$1.80 -- the wide trade
+risks $22 to make $1.80 risk-free. The R floor scales the lock to each trade's own initial risk
 (``R = |entry - initial SL|``), so a wide trade waits until it has earned a fair
 multiple before it is protected.
 """
@@ -192,8 +192,8 @@ def compute_r_lock_floor(
       stops-buffer clamp is a second line of defence, not the only one.
 
     Note: while the R lock is enabled the ``BE_LOCK`` candidate's THRESHOLD is
-    R-gated (it arms at ``max(0.5 * R, 0.75 * ATR, $2.50)``), but its LEVEL
-    stays the classic breakeven offset (``entry +/- $0.50``), so the R-gated BE
+    R-gated (it arms at ``max(0.25 * R, 0.50 * ATR, $0.60, $1.20 + $0.60)``), but its
+    LEVEL stays the breakeven offset (``entry +/- $1.20``), so the R-gated BE
     lock is never less protective than the flat BE lock it replaced. The
     candidate picker keeps the tightest of the two: ``BE_LOCK`` wins at the
     0.5R tier (the R floor is only the entry) and ``R_LOCK`` wins from the

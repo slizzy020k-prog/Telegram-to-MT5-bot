@@ -188,10 +188,15 @@ def test_ladder_seven_tiers_exact(direction, ratio, pct):
     # tests/test_profit_lock_balance.py.)
     if expected + 1e-9 >= pol.mfe_lock_cost_floor_dollars:
         assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(expected, 2), 2))
-        if res["stop_source"] == "MFE_LOCK":
+        if expected >= pol.be_lock_offset_dollars:
+            # The ladder lock is at least as far from the entry as the breakeven lock,
+            # so it is the tighter candidate and wins the picker.
+            assert res["stop_source"] == "MFE_LOCK"
             assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
         else:
-            # Another candidate (the breakeven lock) is tighter, so it wins the picker.
+            # The breakeven lock (entry +/- the $1.20 offset) is TIGHTER than this
+            # ladder tier, so it wins the picker; the ladder lock is still recorded.
+            assert res["stop_source"] == "BE_LOCK"
             assert sign * (res["candidate_sl"] - res["mfe_lock_sl"]) >= 0
     else:
         assert res["mfe_lock_sl"] is None

@@ -53,14 +53,46 @@ def test_market_tp1_exactly_three_spreads_away_is_accepted(monkeypatch):
 
 
 def test_zone_uses_the_l1_tier_as_the_entry_reference(monkeypatch):
-    """A zone entry is anchored on L1, not on the live quote."""
+    """A BUY zone below the market fills at its L1 tier, so L1 is the reference."""
     ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
     ok, msg = ex.check_preflight(
         "XAUUSD.s",
         "BUY",
-        raw_tp1=3891.00,          # $1.00 from the L1 tier at 3890.00
+        raw_tp1=3901.00,          # $1.00 from the L1 tier at 3900.00
         sl=3875.0,
-        zone=_zone(l1=3890.0, top=3880.0, bottom=3892.0),
+        zone=_zone(l1=3900.0, top=3900.0, bottom=3892.0),
+    )
+    assert ok is False
+    assert "too close to the entry" in msg
+
+
+def test_buy_zone_above_the_market_is_anchored_on_the_market_leg(monkeypatch):
+    """A BUY zone whose market already sits above the tier fills L1 at the quote.
+
+    The L1 tier would overstate the TP1 edge, so the guard must measure the edge
+    from the price the market leg really gets.
+    """
+    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ok, msg = ex.check_preflight(
+        "XAUUSD.s",
+        "BUY",
+        raw_tp1=3896.00,          # $1.00 from the market fill at 3895.00
+        sl=3875.0,
+        zone=_zone(l1=3890.0, top=3890.0, bottom=3882.0),
+    )
+    assert ok is False
+    assert "too close to the entry" in msg
+
+
+def test_sell_zone_is_anchored_on_its_l1_tier(monkeypatch):
+    """A SELL zone fills at its tier or above, so the tier is the worst case."""
+    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ok, msg = ex.check_preflight(
+        "XAUUSD.s",
+        "SELL",
+        raw_tp1=3740.00,
+        sl=3910.0,
+        zone=_zone(l1=3742.0, top=3752.0, bottom=3742.0),
     )
     assert ok is False
     assert "too close to the entry" in msg
@@ -96,6 +128,21 @@ def test_guard_is_disabled_when_the_multiple_is_zero(monkeypatch):
     # once the guard is off.
     ok, msg = ex.check_preflight("XAUUSD.s", "BUY", raw_tp1=3897.10, sl=3875.0)
     assert ok is True, msg
+
+
+def test_executor_level_knob_override_takes_effect(monkeypatch):
+    """The executor's own copy of the knob must be reachable (no dead import)."""
+    import mt5_executor
+
+    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ok, msg = ex.check_preflight("XAUUSD.s", "BUY", raw_tp1=3897.10, sl=3875.0)
+    assert ok is False, "the shipped multiple of 3.0 rejects this target"
+    assert "too close to the entry" in msg
+
+    monkeypatch.setattr(mt5_executor, "MIN_TP1_SPREAD_MULTIPLE", 0.0)
+    ex2 = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ok2, msg2 = ex2.check_preflight("XAUUSD.s", "BUY", raw_tp1=3897.10, sl=3875.0)
+    assert ok2 is True, msg2
 
 
 def test_shipped_default_is_three_spreads():

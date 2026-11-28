@@ -68,6 +68,11 @@ def _apply_isolated_env() -> None:
     os.environ["DYNAMIC_ATR_MFE_LOCK_COST_FLOOR_DOLLARS"] = "1.00"
     os.environ["MIN_TP1_SPREAD_MULTIPLE"] = "3.0"
     os.environ["DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS"] = "0.0"
+    # Hermeticity (3): the live .env selects a TRAILING_PROFILE preset (t3), which
+    # rewrites the trail activation multiplier and the trail maximum at import time.
+    # python-dotenv does not override an existing environment entry, so without this
+    # pin the live profile leaks into the baseline suite. Pin the shipped default.
+    os.environ["TRAILING_PROFILE"] = "baseline"
     os.environ["ENTRY_BLACKOUT_ENABLED"] = "false"
     os.environ["ENTRY_BLACKOUT_UTC_START_HOUR"] = "0"
     os.environ["ENTRY_BLACKOUT_UTC_END_HOUR"] = "2"

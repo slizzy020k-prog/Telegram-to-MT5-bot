@@ -259,6 +259,7 @@ _CFG_IMPORT_SNAPSHOT: Dict[str, Any] = {
         "R_LOCK_ENABLED",
         "R_LOCK_TIERS",
         "R_LOCK_MIN_R_DOLLARS",
+        "MIN_TP1_SPREAD_MULTIPLE",
     )
 }
 
@@ -1283,13 +1284,22 @@ class MT5Executor:
             and not isinstance(raw_tp1, bool)
             and float(raw_tp1) > 0.0
         ):
-            entry_ref: Optional[float] = None
+            # The entry reference is the price the copier can actually fill at, i.e.
+            # the WORST case for the TP1 edge:
+            #   * the order's own price (the zone's L1 tier or the single price), and
+            #   * the live quote, which is the market leg's fill.
+            # A BUY fills at its limit price or BELOW, so the worst case is the HIGHER
+            # of the two (a BUY zone whose market already sits above the tier fills
+            # L1 at the quote). A SELL fills at its limit price or ABOVE, so the order
+            # price is already the worst case.
+            quote_ref = float(ask) if direction_norm == "BUY" else float(bid)
+            order_ref: Optional[float] = None
             if (
                 isinstance(single_price, (int, float))
                 and not isinstance(single_price, bool)
                 and float(single_price) > 0.0
             ):
-                entry_ref = float(single_price)
+                order_ref = float(single_price)
             elif zone is not None:
                 try:
                     _tiers = getattr(zone, "tiers", None)
@@ -1299,11 +1309,15 @@ class MT5Executor:
                         and not isinstance(_l1, bool)
                         and float(_l1) > 0.0
                     ):
-                        entry_ref = float(_l1)
+                        order_ref = float(_l1)
                 except Exception:
-                    entry_ref = None
-            if entry_ref is None:
-                entry_ref = float(ask) if direction_norm == "BUY" else float(bid)
+                    order_ref = None
+            if order_ref is None:
+                entry_ref = quote_ref
+            elif direction_norm == "BUY":
+                entry_ref = max(order_ref, quote_ref)
+            else:
+                entry_ref = order_ref
             live_spread = float(ask) - float(bid)
             _mult = float(_cfg("MIN_TP1_SPREAD_MULTIPLE", MIN_TP1_SPREAD_MULTIPLE))
             min_edge = _mult * live_spread
@@ -8392,7 +8406,7 @@ class MT5Executor:
     ) -> Dict[str, Any]:
         """
         Unified Pure Dynamic ATR Engine:
-        - Single engine for BE Lock (`max(0.75 * ATR, $3.50)` -> `entry ± $0.50` + pending sweep),
+        - Single engine for BE Lock (`max(0.25 * R, 0.50 * ATR, $0.60, $1.80)` -> `entry ± $1.20` + pending sweep),
           Milestone Floors (`TP(m-1)` once `TPm` is cleared),
           Forward-only Dynamic Trailing SL (M5 ATR * mult clamped to [$2.50, max]), and
           Momentum-gated Dynamic Trailing TP (`TP1 -> TP2 -> ... -> max_stage`).
@@ -8781,6 +8795,13 @@ class MT5Executor:
             if trail_step.get("peak_price") is not None:
                 lv["dynamic_atr_trail_peak"] = trail_step["peak_price"]
                 lv["mfe_peak_price"] = trail_step["peak_price"]
+            # The trail zone is LATCHED (STANDARD -> EXTENDED -> HOME_RUN, never regressing).
+            # It must be persisted HERE, before the candidate-stop guards below, because a
+            # zone advance that does not produce an accepted SL modification (step filter,
+            # freeze level, broker 10016) would otherwise be dropped - and an ATR expansion
+            # on the next cycle could then regress the zone with no prev_zone to hold it.
+            if trail_step.get("trail_zone"):
+                lv["dynamic_atr_trail_zone"] = trail_step["trail_zone"]
             if policy.mfe_lock_enabled:
                 # Persist the highest ladder tier/pct + ratcheted profit on the layer record
                 # (JSON-safe; survives restart/reconnect via the signal state). Hysteresis.

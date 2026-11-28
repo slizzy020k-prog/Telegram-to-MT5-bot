@@ -713,11 +713,12 @@ def compute_dynamic_atr_trail_stop(
 
     `initial_r` is the trade's initial risk per ounce (`|entry - initial SL|`).
     When it is a positive number the BE lock becomes **R-gated**: it then waits
-    for `max(0.5 * R, 0.75 * ATR, $2.50)` of favourable excursion instead of the
-    flat `max(0.75 * ATR, $3.50)`, so a wide-stop trade is not locked at
+    for `max(0.25 * R, 0.50 * ATR, $0.60, $1.20 + $0.60)` of favourable excursion
+    instead of the
+    flat `max(0.50 * ATR, $0.60, $1.20 + $0.60)`, so a wide-stop trade is not locked at
     breakeven long before the R ladder could matter. The gate changes only
     WHEN the BE lock arms, never WHERE it locks: the stop stays at the classic
-    breakeven offset (`entry +/- $0.50`), so the R-gated path can never be less
+    breakeven offset (`entry +/- $1.20`), so the R-gated path can never be less
     protective than the flat BE lock it replaced. The picker keeps the tightest
     candidate, so `BE_LOCK` wins at the 0.5R tier (the R floor is only `entry`)
     and `R_LOCK` wins from the 1.0R tier upward (the R floor is

@@ -681,7 +681,7 @@ DYNAMIC_ATR_RELATIVE_SCALE_MULT: float = _env_float(
 )
 # Automatic provider 30-pip break-even (SL -> entry), independent of the ATR ladder and
 # fed through the same tightest-stop picker. Opt-in (default False). Pip convention is
-# VERIFIED: get_pip_size gold = $0.10, so 30 pips = $3.00 (BE_OFFSET_PIPS 5 -> $0.50).
+# VERIFIED: get_pip_size gold = $0.10, so 30 pips = $3.00 (BE_OFFSET_PIPS 12 -> $1.20).
 DYNAMIC_ATR_AUTO_BE_ENABLED: bool = _env_bool("DYNAMIC_ATR_AUTO_BE_ENABLED", False)
 DYNAMIC_ATR_AUTO_BE_PIPS: float = _env_float(
     "DYNAMIC_ATR_AUTO_BE_PIPS", 30.0, min_val=0.0, max_val=1000.0

@@ -299,13 +299,13 @@ def test_trail_stop_r_lock_never_loosens_an_existing_stop():
         live_price=3905.0,
         prev_peak=3905.0,
         current_sl=3903.0,     # already tighter than the R floor
-        atr=2.0,
+        atr=20.0,              # wide ATR -> the ATR trail is not armed, so the R floor wins the picker
         policy=pol,
         digits=2,
         r_lock_floor=3902.8,   # the R lock wins the picker, but it is looser than the stop in place
     )
-    assert res["stop_source"] == "ATR_TRAIL"
-    assert res["candidate_sl"] >= 3900.0
+    assert res["stop_source"] == "R_LOCK"
+    assert res["candidate_sl"] == pytest.approx(3902.8)
     # the existing stop is already tighter, so no SL update may be sent
     assert res["should_update"] is False
 
@@ -1397,6 +1397,38 @@ def test_executor_r_lock_skips_a_layer_without_initial_sl_and_logs_it_once(monke
     # The marker lives on the persisted layer record, so it must stay JSON-safe.
     json.dumps(sig["layers"]["L1"])
     assert sig["layers"]["L1"]["broker_sl"] == pytest.approx(3880.0)
+
+
+def test_trail_zone_latch_is_persisted_even_when_no_stop_is_applied(monkeypatch):
+    """The latched zone must survive a cycle that sends no SL modification.
+
+    The zone only ever advances (STANDARD -> EXTENDED -> HOME_RUN). If the zone
+    were recorded only when an SL modify succeeded, a cycle that the step filter
+    or the broker rejects would drop the advance, and an ATR expansion on the next
+    cycle could regress the zone.
+    """
+    import config
+    from mt5_executor import MT5Executor
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
+
+    ex = MT5Executor(dry_run=True)
+    ex.connect()
+    ex._dry_run_capital = 200.0
+    ex._dry_run_atr = 2.0
+
+    sig = _atr_signal(3895.0, 3880.0)
+    # ATR 2.00 -> the ATR-relative HOME_RUN stage opens at min($18, 4.0 x ATR) = $8.00.
+    # MFE 8.00 -> HOME_RUN, trail_dist = clamp(0.80 x 2.00, [2.00, 4.00]) = 2.00,
+    # so the candidate stop is 3903.00 - 2.00 = 3901.00.
+    sig["layers"]["L1"]["broker_sl"] = 3901.0    # already at the candidate stop
+    res = ex.evaluate_dynamic_atr_engine(
+        sig, tick=SimpleNamespace(bid=3903.0, ask=3903.2, time=1700000000.0)
+    )
+    assert not res.get("updated_tickets"), "no SL update may be sent"
+    # The zone advance must be persisted even though no stop was applied.
+    assert sig["layers"]["L1"].get("dynamic_atr_trail_zone") == "HOME_RUN"
 
 
 def test_executor_r_lock_records_the_trail_bookkeeping_when_it_wins(monkeypatch):
