@@ -179,6 +179,28 @@ def test_buy_zone_front_run_shift_is_reflected_in_the_reference(monkeypatch):
     assert "too close to the entry" in msg
 
 
+def test_zone_entry_ignores_a_non_auto_intent(monkeypatch):
+    """A zone entry always routes with AUTO in the placement path.
+
+    The caller may pass MARKET or STOP, but execute_4layer_zone still places the
+    layers by the zone routing. The guard must use the same routing, otherwise it
+    measures the edge from a price the order never gets.
+    """
+    for intent in ("MARKET", "STOP"):
+        ex = _live_executor(monkeypatch, bid=3899.00, ask=3900.00)   # spread 1.00
+        ok, msg = ex.check_preflight(
+            "XAUUSD.s",
+            "BUY",
+            raw_tp1=3894.00,          # $1.50 from the pending limit at 3895.50
+            sl=3875.0,
+            order_intent=intent,
+            is_stop_order=(intent == "STOP"),
+            zone=_zone(l1=3895.0, top=3895.0, bottom=3887.0),
+        )
+        assert ok is False, f"intent {intent} must not bypass the spread guard"
+        assert "too close to the entry" in msg
+
+
 def test_single_price_is_the_entry_reference(monkeypatch):
     ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
     ok, msg = ex.check_preflight(
