@@ -9202,10 +9202,14 @@ async def main() -> None:
             # failure trading is HALTED but Telegram monitoring stays online.
             if await _run_mt5_session_preflight():
                 dl_prog = await _mt5_call(get_daily_loss_progress)
-                if dl_prog.get("triggered_date") == (await _trading_day_str_async()) and dl_prog.get("limit_reached"):
+                if dl_prog.get("enabled") and dl_prog.get("limit_reached"):
+                    # The hard daily-loss cutoff is already breached for today (it either
+                    # fired earlier today or the day's realized loss is already past it).
+                    # Block new signals immediately - the enforcement loop then ends the
+                    # trading day.
                     _daily_loss_locked = True
                     logger.warning(
-                        f"🔒 Daily loss limit already triggered today ({dl_prog['date']}); "
+                        f"🔒 Daily loss limit already reached today ({dl_prog['date']}); "
                         f"starting in LOCKED mode (new signals blocked until next broker day or `dailyloss off`)."
                     )
                 # If all open positions are closed and there are no active signals,
