@@ -1585,6 +1585,12 @@ def _seed_daily_loss_limit_from_config() -> float:
     if str(cur.get("source") or "").strip().lower() == "user":
         return round(float(cur.get("limit_amount") or 0.0), 2)
     amount = round(limit_gbp, 2)
+    prev_amount = round(float(cur.get("limit_amount") or 0.0), 2)
+    if str(cur.get("triggered_date") or "") == _trading_day_str() and prev_amount > 0.0:
+        # The limit already FIRED today. Raising it (or re-seeding a higher value)
+        # would clear "limit_reached" and silently unlock a day that must stay
+        # locked, so the fired amount is kept exactly as it was.
+        amount = prev_amount
     state_mgr.set_daily_loss_config(
         enabled=True,
         limit_amount=amount,
@@ -1726,6 +1732,9 @@ async def check_and_enforce_daily_loss_limit(exit_on_trigger: bool = True) -> st
         limit_amount=limit_amt,
         triggered_date=prog["date"],
         triggered_at=time.time(),
+        # Keep WHO owns the value: a limit the operator set from Saved Messages
+        # must not be reverted to the config seed on the next restart.
+        source=str(cfg.get("source") or "") or "user",
     )
 
     final_realized = round(float(await _mt5_call(executor.get_realized_today_pnl)), 2)
@@ -7298,8 +7307,10 @@ async def _apply_daily_win_input(event: Any, raw_arg: str) -> None:
     await check_and_enforce_daily_win_target()
 
 
-_LOSS_LIMIT_OFF_TOKENS = frozenset(
-    {"off", "0", "0%", "0.0", "0.0%", "none", "disable", "disabled", "false", "unlimited"}
+# Unambiguous "turn everything off" words for /losslimit. "0", "0%" and "0.0"
+# are legitimate PERCENTAGE values, so they never disable the GBP hard cutoff.
+_LOSS_LIMIT_KILL_TOKENS = frozenset(
+    {"off", "none", "disable", "disabled", "false", "unlimited"}
 )
 
 
@@ -7856,8 +7867,14 @@ async def handle_saved_messages_command(event: Any) -> None:
             )
             return
 
+        # Only an unambiguous kill word ("off", "none", "disable", ...) turns the
+        # GBP hard cutoff off. "0" / "0%" / "0.0" are PERCENTAGE values, so they
+        # must never silently disable the only remaining daily-loss guard.
+        kill_all = bool(args) and all(
+            str(a).strip().lower() in _LOSS_LIMIT_KILL_TOKENS for a in args
+        )
         changed, reply_msg = apply_loss_limit_command(
-            _cfg_mod, args, eff_bal, curr, gbp_limit=gbp_now
+            _cfg_mod, args, eff_bal, curr, gbp_limit=(0.0 if kill_all else gbp_now)
         )
         if changed:
             _daily_50pct_alert_date = None
@@ -7865,9 +7882,9 @@ async def handle_saved_messages_command(event: Any) -> None:
                 f"[/losslimit] DAILY_LOSS_PAUSE_PCT={getattr(_cfg_mod, 'DAILY_LOSS_PAUSE_PCT', 0.0)}%, "
                 f"EMERGENCY_CUTOFF_LOSS_PCT={getattr(_cfg_mod, 'EMERGENCY_CUTOFF_LOSS_PCT', 0.0)}%"
             )
-            if args and str(args[0]).strip().lower() in _LOSS_LIMIT_OFF_TOKENS:
+            if kill_all:
                 # "/losslimit off" switches EVERY daily-loss limit off, including the
-                # manual GBP cutoff.
+                # manual GBP cutoff (the reply above already shows it as OFF).
                 state_mgr.set_daily_loss_config(
                     enabled=False,
                     limit_amount=0.0,
@@ -7878,7 +7895,6 @@ async def handle_saved_messages_command(event: Any) -> None:
                 _daily_loss_locked = False
                 _daily_loss_lock_notified_date = None
                 logger.info("[/losslimit] manual hard daily loss cutoff disabled (source=user)")
-                reply_msg += "\n• Hard Daily Loss Cutoff: `OFF` (disabled with the percentage guards)"
         await event.reply(reply_msg)
         return
 
