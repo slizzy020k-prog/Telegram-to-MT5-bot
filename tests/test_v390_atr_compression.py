@@ -370,7 +370,8 @@ def test_r_gated_be_and_r_lock_staircase_integration():
     assert res["stop_source"] == "R_LOCK" and res["candidate_sl"] == pytest.approx(3900.0)
     assert res["be_armed"] is False and res["should_sweep_pending"] is False
 
-    # BE gate opens at $15 -> entry + $0.50 and the pending sweep. For a BUY the
+    # BE gate opens at $15 -> entry + the test policy's $0.50 offset and the pending
+    # sweep (this file's SPEC_KNOBS use the legacy BE numbers). For a BUY the
     # HIGHER stop is tighter, so BE (3900.50) now beats the 0.5R floor (3900.00).
     res, _ = at(14.99)
     assert res["be_armed"] is False

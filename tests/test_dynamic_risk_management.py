@@ -20,8 +20,14 @@ from tests.test_copier_scenarios import MockTelethonEvent
 from trade_ledger import TradeLedger
 
 
-def _pin_dynamic_defaults(monkeypatch) -> None:
-    """Restore default Pure Dynamic ATR config values across tests."""
+def _pin_legacy_dynamic_profile(monkeypatch) -> None:
+    """Pin the LEGACY Pure Dynamic ATR profile used by these tests.
+
+    These tests exercise the historical protection profile (BE activation 0.75x
+    ATR, a $3.50 flat minimum and a $0.50 lock offset). It is NOT the shipped
+    profile any more - the shipped one is 0.50x ATR / $0.60 / $1.20 (see
+    tests/test_shipped_defaults.py).
+    """
     monkeypatch.setattr(config, "DYNAMIC_ATR_SLTP_ENABLED", True)
     monkeypatch.setattr(config, "DYNAMIC_SLTP_MODE", "ADAPTIVE")
     monkeypatch.setattr(config, "DYNAMIC_ATR_TIMEFRAME", "M5")
@@ -83,7 +89,7 @@ def _tick(bid: float, ask: float = None, time: float = 1700000000.0) -> SimpleNa
 # ---------------------------------------------------------------------------
 
 def test_adaptive_scaling_widens_high_vol_and_tightens_low_vol_preserving_monotonic_tps(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     pol = dynamic_risk.read_dynamic_risk_policy(config)
 
     # High volatility: ATR=$6.00 vs baseline $4.00 => 1.50x ratio
@@ -131,7 +137,7 @@ def test_adaptive_scaling_widens_high_vol_and_tightens_low_vol_preserving_monoto
 
 
 def test_zone_sl_anchor_never_moves_inside_entry_zone(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_atr = 2.00  # scale_min = 0.75x
@@ -160,7 +166,7 @@ def test_zone_sl_anchor_never_moves_inside_entry_zone(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_fallback_only_preserves_explicit_and_scales_missing_sl_and_tp1(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     monkeypatch.setattr(config, "DYNAMIC_SLTP_MODE", "FALLBACK_ONLY")
     ex = MT5Executor(dry_run=True)
     ex.connect()
@@ -189,7 +195,7 @@ def test_fallback_only_preserves_explicit_and_scales_missing_sl_and_tp1(monkeypa
 
 @pytest.mark.asyncio
 async def test_unpriced_market_stub_attaches_atr_fallback_tp1(tmp_path, monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     monkeypatch.setattr(config, "DYNAMIC_SLTP_MODE", "FALLBACK_ONLY")
     ex = _reset_main_for_dyn_test(tmp_path, "fb_tp1")
     ex._dry_run_atr = 6.00  # ATR fallback TP1 = 6.0 * 1.5 = $9.00
@@ -215,7 +221,7 @@ async def test_unpriced_market_stub_attaches_atr_fallback_tp1(tmp_path, monkeypa
 
 
 def test_pure_atr_and_disabled_modes(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     monkeypatch.setattr(config, "DYNAMIC_SLTP_MODE", "PURE_ATR")
     pol_pure = dynamic_risk.read_dynamic_risk_policy(config)
 
@@ -271,7 +277,7 @@ def test_pure_atr_and_disabled_modes(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_execute_4layer_single_price_and_market_no_double_scale_and_mtf_atr(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_atr = 6.00  # 1.5x vol ratio
@@ -325,7 +331,7 @@ def test_execute_4layer_single_price_and_market_no_double_scale_and_mtf_atr(monk
 
 
 def test_quiet_session_sl_floor_clamped_to_450_adaptive_and_pure_atr(monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     pol_ad = dynamic_risk.read_dynamic_risk_policy(config)
 
     # ADAPTIVE: $5.00 SL distance * 0.75 quiet-session scale = $3.75 -> clamped up to $4.50
@@ -492,7 +498,7 @@ def test_startup_checks_dynamic_risk_validation(tmp_path):
 
 def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
     """Test evaluate_dynamic_atr_engine: BE lock, forward-only SL trail, pending sweep, clamps."""
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_atr = 2.00
@@ -518,13 +524,15 @@ def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
     # 2) Re-enable trail
     monkeypatch.setattr(config, "DYNAMIC_ATR_TRAIL_ENABLED", True)
 
-    # 3) Low MFE ($1.50) < BE threshold (max(0.75*2, 3.50) = $3.50) and < trail activation (1.0*2.0 = $2.00)
+    # 3) Low MFE ($1.50) < BE threshold (max(0.75*2, 3.50) = $3.50 - the legacy
+    # profile pinned by _pin_legacy_dynamic_profile) and < trail activation (1.0*2.0 = $2.00)
     res_low = ex.evaluate_dynamic_atr_engine(sig, tick=_tick(3896.5, 3896.8))
     assert res_low["newly_armed"] is False
     assert res_low["newly_be_locked"] == []
     assert res_low["pending_swept"] == []
 
-    # 4) Advance to bid=3898.8 (MFE = $3.80 >= $3.50 BE threshold; ATR trail activation = $2.00 also armed)
+    # 4) Advance to bid=3898.8 (MFE = $3.80 >= the $3.50 BE threshold of the legacy
+    # profile; ATR trail activation = $2.00 also armed)
     # BE lock sets SL = 3895.0 + 0.50 = 3895.50.
     # ATR trail dist = clamp(2.0 * 1.40, 2.50, 8.00) = $2.80 -> candidate ATR SL = 3898.8 - 2.80 = 3896.00.
     # Max(BE lock 3895.50, ATR SL 3896.00) = 3896.00. Pending limit 102 is swept!
@@ -584,7 +592,7 @@ def test_dynamic_atr_engine_disabled_and_be_lock_and_trailing_sl(monkeypatch):
 
 def test_dynamic_trailing_tp_progression_buy_and_sell(monkeypatch):
     """Test momentum-gated Dynamic Trailing TP steps TP1 -> TP2 -> TP3 -> TP4 -> TP5."""
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     pol = dynamic_risk.read_dynamic_risk_policy(config)
 
     # 1) BUY Signal: Entry 3900.0, TP1=3910.0, TP2=3920.0, TP3=3930.0, TP4=3940.0, TP5=3950.0. ATR=4.0
@@ -664,7 +672,7 @@ def test_dynamic_trailing_tp_progression_buy_and_sell(monkeypatch):
 @pytest.mark.asyncio
 async def test_zero_early_virtual_closes_on_pullback_wicks(tmp_path, monkeypatch):
     """Verify that pre-TP1 wicks, post-TP1 $4 pullbacks, and post-TP2 $5 wicks trigger ZERO market closes."""
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = _reset_main_for_dyn_test(tmp_path, "zero_virt")
     ex._dry_run_atr = 4.00
 
@@ -981,7 +989,7 @@ def _setup_runtime(tmp_path, tag: str) -> MT5Executor:
 
 @pytest.mark.asyncio
 async def test_handle_new_message_persists_scaled_sl_tp_and_health_display(tmp_path, monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = _reset_main_for_dyn_test(tmp_path, "msg_dyn")
     ex._dry_run_atr = 6.00  # 1.50x volatility scaling
     monkeypatch.setattr(main, "notify_saved_messages", AsyncMock())
@@ -1009,7 +1017,7 @@ async def test_handle_new_message_persists_scaled_sl_tp_and_health_display(tmp_p
 
 @pytest.mark.asyncio
 async def test_saved_messages_dynamic_risk_and_atr_trail_commands(tmp_path, monkeypatch):
-    _pin_dynamic_defaults(monkeypatch)
+    _pin_legacy_dynamic_profile(monkeypatch)
     ex = _reset_main_for_dyn_test(tmp_path, "saved_dyn")
     ex._dry_run_atr = 5.00
 

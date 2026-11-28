@@ -1247,8 +1247,9 @@ def _atr_signal(entry: float, sl: float, ticket: int = 101):
         "market_tickets": [ticket],
         "pending_tickets": [],
         # The TP levels sit BEYOND the live price used by the tests below, so
-        # the milestone floor (which is locked to entry + $0.50 once TP1 is
-        # cleared) cannot win the picker. These tests are about the R floor.
+        # the milestone floor (which is locked to entry + the shipped $1.20 BE
+        # offset once TP1 is cleared) cannot win the picker. These tests are
+        # about the R floor.
         "tp_levels": {"TP1": entry + 20.0, "TP2": entry + 30.0},
         "runner_cleared_milestones": [],
     }
@@ -2233,7 +2234,7 @@ def test_be_lock_stays_flat_when_the_initial_risk_is_unknown():
     """Without a valid initial R the BE lock must behave exactly as it always has."""
     flat = _gated_stop(live_price=3905.0)          # MFE 5.00, ATR 4.00
     assert flat["be_armed"] is True
-    assert flat["be_sl"] == pytest.approx(3900.50)   # entry + $0.50
+    assert flat["be_sl"] == pytest.approx(3900.50)   # entry + the test policy's $0.50 offset
     assert flat["stop_source"] == "BE_LOCK"
 
     for bad in (None, 0.0, -5.0):
@@ -2245,7 +2246,11 @@ def test_be_lock_stays_flat_when_the_initial_risk_is_unknown():
 
 
 def test_gated_be_lock_waits_for_half_the_initial_risk():
-    """A wide-stop trade (R = $22) must not be BE-locked at $3.50 of MFE."""
+    """A wide-stop trade (R = $22) must not be BE-locked at $3.50 of MFE.
+
+    The explicit test policy (_atr_policy) uses the legacy BE numbers: a $3.50
+    flat minimum, a 0.75x ATR term and a $0.50 lock offset.
+    """
     flat = _gated_stop(live_price=3905.0)                 # MFE 5.00
     gated = _gated_stop(live_price=3905.0, initial_r=22.0)
 
@@ -2263,9 +2268,9 @@ def test_gated_be_lock_waits_for_half_the_initial_risk():
     [
         (44.0, 4.0, 10.99, False),    # 0.25 * R = $11.00 dominates
         (44.0, 4.0, 11.00, True),
-        (3.0, 20.0, 14.99, False),    # 0.75 * ATR = $15.00 dominates
+        (3.0, 20.0, 14.99, False),    # 0.75 * ATR = $15.00 dominates (test policy)
         (3.0, 20.0, 15.00, True),
-        (3.0, 2.0, 3.49, False),      # the $3.50 flat BE minimum dominates
+        (3.0, 2.0, 3.49, False),      # the $3.50 flat BE minimum dominates (test policy)
         (3.0, 2.0, 3.50, True),
     ],
 )
@@ -2273,6 +2278,9 @@ def test_gated_be_threshold_is_half_r_the_atr_multiple_or_the_flat_floor(
     initial_r, atr, mfe, armed
 ):
     """The gated threshold is max(0.25 * R, 0.75 * ATR, $3.50, offset + cost floor).
+
+    These are the explicit test policy's numbers (_atr_policy): a 0.75x ATR term,
+    a $3.50 flat minimum and a $0.50 lock offset (+ $0.60 cost floor = $1.10).
 
     The old $2.50 trail minimum no longer gates the lock: it was the term that
     stopped the breakeven lock from ever arming on a real move.
@@ -2290,7 +2298,7 @@ def test_gated_be_lock_keeps_the_classic_level_and_the_be_lock_wins_at_half_r():
     """The R gate changes WHEN the BE lock arms, never WHERE it locks.
 
     At the 0.5R tier the R floor is only the entry, so the classic breakeven
-    stop (entry + $0.50) is the tighter -- and therefore the winning --
+    stop (entry + the test policy's $0.50 offset) is the tighter -- and therefore the winning --
     candidate.
     """
     res = _gated_stop(
@@ -2349,7 +2357,7 @@ def test_gated_be_lock_is_mirrored_for_a_sell():
         r_lock_floor=3900.0,      # the 0.5R tier locks the stop at the entry
     )
     assert res["be_armed"] is True
-    assert res["be_sl"] == pytest.approx(3899.50)     # entry - $0.50 (SELL)
+    assert res["be_sl"] == pytest.approx(3899.50)     # entry - the test policy's $0.50 offset (SELL)
     assert res["stop_source"] == "BE_LOCK"           # tighter than the R floor
     assert res["candidate_sl"] == pytest.approx(3899.50)
 
@@ -2535,7 +2543,8 @@ def _gated_grid_stop(direction, entry, live, atr, current_sl, initial_r, digits=
 def test_the_r_gated_be_lock_is_never_less_protective_than_the_classic_be_lock():
     """The R gate may only DELAY the BE lock; its LEVEL stays the classic one.
 
-    The classic BE lock sits at entry + $0.50 (BUY) / entry - $0.50 (SELL).
+    The classic BE lock of the explicit test policy sits at entry + $0.50 (BUY)
+    / entry - $0.50 (SELL).
     The R-gated BE lock must never place a stop below (BUY) / above (SELL)
     that level, otherwise arming the R-gated path would loosen the stop it
     replaced.
@@ -2593,13 +2602,17 @@ def test_the_r_gated_be_lock_is_never_less_protective_than_the_classic_be_lock()
 
 
 def test_the_r_gated_be_lock_arms_at_the_r_threshold_and_not_at_the_flat_3_50():
-    """A wide-stop trade (R = $22) must not be BE-locked at the old flat $3.50."""
+    """A wide-stop trade (R = $22) must not be BE-locked at the flat $3.50.
+
+    The explicit test policy (_atr_policy) uses the legacy BE numbers: the flat
+    minimum is $3.50 and the R-gated threshold is 0.25 * 22.00 = $5.50.
+    """
     classic = _gated_stop(live_price=3903.50, atr=4.0)
     assert classic["be_armed"] is True              # the flat lock arms at $3.50
     assert classic["be_sl"] == pytest.approx(3900.50)
 
     gated = _gated_stop(live_price=3903.50, atr=4.0, initial_r=22.0)
-    assert gated["be_armed"] is False                # 0.5 * 22.00 = $11.00 dominates
+    assert gated["be_armed"] is False                # 0.25 * 22.00 = $5.50 dominates
     assert gated["be_sl"] is None
 
     at = _gated_stop(live_price=3911.0, atr=4.0, initial_r=22.0)

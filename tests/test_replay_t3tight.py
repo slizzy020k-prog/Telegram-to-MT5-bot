@@ -307,7 +307,8 @@ def test_production_picker_auto_be_30pip_never_loosens():
     at = _pick(pol, live=3603.0, atr=12.0)
     assert at["auto_be_armed"] is True
     assert at["auto_be_sl"] == pytest.approx(3600.0)  # SL -> entry, exactly 30 pips
-    # BE lock (entry + $0.50) is tighter than auto-BE; picker keeps the tighter.
+    # BE lock (entry + the shipped $1.20 offset) is tighter than auto-BE; the
+    # picker keeps the tighter.
     assert at["candidate_sl"] >= at["auto_be_sl"]
     assert at["stop_source"] in ("BE_LOCK", "MFE_LOCK", "ATR_TRAIL", "AUTO_BE")
 

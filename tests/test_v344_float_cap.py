@@ -245,7 +245,8 @@ def test_atr_trail_respects_breakeven_floor(monkeypatch):
     policy = dynamic_risk.read_dynamic_risk_policy(config)
 
     # Entry at 3840.0 — BE floor = 3840 + 0.50 = 3840.50
-    # Price reaches 3843.50 (MFE = $3.50 >= be_min_mfe_dollars 3.50)
+    # Price reaches 3843.50 (MFE = $3.50 >= be_min_mfe_dollars 3.50 - the legacy
+    # values this test pins explicitly)
     # With ATR=4.0, raw atr_sl = 3843.50 - 6.00 = 3837.50 (< entry!)
     # But BE lock is armed -> candidate_sl must be at least BE floor 3840.50!
     r = dynamic_risk.compute_dynamic_atr_trail_stop(

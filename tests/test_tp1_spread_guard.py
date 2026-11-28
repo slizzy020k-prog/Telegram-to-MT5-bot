@@ -4,6 +4,13 @@ The entry pays the spread and so does the exit, so a target closer to the entry
 than MIN_TP1_SPREAD_MULTIPLE live spreads cannot pay for the round trip. The
 guard lives in the LIVE pre-flight path (the dry-run path returns before the
 spread is known), so these tests drive a live-mode executor with a stubbed MT5.
+
+The reference price is the one the copier can REALLY fill at, so these cases
+follow the executor's own routing:
+  * a layer that executes at MARKET now fills at the live quote
+    (ask for a BUY, bid for a SELL);
+  * a pending LIMIT/STOP fills at its own order price, and a pending LIMIT is
+    placed with the front-run shift applied (+$0.50 on a BUY, -$0.50 on a SELL).
 """
 from __future__ import annotations
 
@@ -39,6 +46,9 @@ def _zone(l1: float, top: float, bottom: float):
     return SimpleNamespace(tiers={"L1": l1}, top=top, bottom=bottom)
 
 
+# --- pure market entries ---------------------------------------------------
+
+
 def test_market_tp1_inside_three_spreads_is_rejected(monkeypatch):
     ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)   # spread 1.00
     ok, msg = ex.check_preflight("XAUUSD.s", "BUY", raw_tp1=3897.50, sl=3875.0)
@@ -52,13 +62,40 @@ def test_market_tp1_exactly_three_spreads_away_is_accepted(monkeypatch):
     assert ok is True, msg
 
 
-def test_zone_uses_the_l1_tier_as_the_entry_reference(monkeypatch):
-    """A BUY zone below the market fills at its L1 tier, so L1 is the reference."""
+def test_sell_mirror_anchors_on_the_bid(monkeypatch):
+    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ok, msg = ex.check_preflight("XAUUSD.s", "SELL", raw_tp1=3895.00, sl=3910.0)
+    assert ok is False
+    assert "too close to the entry" in msg
+
+
+# --- zone entries: the reference follows the executor's routing ------------
+
+
+def test_sell_zone_market_leg_is_measured_at_the_bid(monkeypatch):
+    """A SELL whose L1 executes at MARKET fills at the bid, below its tier.
+
+    The L1 tier would overstate the TP1 edge, so the guard must measure the edge
+    from the price the market leg really gets.
+    """
+    ex = _live_executor(monkeypatch, bid=3740.50, ask=3741.50)   # spread 1.00
+    ok, msg = ex.check_preflight(
+        "XAUUSD.s",
+        "SELL",
+        raw_tp1=3738.00,          # $2.50 from the market fill at 3740.50
+        sl=3765.0,
+        zone=_zone(l1=3742.0, top=3752.0, bottom=3742.0),
+    )
+    assert ok is False
+    assert "too close to the entry" in msg
+
+
+def test_buy_zone_market_leg_is_measured_at_the_ask(monkeypatch):
     ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
     ok, msg = ex.check_preflight(
         "XAUUSD.s",
         "BUY",
-        raw_tp1=3901.00,          # $1.00 from the L1 tier at 3900.00
+        raw_tp1=3897.00,          # $2.00 from the market fill at 3895.00
         sl=3875.0,
         zone=_zone(l1=3900.0, top=3900.0, bottom=3892.0),
     )
@@ -66,36 +103,56 @@ def test_zone_uses_the_l1_tier_as_the_entry_reference(monkeypatch):
     assert "too close to the entry" in msg
 
 
-def test_buy_zone_above_the_market_is_anchored_on_the_market_leg(monkeypatch):
-    """A BUY zone whose market already sits above the tier fills L1 at the quote.
+def test_buy_zone_pending_limit_is_measured_at_its_own_price(monkeypatch):
+    """A BUY zone the market has NOT reached becomes a pending limit at its tier.
 
-    The L1 tier would overstate the TP1 edge, so the guard must measure the edge
-    from the price the market leg really gets.
+    The live quote must NOT be used as the reference here: the order fills at the
+    tier price, so the real edge is much larger than the quote would suggest.
     """
-    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    ex = _live_executor(monkeypatch, bid=3903.00, ask=3905.00)   # spread 2.00
     ok, msg = ex.check_preflight(
         "XAUUSD.s",
         "BUY",
-        raw_tp1=3896.00,          # $1.00 from the market fill at 3895.00
+        raw_tp1=3910.00,          # $10.00 from the tier at 3900.00
         sl=3875.0,
-        zone=_zone(l1=3890.0, top=3890.0, bottom=3882.0),
+        zone=_zone(l1=3900.0, top=3900.0, bottom=3892.0),
     )
-    assert ok is False
-    assert "too close to the entry" in msg
+    assert ok is True, msg
 
 
-def test_sell_zone_is_anchored_on_its_l1_tier(monkeypatch):
-    """A SELL zone fills at its tier or above, so the tier is the worst case."""
-    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+def test_sell_zone_pending_limit_is_measured_at_its_own_price(monkeypatch):
+    """A SELL zone below the market stays a pending limit at (below) its tier."""
+    ex = _live_executor(monkeypatch, bid=3739.78, ask=3740.30)   # spread 0.52
     ok, msg = ex.check_preflight(
         "XAUUSD.s",
         "SELL",
-        raw_tp1=3740.00,
-        sl=3910.0,
+        raw_tp1=3739.00,          # $3.00 from the tier at 3742.00
+        sl=3765.0,
         zone=_zone(l1=3742.0, top=3752.0, bottom=3742.0),
+    )
+    assert ok is True, msg
+
+
+def test_pending_limit_uses_the_front_run_shifted_price(monkeypatch):
+    """The pending LIMIT is placed with the front-run shift applied."""
+    import config
+
+    monkeypatch.setattr(config, "LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50)
+    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
+    # A SELL zone whose market leg does not fire: the order sits $0.50 BELOW the
+    # 3900.00 tier, so the edge is measured from 3899.50 and not from 3900.00.
+    ok, msg = ex.check_preflight(
+        "XAUUSD.s",
+        "SELL",
+        raw_tp1=3897.00,          # $2.50 from the shifted price at 3899.50
+        sl=3920.0,
+        zone=_zone(l1=3900.0, top=3900.0, bottom=3900.0),
     )
     assert ok is False
     assert "too close to the entry" in msg
+
+
+# --- single-price entries --------------------------------------------------
 
 
 def test_single_price_is_the_entry_reference(monkeypatch):
@@ -103,7 +160,7 @@ def test_single_price_is_the_entry_reference(monkeypatch):
     ok, msg = ex.check_preflight(
         "XAUUSD.s",
         "BUY",
-        raw_tp1=3900.50,          # $0.50 from the single price at 3900.00
+        raw_tp1=3896.00,          # $1.00 from the market fill at 3895.00
         sl=3875.0,
         single_price=3900.0,
     )
@@ -111,11 +168,7 @@ def test_single_price_is_the_entry_reference(monkeypatch):
     assert "too close to the entry" in msg
 
 
-def test_sell_mirror_anchors_on_the_bid(monkeypatch):
-    ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
-    ok, msg = ex.check_preflight("XAUUSD.s", "SELL", raw_tp1=3895.00, sl=3910.0)
-    assert ok is False
-    assert "too close to the entry" in msg
+# --- the knob ---------------------------------------------------------------
 
 
 def test_guard_is_disabled_when_the_multiple_is_zero(monkeypatch):

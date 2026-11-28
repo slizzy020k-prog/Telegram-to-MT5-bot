@@ -1284,15 +1284,19 @@ class MT5Executor:
             and not isinstance(raw_tp1, bool)
             and float(raw_tp1) > 0.0
         ):
-            # The entry reference is the price the copier can actually fill at, i.e.
-            # the WORST case for the TP1 edge:
-            #   * the order's own price (the zone's L1 tier or the single price), and
-            #   * the live quote, which is the market leg's fill.
-            # A BUY fills at its limit price or BELOW, so the worst case is the HIGHER
-            # of the two (a BUY zone whose market already sits above the tier fills
-            # L1 at the quote). A SELL fills at its limit price or ABOVE, so the order
-            # price is already the worst case.
+            # The entry reference must be the price the copier can REALLY fill at.
+            # That depends on the executor's own routing:
+            #   * a pending LIMIT / STOP fills at its own order price (worst case:
+            #     a BUY fills at or below it, a SELL at or above it), and the order
+            #     price of a pending LIMIT is the FRONT-RUN SHIFTED tier, not the raw
+            #     tier (LIMIT_ENTRY_FRONT_RUN_OFFSET moves it toward the market);
+            #   * a layer that executes at MARKET right now fills at the live quote
+            #     (ask for a BUY, bid for a SELL) - which can be BELOW the tier on a
+            #     SELL, so it must be used as-is.
             quote_ref = float(ask) if direction_norm == "BUY" else float(bid)
+            _intent = (order_intent or "AUTO").strip().upper()
+            if is_stop_order and _intent == "AUTO":
+                _intent = "STOP"
             order_ref: Optional[float] = None
             if (
                 isinstance(single_price, (int, float))
@@ -1314,10 +1318,48 @@ class MT5Executor:
                     order_ref = None
             if order_ref is None:
                 entry_ref = quote_ref
-            elif direction_norm == "BUY":
-                entry_ref = max(order_ref, quote_ref)
             else:
-                entry_ref = order_ref
+                # The order price the broker will actually hold (front-run shifted).
+                placed_ref = order_ref
+                if _intent != "STOP":
+                    try:
+                        placed_ref = float(
+                            self._apply_limit_entry_front_run(
+                                symbol=resolved,
+                                direction=direction_norm,
+                                target_price=order_ref,
+                                final_tp=None,
+                                raw_tp1=float(raw_tp1),
+                                pip_size=pip_size,
+                                digits=digits,
+                            )
+                        )
+                    except Exception:
+                        placed_ref = order_ref
+                # Worst case for a pending order: a BUY fills at or below its price,
+                # a SELL at or above it, so the reference is the HIGHER price for a
+                # BUY and the LOWER price for a SELL.
+                if direction_norm == "BUY":
+                    entry_ref = max(order_ref, placed_ref)
+                else:
+                    entry_ref = min(order_ref, placed_ref)
+                # If the first layer executes at market right now, it fills at the
+                # live quote instead - which is the reference that matters.
+                try:
+                    _at_market = bool(
+                        self._layer_will_execute_at_market(
+                            symbol=resolved,
+                            direction=direction_norm,
+                            target_price=placed_ref,
+                            tick=tick,
+                            order_intent=_intent,
+                            allow_market_buffer=True,
+                        )
+                    )
+                except Exception:
+                    _at_market = False
+                if _at_market:
+                    entry_ref = quote_ref
             live_spread = float(ask) - float(bid)
             _mult = float(_cfg("MIN_TP1_SPREAD_MULTIPLE", MIN_TP1_SPREAD_MULTIPLE))
             min_edge = _mult * live_spread

@@ -1103,7 +1103,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
         return False, (
             f"🎯 **Dynamic ATR Trailing Engine:** {badge}\n"
             f"• Timeframe: `{pol.trail_timeframe}` | SL Trail: `{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f}` (Arm `{pol.trail_activation_atr_mult:.2f}x` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}` | Step `${pol.trail_step_dollars:.2f}`)\n"
-            f"• BE Lock: `max({pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f})` → `Entry ± ${pol.be_lock_offset_dollars:.2f}` | TP Trail: {tp_badge} (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%` [TP1 `≥{pol.tp1_lift_min_progress_pct * 100:.0f}%`]) | Live: `{atr_txt}`\n"
+            f"• BE Lock: `max({pol.be_r_activation_mult:.2f}R, {pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f}, ${pol.be_lock_offset_dollars + pol.be_min_distance_dollars:.2f})` → `Entry ± ${pol.be_lock_offset_dollars:.2f}` | TP Trail: {tp_badge} (`≤{pol.tp_lift_atr_mult:.2f}x ATR` or `≥{pol.tp_lift_progress_pct * 100:.0f}%` [TP1 `≥{pol.tp1_lift_min_progress_pct * 100:.0f}%`]) | Live: `{atr_txt}`\n"
             "• Controls: `/atrtrail on|off`, `/atrtrail tp on|off`, or `/atrtrail <mult> [activation_mult] [M1|M5|M15|H1]`"
         )
     tok = cleaned[0].lower()
@@ -1115,7 +1115,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
         return True, (
             f"🎯 **Dynamic ATR Trailing Engine Enabled → `ON`** (`{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} {pol.trail_timeframe} ATR`, "
             f"Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}`, "
-            f"BE `≥max({pol.be_activation_atr_mult:.2f}x, ${pol.be_min_mfe_dollars:.2f})`, "
+            f"BE `≥${pol.be_lock_offset_dollars + pol.be_min_distance_dollars:.2f}` (max({pol.be_r_activation_mult:.2f}R, {pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f})), "
             f"TP Trail `{'ON' if pol.tp_trail_enabled else 'OFF'}`)."
         )
     if len(cleaned) == 2 and tok == "tp":
@@ -1145,7 +1145,7 @@ def apply_atr_trail_command(cfg_mod: Any, args: Sequence[str], live_atr: float =
     return True, (
         f"🎯 **Dynamic ATR Trailing Engine Enabled → `ON` (`{tf}`)**\n"
         f"• Trail: `{mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} ATR` | Activation: `{act:.2f}x ATR` | Bounds `${pol.trail_min_dollars:.2f}–${pol.trail_max_dollars:.2f}`\n"
-        f"• BE Lock: `max({pol.be_activation_atr_mult:.2f}x, ${pol.be_min_mfe_dollars:.2f})` → `±${pol.be_lock_offset_dollars:.2f}` | TP Trail: `{'ON' if pol.tp_trail_enabled else 'OFF'}`"
+        f"• BE Lock: `max({pol.be_r_activation_mult:.2f}R, {pol.be_activation_atr_mult:.2f}x ATR, ${pol.be_min_mfe_dollars:.2f}, ${pol.be_lock_offset_dollars + pol.be_min_distance_dollars:.2f})` → `±${pol.be_lock_offset_dollars:.2f}` | TP Trail: `{'ON' if pol.tp_trail_enabled else 'OFF'}`"
     )
 
 
@@ -1158,7 +1158,7 @@ def format_dynamic_risk_status_line(cfg_mod: Any, live_sltp_atr: float = 0.0, li
     )
     tp_tag = "+TP" if pol.tp_trail_enabled else ""
     trail_s = (
-        f"🟢 ON (`{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} {pol.trail_timeframe}` `${pol.trail_min_dollars:.2f}-${pol.trail_max_dollars:.2f}` BE≥`${pol.be_min_mfe_dollars:.2f}`{tp_tag}"
+        f"🟢 ON (`{pol.trail_atr_mult:.2f}x -> {pol.trail_extended_atr_mult:.2f}x @ ${pol.trail_extended_mfe_dollars:.0f} -> {pol.trail_homerun_atr_mult:.2f}x @ ${pol.trail_homerun_mfe_dollars:.0f} {pol.trail_timeframe}` `${pol.trail_min_dollars:.2f}-${pol.trail_max_dollars:.2f}` BE≥`${pol.be_lock_offset_dollars + pol.be_min_distance_dollars:.2f}`{tp_tag}"
         + (f" ATR=${live_trail_atr:.2f}" if live_trail_atr > 0.0 else "")
         + ")"
         if pol.trail_enabled else "⚪ OFF"
