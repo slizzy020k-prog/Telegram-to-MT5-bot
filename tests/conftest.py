@@ -73,6 +73,11 @@ def _apply_isolated_env() -> None:
     # python-dotenv does not override an existing environment entry, so without this
     # pin the live profile leaks into the baseline suite. Pin the shipped default.
     os.environ["TRAILING_PROFILE"] = "baseline"
+    # The live .env enables the R lock and the high-risk lot cap; both ship DISABLED,
+    # so they must be neutralised too - otherwise the baseline suite runs with a
+    # protection profile that is not the shipped one.
+    os.environ["R_LOCK_ENABLED"] = "false"
+    os.environ["ENFORCE_HIGH_RISK_LOT_CAP"] = "false"
     os.environ["ENTRY_BLACKOUT_ENABLED"] = "false"
     os.environ["ENTRY_BLACKOUT_UTC_START_HOUR"] = "0"
     os.environ["ENTRY_BLACKOUT_UTC_END_HOUR"] = "2"

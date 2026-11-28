@@ -406,6 +406,13 @@ def test_v351_live_mode_positions_get_and_orders_get_separation(monkeypatch):
 @pytest.mark.asyncio
 async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_path, monkeypatch):
     """Editing an existing staged signal with a zone while active lots are at 0.05/0.05 still places pending L2..L4."""
+    # The high-risk lot cap ships DISABLED and the baseline suite runs it disabled;
+    # this test is about the cap, so it enables it explicitly.
+    import config as cfg_mod
+    import mt5_executor as ex_mod
+
+    monkeypatch.setattr(cfg_mod, "ENFORCE_HIGH_RISK_LOT_CAP", True)
+    monkeypatch.setattr(ex_mod, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", True)
     monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
     monkeypatch.setattr(main, "CHANNEL_IDS", [-1001234567890])

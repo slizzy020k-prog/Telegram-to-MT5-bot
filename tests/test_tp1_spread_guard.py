@@ -155,6 +155,30 @@ def test_pending_limit_uses_the_front_run_shifted_price(monkeypatch):
 # --- single-price entries --------------------------------------------------
 
 
+def test_buy_zone_front_run_shift_is_reflected_in_the_reference(monkeypatch):
+    """The reference must be the price the broker actually holds.
+
+    The pending LIMIT is placed with the front-run shift applied, and the shift is
+    only kept when the TP room allows it - a decision that depends on final_tp.
+    The guard must use the same inputs, or it measures the edge from a price the
+    order never gets (here: 3900.00 instead of 3900.50).
+    """
+    import config
+
+    monkeypatch.setattr(config, "LIMIT_ENTRY_FRONT_RUN_OFFSET", 0.50)
+    ex = _live_executor(monkeypatch, bid=3904.65, ask=3905.00)   # spread 0.35
+    ok, msg = ex.check_preflight(
+        "XAUUSD.s",
+        "BUY",
+        raw_tp1=3901.40,          # $0.90 from the placed order price at 3900.50
+        sl=3875.0,
+        final_tp=3910.00,
+        zone=_zone(l1=3900.0, top=3900.0, bottom=3892.0),
+    )
+    assert ok is False
+    assert "too close to the entry" in msg
+
+
 def test_single_price_is_the_entry_reference(monkeypatch):
     ex = _live_executor(monkeypatch, bid=3894.00, ask=3895.00)
     ok, msg = ex.check_preflight(

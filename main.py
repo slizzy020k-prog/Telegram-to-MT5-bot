@@ -102,6 +102,8 @@ from config import (
     DYNAMIC_ATR_TRAIL_STEP_DOLLARS,
     DYNAMIC_ATR_BE_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS,
+    DYNAMIC_ATR_BE_R_ACTIVATION_MULT,
     DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     DYNAMIC_ATR_TP_TRAIL_ENABLED,
     DYNAMIC_ATR_TP_LIFT_ATR_MULT,
@@ -638,6 +640,8 @@ _MAIN_CFG_SNAPSHOT: Dict[str, Any] = {
     "DYNAMIC_ATR_TRAIL_MIN_DOLLARS": DYNAMIC_ATR_TRAIL_MIN_DOLLARS,
     "DYNAMIC_ATR_BE_ACTIVATION_MULT": DYNAMIC_ATR_BE_ACTIVATION_MULT,
     "DYNAMIC_ATR_BE_MIN_MFE_DOLLARS": DYNAMIC_ATR_BE_MIN_MFE_DOLLARS,
+    "DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS": DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS,
+    "DYNAMIC_ATR_BE_R_ACTIVATION_MULT": DYNAMIC_ATR_BE_R_ACTIVATION_MULT,
     "DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS": DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS,
     "DYNAMIC_ATR_TP_TRAIL_ENABLED": DYNAMIC_ATR_TP_TRAIL_ENABLED,
     "DYNAMIC_ATR_TP_LIFT_ATR_MULT": DYNAMIC_ATR_TP_LIFT_ATR_MULT,
@@ -2725,6 +2729,7 @@ async def _delayed_sell_now_task(
                 raw_tp1=tp1_price,
                 sl=sl,
                 order_intent="MARKET",
+                final_tp=final_tp,
             )
             if not passed:
                 logger.warning(f"Delayed {direction} Now [ID: {msg_id}] blocked by pre-flight after wait: {reason}")
@@ -5028,6 +5033,7 @@ async def _handle_trade_management_action(
             single_price=single_px,
             is_stop_order=is_stop,
             order_intent=intent,
+            final_tp=target_signal.get("final_tp"),
         )
         if not passed:
             logger.warning(f"Reactivation skipped: {reason}")
@@ -5589,6 +5595,7 @@ async def _handle_new_message_unlocked(event: Any) -> Optional[Tuple[Optional[st
             single_price=parsed.single_price,
             is_stop_order=is_stop_order,
             order_intent=order_intent,
+            final_tp=final_tp,
         )
         if not passed:
             logger.warning(f"Pre-flight safety check failed for Msg ID {msg_id}: {reason}")
@@ -6331,6 +6338,7 @@ async def _handle_message_edited_unlocked(event: Any) -> Optional[Tuple[Optional
                 single_price=parsed.single_price,
                 is_stop_order=is_stop_order,
                 order_intent=order_intent,
+                final_tp=new_tp,
             )
             if not passed:
                 _cancel_delayed_sell_now(msg_id, chat_id=chat_id)
@@ -8007,6 +8015,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             single_price=parsed.single_price,
             is_stop_order=is_stop_order,
             order_intent=order_intent,
+            final_tp=final_tp,
         )
         if not passed:
             await event.reply(f"⚠️ **Order Blocked by Pre-Flight**: {reason}")
@@ -8323,8 +8332,10 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"`SLTP={_main_cfg('DYNAMIC_ATR_TIMEFRAME', DYNAMIC_ATR_TIMEFRAME)}` | "
             f"`Trail={_main_cfg('DYNAMIC_ATR_TRAIL_TIMEFRAME', DYNAMIC_ATR_TRAIL_TIMEFRAME)} "
             f"{_main_cfg('DYNAMIC_ATR_TRAIL_MULT', DYNAMIC_ATR_TRAIL_MULT)}x` | "
-            f"`BE>=max({_main_cfg('DYNAMIC_ATR_BE_ACTIVATION_MULT', DYNAMIC_ATR_BE_ACTIVATION_MULT)}x, "
-            f"${_main_cfg('DYNAMIC_ATR_BE_MIN_MFE_DOLLARS', DYNAMIC_ATR_BE_MIN_MFE_DOLLARS):.2f})` | "
+            f"`BE>=max({_main_cfg('DYNAMIC_ATR_BE_R_ACTIVATION_MULT', DYNAMIC_ATR_BE_R_ACTIVATION_MULT)}R, "
+            f"{_main_cfg('DYNAMIC_ATR_BE_ACTIVATION_MULT', DYNAMIC_ATR_BE_ACTIVATION_MULT)}x ATR, "
+            f"${_main_cfg('DYNAMIC_ATR_BE_MIN_MFE_DOLLARS', DYNAMIC_ATR_BE_MIN_MFE_DOLLARS):.2f}, "
+            f"${_main_cfg('DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS', DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS) + _main_cfg('DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS', DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS):.2f})` | "
             f"`TP_Lift={'ON' if _main_cfg('DYNAMIC_ATR_TP_TRAIL_ENABLED', DYNAMIC_ATR_TP_TRAIL_ENABLED) else 'OFF'}` | "
             f"`MaxStage=TP{RUNNER_MAX_TP_STAGE}`\n"
             f"• Active Signals ({len(active_signals)}):{active_block}\n"
@@ -8461,7 +8472,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"1️⃣ **Entry & BE Lock (Pre-TP1 -> TP1):**\n"
             f"   • Designated Runner: Layer {layer_num} ({lot_size} lot) | Distribution: `[0.01/0.01/0.01/0.02]`\n"
             f"   • Adaptive ATR SL/TP scales entry risk (`min SL ${DYNAMIC_SL_MIN_DOLLARS:.2f}`, `min TP ${DYNAMIC_TP_MIN_DOLLARS:.2f}`).\n"
-            f"   • Once MFE reaches `max({DYNAMIC_ATR_BE_ACTIVATION_MULT}x ATR, ${DYNAMIC_ATR_BE_MIN_MFE_DOLLARS:.2f})`, BE locks at `Entry ± ${DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS:.2f}` and unfilled limits sweep.\n"
+            f"   • Once MFE reaches `max({DYNAMIC_ATR_BE_R_ACTIVATION_MULT}R, {DYNAMIC_ATR_BE_ACTIVATION_MULT}x ATR, ${DYNAMIC_ATR_BE_MIN_MFE_DOLLARS:.2f}, ${DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS + DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS:.2f})`, BE locks at `Entry ± ${DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS:.2f}` and unfilled limits sweep.\n"
             f"   • Milestones: `TP1 (3900) -> TP2 (3910) -> TP3 (3920) -> TP4 (3930) -> TP5 (3940)`\n\n"
             f"2️⃣ **Dynamic Trailing TP & Forward-Only ATR SL:**\n"
             f"   • Approaching/clearing `TP1` (`<= {DYNAMIC_ATR_TP_LIFT_ATR_MULT}x ATR` or `>= {int(DYNAMIC_ATR_TP_LIFT_PROGRESS_PCT * 100)}%` with momentum): Runner TP lifts `TP1 -> TP2` while `BANK_TP1` layers bank automatically on MT5.\n"
@@ -8652,7 +8663,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"`SLTP={_main_cfg('DYNAMIC_ATR_TIMEFRAME', DYNAMIC_ATR_TIMEFRAME)}` | "
             f"`Trail={_main_cfg('DYNAMIC_ATR_TRAIL_TIMEFRAME', DYNAMIC_ATR_TRAIL_TIMEFRAME)} "
             f"{_main_cfg('DYNAMIC_ATR_TRAIL_MULT', DYNAMIC_ATR_TRAIL_MULT)}x` | "
-            f"`BE>=${_main_cfg('DYNAMIC_ATR_BE_MIN_MFE_DOLLARS', DYNAMIC_ATR_BE_MIN_MFE_DOLLARS):.2f}` | "
+            f"`BE>=${_main_cfg('DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS', DYNAMIC_ATR_BE_LOCK_OFFSET_DOLLARS) + _main_cfg('DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS', DYNAMIC_ATR_BE_MIN_DISTANCE_DOLLARS):.2f}` | "
             f"`TP_Lift={'ON' if _main_cfg('DYNAMIC_ATR_TP_TRAIL_ENABLED', DYNAMIC_ATR_TP_TRAIL_ENABLED) else 'OFF'}`\n"
             f"   - 4-Layer Lots: `[{lots_str}]` x `{RISK_LOT_MULTIPLIER}` (`{sum(BASE_LAYER_LOTS) * RISK_LOT_MULTIPLIER:.2f}` total)\n"
             f"6. **State & Ledger:** 🟢 PERSISTENT DISK OK (`{ledger_stats['total_trades']}` closed trades, "

@@ -1212,6 +1212,7 @@ class MT5Executor:
         single_price: Optional[float] = None,
         is_stop_order: bool = False,
         order_intent: str = "AUTO",
+        final_tp: Optional[float] = None,
     ) -> Tuple[bool, str]:
         """
         Pre-Flight Safety Checks:
@@ -1285,19 +1286,22 @@ class MT5Executor:
             and float(raw_tp1) > 0.0
         ):
             # The entry reference must be the price the copier can REALLY fill at.
-            # That depends on the executor's own routing:
-            #   * a pending LIMIT / STOP fills at its own order price (worst case:
-            #     a BUY fills at or below it, a SELL at or above it), and the order
-            #     price of a pending LIMIT is the FRONT-RUN SHIFTED tier, not the raw
-            #     tier (LIMIT_ENTRY_FRONT_RUN_OFFSET moves it toward the market);
+            # It is derived from the executor's OWN placement path, so the guard and
+            # the order can never disagree:
+            #   * the order price is the FRONT-RUN SHIFTED tier (LIMIT_ENTRY_FRONT_RUN
+            #     OFFSET moves it toward the market), computed with the same arguments
+            #     the placement path uses (final_tp + raw_tp1);
             #   * a layer that executes at MARKET right now fills at the live quote
             #     (ask for a BUY, bid for a SELL) - which can be BELOW the tier on a
             #     SELL, so it must be used as-is.
+            # Every failure path falls back to the STRICTER of the order price and
+            # the quote, so an unknown fill can only ever over-state the TP1 edge.
             quote_ref = float(ask) if direction_norm == "BUY" else float(bid)
             _intent = (order_intent or "AUTO").strip().upper()
             if is_stop_order and _intent == "AUTO":
                 _intent = "STOP"
             order_ref: Optional[float] = None
+            is_zone_entry = False
             if (
                 isinstance(single_price, (int, float))
                 and not isinstance(single_price, bool)
@@ -1305,9 +1309,10 @@ class MT5Executor:
             ):
                 order_ref = float(single_price)
             elif zone is not None:
+                is_zone_entry = True
                 try:
-                    _tiers = getattr(zone, "tiers", None)
-                    _l1 = _tiers.get("L1") if isinstance(_tiers, dict) else None
+                    _raw_tiers = self._resolve_zone_raw_tiers(direction_norm, zone, digits)
+                    _l1 = _raw_tiers.get("L1")
                     if (
                         isinstance(_l1, (int, float))
                         and not isinstance(_l1, bool)
@@ -1319,47 +1324,75 @@ class MT5Executor:
             if order_ref is None:
                 entry_ref = quote_ref
             else:
-                # The order price the broker will actually hold (front-run shifted).
-                placed_ref = order_ref
-                if _intent != "STOP":
-                    try:
+                # The exact price the broker will hold for the first layer.
+                placed_ref: Optional[float] = None
+                try:
+                    if is_zone_entry:
+                        _raw_tiers2, _tiers2 = self._resolve_zone_tiers(
+                            symbol=resolved,
+                            direction=direction_norm,
+                            zone=zone,
+                            final_tp=final_tp,
+                            raw_tp1=float(raw_tp1),
+                            pip_size=pip_size,
+                            digits=digits,
+                        )
+                        _l1_placed = _tiers2.get("L1")
+                        if (
+                            isinstance(_l1_placed, (int, float))
+                            and not isinstance(_l1_placed, bool)
+                            and float(_l1_placed) > 0.0
+                        ):
+                            placed_ref = float(_l1_placed)
+                    elif _intent != "STOP":
                         placed_ref = float(
                             self._apply_limit_entry_front_run(
                                 symbol=resolved,
                                 direction=direction_norm,
                                 target_price=order_ref,
-                                final_tp=None,
+                                final_tp=final_tp,
                                 raw_tp1=float(raw_tp1),
                                 pip_size=pip_size,
                                 digits=digits,
                             )
                         )
-                    except Exception:
-                        placed_ref = order_ref
-                # Worst case for a pending order: a BUY fills at or below its price,
-                # a SELL at or above it, so the reference is the HIGHER price for a
-                # BUY and the LOWER price for a SELL.
-                if direction_norm == "BUY":
-                    entry_ref = max(order_ref, placed_ref)
-                else:
-                    entry_ref = min(order_ref, placed_ref)
-                # If the first layer executes at market right now, it fills at the
-                # live quote instead - which is the reference that matters.
-                try:
-                    _at_market = bool(
-                        self._layer_will_execute_at_market(
-                            symbol=resolved,
-                            direction=direction_norm,
-                            target_price=placed_ref,
-                            tick=tick,
-                            order_intent=_intent,
-                            allow_market_buffer=True,
-                        )
-                    )
+                    else:
+                        placed_ref = float(order_ref)
                 except Exception:
-                    _at_market = False
-                if _at_market:
-                    entry_ref = quote_ref
+                    placed_ref = None
+                if placed_ref is None:
+                    # Fail safe: use the stricter of the order price and the quote.
+                    entry_ref = (
+                        max(order_ref, quote_ref)
+                        if direction_norm == "BUY"
+                        else min(order_ref, quote_ref)
+                    )
+                else:
+                    entry_ref = placed_ref
+                    # Does the first layer execute at market right now? If the
+                    # routing cannot be determined, the stricter reference is used.
+                    _at_market: Optional[bool]
+                    try:
+                        _at_market = bool(
+                            self._layer_will_execute_at_market(
+                                symbol=resolved,
+                                direction=direction_norm,
+                                target_price=placed_ref,
+                                tick=tick,
+                                order_intent=_intent,
+                                allow_market_buffer=True,
+                            )
+                        )
+                    except Exception:
+                        _at_market = None
+                    if _at_market is True:
+                        entry_ref = quote_ref
+                    elif _at_market is None:
+                        entry_ref = (
+                            max(placed_ref, quote_ref)
+                            if direction_norm == "BUY"
+                            else min(placed_ref, quote_ref)
+                        )
             live_spread = float(ask) - float(bid)
             _mult = float(_cfg("MIN_TP1_SPREAD_MULTIPLE", MIN_TP1_SPREAD_MULTIPLE))
             min_edge = _mult * live_spread

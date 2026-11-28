@@ -210,9 +210,10 @@ def test_trail_stop_unchanged_when_r_lock_floor_is_none():
     )
     assert res["r_lock_floor"] is None
     assert res["stop_source"] == "ATR_TRAIL"
-    # MFE 10.00 at ATR 20.0 -> EXTENDED zone -> mult 1.00 and the trail IS armed
-    # (the activation is 1.00 x ATR = 20.00 -> the $4.00 ceiling caps it), so the
-    # ATR trail (3905.00 - 2.00) is the tightest candidate.
+    # MFE 10.00 at ATR 2.0 -> EXTENDED zone (the ATR-relative stage opens at
+    # min($10, 2.5 x ATR) = $5.00) -> mult 1.00 and the trail IS armed
+    # (the activation is 1.00 x ATR = 2.00), so the ATR trail (3905.00 - 2.00)
+    # is the tightest candidate.
     assert res["candidate_sl"] == pytest.approx(3903.00)
     assert res["should_update"] is True
 

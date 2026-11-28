@@ -35,6 +35,22 @@ LADDER = "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93"
 DIST_TIERS = "6:3.50,10:3.00,15:2.75,20:2.50"  # MODERATE caps (preserve $2-4 Gold retracements)
 TIERS7 = [(0.30, 0.60), (0.50, 0.70), (0.75, 0.78), (1.00, 0.84), (1.40, 0.88), (1.80, 0.91), (2.50, 0.93)]
 
+# The expected outcome of every tier at ATR 4.00 and entry 3700.00, hard-coded so a
+# wrong production constant cannot make the oracle follow the implementation:
+#   ratio -> (retained profit, stop_source, distance from the entry of the winner)
+# The first tier's peak cannot clear the $1.00 cost floor, so the ladder lock stays
+# disarmed; the second tier's retained $1.00 is looser than the $1.20 breakeven
+# lock, so the breakeven lock wins the picker there.
+TIER7_EXPECTED = {
+    0.30: (0.20, None, None),
+    0.50: (1.00, "BE_LOCK", 1.20),
+    0.75: (2.00, "MFE_LOCK", 2.00),
+    1.00: (3.00, "MFE_LOCK", 3.00),
+    1.40: (4.60, "MFE_LOCK", 4.60),
+    1.80: (6.20, "MFE_LOCK", 6.20),
+    2.50: (9.00, "MFE_LOCK", 9.00),
+}
+
 NEW_KNOBS = {
     "DYNAMIC_ATR_TRAIL_ACTIVATION_CEILING_DOLLARS": "trail_activation_ceiling_dollars",
     "DYNAMIC_ATR_BE_ACTIVATION_CEILING_DOLLARS": "be_activation_ceiling_dollars",
@@ -182,24 +198,19 @@ def test_ladder_seven_tiers_exact(direction, ratio, pct):
     assert res["mfe_lock_fraction"] == pytest.approx(pct)
     assert res["mfe_lock_noise_floor"] == pytest.approx(noise)
     assert res["mfe_lock_profit"] == pytest.approx(expected)
-    # The lock only binds when the retained profit clears the cost floor. On the
-    # first tier the peak is too small for that (the cost floor eats it), so the
-    # lock stays disarmed. (The "peak too small to lock" case is also covered in
-    # tests/test_profit_lock_balance.py.)
-    if expected + 1e-9 >= pol.mfe_lock_cost_floor_dollars:
-        assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(expected, 2), 2))
-        if expected >= pol.be_lock_offset_dollars:
-            # The ladder lock is at least as far from the entry as the breakeven lock,
-            # so it is the tighter candidate and wins the picker.
-            assert res["stop_source"] == "MFE_LOCK"
-            assert res["candidate_sl"] == pytest.approx(res["mfe_lock_sl"])
-        else:
-            # The breakeven lock (entry +/- the $1.20 offset) is TIGHTER than this
-            # ladder tier, so it wins the picker; the ladder lock is still recorded.
-            assert res["stop_source"] == "BE_LOCK"
-            assert sign * (res["candidate_sl"] - res["mfe_lock_sl"]) >= 0
-    else:
+    # The expected outcome is hard-coded per tier (see TIER7_EXPECTED), so a wrong
+    # production constant cannot make this oracle follow the implementation.
+    exp_profit, exp_source, exp_distance = TIER7_EXPECTED[ratio]
+    assert expected == pytest.approx(exp_profit)
+    if exp_source is None:
+        # The peak cannot clear the $1.00 cost floor, so the ladder lock stays
+        # disarmed. (The "peak too small to lock" case is also covered in
+        # tests/test_profit_lock_balance.py.)
         assert res["mfe_lock_sl"] is None
+    else:
+        assert res["mfe_lock_sl"] == pytest.approx(round(entry + sign * round(exp_profit, 2), 2))
+        assert res["stop_source"] == exp_source
+        assert res["candidate_sl"] == pytest.approx(round(entry + sign * exp_distance, 2))
 
 
 def test_ladder_no_fixed_dollar_activation():
