@@ -106,8 +106,9 @@ async def test_v351_signal_13164_reproducer_pending_limits_allowed(tmp_path, mon
     assert risk_st["open_lots"] == 0.01
     assert risk_st["pending_lots"] == 0.04
     assert risk_st["total_lots"] == 0.05
-    assert risk_st["high_risk_lots"] == 0.05
-    assert risk_st["available_lots"] == 0.04
+    # The high-risk cap scales with the balance: (57.73 / 50) * 0.09 -> 0.10 lots.
+    assert risk_st["high_risk_lots"] == 0.10
+    assert risk_st["available_lots"] == 0.09
     assert risk_st["risk_tier"] == "LOW_RISK_SAFE"
 
     monkeypatch.setattr(main, "executor", ex)
@@ -139,7 +140,7 @@ async def test_v351_signal_13164_reproducer_pending_limits_allowed(tmp_path, mon
     assert sig["market_tickets"] == []
     assert len(sig["pending_tickets"]) == 4
     assert set(sig["layers"].keys()) == {"L1", "L2", "L3", "L4"}
-    assert round(sum(v["lot"] for v in sig["layers"].values()), 2) == 0.08
+    assert round(sum(v["lot"] for v in sig["layers"].values()), 2) == 0.09
 
     pending_action = getattr(mt5, "TRADE_ACTION_PENDING", 5)
     sell_limit_type = getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
@@ -151,15 +152,15 @@ async def test_v351_signal_13164_reproducer_pending_limits_allowed(tmp_path, mon
 
 
 def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
-    """At 0.05/0.05 active open lots on £50, pending limits/stops succeed while market & stops-fallback block."""
+    """At 0.09/0.09 active open lots on £50, pending limits/stops succeed while market & stops-fallback block."""
     monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 50.0
-    ex._dry_run_ticket_lots = {101: 0.05}
+    ex._dry_run_ticket_lots = {101: 0.09}
 
     st = ex.get_risk_exposure_status()
-    assert st["open_lots"] == 0.05
+    assert st["open_lots"] == 0.09
     assert st["available_lots"] == 0.00
     assert st["risk_tier"] == "HIGH_CAP_REACHED"
 
@@ -179,32 +180,32 @@ def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
     )
     assert mk_z == []
     assert len(pd_z) == 4
-    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.08
+    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.09
 
     lots_now = ex.get_total_active_lots()
-    assert lots_now["open_lots"] == 0.05
-    assert lots_now["pending_lots"] == 0.12
+    assert lots_now["open_lots"] == 0.09
+    assert lots_now["pending_lots"] == 0.13
     assert ex.get_open_market_tickets() == [101]
 
     # Cancelling one pending order removes from _dry_run_pending_ticket_lots only
     assert ex.cancel_pending_order(t_lim) is True
-    assert ex.get_total_active_lots()["pending_lots"] == 0.10
-    assert ex.get_total_active_lots()["open_lots"] == 0.05
+    assert ex.get_total_active_lots()["pending_lots"] == 0.11
+    assert ex.get_total_active_lots()["open_lots"] == 0.09
 
     # Active market buys/sells are strictly blocked
     assert ex.execute_market_order("XAUUSD.s", "BUY", lot=0.01, sl=3870.0, tp=3900.0) is None
-    assert "High Risk Lot Cap Reached (0.05/0.05 active lots" in (ex.last_error or "")
+    assert "High Risk Lot Cap Reached (0.09/0.09 active lots" in (ex.last_error or "")
 
     mk_m, pd_m, layers_m = ex.execute_4layer_market("XAUUSD.s", "BUY", sl=3870.0, final_tp=3899.5, raw_tp1=3900.0)
     assert mk_m == [] and pd_m == [] and layers_m == {}
-    assert "High Risk Lot Cap Reached (0.05/0.05 active lots" in (ex.last_error or "")
+    assert "High Risk Lot Cap Reached (0.09/0.09 active lots" in (ex.last_error or "")
 
     # Live _place_pending_with_stops_fallback: if pending fails (invalid stops) and price crosses into market fallback,
     # execute_market_order still enforces the 0.05 active open lot cap!
     tick_ref = {"tick": _make_tick(3894.80, 3895.00)}
     magic = config.MAGIC_NUMBER
     positions_list = [
-        SimpleNamespace(ticket=801, magic=magic, volume=0.05, symbol="XAUUSD.s", type=0, price_open=3890.0),
+        SimpleNamespace(ticket=801, magic=magic, volume=0.09, symbol="XAUUSD.s", type=0, price_open=3890.0),
     ]
     account = _make_account_info(balance=50.0, currency="GBP")
     live_ex, sent_requests = _patch_live_mt5(
@@ -228,7 +229,7 @@ def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
         pending_kind="LIMIT",
     )
     assert fb_ticket is None and fb_kind == "FAILED"
-    assert "High Risk Lot Cap Reached (0.05/0.05 active lots" in (live_ex.last_error or "")
+    assert "High Risk Lot Cap Reached (0.09/0.09 active lots" in (live_ex.last_error or "")
     deal_action = getattr(mt5, "TRADE_ACTION_DEAL", 1)
     assert not any(r.get("action") == deal_action for r in sent_requests)
 
@@ -236,11 +237,11 @@ def test_v351_pending_allowed_while_market_blocked_at_full_cap(monkeypatch):
 def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch):
     """Mixed zones skip/cap only the layers crossing at market and preserve full lots on pending layers."""
     monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
-    # 1. Full cap (0.05/0.05 on £50): L1=3895 crosses market (ask=3895.00) -> skipped; L2..L4 limits kept
+    # 1. Full cap (0.09/0.09 on £50): L1=3895 crosses market (ask=3895.00) -> skipped; L2..L4 limits kept
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 50.0
-    ex._dry_run_ticket_lots = {101: 0.05}
+    ex._dry_run_ticket_lots = {101: 0.09}
 
     mk, pd, layers = ex.execute_4layer_zone(
         symbol="XAUUSD.s",
@@ -253,16 +254,16 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch)
     assert mk == []
     assert len(pd) == 3
     assert set(layers.keys()) == {"L2", "L3", "L4"}
-    assert round(sum(v["lot"] for v in layers.values()), 2) == 0.06
+    assert round(sum(v["lot"] for v in layers.values()), 2) == 0.07
     assert "High Risk Lot Cap Reached" in (ex.last_allocation_warning or "")
-    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.06, "total_lots": 0.11}
+    assert ex.get_total_active_lots() == {"open_lots": 0.09, "pending_lots": 0.07, "total_lots": 0.16}
 
-    # 2. Partial market budget (0.04/0.05 -> 0.01 avail): L1=3898 & L2=3895 are market, L3=3892 & L4=3889 are limits.
-    # Only 1 market layer (L1=0.01) fits in avail=0.01; L2 is skipped (0.0); L3 & L4 limits keep 0.01 & 0.02!
+    # 2. Partial market budget (0.08/0.09 -> 0.01 avail): L1=3898 & L2=3895 are market, L3=3892 & L4=3889 are limits.
+    # Only 1 market layer (L1=0.01) fits in avail=0.01; L2 is skipped (0.0); L3 & L4 limits keep 0.02 & 0.03!
     ex2 = MT5Executor(dry_run=True)
     ex2.connect()
     ex2._dry_run_capital = 50.0
-    ex2._dry_run_ticket_lots = {201: 0.04}
+    ex2._dry_run_ticket_lots = {201: 0.08}
 
     mk2, pd2, layers2 = ex2.execute_4layer_zone(
         symbol="XAUUSD.s",
@@ -277,8 +278,8 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch)
     assert set(layers2.keys()) == {"L1", "L3", "L4"}
     assert layers2["L1"]["lot"] == 0.01
     assert layers2["L3"]["lot"] == 0.02
-    assert layers2["L4"]["lot"] == 0.02
-    assert ex2.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.04, "total_lots": 0.09}
+    assert layers2["L4"]["lot"] == 0.03
+    assert ex2.get_total_active_lots() == {"open_lots": 0.09, "pending_lots": 0.05, "total_lots": 0.14}
 
     # 3. Single-price: below-market LIMIT succeeds at 0.05/0.05; at-market AUTO blocked
     orig_cons = getattr(config, "SINGLE_PRICE_CONSOLIDATE_ORDERS", True)
@@ -302,7 +303,7 @@ def test_v351_mixed_zone_skips_market_layers_retains_pending_at_cap(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_v351_active_market_cap_end_to_end_50_and_80(tmp_path, monkeypatch):
-    """End-to-end handle_new_message enforces 0.05 (£50) & 0.08 (£80) on active buys/sells while allowing pending zones."""
+    """End-to-end handle_new_message enforces the 0.09 (£50) & 0.12 (£70) cap on active buys/sells while allowing pending zones."""
     monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)
     monkeypatch.setattr(main, "SELL_NOW_DELAY_SECONDS", 0.0)
@@ -324,40 +325,40 @@ async def test_v351_active_market_cap_end_to_end_50_and_80(tmp_path, monkeypatch
     monkeypatch.setattr(main, "notify_saved_messages", _cap)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2001, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
-    assert ex50.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.0, "total_lots": 0.05}
+    assert ex50.get_total_active_lots() == {"open_lots": 0.09, "pending_lots": 0.0, "total_lots": 0.09}
     assert any("MAX HIGH RISK CAP REACHED" in a for a in alerts)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2002, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
     assert main.state_mgr.get_signal(2002, chat_id=-1001234567890) is None
     assert any("High Risk Lot Cap Reached" in a for a in alerts)
 
-    # Pure pending zone still executes cleanly at 0.05/0.05 active cap
+    # Pure pending zone still executes cleanly at the 0.09/0.09 active cap
     await main.handle_new_message(MockTelethonEvent(msg_id=2003, text="Buy 3885-3877\nTP 3895\nSL 3865", chat_id=-1001234567890))
     sig_pend = main.state_mgr.get_signal(2003, chat_id=-1001234567890)
     assert sig_pend is not None and len(sig_pend["pending_tickets"]) == 4
-    assert ex50.get_total_active_lots()["open_lots"] == 0.05
-    assert ex50.get_total_active_lots()["pending_lots"] == 0.08
+    assert ex50.get_total_active_lots()["open_lots"] == 0.09
+    assert ex50.get_total_active_lots()["pending_lots"] == 0.09
 
-    # Part B: GBP 120 account (high_risk_lots = 0.12): the first signal uses 0.08
-    # (4 x 0.02), the second is only PARTIALLY placed (the allocator scales the
+    # Part B: GBP 70 account (high_risk_lots = 0.12): the first signal uses the full
+    # 0.09-lot ladder, the second is only PARTIALLY placed (the allocator scales the
     # layers to the remaining budget) and the third is refused outright.
     alerts.clear()
-    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "e2e_120_state.json"))
-    monkeypatch.setattr(main, "trade_ledger", TradeLedger(tmp_path / "e2e_120_ledger.jsonl"))
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "e2e_70_state.json"))
+    monkeypatch.setattr(main, "trade_ledger", TradeLedger(tmp_path / "e2e_70_ledger.jsonl"))
     ex80 = MT5Executor(dry_run=True)
     ex80.connect()
-    ex80._dry_run_capital = 120.0
+    ex80._dry_run_capital = 70.0
     monkeypatch.setattr(main, "executor", ex80)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2011, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
-    assert ex80.get_total_active_lots()["open_lots"] == 0.08
+    assert ex80.get_total_active_lots()["open_lots"] == 0.09
 
     await main.handle_new_message(MockTelethonEvent(msg_id=2012, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
     sig80 = main.state_mgr.get_signal(2012, chat_id=-1001234567890)
     assert sig80 is not None, "the cap must still allow a partial placement"
     assert len(sig80["market_tickets"]) + len(sig80["pending_tickets"]) >= 1
     partial_lots = round(sum(l["lot"] for l in sig80["layers"].values()), 2)
-    assert partial_lots == 0.04, "the partial must exactly fill the remaining budget"
+    assert partial_lots == 0.03, "the partial must exactly fill the remaining budget"
 
     # The cap is now full: the next signal is refused and the exposure does not grow.
     await main.handle_new_message(MockTelethonEvent(msg_id=2013, text="Buy now\nSL 3875\nTP 3905", chat_id=-1001234567890))
@@ -377,7 +378,7 @@ def test_v351_live_mode_positions_get_and_orders_get_separation(monkeypatch):
     account = _make_account_info(balance=57.73, currency="GBP")
 
     positions_list = [
-        SimpleNamespace(ticket=11, magic=magic, volume=0.05, symbol="XAUUSD.s", type=1, price_open=3741.7),
+        SimpleNamespace(ticket=11, magic=magic, volume=0.10, symbol="XAUUSD.s", type=1, price_open=3741.7),
         SimpleNamespace(ticket=99, magic=999999, volume=0.10, symbol="XAUUSD.s", type=0, price_open=3735.0),
     ]
     orders_list = [
@@ -387,25 +388,25 @@ def test_v351_live_mode_positions_get_and_orders_get_separation(monkeypatch):
     ex, _ = _patch_live_mt5(monkeypatch, tick_ref, account, positions_list, orders_list, start_ticket=91000)
 
     lots = ex.get_total_active_lots()
-    assert lots == {"open_lots": 0.05, "pending_lots": 0.04, "total_lots": 0.09}
+    assert lots == {"open_lots": 0.10, "pending_lots": 0.04, "total_lots": 0.14}
     assert ex.get_open_market_tickets() == [11]
 
     st = ex.get_risk_exposure_status()
     assert st["available_lots"] == 0.00
     assert st["risk_tier"] == "HIGH_CAP_REACHED"
 
-    # Market order blocked when open_lots == 0.05
+    # Market order blocked when open_lots == the cap (0.10 on a £57.73 account)
     assert ex.execute_market_order("XAUUSD.s", "SELL", lot=0.01, sl=3765.0, tp=3730.0) is None
-    assert "High Risk Lot Cap Reached (0.05/0.05 active lots" in (ex.last_error or "")
+    assert "High Risk Lot Cap Reached (0.10/0.10 active lots" in (ex.last_error or "")
 
-    # Pending limit order still succeeds even at 0.05 open + 0.04 pending
+    # Pending limit order still succeeds even at 0.10 open + 0.04 pending
     t_pend = ex.place_limit_order("XAUUSD.s", "SELL", 3745.0, lot=0.02, sl=3765.0, tp=3730.0)
     assert t_pend == 91001
 
 
 @pytest.mark.asyncio
 async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_path, monkeypatch):
-    """Editing an existing staged signal with a zone while active lots are at 0.05/0.05 still places pending L2..L4."""
+    """Editing an existing staged signal with a zone while active lots are at the 0.09 cap still places pending L2..L4."""
     # The high-risk lot cap ships DISABLED and the baseline suite runs it disabled;
     # this test is about the cap, so it enables it explicitly.
     import config as cfg_mod
@@ -422,7 +423,7 @@ async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_pat
     ex = MT5Executor(dry_run=True)
     ex.connect()
     ex._dry_run_capital = 50.0
-    ex._dry_run_ticket_lots = {901: 0.04}  # 0.04 already open -> 0.01 room left for L1
+    ex._dry_run_ticket_lots = {901: 0.08}  # 0.08 already open -> 0.01 room left for L1
     monkeypatch.setattr(main, "executor", ex)
 
     alerts = []
@@ -432,13 +433,13 @@ async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_pat
 
     monkeypatch.setattr(main, "notify_saved_messages", _cap)
 
-    # Initial staged Buy now -> opens L1 (0.01 market), bringing active open exposure to 0.05/0.05
+    # Initial staged Buy now -> opens L1 (0.01 market), bringing active open exposure to 0.09/0.09
     await main.handle_new_message(MockTelethonEvent(msg_id=3001, text="Buy now", chat_id=-1001234567890))
     sig0 = main.state_mgr.get_signal(3001, chat_id=-1001234567890)
     assert sig0 is not None and len(sig0["market_tickets"]) == 1
-    assert ex.get_total_active_lots()["open_lots"] == 0.05
+    assert ex.get_total_active_lots()["open_lots"] == 0.09
 
-    # Now edit msg 3001 to add zone 3895-3887 while active cap is 0.05/0.05 -> L2..L4 limits must still place
+    # Now edit msg 3001 to add zone 3895-3887 while the active cap is 0.09/0.09 -> L2..L4 limits must still place
     edit_evt = MockTelethonEvent(msg_id=3001, text="Buy 3895-3887\nTP 3905\nSL 3875", chat_id=-1001234567890)
     await main.handle_message_edited(edit_evt)
 
@@ -447,4 +448,4 @@ async def test_v351_late_edit_zone_expansion_keeps_pending_limits_at_cap(tmp_pat
     assert len(sig1["market_tickets"]) == 1
     assert len(sig1["pending_tickets"]) == 3
     assert set(sig1["layers"].keys()) == {"L1", "L2", "L3", "L4"}
-    assert ex.get_total_active_lots() == {"open_lots": 0.05, "pending_lots": 0.06, "total_lots": 0.11}
+    assert ex.get_total_active_lots() == {"open_lots": 0.09, "pending_lots": 0.07, "total_lots": 0.16}

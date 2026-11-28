@@ -53,6 +53,13 @@ def _pct_amount(balance: float, pct: float) -> float:
     return round(max(0.0, _safe_float(balance)) * (pct / 100.0), 2)
 
 
+def format_amount(amount: float, currency: str = "GBP") -> str:
+    """Format a currency amount (e.g. 30.0 GBP -> '£30.00')."""
+    val = round(_safe_float(amount, 0.0), 2)
+    sym = {"GBP": "£", "USD": "$", "EUR": "€"}.get(str(currency or "GBP").upper(), "")
+    return f"{sym}{val:.2f}"
+
+
 def read_risk_limits(cfg_mod: Any) -> RiskLimitsSnapshot:
     """Read active runtime risk and drawdown limits from the config module."""
     return RiskLimitsSnapshot(
@@ -116,15 +123,36 @@ def _loss_limit_details(pause_pct: float, cutoff_pct: float, bal: float, currenc
     return f"• Pause New Signals: {p_txt}\n• Emergency Cut-Off: {c_txt}"
 
 
-def apply_loss_limit_command(cfg_mod: Any, args: Sequence[str], balance: float, currency: str = "GBP") -> Tuple[bool, str]:
-    """Query or update DAILY_LOSS_PAUSE_PCT and EMERGENCY_CUTOFF_LOSS_PCT."""
+def apply_loss_limit_command(
+    cfg_mod: Any,
+    args: Sequence[str],
+    balance: float,
+    currency: str = "GBP",
+    gbp_limit: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """Query or update DAILY_LOSS_PAUSE_PCT and EMERGENCY_CUTOFF_LOSS_PCT.
+
+    `gbp_limit` is the manual hard daily-loss cutoff (the DAILY_LOSS_LIMIT_GBP
+    knob / the `dailyloss <amount>` command). It is DISPLAYED here; the command
+    that changes it lives in main.py, because the limit is owned by the persisted
+    state (not by the config module).
+    """
     cleaned = [str(a).strip() for a in (args or []) if str(a).strip()]
     bal, snap = max(0.0, _safe_float(balance)), read_risk_limits(cfg_mod)
+    gbp_line = (
+        f"• Hard Daily Loss Cutoff (GBP): `{format_amount(gbp_limit, currency)}`"
+        if gbp_limit is not None and _safe_float(gbp_limit) > 0.0
+        else "• Hard Daily Loss Cutoff (GBP): `OFF`"
+    )
     if not cleaned:
         is_off = snap.daily_loss_pause_pct <= 0.0 and snap.emergency_cutoff_pct <= 0.0
         header = "⚪ **Daily Loss Limits:** `Unlimited (OFF)`" if is_off else "🛡️ **Daily Loss Limits:** `ACTIVE`"
         body = _loss_limit_details(snap.daily_loss_pause_pct, snap.emergency_cutoff_pct, bal, currency)
-        return False, f"{header}\n{body}\n• Change: `/losslimit <pause_pct> [cutoff_pct]` | Disable: `/losslimit off`"
+        return False, (
+            f"{header}\n{body}\n{gbp_line}\n"
+            "• Change: `/losslimit <pause_pct> [cutoff_pct]` | "
+            "Cutoff: `/losslimit £<amount>` | Disable: `/losslimit off`"
+        )
     parsed = _parse_loss_limit_args(cleaned, snap.emergency_cutoff_pct)
     if parsed is None:
         return False, _LOSS_LIMIT_USAGE
@@ -134,7 +162,7 @@ def apply_loss_limit_command(cfg_mod: Any, args: Sequence[str], balance: float, 
         setattr(cfg_mod, "EMERGENCY_CUTOFF_LOSS_PCT", cutoff_pct)
     body = _loss_limit_details(pause_pct, cutoff_pct, bal, currency)
     header = "⚪ **Daily Loss Limits Disabled → `Unlimited (OFF)`**" if pause_pct <= 0.0 and cutoff_pct <= 0.0 else "🛡️ **Daily Loss Limits Updated**"
-    return True, f"{header}\n{body}\n• Disable anytime: `/losslimit off`"
+    return True, f"{header}\n{body}\n{gbp_line}\n• Disable anytime: `/losslimit off`"
 
 
 def apply_lot_cap_command(cfg_mod: Any, raw_arg: str, risk_status: Dict[str, Any]) -> Tuple[bool, str]:
@@ -187,7 +215,11 @@ def format_limits_status_lines(cfg_mod: Any, dd_status: Dict[str, Any], risk_sta
     return {"active_lots_label": lots_label, "drawdown_guard_line": dd_line, "float_cap_line": fc_line}
 
 
-def format_protection_profile_line(cfg_mod: Any) -> str:
+def format_protection_profile_line(
+    cfg_mod: Any,
+    daily_loss_limit_gbp: Optional[float] = None,
+    daily_loss_currency: str = "GBP",
+) -> str:
     """Display-only one-line summary of the active protection profile.
 
     Reads the live config module without mutating it: TRAILING_PROFILE,
@@ -210,6 +242,8 @@ def format_protection_profile_line(cfg_mod: Any) -> str:
         f"• Protection Profile: TRAILING_PROFILE=`{prof}` | R-Lock: `{r_txt}` "
         f"| Lot Cap: `{lot_txt}` | Daily Loss Pause: `{pause_txt}`"
     )
+    if daily_loss_limit_gbp is not None and _safe_float(daily_loss_limit_gbp) > 0.0:
+        base += f" | Daily Loss Cutoff: `{format_amount(daily_loss_limit_gbp, daily_loss_currency)}`"
     # T3 ATR-relative upgrade announcement (opt-in). Absent when the features are
     # disabled, so the shipped/baseline line stays byte-for-byte unchanged.
     mfe_on = bool(getattr(cfg_mod, "DYNAMIC_ATR_MFE_LOCK_ENABLED", False))

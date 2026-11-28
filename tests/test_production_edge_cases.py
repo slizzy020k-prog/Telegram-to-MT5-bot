@@ -573,17 +573,18 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
     from mt5_executor import calculate_risk_guide_thresholds
     from tests.test_copier_scenarios import MockTelethonEvent
 
-    # 1. Exact professional guide rows
-    assert calculate_risk_guide_thresholds(50) == {"capital": 50.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.02, "high_risk_lots": 0.05}
-    assert calculate_risk_guide_thresholds(100) == {"capital": 100.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.05, "high_risk_lots": 0.10}
-    assert calculate_risk_guide_thresholds(200) == {"capital": 200.0, "low_risk_lots": 0.02, "mid_risk_lots": 0.10, "high_risk_lots": 0.20}
-    assert calculate_risk_guide_thresholds(500) == {"capital": 500.0, "low_risk_lots": 0.05, "mid_risk_lots": 0.25, "high_risk_lots": 0.50}
-    assert calculate_risk_guide_thresholds(1000) == {"capital": 1000.0, "low_risk_lots": 0.10, "mid_risk_lots": 0.50, "high_risk_lots": 1.00}
+    # 1. Exact guide rows: the high-risk cap scales as (balance / 50) * 0.09, floored
+    #    to the broker's 0.01 lot step (and never below 0.09 from £50 up).
+    assert calculate_risk_guide_thresholds(50) == {"capital": 50.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.02, "high_risk_lots": 0.09}
+    assert calculate_risk_guide_thresholds(100) == {"capital": 100.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.05, "high_risk_lots": 0.18}
+    assert calculate_risk_guide_thresholds(200) == {"capital": 200.0, "low_risk_lots": 0.02, "mid_risk_lots": 0.10, "high_risk_lots": 0.36}
+    assert calculate_risk_guide_thresholds(500) == {"capital": 500.0, "low_risk_lots": 0.05, "mid_risk_lots": 0.25, "high_risk_lots": 0.90}
+    assert calculate_risk_guide_thresholds(1000) == {"capital": 1000.0, "low_risk_lots": 0.10, "mid_risk_lots": 0.50, "high_risk_lots": 1.80}
 
-    # Custom account amount (£120 -> High Risk = 0.12 = 3 concurrent 0.04-lot signals)
-    assert calculate_risk_guide_thresholds(120) == {"capital": 120.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.06, "high_risk_lots": 0.12}
+    # Custom account amount (£120 -> High Risk = 0.21)
+    assert calculate_risk_guide_thresholds(120) == {"capital": 120.0, "low_risk_lots": 0.01, "mid_risk_lots": 0.06, "high_risk_lots": 0.21}
 
-    # 2. Enforce High Risk Lot Cap for active open buys/sells on a £50 account (High Risk = 0.05 lots)
+    # 2. Enforce High Risk Lot Cap for active open buys/sells on a £50 account (High Risk = 0.09 lots)
     import config
     monkeypatch.setattr(config, "ENFORCE_HIGH_RISK_LOT_CAP", True)
     monkeypatch.setattr(main, "STAGED_MARKET_ENTRY", False)
@@ -601,10 +602,10 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
 
     monkeypatch.setattr(main, "notify_saved_messages", cap_notify)
 
-    # Signal 1 on £50: 4-layer Market Now (0.01+0.01+0.01+0.02 = 0.05 open lots) -> passes Low, Mid & hits 0.05 High Cap!
+    # Signal 1 on £50: 4-layer Market Now (0.02+0.02+0.02+0.03 = 0.09 open lots) -> passes Low, Mid & hits the 0.09 High Cap!
     evt1 = MockTelethonEvent(msg_id=9961, text="Buy now\nTP 3905\nSL 3875")
     await main.handle_new_message(evt1)
-    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.09
     assert any("Passed LOW RISK" in a and "Passed MID RISK" in a and "MAX HIGH RISK CAP REACHED" in a for a in alerts)
 
     # Signal 2 on £50: 0.00 active lots available -> Market Now blocked by High Risk Cap
@@ -613,32 +614,32 @@ async def test_professional_risk_guide_thresholds_and_hard_cap(tmp_path, monkeyp
     assert main.state_mgr.get_signal(9962) is None
     assert any("High Risk Lot Cap Reached" in a for a in alerts)
 
-    # Pending limit zone below market still allowed even at 0.05/0.05 active open cap
+    # Pending limit zone below market still allowed even at the 0.09/0.09 active open cap
     evt_pend = MockTelethonEvent(msg_id=9963, text="Buy 3885-3877\nTP 3895\nSL 3865")
     await main.handle_new_message(evt_pend)
     sig_pend = main.state_mgr.get_signal(9963)
     assert sig_pend is not None and len(sig_pend["pending_tickets"]) == 4
-    assert main.executor.get_total_active_lots()["open_lots"] == 0.05
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.09
 
-    # 3. Atomic partial cap on a GBP 120 account (High Risk = 0.12 lots): the first
-    # signal uses 0.08 (4 x 0.02), so the SECOND one is only PARTIALLY placed (the
-    # allocator scales the layers to the remaining budget) and the third is refused.
+    # 3. Atomic partial cap on a GBP 70 account (High Risk = 0.12 lots): the first
+    # signal uses 0.09 (the full ladder), so the SECOND one is only PARTIALLY placed
+    # (the allocator scales the layers to the remaining budget) and the third is refused.
     alerts.clear()
-    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state_120.json"))
+    monkeypatch.setattr(main, "state_mgr", StateManager(tmp_path / "risk_cap_state_70.json"))
     ex80 = MT5Executor(dry_run=True)
     ex80.connect()
-    ex80._dry_run_capital = 120.0
+    ex80._dry_run_capital = 70.0
     monkeypatch.setattr(main, "executor", ex80)
 
     await main.handle_new_message(MockTelethonEvent(msg_id=9964, text="Buy now\nTP 3905\nSL 3875"))
-    assert main.executor.get_total_active_lots()["open_lots"] == 0.08
+    assert main.executor.get_total_active_lots()["open_lots"] == 0.09
 
     await main.handle_new_message(MockTelethonEvent(msg_id=9965, text="Buy now\nTP 3905\nSL 3875"))
     sig_partial = main.state_mgr.get_signal(9965)
     assert sig_partial is not None, "the cap must still allow a partial placement"
     assert len(sig_partial["market_tickets"]) + len(sig_partial["pending_tickets"]) >= 1
     partial_lots = round(sum(l["lot"] for l in sig_partial["layers"].values()), 2)
-    assert partial_lots == 0.04, "the partial must exactly fill the remaining budget"
+    assert partial_lots == 0.03, "the partial must exactly fill the remaining budget"
     assert main.executor.get_total_active_lots()["open_lots"] == 0.12
 
     # Now the cap is full: the next signal is refused outright.
@@ -981,7 +982,7 @@ async def test_dailyloss_commands_2step_1step_invalid_switch_and_status(tmp_path
         # 0. /status when OFF
         st0 = MockTelethonEvent(msg_id=11000, text="/status", chat_id="me")
         await main.handle_saved_messages_command(st0)
-        assert "Daily Loss Limit (`dailyloss`): ⚪ OFF" in st0.replies[-1]
+        assert "Daily Loss Cutoff (`dailyloss`): ⚪ OFF" in st0.replies[-1]
         assert "`dailyloss`" in st0.replies[-1]
 
         # 1. Interactive 2-step: `dailyloss` -> invalid -> `£20`
@@ -1008,7 +1009,7 @@ async def test_dailyloss_commands_2step_1step_invalid_switch_and_status(tmp_path
         # /status when ACTIVE
         st1 = MockTelethonEvent(msg_id=11004, text="/status", chat_id="me")
         await main.handle_saved_messages_command(st1)
-        assert "Daily Loss Limit (`dailyloss`): 🟢 ACTIVE — Limit: `-£20.00 GBP`" in st1.replies[-1]
+        assert "Daily Loss Cutoff (`dailyloss`): 🟢 ACTIVE — Cutoff: `£20.00`" in st1.replies[-1]
 
         # 2. 1-step variants
         c3 = MockTelethonEvent(msg_id=11005, text="/dailyloss £25.50", chat_id="me")

@@ -215,7 +215,7 @@ async def test_2_stub_l1_only_and_zone_edit_expansion_never_exceeds_4_layers(tmp
         assert sig_a2["layers"]["L2"]["target_price"] == pytest.approx(3843.67)
         assert sig_a2["layers"]["L3"]["target_price"] == pytest.approx(3840.33)
         assert sig_a2["layers"]["L4"]["target_price"] == pytest.approx(3837.0)
-        assert sig_a2["layers"]["L4"]["lot"] == pytest.approx(0.02)
+        assert sig_a2["layers"]["L4"]["lot"] == pytest.approx(0.03)
 
         # --- Part A2: Zone edit when L1..L4 are ALL already filled -> 0 new orders placed! ---
         # Disable staged entry so 9802 fires all 4 layers at once (simulates full market fill scenario)

@@ -1,0 +1,185 @@
+"""Coverage for the manual GBP daily-loss cutoff and the new lot sizing.
+
+- The hard daily-loss cutoff is seeded from DAILY_LOSS_LIMIT_GBP at startup, and a
+  value the operator set from Saved Messages always wins over that seed.
+- /losslimit manages the cutoff in account currency; /losslimit off switches it off.
+- The high-risk lot cap scales proportionally with the balance and the shipped
+  4-layer ladder is [0.02, 0.02, 0.02, 0.03] (0.09 lots).
+"""
+from __future__ import annotations
+
+import pytest
+
+import config
+import main
+from mt5_executor import calculate_risk_guide_thresholds, compute_dynamic_layer_lots_for_balance
+from state_manager import StateManager
+from tests.test_copier_scenarios import MockTelethonEvent
+from trade_ledger import TradeLedger
+
+
+def _reset_main(tmp_path, tag: str, balance: float = 54.13):
+    main.state_mgr = StateManager(tmp_path / f"{tag}_state.json")
+    main.trade_ledger = TradeLedger(tmp_path / f"{tag}_ledger.jsonl")
+    main._daily_loss_locked = False
+    main._daily_loss_lock_notified_date = None
+    main._daily_loss_terminate_requested = False
+    main._daily_50pct_alert_date = None
+    return main.state_mgr
+
+
+# ---------------------------------------------------------------------------
+# 1. The startup seed
+# ---------------------------------------------------------------------------
+
+
+def test_the_configured_cutoff_is_seeded_into_the_persisted_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed")
+
+    assert main._seed_daily_loss_limit_from_config() == 30.0
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is True
+    assert cfg["limit_amount"] == 30.0
+    assert cfg["source"] == "config"
+
+
+def test_a_zero_knob_seeds_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 0.0)
+    _reset_main(tmp_path, "seed_off")
+
+    main._seed_daily_loss_limit_from_config()
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is False
+    assert cfg["limit_amount"] == 0.0
+
+
+def test_a_user_set_limit_survives_the_startup_seed(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_user")
+
+    main.state_mgr.set_daily_loss_config(enabled=True, limit_amount=55.0, source="user")
+    main._seed_daily_loss_limit_from_config()
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["limit_amount"] == 55.0
+    assert cfg["source"] == "user"
+
+
+def test_a_user_disabled_limit_is_not_re_seeded(tmp_path, monkeypatch):
+    """`dailyloss off` must stay off across a restart."""
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_user_off")
+
+    main.state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, source="user")
+    main._seed_daily_loss_limit_from_config()
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is False
+    assert cfg["limit_amount"] == 0.0
+
+
+def test_the_seed_preserves_a_limit_that_already_fired_today(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_triggered")
+
+    main.state_mgr.set_daily_loss_config(
+        enabled=True, limit_amount=30.0, triggered_date="2026-11-28", triggered_at=1234.0
+    )
+    main._seed_daily_loss_limit_from_config()
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["triggered_date"] == "2026-11-28"
+    assert cfg["triggered_at"] == 1234.0
+    assert cfg["limit_amount"] == 30.0
+
+
+# ---------------------------------------------------------------------------
+# 2. The Saved Messages controls
+# ---------------------------------------------------------------------------
+
+
+def test_the_gbp_argument_parser_accepts_the_currency_forms():
+    assert main._parse_gbp_daily_loss_arg(["£30"]) == 30.0
+    assert main._parse_gbp_daily_loss_arg(["30gbp"]) == 30.0
+    assert main._parse_gbp_daily_loss_arg(["30", "gbp"]) == 30.0
+    assert main._parse_gbp_daily_loss_arg(["£12.50"]) == 12.5
+    # A percentage / unrelated argument is NOT a GBP request.
+    assert main._parse_gbp_daily_loss_arg(["50"]) is None
+    assert main._parse_gbp_daily_loss_arg(["off"]) is None
+    assert main._parse_gbp_daily_loss_arg([]) is None
+
+
+@pytest.mark.asyncio
+async def test_losslimit_sets_the_manual_cutoff(tmp_path, monkeypatch):
+    _reset_main(tmp_path, "losslimit_gbp")
+
+    evt = MockTelethonEvent(msg_id=7001, text="/losslimit £30", chat_id="me")
+    await main.handle_saved_messages_command(evt)
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is True
+    assert cfg["limit_amount"] == 30.0
+    assert cfg["source"] == "user"
+    assert any("Hard Daily Loss Cutoff" in r and "30.00" in r for r in evt.replies)
+
+
+@pytest.mark.asyncio
+async def test_losslimit_off_switches_the_manual_cutoff_off(tmp_path, monkeypatch):
+    _reset_main(tmp_path, "losslimit_off")
+    main.state_mgr.set_daily_loss_config(enabled=True, limit_amount=30.0, source="user")
+
+    evt = MockTelethonEvent(msg_id=7002, text="/losslimit off", chat_id="me")
+    await main.handle_saved_messages_command(evt)
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is False
+    assert cfg["limit_amount"] == 0.0
+    assert cfg["source"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_dailyloss_marks_the_limit_as_user_set(tmp_path, monkeypatch):
+    _reset_main(tmp_path, "dailyloss_user")
+
+    evt = MockTelethonEvent(msg_id=7003, text="dailyloss 40", chat_id="me")
+    await main.handle_saved_messages_command(evt)
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is True
+    assert cfg["limit_amount"] == 40.0
+    assert cfg["source"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# 3. Lot sizing
+# ---------------------------------------------------------------------------
+
+
+def test_the_high_risk_cap_scales_proportionally_with_the_balance():
+    # £50 unlocks the full 0.09-lot ladder; the cap then scales with the balance.
+    assert calculate_risk_guide_thresholds(50.0)["high_risk_lots"] == 0.09
+    assert calculate_risk_guide_thresholds(54.13)["high_risk_lots"] == 0.09
+    assert calculate_risk_guide_thresholds(100.0)["high_risk_lots"] == 0.18
+    assert calculate_risk_guide_thresholds(200.0)["high_risk_lots"] == 0.36
+    assert calculate_risk_guide_thresholds(500.0)["high_risk_lots"] == 0.90
+    # Below £50 the cap scales down proportionally (never below one lot step).
+    assert calculate_risk_guide_thresholds(25.0)["high_risk_lots"] == 0.04
+    # The cap is always a multiple of the broker's 0.01 lot step.
+    for bal in (50.0, 54.13, 77.77, 123.45, 999.99):
+        cap = calculate_risk_guide_thresholds(bal)["high_risk_lots"]
+        assert abs(round(cap / 0.01) * 0.01 - cap) < 1e-9
+
+
+def test_the_shipped_ladder_is_the_0_09_lot_vector(shipped_config):
+    assert config.BASE_LAYER_LOTS == [0.02, 0.02, 0.02, 0.03]
+    assert round(sum(config.BASE_LAYER_LOTS), 2) == 0.09
+    assert config.LAYER_LOTS["L4"] == 0.03
+
+
+def test_the_dynamic_ladder_matches_the_shipped_one_at_50():
+    assert compute_dynamic_layer_lots_for_balance(50.0, risk_mode="high") == [0.02, 0.02, 0.02, 0.03]
+
+
+def test_the_configured_cutoff_default_is_thirty_pounds(shipped_config):
+    assert config.DAILY_LOSS_LIMIT_GBP == 30.0

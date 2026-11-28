@@ -125,8 +125,8 @@ def test_normalize_lot_to_symbol_and_scale_layer_lots():
     # Proportional scaling [0.01, 0.01, 0.01, 0.02]
     assert scale_layer_lots([0.01, 0.01, 0.01, 0.02], 2.0, sym_std) == [0.02, 0.02, 0.02, 0.04]
     assert scale_layer_lots([0.01, 0.01, 0.01, 0.02], 3.0, sym_std) == [0.03, 0.03, 0.03, 0.06]
-    # Invalid base / multiplier safe fallback
-    assert scale_layer_lots([0.01, -1.0, 0.01, 0.02], -5.0, sym_std) == [0.01, 0.01, 0.01, 0.02]
+    # Invalid base / multiplier safe fallback -> the shipped 0.09-lot ladder
+    assert scale_layer_lots([0.01, -1.0, 0.01, 0.02], -5.0, sym_std) == [0.02, 0.02, 0.02, 0.03]
 
 
 def test_allocate_4layer_lots_atomic_budget_cap(monkeypatch):
@@ -134,24 +134,25 @@ def test_allocate_4layer_lots_atomic_budget_cap(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
-    # £100 capital -> high_risk_lots=0.10 -> full [0.01, 0.01, 0.01, 0.02] fits
+    # £100 capital -> high_risk_lots=0.18 -> the full 0.09-lot ladder fits
     ex._dry_run_capital = 100.0
     lots_ok, warn_ok = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_ok == [0.02, 0.02, 0.02, 0.02]
+    assert lots_ok == [0.02, 0.02, 0.02, 0.03]
     assert warn_ok is None
 
-    # Already committed 0.06 lots -> 0.04 remaining -> deterministic cap prioritizing L4 runner
-    ex._dry_run_ticket_lots = {1: 0.06}
+    # Already committed 0.12 lots -> 0.06 remaining -> deterministic cap that fills
+    # the budget exactly, prioritizing the L4 runner
+    ex._dry_run_ticket_lots = {1: 0.12}
     lots_cap4, warn_cap4 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert sum(lots_cap4) == pytest.approx(0.04)
-    assert lots_cap4 == [0.01, 0.01, 0.01, 0.01]
+    assert sum(lots_cap4) == pytest.approx(0.06)
+    assert lots_cap4 == [0.01, 0.01, 0.01, 0.03]
     assert warn_cap4 is not None and "High-Risk Cap applied" in warn_cap4
 
-    # 0.03 active open remaining -> execute_4layer_market keeps L1, L2, L3 (0.03 total) while L4 is skipped;
-    # meanwhile pending limit zone layers keep full pending lots uncapped.
-    ex._dry_run_ticket_lots = {1: 0.07}
+    # 0.02 active open remaining -> execute_4layer_market keeps L1, L2 (0.02 total) while the
+    # deeper layers are skipped; meanwhile pending limit zone layers keep full pending lots uncapped.
+    ex._dry_run_ticket_lots = {1: 0.16}
     lots_cap3, warn_cap3 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_cap3 == [0.01, 0.01, 0.01, 0.0]
+    assert lots_cap3 == [0.01, 0.01, 0.0, 0.0]
     assert warn_cap3 is not None
 
     mk_m, pd_m, layers_m = ex.execute_4layer_market(
@@ -161,9 +162,9 @@ def test_allocate_4layer_lots_atomic_budget_cap(monkeypatch):
         final_tp=3899.5,
         raw_tp1=3900.0,
     )
-    assert len(mk_m) == 3 and pd_m == []
-    assert set(layers_m.keys()) == {"L1", "L2", "L3"}
-    assert round(sum(v["lot"] for v in layers_m.values()), 2) == 0.03
+    assert len(mk_m) == 2 and pd_m == []
+    assert set(layers_m.keys()) == {"L1", "L2"}
+    assert round(sum(v["lot"] for v in layers_m.values()), 2) == 0.02
 
     ex._dry_run_ticket_lots = {1: 0.07}
     mk_z, pd_z, layers_z = ex.execute_4layer_zone(
@@ -176,10 +177,10 @@ def test_allocate_4layer_lots_atomic_budget_cap(monkeypatch):
     )
     assert len(mk_z) == 1 and len(pd_z) == 3
     assert set(layers_z.keys()) == {"L1", "L2", "L3", "L4"}
-    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.08
+    assert round(sum(v["lot"] for v in layers_z.values()), 2) == 0.09
 
-    # 0.00 remaining -> all zeroed, 0 orders placed
-    ex._dry_run_ticket_lots = {1: 0.10}
+    # 0.00 remaining -> all zeroed, 0 orders placed (the £100 cap is 0.18 lots)
+    ex._dry_run_ticket_lots = {1: 0.18}
     lots_zero, warn_zero = ex.allocate_4layer_lots("XAUUSD.s")
     assert lots_zero == [0.0, 0.0, 0.0, 0.0]
     assert "High Risk Lot Cap Reached" in warn_zero
@@ -216,7 +217,7 @@ def test_4layer_zone_splitting_buy_sell_and_cross_boundary():
         assert layers["L3"]["target_price"] == 3889.67 and layers["L3"]["order_type"] == "LIMIT" and layers["L3"]["tp"] == 3899.50
         assert layers["L4"]["target_price"] == 3887.00 and layers["L4"]["order_type"] == "LIMIT" and layers["L4"]["tp"] == 3899.50
         assert all(layers[k]["tp_stage"] == "TP1" for k in ("L1", "L2", "L3", "L4"))
-        assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.02, 0.02, 0.02, 0.02]
+        assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.02, 0.02, 0.02, 0.03]
 
         # SELL zone: 3910-3920, live bid=3905.00 -> all 4 SELL LIMITs from bottom->top, all initially targeting TP1 (3900.5)
         env["sent_requests"].clear()
@@ -265,7 +266,7 @@ def test_4layer_single_price_limit_and_stop_and_10016_fallback():
         )
         assert mk == [] and len(pd) == 4
         assert all(r["type"] == mt5.ORDER_TYPE_BUY_STOP and r["price"] == 3905.0 for r in env["sent_requests"])
-        assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.02, 0.02, 0.02, 0.02]
+        assert [layers[k]["lot"] for k in ("L1", "L2", "L3", "L4")] == [0.02, 0.02, 0.02, 0.03]
 
         # 2. SELL STOP @ 3885.00 (below bid 3895.00) -> 4 ORDER_TYPE_SELL_STOP orders
         env["sent_requests"].clear()
@@ -429,7 +430,7 @@ def test_config_validation_safe_fallbacks(monkeypatch):
         monkeypatch.setenv("DYNAMIC_SLTP_MODE", "INVALID_MODE")
         monkeypatch.setenv("RISK_LOT_MULTIPLIER", "-3")
         importlib.reload(config)
-        assert config.BASE_LAYER_LOTS == [0.02, 0.02, 0.02, 0.02]
+        assert config.BASE_LAYER_LOTS == [0.02, 0.02, 0.02, 0.03]
         assert config.DYNAMIC_SLTP_MODE == "ADAPTIVE"
         assert config.RISK_LOT_MULTIPLIER == 1.0
 

@@ -136,6 +136,7 @@ from risk_controls import (
     apply_float_cap_command,
     apply_loss_limit_command,
     apply_lot_cap_command,
+    format_amount,
     format_limits_status_lines,
     format_protection_profile_line,
     read_risk_limits,
@@ -1562,6 +1563,36 @@ async def check_and_enforce_daily_win_target() -> str:
             logger.debug(f"Telethon disconnect on daily win exit: {e}")
 
     return "DAILY_WIN_REACHED"
+
+
+def _seed_daily_loss_limit_from_config() -> float:
+    """Seed the manual hard daily-loss cutoff from DAILY_LOSS_LIMIT_GBP.
+
+    The automatic percentage guards (DAILY_LOSS_PAUSE_PCT / EMERGENCY_CUTOFF_LOSS_PCT)
+    can stay OFF so a normal stop-out never freezes trading, while this GBP
+    ceiling still ends the trading day: at the limit the copier cancels its
+    pending orders, notifies Saved Messages and stops trading for the day.
+
+    A value the operator set from Saved Messages (source == "user") always wins,
+    so "dailyloss off" or a custom amount survives a restart. The triggered
+    state is preserved, so a limit that already fired today stays locked.
+    """
+    _cfg_mod = sys.modules.get("config") or config
+    limit_gbp = float(getattr(_cfg_mod, "DAILY_LOSS_LIMIT_GBP", 0.0) or 0.0)
+    cur = state_mgr.get_daily_loss_config()
+    if limit_gbp <= 0.0:
+        return round(float(cur.get("limit_amount") or 0.0), 2)
+    if str(cur.get("source") or "").strip().lower() == "user":
+        return round(float(cur.get("limit_amount") or 0.0), 2)
+    amount = round(limit_gbp, 2)
+    state_mgr.set_daily_loss_config(
+        enabled=True,
+        limit_amount=amount,
+        triggered_date=cur.get("triggered_date"),
+        triggered_at=float(cur.get("triggered_at") or 0.0),
+        source="config",
+    )
+    return amount
 
 
 def get_daily_loss_progress() -> Dict[str, Any]:
@@ -7267,6 +7298,43 @@ async def _apply_daily_win_input(event: Any, raw_arg: str) -> None:
     await check_and_enforce_daily_win_target()
 
 
+_LOSS_LIMIT_OFF_TOKENS = frozenset(
+    {"off", "0", "0%", "0.0", "0.0%", "none", "disable", "disabled", "false", "unlimited"}
+)
+
+
+def _parse_gbp_daily_loss_arg(args: Sequence[str]) -> Optional[float]:
+    """Parse a GBP amount for the manual hard daily-loss cutoff.
+
+    Accepts "£30", "30gbp", "30 gbp" and "gbp 30"; returns the amount in the
+    account currency. Returns None when the arguments are not a GBP request
+    (the percentage guards own those).
+    """
+    cleaned = [str(a).strip() for a in (args or []) if str(a).strip()]
+    if not cleaned:
+        return None
+    body = ""
+    if len(cleaned) == 1:
+        low = cleaned[0].lower()
+        if low.endswith("gbp"):
+            body = low[:-3].strip().lstrip("£")
+        elif low.startswith("£"):
+            body = cleaned[0][1:].strip()
+        else:
+            return None
+    elif len(cleaned) == 2 and cleaned[1].lower() == "gbp":
+        body = cleaned[0].lower().lstrip("£").strip()
+    else:
+        return None
+    try:
+        val = float(body)
+    except (TypeError, ValueError):
+        return None
+    if not (val > 0.0):
+        return None
+    return round(val, 2)
+
+
 async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
     """Parse and apply a realized Daily Loss Limit input (e.g. '20', '£20', '-20', or 'off') from Saved Messages."""
     global _awaiting_dailyloss_input, _daily_loss_locked, _daily_loss_lock_notified_date
@@ -7277,7 +7345,7 @@ async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
         _awaiting_dailyloss_input = False
         _daily_loss_locked = False
         _daily_loss_lock_notified_date = None
-        state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, triggered_date=None, triggered_at=0.0)
+        state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, triggered_date=None, triggered_at=0.0, source="user")
         _cfg_mod = sys.modules.get("config") or config
         snap = read_risk_limits(_cfg_mod)
         if snap.daily_loss_pause_pct > 0.0 or snap.emergency_cutoff_pct > 0.0:
@@ -7307,7 +7375,7 @@ async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
         _awaiting_dailyloss_input = False
         _daily_loss_locked = False
         _daily_loss_lock_notified_date = None
-        state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, triggered_date=None, triggered_at=0.0)
+        state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0, triggered_date=None, triggered_at=0.0, source="user")
         await event.reply("⚪ **Daily Loss Limit Disabled.**")
         return
 
@@ -7319,6 +7387,7 @@ async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
         limit_amount=limit_val,
         triggered_date=None,
         triggered_at=0.0,
+        source="user",
     )
 
     prog = await _mt5_call(get_daily_loss_progress)
@@ -7750,15 +7819,66 @@ async def handle_saved_messages_command(event: Any) -> None:
     ):
         _cfg_mod = sys.modules.get("config") or config
         parts = text.split()
+        args = parts[1:]
         fin = await _mt5_call(executor.get_account_financials)
         eff_bal, curr = _effective_account_balance(fin)
-        changed, reply_msg = apply_loss_limit_command(_cfg_mod, parts[1:], eff_bal, curr)
+        dl_cfg = state_mgr.get_daily_loss_config()
+        gbp_now = (
+            round(float(dl_cfg.get("limit_amount") or 0.0), 2) if dl_cfg.get("enabled") else 0.0
+        )
+
+        # A GBP amount ("£30", "30gbp") manages the MANUAL hard daily-loss cutoff.
+        gbp_req = _parse_gbp_daily_loss_arg(args)
+        if gbp_req is not None:
+            state_mgr.set_daily_loss_config(
+                enabled=True,
+                limit_amount=gbp_req,
+                triggered_date=None,
+                triggered_at=0.0,
+                source="user",
+            )
+            _daily_loss_locked = False
+            _daily_loss_lock_notified_date = None
+            prog = await _mt5_call(get_daily_loss_progress)
+            logger.info(
+                f"[/losslimit] manual hard daily loss cutoff set to -{gbp_req:.2f} {curr} "
+                f"(percentage guards unchanged: pause="
+                f"{getattr(_cfg_mod, 'DAILY_LOSS_PAUSE_PCT', 0.0)}%, cutoff="
+                f"{getattr(_cfg_mod, 'EMERGENCY_CUTOFF_LOSS_PCT', 0.0)}%)"
+            )
+            await event.reply(
+                f"🛡️ **Hard Daily Loss Cutoff Updated → `{format_amount(gbp_req, curr)}`**\n"
+                f"• The copier stops for the day once the REALIZED daily loss reaches "
+                f"`{format_amount(-gbp_req, curr)}` (open floating trades are not counted).\n"
+                f"• Realized today: `{format_profit(prog['realized_today_pnl'], curr)}` | "
+                f"Remaining buffer: `{format_amount(prog['remaining_before_limit'], curr)}`\n"
+                "• Change: `/losslimit £<amount>` | Disable: `/losslimit off` or `dailyloss off`"
+            )
+            return
+
+        changed, reply_msg = apply_loss_limit_command(
+            _cfg_mod, args, eff_bal, curr, gbp_limit=gbp_now
+        )
         if changed:
             _daily_50pct_alert_date = None
             logger.info(
                 f"[/losslimit] DAILY_LOSS_PAUSE_PCT={getattr(_cfg_mod, 'DAILY_LOSS_PAUSE_PCT', 0.0)}%, "
                 f"EMERGENCY_CUTOFF_LOSS_PCT={getattr(_cfg_mod, 'EMERGENCY_CUTOFF_LOSS_PCT', 0.0)}%"
             )
+            if args and str(args[0]).strip().lower() in _LOSS_LIMIT_OFF_TOKENS:
+                # "/losslimit off" switches EVERY daily-loss limit off, including the
+                # manual GBP cutoff.
+                state_mgr.set_daily_loss_config(
+                    enabled=False,
+                    limit_amount=0.0,
+                    triggered_date=None,
+                    triggered_at=0.0,
+                    source="user",
+                )
+                _daily_loss_locked = False
+                _daily_loss_lock_notified_date = None
+                logger.info("[/losslimit] manual hard daily loss cutoff disabled (source=user)")
+                reply_msg += "\n• Hard Daily Loss Cutoff: `OFF` (disabled with the percentage guards)"
         await event.reply(reply_msg)
         return
 
@@ -8800,7 +8920,7 @@ async def handle_saved_messages_command(event: Any) -> None:
         lock_str = " 🔒 LOCKED" if _daily_loss_locked else ""
         if dl_prog["enabled"] and dl_prog["limit_amount"] > 0:
             dl_state_str = (
-                f"🟢 ACTIVE — Limit: `{format_profit(-dl_prog['limit_amount'], dl_curr)}` "
+                f"🟢 ACTIVE — Cutoff: `{format_amount(dl_prog['limit_amount'], dl_curr)}` "
                 f"(Realized Today: `{dl_realized_str}`){lock_str}"
             )
         else:
@@ -8808,7 +8928,11 @@ async def handle_saved_messages_command(event: Any) -> None:
 
         _cfg_mod = sys.modules.get("config") or config
         limits_lines = format_limits_status_lines(_cfg_mod, dd_st, risk_st)
-        protection_line = format_protection_profile_line(_cfg_mod)
+        protection_line = format_protection_profile_line(
+            _cfg_mod,
+            daily_loss_limit_gbp=(dl_prog["limit_amount"] if dl_prog["enabled"] else 0.0),
+            daily_loss_currency=dl_curr,
+        )
         dyn_line = await _fetch_dynamic_risk_status_line(_cfg_mod)
         srv_date = await _trading_day_str_async()
         ledger_stats = trade_ledger.get_stats(server_date=srv_date)
@@ -8818,7 +8942,7 @@ async def handle_saved_messages_command(event: Any) -> None:
             f"\n• 4-Layer Split: `[{lots_vec_str}]` x `{RISK_LOT_MULTIPLIER}` (`{MAX_ORDERS_PER_SIGNAL}` orders/signal)"
             f"\n• Active Lots (`/lotcap`): {limits_lines['active_lots_label']}"
             f"\n• Daily Win Limit (`dailywin`): {dw_state_str}"
-            f"\n• Daily Loss Limit (`dailyloss`): {dl_state_str}"
+            f"\n• Daily Loss Cutoff (`dailyloss`): {dl_state_str}"
             f"\n{limits_lines['drawdown_guard_line']}"
             f"\n{limits_lines['float_cap_line']}"
             f"\n{protection_line}"
@@ -9053,6 +9177,15 @@ async def main() -> None:
             state_mgr.update_signal(mid, {"status": "CLOSED"}, chat_id=s.get("chat_id"))
             logger.warning(f"Closed orphaned PENDING signal {mid} left over from previous run (no orders were placed).")
 
+        # Arm the manual hard daily-loss cutoff BEFORE the broker connection, so a
+        # failed MT5 session preflight can never leave the account unprotected.
+        _seeded_loss_limit = _seed_daily_loss_limit_from_config()
+        if _seeded_loss_limit > 0.0:
+            logger.info(
+                f"Manual hard daily loss cutoff active: {format_profit(-_seeded_loss_limit)} "
+                "(percentage drawdown guards stay OFF; adjust with 'dailyloss <amount>' or 'dailyloss off')."
+            )
+
         logger.info("Connecting to MetaTrader 5...")
         mt5_boot_ok = bool(await _mt5_call(executor.connect))
         _mt5_connected_state = mt5_boot_ok
@@ -9113,7 +9246,16 @@ async def main() -> None:
             f"🛡️ Risk Limits: Lot Cap={_lot_lbl} | Drawdown Guard={_dd_lbl} | Float Cap={_fc_lbl} "
             f"(Manual Saved Messages controls: /lotcap, /losslimit, /floatcap, dailyloss, dailywin)"
         )
-        logger.info("🎛️ " + format_protection_profile_line(sys.modules.get("config") or config))
+        _dl_cfg_boot = state_mgr.get_daily_loss_config()
+        logger.info(
+            "🎛️ "
+            + format_protection_profile_line(
+                sys.modules.get("config") or config,
+                daily_loss_limit_gbp=(
+                    float(_dl_cfg_boot.get("limit_amount") or 0.0) if _dl_cfg_boot.get("enabled") else 0.0
+                ),
+            )
+        )
 
         session_file = str(BASE_DIR / TELEGRAM_SESSION_NAME)
         logger.info(f"Initializing Telegram Client (Session: {session_file})...")

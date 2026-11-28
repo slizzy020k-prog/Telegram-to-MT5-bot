@@ -146,7 +146,7 @@ from risk_lifecycle import (
 
 logger = logging.getLogger("copier.mt5")
 
-_DEFAULT_BASE_LOTS: List[float] = [0.01, 0.01, 0.01, 0.02]
+_DEFAULT_BASE_LOTS: List[float] = [0.02, 0.02, 0.02, 0.03]
 _V3_TO_LEGACY_LAYER: Dict[str, str] = {"L1": "TOP", "L2": "MID", "L4": "BOTTOM"}
 
 # Snapshot import-time config bindings so tests monkeypatching either `mt5_executor.<NAME>`
@@ -354,7 +354,7 @@ def scale_layer_lots(
 ) -> List[float]:
     """
     Proportionally scale the 4-layer lot vector and normalize each layer against broker limits.
-    Falls back to [0.01, 0.01, 0.01, 0.02] and multiplier=1.0 on invalid inputs.
+    Falls back to [0.02, 0.02, 0.02, 0.03] and multiplier=1.0 on invalid inputs.
     """
     valid_base: Optional[List[float]] = None
     if isinstance(base_lots, (list, tuple)) and len(base_lots) == 4:
@@ -374,16 +374,24 @@ def scale_layer_lots(
 def calculate_risk_guide_thresholds(capital: float) -> Dict[str, float]:
     """
     Professional Risk Guide Calculator for any custom account balance:
-      £50   -> Low: 0.01 | Mid: 0.02 | High: 0.05
-      £100  -> Low: 0.01 | Mid: 0.05 | High: 0.10
-      £200  -> Low: 0.02 | Mid: 0.10 | High: 0.20
-      £500  -> Low: 0.05 | Mid: 0.25 | High: 0.50
-      £1000 -> Low: 0.10 | Mid: 0.50 | High: 1.00
+      £50   -> Low: 0.01 | Mid: 0.02 | High: 0.09
+      £100  -> Low: 0.01 | Mid: 0.05 | High: 0.18
+      £200  -> Low: 0.02 | Mid: 0.10 | High: 0.36
+      £500  -> Low: 0.05 | Mid: 0.25 | High: 0.90
+      £1000 -> Low: 0.10 | Mid: 0.50 | High: 1.80
+
+    The HIGH-risk cap scales proportionally with the balance:
+    max_lots = (balance / 50) * 0.09, floored to the broker's 0.01 lot step and
+    never below 0.09 once the account reaches £50, so a £50 account unlocks the
+    full 0.09-lot 4-layer ladder.
     """
     cap = max(0.0, float(capital or 0.0))
     low_risk = max(0.01, round(math.floor((cap + 1e-9) / 100.0) * 0.01, 2))
     mid_risk = max(0.01, round(math.floor((cap + 1e-9) / 20.0) * 0.01, 2))
-    high_risk = max(0.01, round(math.floor((cap + 1e-9) / 10.0) * 0.01, 2))
+    # Proportional high-risk cap, stepped to the broker's 0.01 lot granularity.
+    high_risk = max(0.01, round(math.floor((cap + 1e-9) / 50.0 * 0.09 / 0.01) * 0.01, 2))
+    if cap >= 50.0:
+        high_risk = max(high_risk, 0.09)
     return {
         "capital": round(cap, 2),
         "low_risk_lots": low_risk,
@@ -396,11 +404,11 @@ def compute_dynamic_layer_lots_for_balance(capital: float, risk_mode: str = "hig
     """
     Compute 4-layer lot vector [L1, L2, L3, L4] scaled to live account balance
     following the user's Professional Risk Guide:
-      £50   account -> High: 0.05 | Mid: 0.02 | Low: 0.01 -> [0.01, 0.01, 0.01, 0.02]
-      £100  account -> High: 0.10 | Mid: 0.05 | Low: 0.01 -> [0.02, 0.02, 0.02, 0.04]
-      £200  account -> High: 0.20 | Mid: 0.10 | Low: 0.02 -> [0.04, 0.04, 0.04, 0.08]
-      £500  account -> High: 0.50 | Mid: 0.25 | Low: 0.05 -> [0.10, 0.10, 0.10, 0.20]
-      £1000 account -> High: 1.00 | Mid: 0.50 | Low: 0.10 -> [0.20, 0.20, 0.20, 0.40]
+      £50   account -> High: 0.09 | Mid: 0.02 | Low: 0.01 -> [0.02, 0.02, 0.02, 0.03]
+      £100  account -> High: 0.18 | Mid: 0.05 | Low: 0.01 -> [0.04, 0.04, 0.04, 0.06]
+      £200  account -> High: 0.36 | Mid: 0.10 | Low: 0.02 -> [0.07, 0.07, 0.07, 0.15]
+      £500  account -> High: 0.90 | Mid: 0.25 | Low: 0.05 -> [0.18, 0.18, 0.18, 0.36]
+      £1000 account -> High: 1.80 | Mid: 0.50 | Low: 0.10 -> [0.36, 0.36, 0.36, 0.72]
 
     Splits the target lot total into 4 layers with the canonical 1:1:1:2 ratio:
       L1 = 20%
@@ -417,7 +425,8 @@ def compute_dynamic_layer_lots_for_balance(capital: float, risk_mode: str = "hig
     else:
         target = thresholds["high_risk_lots"]
 
-    # When target lot total <= 0.05 (e.g. <= £50 account), return base [0.01, 0.01, 0.01, 0.02]
+    # Below £50 the proportional cap cannot fund the 0.09-lot ladder, so the
+    # smallest ladder [0.01, 0.01, 0.01, 0.02] is used instead.
     if target <= 0.05 + 1e-9:
         return [0.01, 0.01, 0.01, 0.02]
 

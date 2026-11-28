@@ -61,14 +61,14 @@ def test_scenario_a_asymmetric_zone_execution():
     assert layers_data["L1"]["lot"] == 0.02
     assert layers_data["L2"]["lot"] == 0.02
     assert layers_data["L3"]["lot"] == 0.02
-    assert layers_data["L4"]["lot"] == 0.02
+    assert layers_data["L4"]["lot"] == 0.03
     assert layers_data["L1"]["target_price"] == 3895.00
     assert layers_data["L2"]["target_price"] == 3892.33
     assert layers_data["L3"]["target_price"] == 3889.67
     assert layers_data["L4"]["target_price"] == 3887.00
 
     total_lots = round(sum(l["lot"] for l in layers_data.values()), 2)
-    assert total_lots == 0.08
+    assert total_lots == 0.09
 
 
 def test_scenario_b_edit_workflow(tmp_path):
@@ -187,7 +187,7 @@ def test_scenario_b_edit_workflow(tmp_path):
     assert total_step2 == 4
     assert sig_step2["zone_completed"] is True
     assert sig_step2["final_tp"] == 3899.50
-    assert round(sum(l["lot"] for l in sig_step2["layers"].values()), 2) == 0.08
+    assert round(sum(l["lot"] for l in sig_step2["layers"].values()), 2) == 0.09
 
 
 def test_selective_breakeven():
@@ -280,7 +280,7 @@ async def test_end_to_end_event_handlers(tmp_path):
     assert sig_a["final_tp"] == 3899.50
     assert sig_a["proximity_close_price"] == 3898.00
     assert len(sig_a["market_tickets"]) + len(sig_a["pending_tickets"]) == 4
-    assert sig_a["layers"]["L4"]["lot"] == 0.02
+    assert sig_a["layers"]["L4"]["lot"] == 0.03
     assert sig_a["tp_levels"] == {
         "TP1": 3900.0, "TP2": 3910.0, "TP3": 3920.0, "TP4": 3930.0, "TP5": 3940.0
     }

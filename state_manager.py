@@ -997,6 +997,9 @@ class StateManager:
                 "daily_loss_limit": 0.0,
                 "triggered_date": None,
                 "triggered_at": 0.0,
+                # "config" = seeded from DAILY_LOSS_LIMIT_GBP, "user" = set by the
+                # operator from Telegram (always wins over the config seed).
+                "source": "",
             }
             cfg = self._state.get("_daily_loss")
             if isinstance(cfg, dict):
@@ -1016,8 +1019,14 @@ class StateManager:
         triggered_date: Optional[str] = None,
         triggered_at: float = 0.0,
         daily_loss_limit: Optional[float] = None,
+        source: str = "",
     ) -> Dict[str, Any]:
-        """Persist the Daily Loss Limit configuration, keeping limit_amount and daily_loss_limit synced."""
+        """Persist the Daily Loss Limit configuration, keeping limit_amount and daily_loss_limit synced.
+
+        The "source" field records who owns the value: "config" (seeded from the
+        DAILY_LOSS_LIMIT_GBP knob) or "user" (set from Saved Messages). A "user"
+        value is never overwritten by the config seed on restart.
+        """
         with self._lock:
             raw_lim = daily_loss_limit if (daily_loss_limit is not None and limit_amount == 0.0) else limit_amount
             lim = round(abs(float(raw_lim or 0.0)), 2)
@@ -1027,6 +1036,7 @@ class StateManager:
                 "daily_loss_limit": lim,
                 "triggered_date": triggered_date,
                 "triggered_at": float(triggered_at or 0.0),
+                "source": str(source or ""),
             }
             self._state["_daily_loss"] = cfg
             self._save_state_locked()

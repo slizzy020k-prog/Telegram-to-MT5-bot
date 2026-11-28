@@ -29,21 +29,23 @@ from tests.test_copier_scenarios import MockTelethonEvent
 @pytest.mark.parametrize(
     "balance, exp_high, exp_mid, exp_low, exp_layers",
     [
-        (50.0, 0.05, 0.02, 0.01, [0.01, 0.01, 0.01, 0.02]),
-        (100.0, 0.10, 0.05, 0.01, [0.02, 0.02, 0.02, 0.04]),
-        (200.0, 0.20, 0.10, 0.02, [0.04, 0.04, 0.04, 0.08]),
-        (500.0, 0.50, 0.25, 0.05, [0.10, 0.10, 0.10, 0.20]),
-        (1000.0, 1.00, 0.50, 0.10, [0.20, 0.20, 0.20, 0.40]),
+        (50.0, 0.09, 0.02, 0.01, [0.02, 0.02, 0.02, 0.03]),
+        (100.0, 0.18, 0.05, 0.01, [0.04, 0.04, 0.04, 0.06]),
+        (200.0, 0.36, 0.10, 0.02, [0.07, 0.07, 0.07, 0.15]),
+        (500.0, 0.90, 0.25, 0.05, [0.18, 0.18, 0.18, 0.36]),
+        (1000.0, 1.80, 0.50, 0.10, [0.36, 0.36, 0.36, 0.72]),
     ],
 )
 def test_user_risk_guide_guideline_tiers(balance, exp_high, exp_mid, exp_low, exp_layers):
     """
-    Verify the user's exact account guideline:
-    £50   -> High: 0.05 | Mid: 0.02 | Low: 0.01 -> [0.01, 0.01, 0.01, 0.02]
-    £100  -> High: 0.10 | Mid: 0.05 | Low: 0.01 -> [0.02, 0.02, 0.02, 0.04]
-    £200  -> High: 0.20 | Mid: 0.10 | Low: 0.02 -> [0.04, 0.04, 0.04, 0.08]
-    £500  -> High: 0.50 | Mid: 0.25 | Low: 0.05 -> [0.10, 0.10, 0.10, 0.20]
-    £1000 -> High: 1.00 | Mid: 0.50 | Low: 0.10 -> [0.20, 0.20, 0.20, 0.40]
+    Verify the account guideline (high-risk cap scales proportionally with the
+    balance: (balance / 50) * 0.09, floored to the broker's 0.01 lot step and
+    never below 0.09 from £50 up):
+    £50   -> High: 0.09 | Mid: 0.02 | Low: 0.01 -> [0.02, 0.02, 0.02, 0.03]
+    £100  -> High: 0.18 | Mid: 0.05 | Low: 0.01 -> [0.04, 0.04, 0.04, 0.06]
+    £200  -> High: 0.36 | Mid: 0.10 | Low: 0.02 -> [0.07, 0.07, 0.07, 0.15]
+    £500  -> High: 0.90 | Mid: 0.25 | Low: 0.05 -> [0.18, 0.18, 0.18, 0.36]
+    £1000 -> High: 1.80 | Mid: 0.50 | Low: 0.10 -> [0.36, 0.36, 0.36, 0.72]
     """
     thresh = calculate_risk_guide_thresholds(balance)
     assert thresh["high_risk_lots"] == exp_high
@@ -64,30 +66,30 @@ def test_allocate_4layer_lots_adjusts_to_live_balance(monkeypatch):
     ex = MT5Executor(dry_run=True)
     ex.connect()
 
-    # Case A: Live balance = £50 -> allocates [0.01, 0.01, 0.01, 0.02] (0.05 total)
+    # Case A: Live balance = £50 -> allocates [0.02, 0.02, 0.02, 0.03] (0.09 total = the cap)
     ex._dry_run_capital = 50.0
     ex._dry_run_ticket_lots = {}
     lots_50, warn_50 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_50 == [0.01, 0.01, 0.01, 0.02]
-    assert round(sum(lots_50), 2) == 0.05
+    assert lots_50 == [0.02, 0.02, 0.02, 0.03]
+    assert round(sum(lots_50), 2) == 0.09
 
-    # Case B: Live balance = £100 -> allocates [0.02, 0.02, 0.02, 0.04] (0.10 total)
+    # Case B: Live balance = £100 -> allocates [0.04, 0.04, 0.04, 0.06] (0.18 total)
     ex._dry_run_capital = 100.0
     lots_100, warn_100 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_100 == [0.02, 0.02, 0.02, 0.04]
-    assert round(sum(lots_100), 2) == 0.10
+    assert lots_100 == [0.04, 0.04, 0.04, 0.06]
+    assert round(sum(lots_100), 2) == 0.18
 
-    # Case C: Live balance = £200 -> allocates [0.04, 0.04, 0.04, 0.08] (0.20 total)
+    # Case C: Live balance = £200 -> allocates [0.07, 0.07, 0.07, 0.15] (0.36 total)
     ex._dry_run_capital = 200.0
     lots_200, warn_200 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_200 == [0.04, 0.04, 0.04, 0.08]
-    assert round(sum(lots_200), 2) == 0.20
+    assert lots_200 == [0.07, 0.07, 0.07, 0.15]
+    assert round(sum(lots_200), 2) == 0.36
 
-    # Case D: Live balance = £500 -> allocates [0.10, 0.10, 0.10, 0.20] (0.50 total)
+    # Case D: Live balance = £500 -> allocates [0.18, 0.18, 0.18, 0.36] (0.90 total)
     ex._dry_run_capital = 500.0
     lots_500, warn_500 = ex.allocate_4layer_lots("XAUUSD.s")
-    assert lots_500 == [0.10, 0.10, 0.10, 0.20]
-    assert round(sum(lots_500), 2) == 0.50
+    assert lots_500 == [0.18, 0.18, 0.18, 0.36]
+    assert round(sum(lots_500), 2) == 0.90
 
 
 # ---------------------------------------------------------------------------

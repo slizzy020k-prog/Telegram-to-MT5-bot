@@ -135,9 +135,9 @@ def _is_positive_number(val: Any) -> bool:
 def _parse_base_layer_lots() -> List[float]:
     """
     Parse BASE_LAYER_LOTS (or legacy LAYER_LOTS) into 4 strictly positive floats.
-    Falls back safely to [0.02, 0.02, 0.02, 0.02] on malformed or wrong-length input.
+    Falls back safely to [0.02, 0.02, 0.02, 0.03] on malformed or wrong-length input.
     """
-    default_lots = [0.02, 0.02, 0.02, 0.02]
+    default_lots = [0.02, 0.02, 0.02, 0.03]
     raw_base = os.getenv("BASE_LAYER_LOTS")
     if raw_base and raw_base.strip():
         stripped = raw_base.strip()
@@ -281,7 +281,9 @@ UNPRICED_TP_GRACE_SECONDS: float = _env_float("UNPRICED_TP_GRACE_SECONDS", 45.0,
 # (/lotcap, /losslimit, /floatcap, dailyloss).
 ENFORCE_HIGH_RISK_LOT_CAP: bool = _env_bool("ENFORCE_HIGH_RISK_LOT_CAP", False)
 # Automatically adjust layer lots & max risk cap based on live balance following the Risk Guide:
-# £50 -> 0.05 max | £100 -> 0.10 max | £200 -> 0.20 max | £500 -> 0.50 max | £1000 -> 1.00 max
+# High-risk cap: £50 -> 0.09 max lots, scaling proportionally with the balance
+# (max_lots = (balance / 50) * 0.09, floored to the broker's 0.01 lot step, and
+# never below 0.09 from £50 up) -> £100 -> 0.18 | £200 -> 0.36 | £500 -> 0.90
 AUTO_ADJUST_LOTS_TO_BALANCE: bool = _env_bool("AUTO_ADJUST_LOTS_TO_BALANCE", False)
 DAILY_LOSS_PAUSE_PCT: float = _env_float(
     "DAILY_LOSS_PAUSE_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False
@@ -290,6 +292,15 @@ EMERGENCY_CUTOFF_LOSS_PCT: float = _env_float(
     "EMERGENCY_CUTOFF_LOSS_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False
 )
 DAILY_LOSS_CLOSE_OPEN_TRADES: bool = _env_bool("DAILY_LOSS_CLOSE_OPEN_TRADES", False)
+# Manual hard daily loss cutoff in account currency (GBP on this account). It is
+# seeded into the realized daily-loss limit at startup, so the automatic
+# percentage guards can stay OFF (no pause on a normal stop-out) while a hard
+# GBP ceiling still ends the trading day. Adjust or toggle it anytime from
+# Saved Messages with `dailyloss <amount>` / `dailyloss off` (or `/losslimit`).
+# 0.0 = no cutoff. A value the user sets from Telegram always wins over this seed.
+DAILY_LOSS_LIMIT_GBP: float = _env_float(
+    "DAILY_LOSS_LIMIT_GBP", 30.0, min_val=0.0, max_val=100000.0, positive_only=False
+)
 # Optional floating-loss hard cap: 0.0 = disabled (unlimited). Enable live with /floatcap <1-100>.
 FLOAT_LOSS_FORCE_CLOSE_PCT: float = _env_float(
     "FLOAT_LOSS_FORCE_CLOSE_PCT", 0.0, min_val=0.0, max_val=100.0, positive_only=False

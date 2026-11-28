@@ -45,8 +45,8 @@ def _apply_isolated_env() -> None:
     # ambient live .env cannot leak into it. Tests that exercise the new
     # configuration set the knob explicitly.
     os.environ["MAX_ORDERS_PER_SIGNAL"] = "4"
-    os.environ["BASE_LAYER_LOTS"] = "[0.02, 0.02, 0.02, 0.02]"
-    os.environ["LAYER_LOTS"] = '{"L1": 0.02, "L2": 0.02, "L3": 0.02, "L4": 0.02}'
+    os.environ["BASE_LAYER_LOTS"] = "[0.02, 0.02, 0.02, 0.03]"
+    os.environ["LAYER_LOTS"] = '{"L1": 0.02, "L2": 0.02, "L3": 0.02, "L4": 0.03}'
     os.environ["SINGLE_PRICE_LOT"] = "0.02"
     os.environ["DYNAMIC_ATR_MFE_LOCK_TIERS"] = (
         "0.30:0.60,0.50:0.70,0.75:0.78,1.00:0.84,1.40:0.88,1.80:0.91,2.50:0.93"
@@ -55,6 +55,7 @@ def _apply_isolated_env() -> None:
     os.environ["DYNAMIC_SL_MAX_DOLLARS"] = "35.00"
     os.environ["R_LOCK_TIERS"] = "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75"
     os.environ["DAILY_LOSS_PAUSE_PCT"] = "0.0"
+    os.environ["DAILY_LOSS_LIMIT_GBP"] = "30.0"
     os.environ["FLOAT_LOSS_FORCE_CLOSE_PCT"] = "0.0"
     os.environ["EMERGENCY_CUTOFF_LOSS_PCT"] = "0.0"
     os.environ["STOP_LEVEL_STOPS_DISTANCE_MULT"] = "2.0"
