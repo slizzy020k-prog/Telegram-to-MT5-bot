@@ -1373,13 +1373,18 @@ class MT5Executor:
                     # routing cannot be determined, the stricter reference is used.
                     _at_market: Optional[bool]
                     try:
+                        # A ZONE entry always routes with "AUTO" in the placement path
+                        # (execute_4layer_zone ignores the caller's intent), while a
+                        # SINGLE-PRICE entry routes with the caller's intent. Mirror
+                        # that exactly so the guard measures the real fill.
+                        _probe_intent = "AUTO" if is_zone_entry else _intent
                         _at_market = bool(
                             self._layer_will_execute_at_market(
                                 symbol=resolved,
                                 direction=direction_norm,
                                 target_price=placed_ref,
                                 tick=tick,
-                                order_intent=_intent,
+                                order_intent=_probe_intent,
                                 allow_market_buffer=True,
                             )
                         )
