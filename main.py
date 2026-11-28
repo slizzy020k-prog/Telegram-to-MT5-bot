@@ -1565,6 +1565,22 @@ async def check_and_enforce_daily_win_target() -> str:
     return "DAILY_WIN_REACHED"
 
 
+def _broker_day_known() -> bool:
+    """True when the executor can report the BROKER's trading day.
+
+    While the terminal is not connected, get_server_date_str() falls back to the
+    LOCAL calendar day, which can differ from the broker's day - so a fired
+    daily-loss limit must not be compared against it.
+    """
+    try:
+        ex = executor
+        if bool(getattr(ex, "dry_run", False)) or not bool(getattr(ex, "_connected", False)):
+            return False
+        return bool(ex.get_server_date_str())
+    except Exception:
+        return False
+
+
 def _seed_daily_loss_limit_from_config() -> float:
     """Seed the manual hard daily-loss cutoff from DAILY_LOSS_LIMIT_GBP.
 
@@ -1580,21 +1596,36 @@ def _seed_daily_loss_limit_from_config() -> float:
     _cfg_mod = sys.modules.get("config") or config
     limit_gbp = float(getattr(_cfg_mod, "DAILY_LOSS_LIMIT_GBP", 0.0) or 0.0)
     cur = state_mgr.get_daily_loss_config()
-    if limit_gbp <= 0.0:
-        return round(float(cur.get("limit_amount") or 0.0), 2)
-    if str(cur.get("source") or "").strip().lower() == "user":
-        return round(float(cur.get("limit_amount") or 0.0), 2)
-    amount = round(limit_gbp, 2)
+    src = str(cur.get("source") or "").strip().lower()
     prev_amount = round(float(cur.get("limit_amount") or 0.0), 2)
-    if str(cur.get("triggered_date") or "") == _trading_day_str() and prev_amount > 0.0:
-        # The limit already FIRED today. Raising it (or re-seeding a higher value)
-        # would clear "limit_reached" and silently unlock a day that must stay
-        # locked, so the fired amount is kept exactly as it was.
-        amount = prev_amount
+    prev_triggered = str(cur.get("triggered_date") or "")
+    if cur.get("present") and src != "config":
+        # A record this seed does NOT own: the operator set it from Saved
+        # Messages, or it came from an older release (no source marker). It is
+        # never overwritten - not even by a higher shipped seed.
+        return prev_amount
+    if limit_gbp <= 0.0:
+        return prev_amount
+    amount = round(limit_gbp, 2)
+    if prev_triggered and prev_amount > 0.0:
+        # The limit already FIRED at some point. Raising it (or re-seeding a higher
+        # value) could clear "limit_reached" and silently unlock a day that must
+        # stay locked, so a fired amount is never raised.
+        if _broker_day_known():
+            # The broker's trading day is known: only a limit that fired TODAY is
+            # protected; a limit that fired on an earlier day is replaced by the
+            # current seed value.
+            if prev_triggered == _trading_day_str():
+                amount = prev_amount
+        else:
+            # The broker's trading day is unknown (no connection yet): the fired
+            # amount is kept, because a local-clock comparison could differ from
+            # the broker's day and silently unlock the day.
+            amount = prev_amount
     state_mgr.set_daily_loss_config(
         enabled=True,
         limit_amount=amount,
-        triggered_date=cur.get("triggered_date"),
+        triggered_date=prev_triggered or None,
         triggered_at=float(cur.get("triggered_at") or 0.0),
         source="config",
     )
@@ -7352,7 +7383,9 @@ async def _apply_daily_loss_input(event: Any, raw_arg: str) -> None:
     import re
 
     clean = raw_arg.strip().lower()
-    if clean in ("off", "disable", "disabled", "stop", "none", "cancel", "no", "false", "0"):
+    # "0" is a GBP amount of zero (no limit), not the word "off", so it falls
+    # through to the amount path below.
+    if clean in ("off", "disable", "disabled", "stop", "none", "cancel", "no", "false"):
         _awaiting_dailyloss_input = False
         _daily_loss_locked = False
         _daily_loss_lock_notified_date = None
@@ -9193,15 +9226,6 @@ async def main() -> None:
             state_mgr.update_signal(mid, {"status": "CLOSED"}, chat_id=s.get("chat_id"))
             logger.warning(f"Closed orphaned PENDING signal {mid} left over from previous run (no orders were placed).")
 
-        # Arm the manual hard daily-loss cutoff BEFORE the broker connection, so a
-        # failed MT5 session preflight can never leave the account unprotected.
-        _seeded_loss_limit = _seed_daily_loss_limit_from_config()
-        if _seeded_loss_limit > 0.0:
-            logger.info(
-                f"Manual hard daily loss cutoff active: {format_profit(-_seeded_loss_limit)} "
-                "(percentage drawdown guards stay OFF; adjust with 'dailyloss <amount>' or 'dailyloss off')."
-            )
-
         logger.info("Connecting to MetaTrader 5...")
         mt5_boot_ok = bool(await _mt5_call(executor.connect))
         _mt5_connected_state = mt5_boot_ok
@@ -9213,6 +9237,17 @@ async def main() -> None:
             )
         else:
             logger.info("MetaTrader 5 connection established successfully.")
+            # Arm the manual hard daily-loss cutoff now that the BROKER trading day
+            # is known (the seed compares the fired date with the broker day), and
+            # before the session preflight, so a failed preflight can never leave
+            # the account unprotected. Without a connection the copier cannot place
+            # an order at all, so there is nothing to protect yet.
+            _seeded_loss_limit = _seed_daily_loss_limit_from_config()
+            if _seeded_loss_limit > 0.0:
+                logger.info(
+                    f"Manual hard daily loss cutoff active: {format_profit(-_seeded_loss_limit)} "
+                    "(percentage drawdown guards stay OFF; adjust with 'dailyloss <amount>' or 'dailyloss off')."
+                )
             # Phase 1.4 (R9): read-only MT5 session preflight (connectivity / server /
             # account / permissions) BEFORE hydration and handlers are armed. On hard
             # failure trading is HALTED but Telegram monitoring stays online.

@@ -1004,6 +1004,10 @@ class StateManager:
             cfg = self._state.get("_daily_loss")
             if isinstance(cfg, dict):
                 defaults.update(cfg)
+                # "present" tells the caller whether a record exists at all (a
+                # fresh install has none), so a config seed can tell an untouched
+                # state apart from a limit the operator owns.
+                defaults["present"] = True
                 defaults["enabled"] = bool(defaults["enabled"])
                 raw_lim = cfg.get("limit_amount") if "limit_amount" in cfg else cfg.get("daily_loss_limit")
                 lim = round(abs(float(raw_lim or 0.0)), 2)

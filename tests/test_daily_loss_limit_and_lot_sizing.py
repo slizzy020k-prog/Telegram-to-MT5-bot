@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 import config
@@ -149,6 +151,54 @@ async def test_dailyloss_marks_the_limit_as_user_set(tmp_path, monkeypatch):
     assert cfg["enabled"] is True
     assert cfg["limit_amount"] == 40.0
     assert cfg["source"] == "user"
+
+
+def test_a_fired_limit_is_compared_against_the_broker_trading_day(tmp_path, monkeypatch):
+    """The fired date comes from the BROKER, so the seed must use the broker day.
+
+    A local-clock comparison would silently raise the limit on every restart
+    that happens while the broker's trading day has rolled over.
+    """
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_broker_day")
+
+    class _DisconnectedExecutor:
+        """A disconnected executor: the trading day falls back to the LOCAL day."""
+
+        dry_run = False
+        _connected = False
+
+        def get_server_date_str(self):
+            return datetime.now().strftime("%Y-%m-%d")
+
+    monkeypatch.setattr(main, "executor", _DisconnectedExecutor())
+    main.state_mgr.set_daily_loss_config(
+        enabled=True,
+        limit_amount=10.0,
+        triggered_date="2026-11-29",      # a BROKER day that differs from the local one
+        triggered_at=1.0,
+        source="config",
+    )
+    main._seed_daily_loss_limit_from_config()
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["limit_amount"] == 10.0, "a limit that fired on the broker day must not be raised"
+    assert cfg["triggered_date"] == "2026-11-29"
+
+
+def test_a_legacy_limit_without_a_source_marker_is_not_overwritten(tmp_path, monkeypatch):
+    """A limit persisted by an older release belongs to the operator."""
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_legacy")
+
+    # No source marker: this is what the previous release wrote.
+    main.state_mgr.set_daily_loss_config(enabled=True, limit_amount=10.0)
+
+    main._seed_daily_loss_limit_from_config()
+
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["limit_amount"] == 10.0, "an operator-owned limit is never overwritten"
+    assert str(cfg.get("source") or "") == "", "the ownership marker is not overwritten either"
 
 
 def test_a_limit_that_already_fired_today_is_not_raised_by_the_seed(tmp_path, monkeypatch):

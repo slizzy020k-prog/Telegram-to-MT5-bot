@@ -56,6 +56,7 @@ def _apply_isolated_env() -> None:
     os.environ["R_LOCK_TIERS"] = "0.5:0.00,1.0:0.25,1.5:0.50,2.0:0.75"
     os.environ["DAILY_LOSS_PAUSE_PCT"] = "0.0"
     os.environ["DAILY_LOSS_LIMIT_GBP"] = "30.0"
+    os.environ["DAILY_LOSS_CLOSE_OPEN_TRADES"] = "false"
     os.environ["FLOAT_LOSS_FORCE_CLOSE_PCT"] = "0.0"
     os.environ["EMERGENCY_CUTOFF_LOSS_PCT"] = "0.0"
     os.environ["STOP_LEVEL_STOPS_DISTANCE_MULT"] = "2.0"
