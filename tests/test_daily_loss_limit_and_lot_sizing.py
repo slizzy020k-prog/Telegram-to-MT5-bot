@@ -186,6 +186,25 @@ def test_a_fired_limit_is_compared_against_the_broker_trading_day(tmp_path, monk
     assert cfg["triggered_date"] == "2026-11-29"
 
 
+def test_a_legacy_record_without_a_limit_is_adopted_by_the_seed(tmp_path, monkeypatch):
+    """A legacy record that carries NO limit is an untouched placeholder.
+
+    The live state file holds exactly that shape (enabled=false, limit_amount=0.0,
+    no ownership marker), so it must still be adopted by the config seed - otherwise
+    the shipped cutoff would never be armed on the live account.
+    """
+    monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)
+    _reset_main(tmp_path, "seed_legacy_empty")
+
+    main.state_mgr.set_daily_loss_config(enabled=False, limit_amount=0.0)
+
+    assert main._seed_daily_loss_limit_from_config() == 30.0
+    cfg = main.state_mgr.get_daily_loss_config()
+    assert cfg["enabled"] is True
+    assert cfg["limit_amount"] == 30.0
+    assert cfg["source"] == "config"
+
+
 def test_a_legacy_limit_without_a_source_marker_is_not_overwritten(tmp_path, monkeypatch):
     """A limit persisted by an older release belongs to the operator."""
     monkeypatch.setattr(config, "DAILY_LOSS_LIMIT_GBP", 30.0)

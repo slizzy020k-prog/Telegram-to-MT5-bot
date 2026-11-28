@@ -1599,10 +1599,15 @@ def _seed_daily_loss_limit_from_config() -> float:
     src = str(cur.get("source") or "").strip().lower()
     prev_amount = round(float(cur.get("limit_amount") or 0.0), 2)
     prev_triggered = str(cur.get("triggered_date") or "")
-    if cur.get("present") and src != "config":
-        # A record this seed does NOT own: the operator set it from Saved
-        # Messages, or it came from an older release (no source marker). It is
-        # never overwritten - not even by a higher shipped seed.
+    if src == "user":
+        # The operator owns this value (it was set from Saved Messages, including
+        # "dailyloss off") - it is never touched by the config seed.
+        return prev_amount
+    if src == "" and prev_amount > 0.0:
+        # A limit persisted by an older release (no ownership marker). It carries
+        # a limit, so it belongs to the operator and is never overwritten - not
+        # even by a higher shipped seed. (A legacy record with NO limit at all is
+        # an untouched placeholder and may be adopted by the seed.)
         return prev_amount
     if limit_gbp <= 0.0:
         return prev_amount
@@ -9226,6 +9231,13 @@ async def main() -> None:
             state_mgr.update_signal(mid, {"status": "CLOSED"}, chat_id=s.get("chat_id"))
             logger.warning(f"Closed orphaned PENDING signal {mid} left over from previous run (no orders were placed).")
 
+        # Arm the manual hard daily-loss cutoff BEFORE the broker connection, so it
+        # is armed even when the terminal is not up yet (the executor reconnects on
+        # demand, so the copier can still trade later in the session). The broker's
+        # trading day is not known yet, so a fired limit is never raised here; the
+        # seed runs again once the connection is up, when the broker day is exact.
+        _seed_daily_loss_limit_from_config()
+
         logger.info("Connecting to MetaTrader 5...")
         mt5_boot_ok = bool(await _mt5_call(executor.connect))
         _mt5_connected_state = mt5_boot_ok
@@ -9237,11 +9249,9 @@ async def main() -> None:
             )
         else:
             logger.info("MetaTrader 5 connection established successfully.")
-            # Arm the manual hard daily-loss cutoff now that the BROKER trading day
-            # is known (the seed compares the fired date with the broker day), and
-            # before the session preflight, so a failed preflight can never leave
-            # the account unprotected. Without a connection the copier cannot place
-            # an order at all, so there is nothing to protect yet.
+            # Re-seed now that the BROKER trading day is known, so the "fired today"
+            # comparison is exact. This runs BEFORE the session preflight, so a
+            # failed preflight can never leave the account unprotected.
             _seeded_loss_limit = _seed_daily_loss_limit_from_config()
             if _seeded_loss_limit > 0.0:
                 logger.info(
